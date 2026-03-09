@@ -7,6 +7,7 @@ members = [
     "crates/index",
     "crates/ontology",
     "crates/query",
+    "crates/transform",
 ]
 resolver = "3"
 
@@ -23,9 +24,12 @@ mimisbrunnr-meta = { path = "crates/meta" }
 mimisbrunnr-index = { path = "crates/index" }
 mimisbrunnr-ontology = { path = "crates/ontology" }
 mimisbrunnr-query = { path = "crates/query" }
+mimisbrunnr-transform = { path = "crates/transform" }
 
+blake3 = "1"
 bytemuck = { version = "1", features = ["derive"] }
 crc32fast = "1"
 roaring = "0.11"
 tempfile = "3"
 thiserror = "2"
+zstd = "0.13"

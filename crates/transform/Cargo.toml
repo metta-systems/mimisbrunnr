@@ -1,0 +1,15 @@
+[package]
+name = "mimisbrunnr-transform"
+description = "Transform pipeline: hash, compress, pad, encrypt for Mímisbrunnr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimisbrunnr-types = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
