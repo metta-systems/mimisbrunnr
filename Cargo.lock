@@ -335,6 +335,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimisbrunnr-watch"
+version = "0.1.0"
+dependencies = [
+ "mimisbrunnr-index",
+ "mimisbrunnr-ontology",
+ "mimisbrunnr-query",
+ "mimisbrunnr-types",
+ "roaring",
+ "thiserror",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
