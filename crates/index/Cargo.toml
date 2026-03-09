@@ -1,0 +1,13 @@
+[package]
+name = "mimisbrunnr-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimisbrunnr-types = { workspace = true }
+thiserror = { workspace = true }
+roaring = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
