@@ -3,6 +3,7 @@ members = [
     "crates/types",
     "crates/storage",
     "crates/wal",
+    "crates/meta",
 ]
 resolver = "3"
 
@@ -15,6 +16,7 @@ license = "MIT"
 mimisbrunnr-types = { path = "crates/types" }
 mimisbrunnr-storage = { path = "crates/storage" }
 mimisbrunnr-wal = { path = "crates/wal" }
+mimisbrunnr-meta = { path = "crates/meta" }
 
 bytemuck = { version = "1", features = ["derive"] }
 crc32fast = "1"
