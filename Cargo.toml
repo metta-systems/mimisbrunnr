@@ -2,6 +2,7 @@
 members = [
     "crates/types",
     "crates/storage",
+    "crates/wal",
 ]
 resolver = "3"
 
@@ -13,6 +14,7 @@ license = "MIT"
 [workspace.dependencies]
 mimisbrunnr-types = { path = "crates/types" }
 mimisbrunnr-storage = { path = "crates/storage" }
+mimisbrunnr-wal = { path = "crates/wal" }
 
 bytemuck = { version = "1", features = ["derive"] }
 crc32fast = "1"

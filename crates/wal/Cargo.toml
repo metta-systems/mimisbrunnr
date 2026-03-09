@@ -1,0 +1,15 @@
+[package]
+name = "mimisbrunnr-wal"
+description = "Write-ahead log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimisbrunnr-types = { workspace = true }
+mimisbrunnr-storage = { workspace = true }
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
