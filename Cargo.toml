@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/types",
 ]
 resolver = "3"
 
@@ -9,3 +10,6 @@ edition = "2024"
 license = "MIT"
 
 [workspace.dependencies]
+mimisbrunnr-types = { path = "crates/types" }
+
+thiserror = "2"

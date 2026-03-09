@@ -1,0 +1,8 @@
+[package]
+name = "mimisbrunnr-types"
+description = "Core data model types for the Mímisbrunnr associative filesystem"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
