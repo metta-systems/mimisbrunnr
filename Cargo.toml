@@ -11,6 +11,7 @@ members = [
     "crates/watch",
     "crates/pool",
     "crates/engine",
+    "crates/unix",
 ]
 resolver = "3"
 
@@ -31,6 +32,7 @@ mimisbrunnr-transform = { path = "crates/transform" }
 mimisbrunnr-watch = { path = "crates/watch" }
 mimisbrunnr-pool = { path = "crates/pool" }
 mimisbrunnr-engine = { path = "crates/engine" }
+mimisbrunnr-unix = { path = "crates/unix" }
 
 blake3 = "1"
 bytemuck = { version = "1", features = ["derive"] }

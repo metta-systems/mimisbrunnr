@@ -356,6 +356,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimisbrunnr-unix"
+version = "0.1.0"
+dependencies = [
+ "mimisbrunnr-engine",
+ "mimisbrunnr-ontology",
+ "mimisbrunnr-transform",
+ "mimisbrunnr-types",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "mimisbrunnr-wal"
 version = "0.1.0"
 dependencies = [

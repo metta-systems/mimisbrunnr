@@ -1,0 +1,16 @@
+[package]
+name = "mimisbrunnr-unix"
+description = "Unix path projections and import/export for Mímisbrunnr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimisbrunnr-types = { workspace = true }
+mimisbrunnr-engine = { workspace = true }
+mimisbrunnr-ontology = { workspace = true }
+mimisbrunnr-transform = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

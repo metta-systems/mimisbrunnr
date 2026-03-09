@@ -30,6 +30,15 @@ pub enum Error {
 
     #[error("cycle detected in implication DAG")]
     CycleDetected,
+
+    #[error("context not found: {0}")]
+    ContextNotFound(String),
+
+    #[error("context already exists: {0}")]
+    ContextAlreadyExists(String),
+
+    #[error("path not found in context {context}: {path}")]
+    PathNotFound { context: String, path: String },
 }
 
 #[cfg(test)]
