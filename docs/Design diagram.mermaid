@@ -1,0 +1,222 @@
+graph TB
+    %% ═══════════════════════════════════════════
+    %% CLIENT / QUERY LAYER
+    %% ═══════════════════════════════════════════
+
+    subgraph ClientLayer["Client Layer"]
+        CLI["CLI / Shell<br/><i>query DSL, tag ops,<br/>browse, import</i>"]
+        API["Library API<br/><i>Rust crate interface</i>"]
+        FUSE["Optional FUSE<br/><i>POSIX compat shim</i>"]
+    end
+
+    %% ═══════════════════════════════════════════
+    %% QUERY ENGINE
+    %% ═══════════════════════════════════════════
+
+    subgraph QueryEngine["Query Engine"]
+        Parser["Query Parser<br/><i>text → Query AST</i>"]
+        Planner["Query Planner<br/><i>reorder, optimize,<br/>choose index</i>"]
+        Executor["Set Executor<br/><i>bitmap AND/OR/NOT,<br/>range scans</i>"]
+        FacetCounter["Facet Counter<br/><i>co-occurrence,<br/>refinement tags</i>"]
+    end
+
+    CLI --> Parser
+    API --> Parser
+    FUSE --> Parser
+    Parser --> Planner
+    Planner --> Executor
+    Executor --> FacetCounter
+
+    %% ═══════════════════════════════════════════
+    %% DATA MODEL
+    %% ═══════════════════════════════════════════
+
+    subgraph DataModel["Data Model"]
+        direction TB
+        Objects["Objects<br/><i>ObjectId: u64<br/>content hash, size,<br/>timestamps</i>"]
+        Assertions["Assertions<br/><i>Tag(TagId)<br/>Attr(key, value)<br/>Relation(pred, target)</i>"]
+        Values["Values<br/><i>Text, Int, Float,<br/>Timestamp, Blob</i>"]
+        Objects --- Assertions
+        Assertions --- Values
+    end
+
+    %% ═══════════════════════════════════════════
+    %% ONTOLOGY
+    %% ═══════════════════════════════════════════
+
+    subgraph Ontology["Ontology Layer"]
+        ImplGraph["Implication DAG<br/><i>car → vehicle → physical<br/>transitive closure</i>"]
+        Aliases["Aliases<br/><i>laptop = notebook</i>"]
+        MutexGroups["Mutex Groups<br/><i>active ⊕ discontinued</i>"]
+        Materializer["Materializer<br/><i>on tag add: insert<br/>all implied tags</i>"]
+    end
+
+    ImplGraph --> Materializer
+    Aliases --> Planner
+    MutexGroups --> Materializer
+
+    %% ═══════════════════════════════════════════
+    %% INDEX LAYER (in-memory, persisted)
+    %% ═══════════════════════════════════════════
+
+    subgraph IndexLayer["Index Layer (RAM-resident, WAL-persisted)"]
+        TagIndex["Tag Inverted Index<br/><i>TagId → RoaringBitmap<br/>5000 tags × ~20-50KB each</i>"]
+        KVIndex["KV Equality Index<br/><i>(key, value_hash) → RoaringBitmap<br/>compound tag approach</i>"]
+        RangeIndex["Range B+ Tree<br/><i>(attr_id, value, obj_id)<br/>ordered scans for &lt; &gt; BETWEEN</i>"]
+        ForwardIndex["Forward Index<br/><i>ObjectId → Vec&lt;TagId&gt;<br/>for getattr / tag listing</i>"]
+    end
+
+    Executor --> TagIndex
+    Executor --> KVIndex
+    Executor --> RangeIndex
+    Materializer --> TagIndex
+    Materializer --> ForwardIndex
+
+    %% ═══════════════════════════════════════════
+    %% METADATA LAYER
+    %% ═══════════════════════════════════════════
+
+    subgraph MetadataLayer["Metadata Layer"]
+        ObjTable["Object Table<br/><i>ObjectId → ObjectRecord<br/>128B fixed slots<br/>array indexed by ID</i>"]
+        LocTable["Location Table<br/><i>ObjectId → ObjectLocation<br/>disk_id, extent_offset,<br/>replica refs</i>"]
+    end
+
+    Executor --> ObjTable
+    ObjTable --> LocTable
+
+    %% ═══════════════════════════════════════════
+    %% PLACEMENT & TIERING ENGINE
+    %% ═══════════════════════════════════════════
+
+    subgraph PlacementEngine["Placement & Tiering Engine"]
+        Rules["Placement Rules<br/><i>Pin, Prefer, Replicate,<br/>Colocate, AutoTier</i>"]
+        TierCalc["Tier Calculator<br/><i>tags + access time<br/>→ ideal tier</i>"]
+        Migrator["Migration Planner<br/><i>background moves,<br/>rate-limited I/O</i>"]
+        Allocator["Extent Allocator<br/><i>per-disk free space<br/>B+ tree of extents</i>"]
+    end
+
+    Rules --> TierCalc
+    TierCalc --> Migrator
+    Migrator --> Allocator
+    TagIndex -.->|"query matching<br/>objects"| TierCalc
+    LocTable <-->|"read current /<br/>update after move"| Migrator
+
+    %% ═══════════════════════════════════════════
+    %% TRANSACTION / WAL
+    %% ═══════════════════════════════════════════
+
+    subgraph TxnLayer["Transaction Layer"]
+        WAL["Write-Ahead Log<br/><i>circular 64MB buffer<br/>on fastest disk<br/>+ mirror</i>"]
+        Checkpoint["Checkpoint Engine<br/><i>flush dirty bitmaps<br/>+ metadata to zones</i>"]
+        Recovery["Crash Recovery<br/><i>replay WAL from<br/>last checkpoint</i>"]
+    end
+
+    TagIndex -->|"mutations"| WAL
+    ForwardIndex -->|"mutations"| WAL
+    ObjTable -->|"mutations"| WAL
+    LocTable -->|"mutations"| WAL
+    WAL --> Checkpoint
+    Recovery --> WAL
+
+    %% ═══════════════════════════════════════════
+    %% POOL MANAGER
+    %% ═══════════════════════════════════════════
+
+    subgraph PoolManager["Pool Manager"]
+        Topology["Topology Map<br/><i>DiskDescriptor[]<br/>media type, tier,<br/>capacity, health</i>"]
+        Rebalancer["Rebalancer<br/><i>on disk add/remove:<br/>semantic migration</i>"]
+        Resilverer["Resilverer<br/><i>on disk fail/replace:<br/>location table scan<br/>priority by replica count</i>"]
+        HealthMon["Health Monitor<br/><i>SMART, I/O errors,<br/>latency tracking</i>"]
+    end
+
+    Topology --> Allocator
+    Topology --> TierCalc
+    Rebalancer --> Migrator
+    Resilverer --> Migrator
+    HealthMon --> Topology
+    HealthMon --> Resilverer
+
+    %% ═══════════════════════════════════════════
+    %% PHYSICAL DISK LAYER
+    %% ═══════════════════════════════════════════
+
+    subgraph DiskLayer["Physical Disk Layer (Raw Block Devices)"]
+
+        subgraph Disk0["Disk 0 — NVMe (Hot Tier)"]
+            D0Super["Superblock"]
+            D0WAL["WAL (primary)"]
+            D0Index["Index Zone<br/><i>tag bitmaps,<br/>B+ trees</i>"]
+            D0Meta["Metadata Zone<br/><i>object table,<br/>location table</i>"]
+            D0Blobs["Hot Blobs<br/><i>tag:active,<br/>tag:scratch</i>"]
+        end
+
+        subgraph Disk1["Disk 1 — SATA SSD (Warm Tier)"]
+            D1Super["Superblock<br/>(mirror)"]
+            D1WAL["WAL (mirror)"]
+            D1Blobs["Warm Blobs<br/><i>default placement</i>"]
+        end
+
+        subgraph Disk2["Disk 2 — HDD (Cold Tier)"]
+            D2Super["Superblock<br/>(mirror)"]
+            D2Blobs["Cold Blobs<br/><i>tag:archive,<br/>tag:backup</i>"]
+        end
+
+        subgraph DiskN["Disk N — (any tier)"]
+            DNSuper["Superblock<br/>(mirror)"]
+            DNBlobs["Blobs<br/><i>rule-driven<br/>placement</i>"]
+        end
+
+    end
+
+    WAL -->|"primary"| D0WAL
+    WAL -->|"mirror"| D1WAL
+    Checkpoint --> D0Index
+    Checkpoint --> D0Meta
+    Allocator --> D0Blobs
+    Allocator --> D1Blobs
+    Allocator --> D2Blobs
+    Allocator --> DNBlobs
+
+    %% ═══════════════════════════════════════════
+    %% BLOB I/O PATH
+    %% ═══════════════════════════════════════════
+
+    subgraph BlobIO["Blob I/O Path"]
+        BlobRead["Read Path<br/><i>LocTable → disk_id +<br/>offset → direct I/O</i>"]
+        BlobWrite["Write Path<br/><i>allocate extent →<br/>write → update loc<br/>→ WAL commit</i>"]
+        ContentAddr["Content Addressing<br/><i>BLAKE3 hash<br/>dedup optional</i>"]
+    end
+
+    LocTable --> BlobRead
+    BlobRead --> DiskLayer
+    BlobWrite --> Allocator
+    BlobWrite --> WAL
+    ContentAddr --> BlobWrite
+
+    %% ═══════════════════════════════════════════
+    %% STYLING
+    %% ═══════════════════════════════════════════
+
+    classDef client fill:#e8f4f8,stroke:#2980b9,stroke-width:2px,color:#000
+    classDef query fill:#fef9e7,stroke:#f39c12,stroke-width:2px,color:#000
+    classDef data fill:#fdf2e9,stroke:#e67e22,stroke-width:2px,color:#000
+    classDef ontology fill:#f4ecf7,stroke:#8e44ad,stroke-width:2px,color:#000
+    classDef index fill:#eafaf1,stroke:#27ae60,stroke-width:2px,color:#000
+    classDef meta fill:#fdebd0,stroke:#d35400,stroke-width:2px,color:#000
+    classDef placement fill:#ebf5fb,stroke:#2e86c1,stroke-width:2px,color:#000
+    classDef txn fill:#fdedec,stroke:#e74c3c,stroke-width:2px,color:#000
+    classDef pool fill:#e8daef,stroke:#7d3c98,stroke-width:2px,color:#000
+    classDef disk fill:#d5dbdb,stroke:#566573,stroke-width:2px,color:#000
+    classDef blob fill:#d6eaf8,stroke:#2874a6,stroke-width:2px,color:#000
+
+    class CLI,API,FUSE client
+    class Parser,Planner,Executor,FacetCounter query
+    class Objects,Assertions,Values data
+    class ImplGraph,Aliases,MutexGroups,Materializer ontology
+    class TagIndex,KVIndex,RangeIndex,ForwardIndex index
+    class ObjTable,LocTable meta
+    class Rules,TierCalc,Migrator,Allocator placement
+    class WAL,Checkpoint,Recovery txn
+    class Topology,Rebalancer,Resilverer,HealthMon pool
+    class D0Super,D0WAL,D0Index,D0Meta,D0Blobs,D1Super,D1WAL,D1Blobs,D2Super,D2Blobs,DNSuper,DNBlobs disk
+    class BlobRead,BlobWrite,ContentAddr blob
