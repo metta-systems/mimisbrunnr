@@ -1,0 +1,17 @@
+[package]
+name = "mimisbrunnr-pool"
+description = "Multi-disk pool management, placement rules, and tiering for Mímisbrunnr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimisbrunnr-types = { workspace = true }
+mimisbrunnr-storage = { workspace = true }
+mimisbrunnr-meta = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
