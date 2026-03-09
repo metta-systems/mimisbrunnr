@@ -13,6 +13,9 @@ members = [
     "crates/engine",
     "crates/unix",
     "crates/fuse",
+    "crates/mimisbrunnr",
+    "bin/mimir",
+    "bin/brunnr",
 ]
 resolver = "3"
 
@@ -35,9 +38,11 @@ mimisbrunnr-pool = { path = "crates/pool" }
 mimisbrunnr-engine = { path = "crates/engine" }
 mimisbrunnr-unix = { path = "crates/unix" }
 mimisbrunnr-fuse = { path = "crates/fuse" }
+mimisbrunnr = { path = "crates/mimisbrunnr" }
 
 blake3 = "1"
 bytemuck = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
 fuser = { version = "0.17" }
 roaring = "0.11"

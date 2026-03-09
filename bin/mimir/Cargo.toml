@@ -1,0 +1,10 @@
+[package]
+name = "mimir"
+description = "Query and tag management tool for the Mímisbrunnr filesystem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimisbrunnr = { workspace = true }
+clap = { workspace = true }

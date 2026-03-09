@@ -1,0 +1,15 @@
+[package]
+name = "brunnr"
+description = "Pool management tool for the Mímisbrunnr filesystem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimisbrunnr = { workspace = true }
+mimisbrunnr-fuse = { workspace = true, features = ["fuse"] }
+clap = { workspace = true }
+fuser = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
