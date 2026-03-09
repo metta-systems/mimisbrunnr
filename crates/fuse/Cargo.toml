@@ -1,0 +1,19 @@
+[package]
+name = "mimisbrunnr-fuse"
+description = "FUSE bridge for mounting Mímisbrunnr path projections as Unix filesystems"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+fuse = ["dep:fuser"]
+
+[dependencies]
+mimisbrunnr-types = { workspace = true }
+mimisbrunnr-index = { workspace = true }
+mimisbrunnr-ontology = { workspace = true }
+mimisbrunnr-engine = { workspace = true }
+roaring = { workspace = true }
+fuser = { workspace = true, optional = true }
+thiserror = { workspace = true }

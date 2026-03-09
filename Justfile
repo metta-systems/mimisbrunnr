@@ -9,6 +9,8 @@
 
 pool_dir   := justfile_directory() / ".demo-pool"
 pool_toml  := pool_dir / "pool.toml"
+fuse_dir   := justfile_directory() / "crates"
+fuse_ctx   := "mimisbrunnr-types-src"
 mimir      := "cargo run --quiet --bin mimir -- --pool " + pool_toml
 brunnr     := "cargo run --quiet --bin brunnr --"
 
@@ -243,8 +245,7 @@ import-source:
     set -euo pipefail
 
     echo "=== Importing source tree ==="
-    {{mimir}} project import "{{justfile_directory()}}/crates/mimisbrunnr-types/src" \
-        --context mimisbrunnr-types-src
+    {{mimir}} project import {{fuse_dir}} --context {{fuse_ctx}}
 
 # ── Full Demo ────────────────────────────────────────────────────────
 
@@ -258,6 +259,17 @@ demo: build pool-create pool-status ontology-setup populate-objects run-queries 
     @echo "    {{mimir}} info --object 0"
     @echo "    {{mimir}} ontology list"
     @echo "═══════════════════════════════════════════════════"
+
+demo-fuse: build pool-create import-source
+    @echo ""
+    @echo "═══════════════════════════════════════════════════"
+    @echo " cd /tmp/mbrunnr-test and cd and ls around"
+    @echo "═══════════════════════════════════════════════════"
+    @echo ""
+    # Mount it as a FUSE filesystem
+    -{{brunnr}} mount-unix /tmp/mbrunnr-test --pool {{pool_toml}} --context {{fuse_ctx}}
+    # Unmount after exiting FUSE driver
+    diskutil unmount /tmp/mbrunnr-test
 
 # Clean up demo artifacts
 clean-demo:
