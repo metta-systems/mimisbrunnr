@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/types",
+    "crates/storage",
 ]
 resolver = "3"
 
@@ -11,5 +12,9 @@ license = "MIT"
 
 [workspace.dependencies]
 mimisbrunnr-types = { path = "crates/types" }
+mimisbrunnr-storage = { path = "crates/storage" }
 
+bytemuck = { version = "1", features = ["derive"] }
+crc32fast = "1"
+tempfile = "3"
 thiserror = "2"

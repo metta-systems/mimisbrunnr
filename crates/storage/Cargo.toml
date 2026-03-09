@@ -1,0 +1,14 @@
+[package]
+name = "mimisbrunnr-storage"
+description = "Block device abstraction and on-disk layout for Mímisbrunnr"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+mimisbrunnr-types = { workspace = true }
+thiserror = { workspace = true }
+crc32fast = { workspace = true }
+bytemuck = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
