@@ -203,6 +203,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimisbrunnr-query"
+version = "0.1.0"
+dependencies = [
+ "mimisbrunnr-index",
+ "mimisbrunnr-ontology",
+ "mimisbrunnr-types",
+ "roaring",
+ "thiserror",
+]
+
+[[package]]
 name = "mimisbrunnr-storage"
 version = "0.1.0"
 dependencies = [

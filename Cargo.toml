@@ -6,6 +6,7 @@ members = [
     "crates/meta",
     "crates/index",
     "crates/ontology",
+    "crates/query",
 ]
 resolver = "3"
 
@@ -21,6 +22,7 @@ mimisbrunnr-wal = { path = "crates/wal" }
 mimisbrunnr-meta = { path = "crates/meta" }
 mimisbrunnr-index = { path = "crates/index" }
 mimisbrunnr-ontology = { path = "crates/ontology" }
+mimisbrunnr-query = { path = "crates/query" }
 
 bytemuck = { version = "1", features = ["derive"] }
 crc32fast = "1"
