@@ -36,6 +36,7 @@ use mimisbrunnr_types::{Assertion, ObjectId, TagId};
 use roaring::RoaringBitmap;
 
 use crate::vfs::{VfsAttr, VfsFileType, VfsTree};
+use log::trace;
 
 // Fixed inode numbers for well-known entries.
 const INO_ROOT: u64 = 1;
@@ -189,6 +190,7 @@ impl TagVfs {
 
     /// Lookup a child by name within a directory.
     pub fn lookup(&mut self, parent_ino: u64, name: &str) -> Option<u64> {
+        trace!("tag_vfs::lookup parent_ino={parent_ino} name={name:?}");
         let parent = self.entries.get(&parent_ino)?.clone();
         match parent {
             TagVfsEntry::Root => match name {
@@ -276,6 +278,7 @@ impl TagVfs {
 
     /// List directory contents.
     pub fn readdir(&mut self, dir_ino: u64) -> Option<Vec<DirEntry>> {
+        trace!("tag_vfs::readdir dir_ino={dir_ino}");
         let entry = self.entries.get(&dir_ino)?.clone();
         let mut result = Vec::new();
 
@@ -456,6 +459,7 @@ impl TagVfs {
 
     /// Read file content.
     pub fn read(&self, ino: u64, offset: u64, size: u32) -> Option<&[u8]> {
+        trace!("tag_vfs::read ino={ino} offset={offset} size={size}");
         let entry = self.entries.get(&ino)?;
         match entry {
             TagVfsEntry::TagFile { obj_local, .. } => {
@@ -480,6 +484,7 @@ impl TagVfs {
 
     /// Get the symlink target for a context node.
     pub fn readlink(&self, ino: u64) -> Option<&str> {
+        trace!("tag_vfs::readlink ino={ino}");
         let entry = self.entries.get(&ino)?;
         if let TagVfsEntry::CtxNode { ctx, vfs_ino } = entry {
             let tree = self.context_trees.get(ctx)?;
@@ -495,6 +500,7 @@ impl TagVfs {
     // ------------------------------------------------------------------
 
     fn alloc_ino(&mut self) -> u64 {
+        trace!("tag_vfs::alloc_ino -> {}", self.next_ino);
         let ino = self.next_ino;
         self.next_ino += 1;
         ino
@@ -550,6 +556,7 @@ impl TagVfs {
 
     /// Intersect bitmaps for a set of tags.
     fn intersect_tags(&self, tags: &BTreeSet<TagId>) -> RoaringBitmap {
+        trace!("tag_vfs::intersect_tags tags={tags:?}");
         let mut iter = tags.iter();
         let first = match iter.next() {
             Some(t) => t,

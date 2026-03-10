@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::{BlockDevice, StorageError};
+use log::trace;
 
 /// A block device backed by a regular file, for use in std environments.
 pub struct FileBlockDevice {
@@ -17,6 +18,7 @@ impl FileBlockDevice {
     /// If `capacity` is 0, uses the existing file size (for opening existing disks).
     /// Otherwise, extends the file to `capacity` bytes if needed.
     pub fn open(path: &Path, capacity: u64) -> Result<Self, StorageError> {
+        trace!("FileBlockDevice::open path={} capacity={}", path.display(), capacity);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -56,6 +58,7 @@ impl FileBlockDevice {
 
 impl BlockDevice for FileBlockDevice {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
+        trace!("block_device::read_at offset={:#x} len={}", offset, buf.len());
         let end = offset + buf.len() as u64;
         if end > self.capacity {
             return Err(StorageError::OutOfBounds {
@@ -72,6 +75,7 @@ impl BlockDevice for FileBlockDevice {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), StorageError> {
+        trace!("block_device::write_at offset={:#x} len={}", offset, buf.len());
         let end = offset + buf.len() as u64;
         if end > self.capacity {
             return Err(StorageError::OutOfBounds {
@@ -92,6 +96,7 @@ impl BlockDevice for FileBlockDevice {
     }
 
     fn sync(&self) -> Result<(), StorageError> {
+        trace!("block_device::sync");
         let file = self.file.lock().unwrap();
         file.sync_all()?;
         Ok(())

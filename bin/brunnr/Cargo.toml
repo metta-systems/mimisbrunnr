@@ -9,6 +9,8 @@ license.workspace = true
 mimisbrunnr = { workspace = true }
 mimisbrunnr-fuse = { workspace = true, features = ["fuse"] }
 clap = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
 fuser = { workspace = true }
 
 [dev-dependencies]

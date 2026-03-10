@@ -9,6 +9,7 @@ use fuser::{
 
 use crate::tag_vfs::TagVfs;
 use crate::vfs::{VfsFileType, VfsTree};
+use log::trace;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -87,6 +88,7 @@ impl MimisbrunnrFs {
 impl Filesystem for MimisbrunnrFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name = name.to_str().unwrap_or("");
+        trace!("fuse::lookup parent={} name={:?}", parent.0, name);
         let mut vfs = self.vfs.write().unwrap();
         match vfs.lookup(parent.0, name) {
             Some(ino) => match vfs.getattr(ino) {
@@ -104,6 +106,7 @@ impl Filesystem for MimisbrunnrFs {
         _fh: Option<FileHandle>,
         reply: ReplyAttr,
     ) {
+        trace!("fuse::getattr ino={}", ino.0);
         match self.vfs.read().unwrap().getattr(ino.0) {
             Some(attr) => reply.attr(&TTL, &vfs_attr_to_fuse(&attr)),
             None => reply.error(Errno::ENOENT),
@@ -121,6 +124,7 @@ impl Filesystem for MimisbrunnrFs {
         _lock: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        trace!("fuse::read ino={} offset={offset} size={size}", ino.0);
         match self.vfs.read().unwrap().read(ino.0, offset, size) {
             Some(data) => reply.data(data),
             None => reply.error(Errno::ENOENT),
@@ -135,6 +139,7 @@ impl Filesystem for MimisbrunnrFs {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        trace!("fuse::readdir ino={} offset={offset}", ino.0);
         match self.vfs.write().unwrap().readdir(ino.0) {
             Some(entries) => {
                 for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
@@ -155,6 +160,7 @@ impl Filesystem for MimisbrunnrFs {
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        trace!("fuse::readlink ino={}", ino.0);
         match self.vfs.read().unwrap().readlink(ino.0) {
             Some(target) => reply.data(target.as_bytes()),
             None => reply.error(Errno::ENOENT),

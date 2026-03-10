@@ -16,4 +16,5 @@ mimisbrunnr-ontology = { workspace = true }
 mimisbrunnr-engine = { workspace = true }
 roaring = { workspace = true }
 fuser = { workspace = true, optional = true }
+log = { workspace = true }
 thiserror = { workspace = true }

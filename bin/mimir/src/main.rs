@@ -148,6 +148,7 @@ enum ProjectAction {
 }
 
 fn main() {
+    env_logger::init();
     let cli = Cli::parse();
 
     match cli.pool {

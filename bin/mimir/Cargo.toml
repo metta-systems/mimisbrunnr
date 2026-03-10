@@ -8,3 +8,5 @@ license.workspace = true
 [dependencies]
 mimisbrunnr = { workspace = true }
 clap = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }

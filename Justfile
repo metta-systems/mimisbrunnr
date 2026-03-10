@@ -192,15 +192,20 @@ demo-sql: build pool-create ontology-setup populate-objects
     @echo "═══════════════════════════════════════════════════"
     {{mimir}} sql
 
-demo-fuse: build pool-create ontology-setup populate-objects import-source
+demo-fuse: build pool-create ontology-setup populate-objects import-source && demo-fuse-unmount
     @echo ""
     @echo "═══════════════════════════════════════════════════"
     @echo " cd /tmp/mbrunnr-test and cd and ls around"
     @echo "═══════════════════════════════════════════════════"
     @echo ""
+    # - `RUST_LOG=mimisbrunnr_engine=trace` — just engine operations
+    # - `RUST_LOG=mimisbrunnr_fuse=trace` — just FUSE calls
+    # - `RUST_LOG=mimisbrunnr_storage::file_device=trace` — just physical I/O
     # Mount it as a FUSE filesystem
-    -{{brunnr}} mount-unix /tmp/mbrunnr-test --pool {{pool_toml}} --context {{fuse_ctx}}
-    # Unmount after exiting FUSE driver
+    -env RUST_LOG=trace,mimisbrunnr_fuse=info,fuser=info {{brunnr}} mount-unix /tmp/mbrunnr-test --pool {{pool_toml}} --context {{fuse_ctx}}
+
+# Unmount after exiting FUSE driver
+demo-fuse-unmount:
     diskutil unmount /tmp/mbrunnr-test
 
 # Clean up demo artifacts

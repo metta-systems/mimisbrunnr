@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::PoolError;
+use log::trace;
 
 /// On-disk pool configuration, persisted as TOML alongside the pool.
 ///
@@ -41,6 +42,7 @@ impl PoolConfig {
 
     /// Write config to a TOML file.
     pub fn save(&self, path: &Path) -> Result<(), PoolError> {
+        trace!("PoolConfig::save path={}", path.display());
         let toml_str =
             toml::to_string_pretty(self).map_err(|e| PoolError::ConfigError(e.to_string()))?;
         std::fs::write(path, toml_str).map_err(PoolError::Io)?;
@@ -49,6 +51,7 @@ impl PoolConfig {
 
     /// Load config from a TOML file.
     pub fn load(path: &Path) -> Result<Self, PoolError> {
+        trace!("PoolConfig::load path={}", path.display());
         let contents = std::fs::read_to_string(path).map_err(PoolError::Io)?;
         let config: Self =
             toml::from_str(&contents).map_err(|e| PoolError::ConfigError(e.to_string()))?;
@@ -58,6 +61,7 @@ impl PoolConfig {
     /// Find the pool.toml by searching upward from a given disk path,
     /// or by looking in the same directory.
     pub fn find_from_disk(disk_path: &Path) -> Result<(PathBuf, Self), PoolError> {
+        trace!("PoolConfig::find_from_disk disk={}", disk_path.display());
         // Try same directory as the disk file
         if let Some(parent) = disk_path.parent() {
             let config_path = parent.join("pool.toml");

@@ -10,4 +10,5 @@ mimisbrunnr-types = { workspace = true }
 mimisbrunnr-index = { workspace = true }
 mimisbrunnr-ontology = { workspace = true }
 roaring = { workspace = true }
+log = { workspace = true }
 thiserror = { workspace = true }

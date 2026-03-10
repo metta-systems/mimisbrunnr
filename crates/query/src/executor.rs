@@ -1,6 +1,7 @@
 use mimisbrunnr_index::{TagIndex, KvIndex, RoaringBitmap};
 use mimisbrunnr_ontology::ImplicationDag;
 use mimisbrunnr_types::{Query, CmpOp, Value, TagId};
+use log::trace;
 
 /// Executes queries against the index layer using bitmap algebra.
 ///
@@ -23,6 +24,7 @@ impl<'a> QueryExecutor<'a> {
 
     /// Execute a query and return the matching object IDs as a bitmap.
     pub fn execute(&self, query: &Query) -> RoaringBitmap {
+        trace!("query::execute {:?}", query);
         match query {
             Query::HasTag(tag) => self.eval_has_tag(*tag),
             Query::HasAttr { key, op, value } => self.eval_has_attr(*key, *op, value),
@@ -69,6 +71,7 @@ impl<'a> QueryExecutor<'a> {
     }
 
     fn eval_and(&self, subs: &[Query]) -> RoaringBitmap {
+        trace!("query::eval_and {} sub-queries", subs.len());
         if subs.is_empty() {
             return RoaringBitmap::new();
         }
@@ -88,6 +91,7 @@ impl<'a> QueryExecutor<'a> {
     }
 
     fn eval_or(&self, subs: &[Query]) -> RoaringBitmap {
+        trace!("query::eval_or {} sub-queries", subs.len());
         let mut result = RoaringBitmap::new();
         for sub in subs {
             result |= self.execute(sub);
@@ -96,6 +100,7 @@ impl<'a> QueryExecutor<'a> {
     }
 
     fn eval_not(&self, sub: &Query) -> RoaringBitmap {
+        trace!("query::eval_not");
         // NOT requires knowing the universal set.
         // We approximate with "all objects in the tag index".
         let universal = self.universal_set();
@@ -106,6 +111,7 @@ impl<'a> QueryExecutor<'a> {
     /// IsA: ontology-aware query. "vehicle" matches objects tagged with
     /// "vehicle" OR any descendant ("car", "truck", etc.)
     fn eval_isa(&self, tag: TagId) -> RoaringBitmap {
+        trace!("query::eval_isa tag={tag}");
         let mut result = self.eval_has_tag(tag);
 
         // Union with all descendants

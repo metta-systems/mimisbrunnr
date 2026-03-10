@@ -1,8 +1,10 @@
-use crate::layout::ZoneLayout;
-use crate::StorageError;
+use {
+    crate::{StorageError, layout::ZoneLayout},
+    log::trace,
+};
 
 /// Magic bytes identifying a Mímisbrunnr superblock: "MIMIS\x01\x00\x00"
-const MAGIC: [u8; 8] = *b"MIMIS\x01\0\0";
+const MAGIC: [u8; 8] = *b"MIMIR\x01\0\0";
 
 /// Current on-disk format version.
 const FORMAT_VERSION: u32 = 1;
@@ -148,6 +150,12 @@ impl Superblock {
 
     /// Write superblock to all three locations on the device.
     pub fn write_to(&self, dev: &dyn crate::BlockDevice) -> Result<(), StorageError> {
+        trace!(
+            "superblock::write_to primary={:#x} copy={:#x} backup={:#x}",
+            self.layout.superblock_primary,
+            self.layout.superblock_copy,
+            self.layout.superblock_backup
+        );
         let bytes = self.to_bytes();
         // Pad to full block
         let mut block = [0u8; crate::BLOCK_SIZE as usize];
@@ -166,6 +174,7 @@ impl Superblock {
         let mut block = [0u8; crate::BLOCK_SIZE as usize];
 
         // Try primary
+        trace!("superblock::read_from trying primary at offset 0");
         if dev.read_at(0, &mut block).is_ok() {
             let bytes: &[u8; SUPERBLOCK_BYTES] = block[..SUPERBLOCK_BYTES].try_into().unwrap();
             if let Ok(sb) = Self::from_bytes(bytes) {
@@ -174,6 +183,10 @@ impl Superblock {
         }
 
         // Try copy at offset 4K
+        trace!(
+            "superblock::read_from trying copy at offset {:#x}",
+            crate::SUPERBLOCK_SIZE
+        );
         if dev.read_at(crate::SUPERBLOCK_SIZE, &mut block).is_ok() {
             let bytes: &[u8; SUPERBLOCK_BYTES] = block[..SUPERBLOCK_BYTES].try_into().unwrap();
             if let Ok(sb) = Self::from_bytes(bytes) {
@@ -181,13 +194,14 @@ impl Superblock {
             }
         }
 
-        // Try backup at end — we need to know the device size
+        // Try backup at end
+        trace!("superblock::read_from trying backup");
+        // we need to know the device size
         let cap = dev.capacity();
         if cap >= crate::SUPERBLOCK_SIZE {
             let backup_offset = cap - crate::SUPERBLOCK_SIZE;
             if dev.read_at(backup_offset, &mut block).is_ok() {
-                let bytes: &[u8; SUPERBLOCK_BYTES] =
-                    block[..SUPERBLOCK_BYTES].try_into().unwrap();
+                let bytes: &[u8; SUPERBLOCK_BYTES] = block[..SUPERBLOCK_BYTES].try_into().unwrap();
                 if let Ok(sb) = Self::from_bytes(bytes) {
                     return Ok(sb);
                 }
@@ -200,9 +214,10 @@ impl Superblock {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::BlockDevice;
-    use crate::layout::MIN_DEVICE_SIZE;
+    use {
+        super::*,
+        crate::{BlockDevice, layout::MIN_DEVICE_SIZE},
+    };
 
     fn test_superblock() -> Superblock {
         let layout = ZoneLayout::compute(256 * 1024 * 1024).unwrap();

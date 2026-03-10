@@ -7,6 +7,7 @@ use {
 };
 
 use crate::{engine::Engine, error::EngineError};
+use log::trace;
 
 /// Persistent state serialized to the index zone.
 ///
@@ -111,6 +112,7 @@ pub struct DiskEngine {
 impl DiskEngine {
     /// Open an existing pool from its config file path.
     pub fn open(config_path: &Path) -> Result<Self, EngineError> {
+        trace!("DiskEngine::open config={}", config_path.display());
         let config = PoolConfig::load(config_path)
             .map_err(|e| EngineError::Io(std::io::Error::other(e.to_string())))?;
 
@@ -144,6 +146,8 @@ impl DiskEngine {
             &mut blobs,
         )?;
 
+        trace!("DiskEngine::open loaded {} objects", engine.object_table.count());
+
         Ok(Self {
             engine,
             context_mgr,
@@ -164,6 +168,7 @@ impl DiskEngine {
 
     /// Flush all in-memory state to disk.
     pub fn flush(&mut self) -> Result<(), EngineError> {
+        trace!("DiskEngine::flush");
         let layout = &self.superblock.layout;
 
         // Flush object table to metadata zone
@@ -183,6 +188,7 @@ impl DiskEngine {
         )?;
 
         self.primary_device.sync().map_err(EngineError::Storage)?;
+        trace!("DiskEngine::flush complete");
         Ok(())
     }
 
@@ -319,6 +325,7 @@ impl DiskEngine {
 
         let json = serde_json::to_vec(&state)
             .map_err(|e| EngineError::Io(std::io::Error::other(e.to_string())))?;
+        trace!("DiskEngine::save_index_state json_len={} zone_size={zone_size}", json.len());
 
         if json.len() as u64 + 8 > zone_size {
             return Err(EngineError::Io(std::io::Error::other(format!(
@@ -352,6 +359,7 @@ impl DiskEngine {
         dev.read_at(zone_offset, &mut len_buf)
             .map_err(EngineError::Storage)?;
         let json_len = u64::from_le_bytes(len_buf);
+        trace!("DiskEngine::load_index_state json_len={json_len} zone_size={zone_size}");
 
         if json_len == 0 || json_len > zone_size - 8 {
             // Empty or invalid — fresh pool, nothing to load

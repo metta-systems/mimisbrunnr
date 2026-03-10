@@ -9,6 +9,7 @@ use mimisbrunnr_types::{
 
 use crate::error::EngineError;
 use crate::oplog::{OpKind, OpLog, OpLogEntry};
+use log::trace;
 
 /// The main storage engine, tying all layers together.
 ///
@@ -78,7 +79,9 @@ impl Engine {
 
     /// Create a new object. Returns its ObjectId.
     pub fn create_object(&mut self, now_ms: u64) -> Result<ObjectId, EngineError> {
+        trace!("engine::create_object");
         let oid = self.object_table.create(self.node_id)?;
+        trace!("engine::create_object -> {oid}");
         let rec = self.object_table.get_mut(oid).unwrap();
         rec.created_ns = (now_ms as i64) * 1_000_000;
         rec.modified_ns = rec.created_ns;
@@ -89,6 +92,7 @@ impl Engine {
 
     /// Delete an object (phase 1: tombstone).
     pub fn delete_object(&mut self, oid: ObjectId, now_ms: u64) -> Result<(), EngineError> {
+        trace!("engine::delete_object oid={oid}");
         let rec = self
             .object_table
             .get_mut(oid)
@@ -140,6 +144,7 @@ impl Engine {
         tag: TagId,
         now_ms: u64,
     ) -> Result<Vec<TagId>, EngineError> {
+        trace!("engine::add_tag oid={oid} tag={tag}");
         self.ensure_active(oid)?;
         let obj_local = oid.local() as u32;
 
@@ -151,6 +156,7 @@ impl Engine {
         // Materialize implied tags
         let materialized =
             Materializer::materialize_tag(&self.dag, &mut self.tag_index, &mut self.forward_index, oid, tag);
+        trace!("engine::add_tag materialized {} implied tags", materialized.len());
 
         // Update record
         if let Some(rec) = self.object_table.get_mut(oid) {
@@ -169,6 +175,7 @@ impl Engine {
         tag: TagId,
         now_ms: u64,
     ) -> Result<Vec<TagId>, EngineError> {
+        trace!("engine::remove_tag oid={oid} tag={tag}");
         self.ensure_active(oid)?;
         let obj_local = oid.local() as u32;
 
@@ -206,6 +213,7 @@ impl Engine {
         value: Value,
         now_ms: u64,
     ) -> Result<(), EngineError> {
+        trace!("engine::set_attr oid={oid} key={key}");
         self.ensure_active(oid)?;
         let obj_local = oid.local() as u32;
 
@@ -252,6 +260,7 @@ impl Engine {
         value: &Value,
         now_ms: u64,
     ) -> Result<(), EngineError> {
+        trace!("engine::remove_attr oid={oid} key={key}");
         self.ensure_active(oid)?;
         let obj_local = oid.local() as u32;
 
@@ -283,6 +292,7 @@ impl Engine {
         data: &[u8],
         now_ms: u64,
     ) -> Result<[u8; 32], EngineError> {
+        trace!("engine::write_blob oid={oid} len={}", data.len());
         self.ensure_active(oid)?;
 
         let result = self.transform.transform_write(data)?;
@@ -302,6 +312,7 @@ impl Engine {
 
     /// Execute a query and return matching object IDs.
     pub fn query(&self, query: &Query) -> Vec<ObjectId> {
+        trace!("engine::query");
         let executor = QueryExecutor::new(&self.tag_index, &self.kv_index, &self.dag);
         executor
             .execute(query)
@@ -319,6 +330,7 @@ impl Engine {
 
     /// Parse and execute a query string.
     pub fn query_str(&self, query_str: &str) -> Result<Vec<ObjectId>, EngineError> {
+        trace!("engine::query_str query={query_str:?}");
         let parser = mimisbrunnr_query::QueryParser::new(&self.dag);
         let query = parser.parse(query_str)?;
         Ok(self.query(&query))
@@ -351,11 +363,13 @@ impl Engine {
         &mut self,
         def: mimisbrunnr_ontology::TagDefinition,
     ) -> Result<TagId, EngineError> {
+        trace!("engine::register_tag name={}", def.name);
         Ok(self.dag.register_tag(def)?)
     }
 
     /// Add an implication and materialize it across existing objects.
     pub fn add_implication(&mut self, from: TagId, to: TagId) -> Result<(), EngineError> {
+        trace!("engine::add_implication from={from} to={to}");
         self.dag.add_implication(from, to)?;
         Materializer::materialize_implication(&mut self.tag_index, from, to);
         Ok(())

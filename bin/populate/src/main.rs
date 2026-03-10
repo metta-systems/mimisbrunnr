@@ -94,6 +94,7 @@ struct GenerateSpec {
 // ── Main ─────────────────────────────────────────────────────────────
 
 fn main() {
+    env_logger::init();
     let cli = Cli::parse();
 
     // Load manifest
