@@ -1,0 +1,42 @@
+[module]
+id = "systems.metta.unix-interop"
+version = "0.1.0"
+name = "Unix Path Ontology"
+
+[requires]
+"systems.metta.core" = ">=0.1"
+
+[[tags]]
+name = "path-context"
+semantics = "grouping"
+description = "A named Unix filesystem projection"
+# path-context:project-vesper, path-context:install-rpi4, path-context:package-deb
+
+[[tags]]
+name = "unix-path"
+semantics = "attribute"
+value_type = "text"
+description = "Path within a specific unix tree projection. Scoped by path-context."
+# Always paired with a path-context tag
+
+[[tags]]
+name = "unix-mode"
+semantics = "attribute"
+value_type = "int"
+description = "Unix permission bits for this object in the projection"
+
+[[tags]]
+name = "unix-uid"
+semantics = "attribute"
+value_type = "int"
+
+[[tags]]
+name = "unix-gid"
+semantics = "attribute"
+value_type = "int"
+
+[[tags]]
+name = "symlink-target"
+semantics = "attribute"
+value_type = "text"
+description = "If this entry is a symlink in the projection, what it points to"

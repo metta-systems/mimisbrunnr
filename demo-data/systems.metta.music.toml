@@ -1,0 +1,34 @@
+[module]
+id = "systems.metta.music"
+version = "0.1.0"
+name = "Music Ontology"
+
+[requires]
+"systems.metta.core" = ">=0.1"
+
+[[tags]]
+name = "artist"
+semantics = "attribute"
+value_type = "text"
+
+[[tags]]
+name = "playlist"
+semantics = "ordered-collection"
+element_constraint = "audio"
+
+[[tags]]
+name = "genre"
+semantics = "grouping"
+extensible = true
+
+[[implications]]
+from = "rock"
+to = "genre"
+
+[[implications]]
+from = "flac"
+to = "audio"
+
+[[constraints]]
+tag = "bpm"
+requires = "audio"
