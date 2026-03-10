@@ -1,65 +1,75 @@
-Yes, it makes sense as an interop attribute, but it should be designed carefully to avoid reintroducing hierarchy through the back door.
-
-## The Right Framing
+## Framing
 
 `unix_path` is not how the file _lives_ in Mímisbrunnr. It's metadata about how this file _appears_ when projected onto a Unix system. The same object can have different unix_paths for different contexts — a source file has one path in the project tree, a different path in the installed system, maybe a third in a container image.
 
-This means it's not one attribute, it's scoped:
+For example, a bash shell from unix may have a canonical path and a symlink, but to mimir it is of no consequence, the binary will just have two `unix_path` attributes:
 
 ```rust
-// Not this:
+// /usr/bin/bash and /bin/bash are the same object, could be a hardlink on a unix fs.
 Attr { key: unix_path, value: "/bin/bash" }
 Attr { key: unix_path, value: "/usr/bin/bash" }
-
-// This:
-Attr { key: unix_path, value: "src/kernel/main.rs",     context: "project:vesper" }
-Attr { key: unix_path, value: "/boot/vesper",            context: "install:rpi4" }
-Attr { key: unix_path, value: "usr/bin/vesper",          context: "package:deb" }
 ```
 
-Different projections of the same object into different Unix trees.
+A symlink object may be crafted by having a pair of attributes:
+```rust
+// /usr/bin/bash is a symlink to /bin/bash
+Attr { key: unix_path, value: "/usr/bin/bash" }
+Attr { key: unix_symlink_target, value: "/bin/bash" }
+```
 
-## Modeling It
+It's not only one attribute, it's also optionally scoped. Scoping lets you optionally group trees of files, for example when importing them from a unix volume or a tarball.
 
-A **path context** is itself a tag with `Grouping` semantics — it represents a specific Unix tree projection:
+```rust
+Attr { key: unix_path, value: "src/kernel/main.rs",  context: Some("project:vesper") }
+Attr { key: unix_path, value: "/boot/vesper",        context: Some("install:rpi4") }
+Attr { key: unix_path, value: "usr/bin/vesper",      context: Some("package:deb") }
+```
+
+A **unix path context** is itself a tag with `Grouping` semantics — it represents a specific Unix tree projection:
 
 ```toml
-# In org.metta.unix-interop.toml
+# In systems.metta.unix-interop.toml
 
 [[tags]]
-name = "path-context"
+name = "unix-path-context"
 semantics = "grouping"
 description = "A named Unix filesystem projection"
-# path-context:project-vesper, path-context:install-rpi4, path-context:package-deb
+# path-context:project-vesper, path-context:install-rpi4, path-context:my-package.deb, path-context:this-archive.tar.gz
 
 [[tags]]
 name = "unix-path"
 semantics = "attribute"
 value_type = "text"
-description = "Path within a specific unix tree projection. Scoped by path-context."
-# Always paired with a path-context tag
+description = "Path that may be associated with a specific unix path projection."
+# Optionally scoped by path-context.
 
 [[tags]]
 name = "unix-mode"
 semantics = "attribute"
 value_type = "int"
-description = "Unix permission bits for this object in the projection"
+description = "Optional Unix permission bits for this object in the path projection."
+# This will override the permissions derived from mimir file object.
 
 [[tags]]
 name = "unix-uid"
 semantics = "attribute"
 value_type = "int"
+description = "Optional Unix owner user id for this object in the path projection."
+# This will override the uid derived from mimir file object.
 
 [[tags]]
 name = "unix-gid"
 semantics = "attribute"
 value_type = "int"
+description = "Optional Unix owner group id for this object in the path projection."
+# This will override the gid derived from mimir file object.
 
 [[tags]]
-name = "symlink-target"
+name = "unix-symlink-target"
 semantics = "attribute"
 value_type = "text"
 description = "If this entry is a symlink in the projection, what it points to"
+# Such object may have an empty blob and be entirely represented by unix-path + unix-symlink-target attribute pair.
 ```
 
 The actual data on a file:
@@ -70,85 +80,41 @@ Object: vesper (the kernel binary)
   executable  stripped  current
   target=aarch64-unknown-none
 
-  path-context:project-vesper
+  unix-path="/boot/vesper"
+  unix-mode=0o755
+  unix-uid=0
+  unix-gid=0
+
+  unix-path-context:project-vesper
     unix-path="target/aarch64-unknown-none/release/vesper"
 
-  path-context:install-rpi4
-    unix-path="/boot/vesper"
-    unix-mode=0o755
-    unix-uid=0
-    unix-gid=0
-
-  path-context:package-deb
+  unix-path-context:package-deb
     unix-path="usr/lib/vesper/vesper"
     unix-mode=0o755
 
 Object: bash
   executable  shell  system
-  
-  path-context:fhs
+
+  unix-path-context:symlink
+    unix-path="/bin/bash"          ← this is a symlink entry, not the file itself
+    unix-symlink-target="/usr/bin/bash"
+
+  unix-path-context:fhs
     unix-path="/usr/bin/bash"
     unix-mode=0o755
-  
-  path-context:fhs
-    symlink-target="/usr/bin/bash"
-    unix-path="/bin/bash"          ← this is a symlink entry, not the file itself
 ```
 
-Wait — that symlink case reveals a subtlety. In Unix, `/bin/bash` and `/usr/bin/bash` might be the same file (hardlink) or one might be a symlink. In Mímisbrunnr there's only one object. The projection needs to express this:
-
-```rust
-enum PathEntry {
-    // This object appears at this path
-    Direct {
-        unix_path: String,
-        mode: u32,
-        uid: u32,
-        gid: u32,
-    },
-    // A symlink at this path points to another path
-    Symlink {
-        unix_path: String,
-        target: String,         // what the symlink points to
-    },
-    // A hardlink: same object appears at multiple paths
-    Hardlink {
-        unix_path: String,
-        // Same object, multiple paths — natural in Mímisbrunnr
-    },
-}
-```
-
-But encoding these as attributes gets awkward. Better to make the path context a proper structure:
-
-```rust
-struct PathProjection {
-    context: String,              // "install-rpi4", "package-deb"
-    entries: Vec<ProjectedEntry>,
-}
-
-struct ProjectedEntry {
-    object: ObjectId,
-    path: String,
-    entry_type: ProjectedEntryType,
-}
-
-enum ProjectedEntryType {
-    File { mode: u32, uid: u32, gid: u32 },
-    Symlink { target: String },
-    Directory { mode: u32 },       // virtual — doesn't correspond to an object
-}
-```
+In Unix, `/bin/bash` and `/usr/bin/bash` might be the same file (hardlink) or one might be a symlink. In Mímisbrunnr there's only one object.
 
 Directories are interesting. In Mímisbrunnr there's no directory object. But when projecting to Unix, you need `/usr/bin/` to exist for `/usr/bin/bash` to make sense. These are **virtual entries** — synthesized from the paths, not backed by real objects.
 
-## Storage Design
+## Storage Design --- ???
 
 A path context is a first-class object in the filesystem — it's the projection definition itself:
 
 ```
-Object: path-context:install-rpi4
-  path-context
+Object: unix-path-context:install-rpi4
+  unix-path-context
   name="install-rpi4"
   description="Raspberry Pi 4 installed system layout"
   base-path="/"
