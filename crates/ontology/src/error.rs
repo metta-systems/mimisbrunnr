@@ -14,4 +14,10 @@ pub enum OntologyError {
 
     #[error("mutex violation: tags {0} and {1} are mutually exclusive")]
     MutexViolation(mimisbrunnr_types::TagId, mimisbrunnr_types::TagId),
+
+    #[error("unknown tag: {0}")]
+    UnknownTag(String),
+
+    #[error("module parse error: {0}")]
+    ModuleParse(String),
 }

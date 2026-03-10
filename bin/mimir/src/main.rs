@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 
 use mimisbrunnr::{
     engine::{DiskEngine, Engine},
-    ontology::{TagDefinition, TagSemantics, ValueType},
+    ontology::{OntologyModule, TagDefinition, TagSemantics, ValueType},
     types::{Assertion, ObjectId, Value},
     unix::{Importer, PathContextManager},
 };
@@ -119,6 +119,12 @@ enum OntologyAction {
 
         /// Target tag name.
         to: String,
+    },
+
+    /// Load an ontology module from a TOML file.
+    Load {
+        /// Path to the ontology TOML file.
+        file: PathBuf,
     },
 }
 
@@ -416,6 +422,32 @@ fn cmd_ontology(engine: &mut Engine, action: OntologyAction) {
             };
             match engine.add_implication(from_id, to_id) {
                 Ok(()) => println!("added implication: {from} → {to}"),
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        OntologyAction::Load { file } => {
+            let module = match OntologyModule::from_file(&file) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: failed to load {}: {e}", file.display());
+                    return;
+                }
+            };
+
+            let label = module
+                .name
+                .clone()
+                .or_else(|| module.id.clone())
+                .unwrap_or_else(|| file.display().to_string());
+
+            match module.install(&mut engine.dag) {
+                Ok(result) => {
+                    println!("Loaded ontology module '{label}'");
+                    println!(
+                        "  {} tag(s) registered, {} skipped, {} implication(s) added",
+                        result.tags_registered, result.tags_skipped, result.implications_added
+                    );
+                }
                 Err(e) => eprintln!("error: {e}"),
             }
         }

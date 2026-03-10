@@ -510,8 +510,10 @@ version = "0.1.0"
 dependencies = [
  "mimisbrunnr-index",
  "mimisbrunnr-types",
+ "serde",
  "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

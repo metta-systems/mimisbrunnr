@@ -71,44 +71,10 @@ pool-status-after-add:
 
 # ── Ontology Setup (mimir) ──────────────────────────────────────────
 
-# Register label tags for a music library ontology
-ontology-labels:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "=== Registering label tags ==="
-    {{mimir}} ontology register electronic
-    {{mimir}} ontology register ambient
-    {{mimir}} ontology register rock
-    {{mimir}} ontology register jazz
-    {{mimir}} ontology register favorite
-    {{mimir}} ontology register audio
-    {{mimir}} ontology register video
-    {{mimir}} ontology register media
-    {{mimir}} ontology register portable
-    {{mimir}} ontology register discontinued
-
-# Register attribute tags (key-value pairs)
-ontology-attrs:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "=== Registering attribute tags ==="
-    {{mimir}} ontology register artist --semantics attribute --value-type text
-    {{mimir}} ontology register album --semantics attribute --value-type text
-    {{mimir}} ontology register year --semantics attribute --value-type int
-    {{mimir}} ontology register bpm --semantics attribute --value-type int
-    {{mimir}} ontology register genre --semantics attribute --value-type text
-
-# Set up tag implications (car → vehicle style)
-ontology-implications:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    echo "=== Setting up implications ==="
-    {{mimir}} ontology imply electronic media
-    {{mimir}} ontology imply ambient electronic
-    {{mimir}} ontology imply rock media
-    {{mimir}} ontology imply jazz media
-    {{mimir}} ontology imply audio media
-    {{mimir}} ontology imply video media
+# Load ontology from TOML module file
+ontology-load:
+    @echo "=== Loading ontology module ==="
+    {{mimir}} ontology load demo-data/demo-labels.toml
 
 # List all registered tags and their implications
 ontology-list:
@@ -116,7 +82,7 @@ ontology-list:
     {{mimir}} ontology list
 
 # Full ontology setup
-ontology-setup: ontology-labels ontology-attrs ontology-implications ontology-list
+ontology-setup: ontology-load ontology-list
 
 # ── Object Operations (mimir) ───────────────────────────────────────
 
@@ -267,7 +233,7 @@ demo-sql: build pool-create ontology-setup populate-objects
     @echo "═══════════════════════════════════════════════════"
     {{mimir}} sql
 
-demo-fuse: build pool-create import-source
+demo-fuse: build pool-create ontology-setup populate-objects import-source
     @echo ""
     @echo "═══════════════════════════════════════════════════"
     @echo " cd /tmp/mbrunnr-test and cd and ls around"

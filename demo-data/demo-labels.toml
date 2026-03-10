@@ -1,0 +1,88 @@
+[[tags]]
+name = "electronic"
+semantics = "label"
+
+[[tags]]
+name = "ambient"
+semantics = "label"
+
+[[tags]]
+name = "rock"
+semantics = "label"
+
+[[tags]]
+name = "jazz"
+semantics = "label"
+
+[[tags]]
+name = "favorite"
+semantics = "label"
+
+[[tags]]
+name = "audio"
+semantics = "label"
+
+[[tags]]
+name = "video"
+semantics = "label"
+
+[[tags]]
+name = "media"
+semantics = "label"
+
+[[tags]]
+name = "portable"
+semantics = "label"
+
+[[tags]]
+name = "discontinued"
+semantics = "label"
+
+[[tags]]
+name = "artist"
+semantics = "attribute"
+value_type = "text"
+
+[[tags]]
+name = "album"
+semantics = "attribute"
+value_type = "text"
+
+[[tags]]
+name = "year"
+semantics = "attribute"
+value_type = "int"
+
+[[tags]]
+name = "bpm"
+semantics = "attribute"
+value_type = "int"
+
+[[tags]]
+name = "genre"
+semantics = "attribute"
+value_type = "text"
+
+[[implications]]
+from = "electronic"
+to = "media"
+
+[[implications]]
+from = "ambient"
+to = "electronic"
+
+[[implications]]
+from = "rock"
+to = "media"
+
+[[implications]]
+from = "jazz"
+to = "media"
+
+[[implications]]
+from = "audio"
+to = "media"
+
+[[implications]]
+from = "video"
+to = "media"
