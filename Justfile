@@ -13,6 +13,7 @@ fuse_dir   := justfile_directory() / "crates"
 fuse_ctx   := "mimisbrunnr-types-src"
 mimir      := "cargo run --quiet --bin mimir -- --pool " + pool_toml
 brunnr     := "cargo run --quiet --bin brunnr --"
+populate   := "cargo run --quiet --bin populate -- --pool " + pool_toml
 
 _default:
     @just --list
@@ -86,51 +87,9 @@ ontology-setup: ontology-load ontology-list
 
 # ── Object Operations (mimir) ───────────────────────────────────────
 
-# Create objects and tag them — simulates adding music tracks
+# Use manifest to create objects and tag them — simulates adding music tracks
 populate-objects:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    echo "=== Creating 6 objects ==="
-    {{mimir}} create 6
-
-    echo "=== Tagging objects ==="
-
-    # Object 0: Aphex Twin - Selected Ambient Works 85-92
-    {{mimir}} tag --object 0 electronic ambient favorite
-    {{mimir}} set --object 0 artist="Aphex Twin"
-    {{mimir}} set --object 0 album="Selected Ambient Works 85-92"
-    {{mimir}} set --object 0 year=1992
-    {{mimir}} set --object 0 bpm=130
-
-    # Object 1: Boards of Canada - Music Has the Right to Children
-    {{mimir}} tag --object 1 electronic ambient
-    {{mimir}} set --object 1 artist="Boards of Canada"
-    {{mimir}} set --object 1 album="Music Has the Right to Children"
-    {{mimir}} set --object 1 year=1998
-
-    # Object 2: Pink Floyd - The Dark Side of the Moon
-    {{mimir}} tag --object 2 rock favorite
-    {{mimir}} set --object 2 artist="Pink Floyd"
-    {{mimir}} set --object 2 album="The Dark Side of the Moon"
-    {{mimir}} set --object 2 year=1973
-
-    # Object 3: Miles Davis - Kind of Blue
-    {{mimir}} tag --object 3 jazz favorite
-    {{mimir}} set --object 3 artist="Miles Davis"
-    {{mimir}} set --object 3 album="Kind of Blue"
-    {{mimir}} set --object 3 year=1959
-
-    # Object 4: Autechre - LP5 (electronic but NOT ambient)
-    {{mimir}} tag --object 4 electronic
-    {{mimir}} set --object 4 artist=Autechre
-    {{mimir}} set --object 4 album=LP5
-    {{mimir}} set --object 4 year=1998
-
-    # Object 5: some discontinued portable gadget
-    {{mimir}} tag --object 5 electronic portable discontinued
-
-    echo "  6 objects created and tagged"
+    {{populate}} demo-data/demo-objects.toml
 
 # ── Queries (mimir) ──────────────────────────────────────────────────
 

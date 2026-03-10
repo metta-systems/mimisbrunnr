@@ -1,0 +1,45 @@
+# Demo manifest for the `populate` tool.
+# Loads ontology, then creates objects in a single engine session.
+
+ontology = ["demo-labels.toml"]
+
+# ── Music collection ─────────────────────────────────────────────
+
+[[objects]]
+tags = ["electronic", "ambient", "favorite"]
+[objects.attrs]
+artist = "Aphex Twin"
+album = "Selected Ambient Works 85-92"
+year = 1992
+bpm = 130
+
+[[objects]]
+tags = ["electronic", "ambient"]
+[objects.attrs]
+artist = "Boards of Canada"
+album = "Music Has the Right to Children"
+year = 1998
+
+[[objects]]
+tags = ["rock", "favorite"]
+[objects.attrs]
+artist = "Pink Floyd"
+album = "The Dark Side of the Moon"
+year = 1973
+
+[[objects]]
+tags = ["jazz", "favorite"]
+[objects.attrs]
+artist = "Miles Davis"
+album = "Kind of Blue"
+year = 1959
+
+[[objects]]
+tags = ["electronic"]
+[objects.attrs]
+artist = "Autechre"
+album = "LP5"
+year = 1998
+
+[[objects]]
+tags = ["electronic", "portable", "discontinued"]

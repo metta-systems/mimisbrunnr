@@ -17,6 +17,7 @@ members = [
     "crates/mimisbrunnr",
     "bin/mimir",
     "bin/brunnr",
+    "bin/populate",
 ]
 resolver = "3"
 

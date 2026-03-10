@@ -1,0 +1,12 @@
+[package]
+name = "populate"
+description = "Batch object population tool for the Mímisbrunnr filesystem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimisbrunnr = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
