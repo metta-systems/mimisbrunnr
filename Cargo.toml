@@ -13,6 +13,7 @@ members = [
     "crates/engine",
     "crates/unix",
     "crates/fuse",
+    "crates/sql",
     "crates/mimisbrunnr",
     "bin/mimir",
     "bin/brunnr",
@@ -38,6 +39,7 @@ mimisbrunnr-pool = { path = "crates/pool" }
 mimisbrunnr-engine = { path = "crates/engine" }
 mimisbrunnr-unix = { path = "crates/unix" }
 mimisbrunnr-fuse = { path = "crates/fuse" }
+mimisbrunnr-sql = { path = "crates/sql" }
 mimisbrunnr = { path = "crates/mimisbrunnr" }
 
 blake3 = "1"
@@ -48,6 +50,7 @@ fuser = { version = "0.17" }
 roaring = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sqlparser = "0.61"
 tempfile = "3"
 thiserror = "2"
 toml = "1.0"

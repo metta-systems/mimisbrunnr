@@ -18,3 +18,4 @@ mimisbrunnr-query = { workspace = true }
 mimisbrunnr-watch = { workspace = true }
 mimisbrunnr-pool = { workspace = true }
 mimisbrunnr-unix = { workspace = true }
+mimisbrunnr-sql = { workspace = true }

@@ -260,6 +260,13 @@ demo: build pool-create pool-status ontology-setup populate-objects run-queries 
     @echo "    {{mimir}} ontology list"
     @echo "═══════════════════════════════════════════════════"
 
+demo-sql: build pool-create ontology-setup populate-objects
+    @echo ""
+    @echo "═══════════════════════════════════════════════════"
+    @echo "Entering Mimir SQL REPL. Type .help for info"
+    @echo "═══════════════════════════════════════════════════"
+    {{mimir}} sql
+
 demo-fuse: build pool-create import-source
     @echo ""
     @echo "═══════════════════════════════════════════════════"

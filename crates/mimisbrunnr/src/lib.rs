@@ -10,3 +10,4 @@ pub use mimisbrunnr_query as query;
 pub use mimisbrunnr_watch as watch;
 pub use mimisbrunnr_pool as pool;
 pub use mimisbrunnr_unix as unix;
+pub use mimisbrunnr_sql as sql;

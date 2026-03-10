@@ -85,6 +85,12 @@ enum Commands {
         #[command(subcommand)]
         action: ProjectAction,
     },
+
+    /// Execute a SQL query, or start an interactive SQL REPL if no query given.
+    Sql {
+        /// SQL query to execute. Omit to enter REPL mode.
+        query: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -196,6 +202,7 @@ fn dispatch(
         Commands::Query { query } => cmd_query(engine, &query),
         Commands::Ontology { action } => cmd_ontology(engine, action),
         Commands::Project { action } => cmd_project(engine, ctx_mgr, blobs, action),
+        Commands::Sql { query } => cmd_sql(engine, query.as_deref()),
     }
 }
 
@@ -466,6 +473,251 @@ fn cmd_project(
             Err(e) => eprintln!("error: {e}"),
         },
     }
+}
+
+fn cmd_sql(engine: &Engine, query: Option<&str>) {
+    match query {
+        Some(sql) => execute_sql_query(engine, sql),
+        None => sql_repl(engine),
+    }
+}
+
+fn sql_repl(engine: &Engine) {
+    println!("mimir sql — interactive SQL REPL");
+    println!("Type SQL queries, or .help for commands. End queries with ;");
+    println!();
+
+    let stdin = std::io::stdin();
+    let mut buf = String::new();
+
+    loop {
+        let prompt = if buf.is_empty() { "sql> " } else { "  -> " };
+        eprint!("{prompt}");
+
+        let mut line = String::new();
+        match stdin.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("error reading input: {e}");
+                break;
+            }
+        }
+
+        let trimmed = line.trim();
+
+        // Dot-commands (only at the start of input, not mid-statement)
+        if buf.is_empty() {
+            match trimmed {
+                ".quit" | ".exit" | ".q" => break,
+                ".help" | ".h" => {
+                    print_sql_help();
+                    continue;
+                }
+                ".tables" => {
+                    println!("objects  (the only table — all objects in the store)");
+                    continue;
+                }
+                ".tags" => {
+                    let tags = engine.dag.all_tags();
+                    if tags.is_empty() {
+                        println!("No tags registered.");
+                    } else {
+                        for id in tags {
+                            if let Some(def) = engine.dag.get(id) {
+                                println!("  {} ({:?})", def.name, def.semantics);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                ".schema" => {
+                    println!("-- Mímisbrunnr is schemaless. Attributes are dynamic.");
+                    println!("-- Registered attributes:");
+                    for id in engine.dag.all_tags() {
+                        if let Some(def) = engine.dag.get(id) {
+                            if let mimisbrunnr::ontology::TagSemantics::Attribute { value_type } =
+                                &def.semantics
+                            {
+                                println!("  {} {:?}", def.name, value_type);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                "" => continue,
+                _ => {}
+            }
+        }
+
+        buf.push_str(&line);
+
+        // Check if the statement is complete (ends with ;)
+        let trimmed_buf = buf.trim();
+        if trimmed_buf.ends_with(';') {
+            let sql = trimmed_buf.trim_end_matches(';').trim();
+            if !sql.is_empty() {
+                execute_sql_query(engine, sql);
+            }
+            buf.clear();
+        }
+    }
+}
+
+fn execute_sql_query(engine: &Engine, sql: &str) {
+    use mimisbrunnr::sql::{self, QueryResult};
+
+    let result = sql::execute(
+        sql,
+        &engine.tag_index,
+        &engine.kv_index,
+        &engine.forward_index,
+        &engine.dag,
+    );
+
+    match result {
+        Ok(QueryResult::Select { columns, rows }) => {
+            if rows.is_empty() {
+                println!("(0 rows)");
+                return;
+            }
+
+            // Determine column widths
+            let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+            for row in &rows {
+                for (i, col_name) in columns.iter().enumerate() {
+                    let val = row
+                        .columns
+                        .iter()
+                        .find(|(k, _)| k == col_name)
+                        .map(|(_, v)| format_value(v))
+                        .unwrap_or_default();
+                    if i < widths.len() {
+                        widths[i] = widths[i].max(val.len());
+                    }
+                }
+            }
+
+            // Print header
+            let header: Vec<String> = columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
+                .collect();
+            println!("{}", header.join(" | "));
+            let separator: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+            println!("{}", separator.join("-+-"));
+
+            // Print rows
+            for row in &rows {
+                let vals: Vec<String> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col_name)| {
+                        let val = row
+                            .columns
+                            .iter()
+                            .find(|(k, _)| k == col_name)
+                            .map(|(_, v)| format_value(v))
+                            .unwrap_or_default();
+                        format!("{:<width$}", val, width = widths[i])
+                    })
+                    .collect();
+                println!("{}", vals.join(" | "));
+            }
+            println!("({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+        }
+
+        Ok(QueryResult::Aggregate { columns, rows }) => {
+            if rows.is_empty() {
+                println!("(0 rows)");
+                return;
+            }
+
+            let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+            for row in &rows {
+                for (i, col_name) in columns.iter().enumerate() {
+                    let val = row
+                        .columns
+                        .iter()
+                        .find(|(k, _)| k == col_name)
+                        .map(|(_, v)| format_value(v))
+                        .unwrap_or_default();
+                    if i < widths.len() {
+                        widths[i] = widths[i].max(val.len());
+                    }
+                }
+            }
+
+            let header: Vec<String> = columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
+                .collect();
+            println!("{}", header.join(" | "));
+            let separator: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+            println!("{}", separator.join("-+-"));
+
+            for row in &rows {
+                let vals: Vec<String> = columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, col_name)| {
+                        let val = row
+                            .columns
+                            .iter()
+                            .find(|(k, _)| k == col_name)
+                            .map(|(_, v)| format_value(v))
+                            .unwrap_or_default();
+                        format!("{:<width$}", val, width = widths[i])
+                    })
+                    .collect();
+                println!("{}", vals.join(" | "));
+            }
+            println!("({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+        }
+
+        Ok(QueryResult::Scalar(value)) => {
+            println!("{}", format_value(&value));
+        }
+
+        Err(e) => {
+            eprintln!("error: {e}");
+        }
+    }
+}
+
+fn format_value(v: &Value) -> String {
+    match v {
+        Value::Text(s) => s.clone(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => format!("{:.2}", f),
+        Value::Timestamp(t) => t.to_string(),
+        Value::Blob(b) => format!("<blob:{} bytes>", b.len()),
+    }
+}
+
+fn print_sql_help() {
+    println!("Mímisbrunnr SQL REPL commands:");
+    println!();
+    println!("  .help     Show this help");
+    println!("  .quit     Exit the REPL");
+    println!("  .tables   List available tables");
+    println!("  .tags     List registered tags");
+    println!("  .schema   Show registered attributes");
+    println!();
+    println!("SQL syntax:");
+    println!("  SELECT id, name FROM objects WHERE HAS TAG 'electronic';");
+    println!("  SELECT * FROM objects WHERE IS A 'audio' AND year > 2000;");
+    println!("  SELECT artist, COUNT(*) FROM objects GROUP BY artist;");
+    println!("  SELECT * FROM objects WHERE HAS TAG 'source' LIMIT 10;");
+    println!();
+    println!("Extensions:");
+    println!("  HAS TAG 'x'              Tag membership");
+    println!("  HAS ALL TAGS ('x', 'y')  AND of tags");
+    println!("  HAS ANY TAG ('x', 'y')   OR of tags");
+    println!("  IS A 'x'                 Ontology-aware (follows implications)");
+    println!("  NOT HAS TAG 'x'          Exclusion");
 }
 
 fn now_ms() -> u64 {

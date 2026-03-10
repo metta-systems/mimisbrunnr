@@ -1,0 +1,15 @@
+[package]
+name = "mimisbrunnr-sql"
+description = "SQL query layer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mimisbrunnr-types = { workspace = true }
+mimisbrunnr-index = { workspace = true }
+mimisbrunnr-ontology = { workspace = true }
+mimisbrunnr-query = { workspace = true }
+roaring = { workspace = true }
+sqlparser = { workspace = true }
+thiserror = { workspace = true }
