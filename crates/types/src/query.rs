@@ -34,7 +34,7 @@ pub enum Query {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, arbitrary_int::u48};
 
     #[test]
     fn simple_tag_query() {
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn related_query() {
-        let target = ObjectId::new(1, 42);
+        let target = ObjectId::new(1, u48::from_u64(42));
         let q = Query::Related {
             predicate: TagId::new(5),
             target,

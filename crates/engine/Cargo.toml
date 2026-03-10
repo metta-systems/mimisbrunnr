@@ -6,19 +6,20 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-mimisbrunnr-types = { workspace = true }
-mimisbrunnr-storage = { workspace = true }
-mimisbrunnr-wal = { workspace = true }
-mimisbrunnr-meta = { workspace = true }
 mimisbrunnr-index = { workspace = true }
+mimisbrunnr-meta = { workspace = true }
 mimisbrunnr-ontology = { workspace = true }
-mimisbrunnr-transform = { workspace = true }
-mimisbrunnr-query = { workspace = true }
 mimisbrunnr-pool = { workspace = true }
+mimisbrunnr-query = { workspace = true }
+mimisbrunnr-storage = { workspace = true }
+mimisbrunnr-transform = { workspace = true }
+mimisbrunnr-types = { workspace = true }
+mimisbrunnr-wal = { workspace = true }
+arbitrary-int = { workspace = true }
 log = { workspace = true }
-thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

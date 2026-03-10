@@ -26,7 +26,7 @@ impl Materializer {
         direct_tag: TagId,
     ) -> Vec<TagId> {
         let implied = dag.transitive_closure(direct_tag);
-        let obj_local = oid.local() as u32;
+        let obj_local = oid.local().value() as u32;
         let mut added = Vec::new();
 
         for implied_tag in implied {
@@ -70,7 +70,7 @@ impl Materializer {
         oid: ObjectId,
         removed_tag: TagId,
     ) -> Vec<TagId> {
-        let obj_local = oid.local() as u32;
+        let obj_local = oid.local().value() as u32;
 
         // Get all tags that were implied by the removed tag
         let was_implied = dag.transitive_closure(removed_tag);
@@ -102,7 +102,7 @@ impl Materializer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, arbitrary_int::u48};
     use crate::tag_def::{TagDefinition, TagSemantics};
 
     fn tag(id: u32) -> TagId {
@@ -110,7 +110,7 @@ mod tests {
     }
 
     fn oid(local: u64) -> ObjectId {
-        ObjectId::new(0, local)
+        ObjectId::new(0, u48::from_u64(local))
     }
 
     fn label(id: u32, name: &str) -> TagDefinition {
@@ -139,7 +139,7 @@ mod tests {
         let obj = oid(1);
 
         // Directly tag object as "car"
-        tag_index.tag_object(tag(1), obj.local() as u32);
+        tag_index.tag_object(tag(1), obj.local().value() as u32);
         fwd_index.add(obj, Assertion::Tag(tag(1)), TagOrigin::Direct);
 
         // Materialize

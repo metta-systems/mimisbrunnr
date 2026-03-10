@@ -1,8 +1,12 @@
-use mimisbrunnr_storage::BlockDevice;
-use mimisbrunnr_types::ObjectId;
-
-use crate::error::MetaError;
-use crate::record::{ObjectRecord, RECORD_SIZE};
+use {
+    crate::{
+        error::MetaError,
+        record::{ObjectRecord, RECORD_SIZE},
+    },
+    arbitrary_int::u48,
+    mimisbrunnr_storage::BlockDevice,
+    mimisbrunnr_types::ObjectId,
+};
 
 /// An array-indexed object table backed by the metadata zone on disk.
 ///
@@ -32,7 +36,11 @@ impl ObjectTable {
     }
 
     /// Load the object table from disk, reading all non-zero records.
-    pub fn load(dev: &dyn BlockDevice, zone_offset: u64, zone_size: u64) -> Result<Self, MetaError> {
+    pub fn load(
+        dev: &dyn BlockDevice,
+        zone_offset: u64,
+        zone_size: u64,
+    ) -> Result<Self, MetaError> {
         let capacity = zone_size / RECORD_SIZE as u64;
         let mut records = Vec::with_capacity(capacity as usize);
         let mut buf = [0u8; RECORD_SIZE];
@@ -48,7 +56,7 @@ impl ObjectTable {
             } else {
                 match ObjectRecord::from_bytes(&buf) {
                     Ok(rec) => {
-                        let local = ObjectId::from_raw(rec.id).local();
+                        let local: u64 = ObjectId::from_raw(rec.id).local().value();
                         if local >= next_local_seq {
                             next_local_seq = local + 1;
                         }
@@ -73,11 +81,13 @@ impl ObjectTable {
     pub fn create(&mut self, node_id: u16) -> Result<ObjectId, MetaError> {
         let local = self.next_local_seq;
         if local >= self.capacity {
-            return Err(MetaError::TableFull { capacity: self.capacity });
+            return Err(MetaError::TableFull {
+                capacity: self.capacity,
+            });
         }
 
-        let oid = ObjectId::new(node_id, local);
-        let rec = ObjectRecord::new(oid.raw());
+        let oid = ObjectId::new(node_id, u48::from_u64(local));
+        let rec = ObjectRecord::new(oid.raw_value());
 
         // Ensure records vec is large enough
         while self.records.len() <= local as usize {
@@ -91,23 +101,23 @@ impl ObjectTable {
 
     /// Get a record by ObjectId (O(1) lookup).
     pub fn get(&self, oid: ObjectId) -> Option<&ObjectRecord> {
-        let local = oid.local() as usize;
+        let local: usize = oid.local().value() as usize;
         self.records.get(local).and_then(|r| r.as_ref())
     }
 
     /// Get a mutable record by ObjectId.
     pub fn get_mut(&mut self, oid: ObjectId) -> Option<&mut ObjectRecord> {
-        let local = oid.local() as usize;
+        let local: usize = oid.local().value() as usize;
         self.records.get_mut(local).and_then(|r| r.as_mut())
     }
 
     /// Flush a single record to disk.
     pub fn flush_record(&self, dev: &dyn BlockDevice, oid: ObjectId) -> Result<(), MetaError> {
-        let local = oid.local();
-        let offset = self.zone_offset + local * RECORD_SIZE as u64;
-        match &self.records[local as usize] {
+        let local: usize = oid.local().value() as usize;
+        let offset = self.zone_offset + local as u64 * RECORD_SIZE as u64;
+        match &self.records[local] {
             Some(rec) => {
-                let bytes = rec.to_bytes();
+                let bytes: [u8; RECORD_SIZE] = rec.to_bytes();
                 dev.write_at(offset, &bytes)?;
             }
             None => {
@@ -147,10 +157,10 @@ impl ObjectTable {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use mimisbrunnr_storage::FileBlockDevice;
-    use mimisbrunnr_types::ObjectState;
-    use tempfile::NamedTempFile;
+    use {
+        super::*, mimisbrunnr_storage::FileBlockDevice, mimisbrunnr_types::ObjectState,
+        tempfile::NamedTempFile,
+    };
 
     fn test_table() -> ObjectTable {
         // 1 MiB zone = 8192 record slots
@@ -164,8 +174,8 @@ mod tests {
         let oid2 = table.create(1).unwrap();
 
         assert_eq!(oid1.node(), 1);
-        assert_eq!(oid1.local(), 0);
-        assert_eq!(oid2.local(), 1);
+        assert_eq!(oid1.local(), u48::from_u64(0));
+        assert_eq!(oid2.local(), u48::from_u64(1));
         assert_eq!(table.count(), 2);
     }
 
@@ -175,7 +185,7 @@ mod tests {
         let oid = table.create(1).unwrap();
 
         let rec = table.get(oid).unwrap();
-        assert_eq!(rec.id, oid.raw());
+        assert_eq!(rec.id, oid.raw_value());
         assert!(rec.is_active());
     }
 
@@ -196,7 +206,7 @@ mod tests {
     #[test]
     fn get_nonexistent_returns_none() {
         let table = test_table();
-        let oid = ObjectId::new(1, 999);
+        let oid = ObjectId::new(1, u48::from_u64(999));
         assert!(table.get(oid).is_none());
     }
 

@@ -6,11 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-mimisbrunnr-types = { workspace = true }
-mimisbrunnr-storage = { workspace = true }
 mimisbrunnr-meta = { workspace = true }
-serde = { workspace = true }
+mimisbrunnr-storage = { workspace = true }
+mimisbrunnr-types = { workspace = true }
 log = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 

@@ -6,8 +6,9 @@ license.workspace = true
 
 [dependencies]
 mimisbrunnr-types = { workspace = true }
-thiserror = { workspace = true }
+arbitrary-int = { workspace = true }
 roaring = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

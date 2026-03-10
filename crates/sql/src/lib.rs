@@ -61,6 +61,7 @@ mod tests {
     use mimisbrunnr_index::TagIndex;
     use mimisbrunnr_ontology::{TagDefinition, TagSemantics, ValueType};
     use mimisbrunnr_types::{Assertion, ObjectId, TagId, TagOrigin, Value};
+    use arbitrary_int::u48;
 
     fn tag(id: u32) -> TagId {
         TagId::new(id)
@@ -101,13 +102,13 @@ mod tests {
 
         fn add_tag(&mut self, obj_local: u32, tag_id: TagId) {
             self.tag_index.tag_object(tag_id, obj_local);
-            let oid = ObjectId::new(0, obj_local as u64);
+            let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
             self.forward_index
                 .add(oid, Assertion::Tag(tag_id), TagOrigin::Direct);
         }
 
         fn set_attr(&mut self, obj_local: u32, key: TagId, value: Value) {
-            let oid = ObjectId::new(0, obj_local as u64);
+            let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
             self.kv_index.insert(key, &value, obj_local);
             self.forward_index
                 .add(oid, Assertion::Attr { key, value }, TagOrigin::Direct);

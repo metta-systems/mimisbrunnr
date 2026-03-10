@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
+use arbitrary_int::u48;
 use mimisbrunnr::{
     engine::{DiskEngine, Engine},
     ontology::{OntologyModule, TagDefinition, TagSemantics, ValueType},
@@ -226,7 +227,7 @@ fn cmd_create(engine: &mut Engine, count: u32) {
 }
 
 fn cmd_tag(engine: &mut Engine, object: u64, tags: &[String]) {
-    let oid = ObjectId::new(engine.node_id(), object);
+    let oid = ObjectId::new(engine.node_id(), u48::from_u64(object));
 
     for tag_name in tags {
         match engine.dag.lookup(tag_name) {
@@ -247,7 +248,7 @@ fn cmd_tag(engine: &mut Engine, object: u64, tags: &[String]) {
 }
 
 fn cmd_untag(engine: &mut Engine, object: u64, tag_name: &str) {
-    let oid = ObjectId::new(engine.node_id(), object);
+    let oid = ObjectId::new(engine.node_id(), u48::from_u64(object));
     match engine.dag.lookup(tag_name) {
         Some(tag_id) => match engine.remove_tag(oid, tag_id, now_ms()) {
             Ok(_) => println!("untagged {oid} from {tag_name}"),
@@ -258,7 +259,7 @@ fn cmd_untag(engine: &mut Engine, object: u64, tag_name: &str) {
 }
 
 fn cmd_set(engine: &mut Engine, object: u64, attr: &str) {
-    let oid = ObjectId::new(engine.node_id(), object);
+    let oid = ObjectId::new(engine.node_id(), u48::from_u64(object));
     let Some((key, val)) = attr.split_once('=') else {
         eprintln!("error: attribute must be in key=value format");
         return;
@@ -288,7 +289,7 @@ fn cmd_set(engine: &mut Engine, object: u64, attr: &str) {
 }
 
 fn cmd_info(engine: &Engine, object: u64) {
-    let oid = ObjectId::new(engine.node_id(), object);
+    let oid = ObjectId::new(engine.node_id(), u48::from_u64(object));
     match engine.get_object(oid) {
         Ok(rec) => {
             println!("Object {oid}");
@@ -485,7 +486,7 @@ fn cmd_project(
                             if let Some(oid) = entry.object
                                 && let Ok(content) = std::fs::read(path.join(&entry.path))
                             {
-                                blobs.insert(oid.raw(), content);
+                                blobs.insert(oid.raw_value(), content);
                             }
                         }
                     }

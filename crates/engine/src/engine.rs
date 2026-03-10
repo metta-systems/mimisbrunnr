@@ -1,3 +1,4 @@
+use arbitrary_int::u48;
 use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
 use mimisbrunnr_meta::ObjectTable;
 use mimisbrunnr_ontology::{ImplicationDag, Materializer};
@@ -107,7 +108,7 @@ impl Engine {
 
         // Phase 2: Index cleanup — remove from all bitmaps using forward index
         let entries = self.forward_index.remove_object(oid);
-        let obj_local = oid.local() as u32;
+        let obj_local = oid.local().value() as u32;
         for entry in &entries {
             match &entry.assertion {
                 Assertion::Tag(tag) => {
@@ -146,7 +147,7 @@ impl Engine {
     ) -> Result<Vec<TagId>, EngineError> {
         trace!("engine::add_tag oid={oid} tag={tag}");
         self.ensure_active(oid)?;
-        let obj_local = oid.local() as u32;
+        let obj_local = oid.local().value() as u32;
 
         // Add direct tag
         self.tag_index.tag_object(tag, obj_local);
@@ -177,7 +178,7 @@ impl Engine {
     ) -> Result<Vec<TagId>, EngineError> {
         trace!("engine::remove_tag oid={oid} tag={tag}");
         self.ensure_active(oid)?;
-        let obj_local = oid.local() as u32;
+        let obj_local = oid.local().value() as u32;
 
         // Remove direct tag
         self.tag_index.untag_object(tag, obj_local);
@@ -215,7 +216,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         trace!("engine::set_attr oid={oid} key={key}");
         self.ensure_active(oid)?;
-        let obj_local = oid.local() as u32;
+        let obj_local = oid.local().value() as u32;
 
         // Remove previous value for this key (if any) from kv index
         let existing: Vec<_> = self
@@ -262,7 +263,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         trace!("engine::remove_attr oid={oid} key={key}");
         self.ensure_active(oid)?;
-        let obj_local = oid.local() as u32;
+        let obj_local = oid.local().value() as u32;
 
         self.kv_index.remove(key, value, obj_local);
         self.forward_index
@@ -318,7 +319,7 @@ impl Engine {
             .execute(query)
             .iter()
             .filter_map(|local| {
-                let oid = ObjectId::new(self.node_id, local as u64);
+                let oid = ObjectId::new(self.node_id, u48::from_u64(local as u64));
                 // Only return active objects
                 self.object_table
                     .get(oid)
@@ -446,7 +447,7 @@ mod tests {
         let oid = e.create_object(1000).unwrap();
 
         let rec = e.get_object(oid).unwrap();
-        assert_eq!(rec.id, oid.raw());
+        assert_eq!(rec.id, oid.raw_value());
         assert!(rec.is_active());
     }
 
@@ -585,8 +586,8 @@ mod tests {
         e.delete_object(oid, 2000).unwrap();
 
         // All indexes should be clean
-        assert!(!e.tag_index.has_tag(tag(1), oid.local() as u32));
-        assert!(!e.tag_index.has_tag(tag(2), oid.local() as u32));
+        assert!(!e.tag_index.has_tag(tag(1), oid.local().value() as u32));
+        assert!(!e.tag_index.has_tag(tag(2), oid.local().value() as u32));
         assert!(e.forward_index.get(oid).is_empty());
     }
 

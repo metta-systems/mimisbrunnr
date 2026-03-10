@@ -10,11 +10,12 @@ default = []
 fuse = ["dep:fuser"]
 
 [dependencies]
-mimisbrunnr-types = { workspace = true }
+mimisbrunnr-engine = { workspace = true }
 mimisbrunnr-index = { workspace = true }
 mimisbrunnr-ontology = { workspace = true }
-mimisbrunnr-engine = { workspace = true }
-roaring = { workspace = true }
+mimisbrunnr-types = { workspace = true }
+arbitrary-int = { workspace = true }
 fuser = { workspace = true, optional = true }
 log = { workspace = true }
+roaring = { workspace = true }
 thiserror = { workspace = true }

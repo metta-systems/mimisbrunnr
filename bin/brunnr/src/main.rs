@@ -405,9 +405,9 @@ fn cmd_mount_unix(pool_path: &Path, context_name: &str, mountpoint: &Path) {
     let fs = MimisbrunnrFs::from_tag_vfs(tag_vfs);
     for entry in &projection.entries {
         if let Some(oid) = entry.object
-            && let Some(blob_data) = disk_engine.get_blob(oid.raw())
+            && let Some(blob_data) = disk_engine.get_blob(oid.raw_value())
         {
-            fs.set_blob(oid.raw(), blob_data.to_vec());
+            fs.set_blob(oid.raw_value(), blob_data.to_vec());
         }
     }
 

@@ -77,6 +77,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arbitrary-int"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993a810118f8f37e9c4411c86f1c4c940a09a7ab34b7bf2d88d06f50c553fab7"
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -93,6 +99,17 @@ name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
+
+[[package]]
+name = "bitbybit"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71d2a3353d70ac1091a33cbf31fc7e77b19091538a7e306e3740712af19807ca"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "bitflags"
@@ -486,6 +503,7 @@ dependencies = [
 name = "mimir"
 version = "0.1.0"
 dependencies = [
+ "arbitrary-int",
  "clap",
  "env_logger",
  "log",
@@ -515,6 +533,7 @@ dependencies = [
 name = "mimisbrunnr-engine"
 version = "0.1.0"
 dependencies = [
+ "arbitrary-int",
  "log",
  "mimisbrunnr-index",
  "mimisbrunnr-meta",
@@ -535,6 +554,7 @@ dependencies = [
 name = "mimisbrunnr-fuse"
 version = "0.1.0"
 dependencies = [
+ "arbitrary-int",
  "fuser",
  "log",
  "mimisbrunnr-engine",
@@ -549,6 +569,7 @@ dependencies = [
 name = "mimisbrunnr-index"
 version = "0.1.0"
 dependencies = [
+ "arbitrary-int",
  "mimisbrunnr-types",
  "roaring",
  "tempfile",
@@ -559,6 +580,7 @@ dependencies = [
 name = "mimisbrunnr-meta"
 version = "0.1.0"
 dependencies = [
+ "arbitrary-int",
  "bytemuck",
  "mimisbrunnr-storage",
  "mimisbrunnr-types",
@@ -570,6 +592,7 @@ dependencies = [
 name = "mimisbrunnr-ontology"
 version = "0.1.0"
 dependencies = [
+ "arbitrary-int",
  "mimisbrunnr-index",
  "mimisbrunnr-types",
  "serde",
@@ -608,6 +631,7 @@ dependencies = [
 name = "mimisbrunnr-sql"
 version = "0.1.0"
 dependencies = [
+ "arbitrary-int",
  "mimisbrunnr-index",
  "mimisbrunnr-ontology",
  "mimisbrunnr-query",
@@ -644,6 +668,8 @@ dependencies = [
 name = "mimisbrunnr-types"
 version = "0.1.0"
 dependencies = [
+ "arbitrary-int",
+ "bitbybit",
  "thiserror",
 ]
 
@@ -675,6 +701,7 @@ dependencies = [
 name = "mimisbrunnr-watch"
 version = "0.1.0"
 dependencies = [
+ "arbitrary-int",
  "mimisbrunnr-index",
  "mimisbrunnr-ontology",
  "mimisbrunnr-query",

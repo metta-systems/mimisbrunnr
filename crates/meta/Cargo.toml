@@ -5,10 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-mimisbrunnr-types = { workspace = true }
 mimisbrunnr-storage = { workspace = true }
-thiserror = { workspace = true }
+mimisbrunnr-types = { workspace = true }
+arbitrary-int = { workspace = true }
 bytemuck = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

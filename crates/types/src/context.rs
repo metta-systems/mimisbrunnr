@@ -99,10 +99,10 @@ impl Default for PathContextManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, arbitrary_int::u48};
 
     fn oid(n: u64) -> ObjectId {
-        ObjectId::new(0, n)
+        ObjectId::new(0, u48::from_u64(n))
     }
 
     #[test]

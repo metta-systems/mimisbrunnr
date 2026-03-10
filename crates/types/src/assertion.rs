@@ -22,7 +22,7 @@ pub enum TagOrigin {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, arbitrary_int::u48};
 
     #[test]
     fn tag_assertion() {
@@ -50,13 +50,16 @@ mod tests {
 
     #[test]
     fn relation_assertion() {
-        let target = ObjectId::new(1, 900);
+        let target = ObjectId::new(1, u48::from_u64(900));
         let a = Assertion::Relation {
             predicate: TagId::new(5),
             target,
         };
         match &a {
-            Assertion::Relation { predicate, target: t } => {
+            Assertion::Relation {
+                predicate,
+                target: t,
+            } => {
                 assert_eq!(predicate.raw(), 5);
                 assert_eq!(*t, target);
             }

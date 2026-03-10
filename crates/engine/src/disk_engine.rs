@@ -287,7 +287,7 @@ impl DiskEngine {
                     .entries
                     .iter()
                     .map(|e| ProjectionEntryRecord {
-                        object_id: e.object.map(|o| o.raw()),
+                        object_id: e.object.map(|o| o.raw_value()),
                         path: e.path.clone(),
                         entry_type: match &e.entry_type {
                             mimisbrunnr_types::ProjectedEntryType::File { mode, uid, gid } => {
@@ -396,7 +396,7 @@ impl DiskEngine {
         // Rebuild forward index, tag index, and kv index from forward records
         for fwd in &state.forward {
             let oid = mimisbrunnr_types::ObjectId::from_raw(fwd.object_id);
-            let obj_local = oid.local() as u32;
+            let obj_local = oid.local().value() as u32;
 
             for &tag_raw in &fwd.tag_ids_direct {
                 let tag = mimisbrunnr_types::TagId::new(tag_raw);
@@ -519,6 +519,7 @@ fn parse_semantics(s: &str) -> mimisbrunnr_ontology::TagSemantics {
 mod tests {
     use {
         super::*,
+        arbitrary_int::u48,
         mimisbrunnr_ontology::{TagDefinition, TagSemantics},
         mimisbrunnr_storage::WAL_SIZE,
         mimisbrunnr_types::{ObjectId, Query, TagId, Value},
@@ -708,7 +709,7 @@ mod tests {
             let de = DiskEngine::open(&config_path).unwrap();
             let e = de.engine();
 
-            let oid = ObjectId::new(0, 0);
+            let oid = ObjectId::new(0, u48::from_u64(0));
             let rec = e.get_object(oid).unwrap();
             assert_eq!(rec.content_hash, hash);
             assert_eq!(rec.blob_length, 11);

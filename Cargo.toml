@@ -43,6 +43,8 @@ mimisbrunnr-fuse = { path = "crates/fuse" }
 mimisbrunnr-sql = { path = "crates/sql" }
 mimisbrunnr = { path = "crates/mimisbrunnr" }
 
+arbitrary-int = "2.1"
+bitbybit = "2.0"
 blake3 = "1"
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }

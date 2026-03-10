@@ -6,11 +6,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-mimisbrunnr-types = { workspace = true }
 mimisbrunnr-storage = { workspace = true }
+mimisbrunnr-types = { workspace = true }
+crc32fast = { workspace = true }
 log = { workspace = true }
 thiserror = { workspace = true }
-crc32fast = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

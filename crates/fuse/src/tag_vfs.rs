@@ -32,6 +32,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
 use mimisbrunnr_ontology::ImplicationDag;
+use arbitrary_int::u48;
 use mimisbrunnr_types::{Assertion, ObjectId, TagId};
 use roaring::RoaringBitmap;
 
@@ -166,10 +167,10 @@ impl TagVfs {
             | TagVfsEntry::CtxDir(_) => Some(dir_attr(ino)),
 
             TagVfsEntry::TagFile { obj_local, .. } => {
-                let oid = ObjectId::new(0, *obj_local as u64);
+                let oid = ObjectId::new(0, u48::from_u64(*obj_local as u64));
                 let size = self
                     .blobs
-                    .get(&oid.raw())
+                    .get(&oid.raw_value())
                     .map(|b| b.len() as u64)
                     .unwrap_or(0);
                 Some(file_attr(ino, size))
@@ -463,8 +464,8 @@ impl TagVfs {
         let entry = self.entries.get(&ino)?;
         match entry {
             TagVfsEntry::TagFile { obj_local, .. } => {
-                let oid = ObjectId::new(0, *obj_local as u64);
-                let data = self.blobs.get(&oid.raw())?;
+                let oid = ObjectId::new(0, u48::from_u64(*obj_local as u64));
+                let data = self.blobs.get(&oid.raw_value())?;
                 let start = (offset as usize).min(data.len());
                 let end = (start + size as usize).min(data.len());
                 Some(&data[start..end])
@@ -473,7 +474,7 @@ impl TagVfs {
                 let tree = self.context_trees.get(ctx)?;
                 let node = tree.get(*vfs_ino)?;
                 let oid = node.object?;
-                let data = self.blobs.get(&oid.raw())?;
+                let data = self.blobs.get(&oid.raw_value())?;
                 let start = (offset as usize).min(data.len());
                 let end = (start + size as usize).min(data.len());
                 Some(&data[start..end])
@@ -586,7 +587,7 @@ impl TagVfs {
     /// If multiple objects in the same bitmap share a name, disambiguates
     /// with `_<id>` suffix.
     fn object_display_name(&self, obj_local: u32, bitmap: &RoaringBitmap) -> String {
-        let oid = ObjectId::new(0, obj_local as u64);
+        let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
         let base_name = self.get_name_attr(oid);
 
         let name = match base_name {
@@ -600,7 +601,7 @@ impl TagVfs {
             if other == obj_local {
                 continue;
             }
-            let other_oid = ObjectId::new(0, other as u64);
+            let other_oid = ObjectId::new(0, u48::from_u64(other as u64));
             if let Some(other_name) = self.get_name_attr(other_oid) {
                 if other_name == name {
                     count += 1;
@@ -775,7 +776,7 @@ mod tests {
         }
 
         fn add_object(&mut self, obj_local: u32, tags: &[TagId], name: Option<&str>) {
-            let oid = ObjectId::new(0, obj_local as u64);
+            let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
             for &tag_id in tags {
                 self.tag_index.tag_object(tag_id, obj_local);
                 self.forward_index
@@ -889,8 +890,8 @@ mod tests {
         let mut vfs = f.build_vfs();
 
         // Set blob data for obj 1.
-        let oid = ObjectId::new(0, 1);
-        vfs.set_blob(oid.raw(), vec![0u8; 1024]);
+        let oid = ObjectId::new(0, u48::from_u64(1));
+        vfs.set_blob(oid.raw_value(), vec![0u8; 1024]);
 
         let tag_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
         let file_ino = vfs.lookup(tag_ino, "track1.flac").unwrap();
@@ -903,8 +904,8 @@ mod tests {
     #[test]
     fn read_file_content() {
         let mut vfs = music_fixture().build_vfs();
-        let oid = ObjectId::new(0, 1);
-        vfs.set_blob(oid.raw(), b"hello world".to_vec());
+        let oid = ObjectId::new(0, u48::from_u64(1));
+        vfs.set_blob(oid.raw_value(), b"hello world".to_vec());
 
         let tag_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
         let file_ino = vfs.lookup(tag_ino, "track1.flac").unwrap();
@@ -923,7 +924,7 @@ mod tests {
         let music = f.register_tag(1, "music");
         // No "name" attribute registered, so obj has no name.
         f.tag_index.tag_object(music, 42);
-        let oid = ObjectId::new(0, 42);
+        let oid = ObjectId::new(0, u48::from_u64(42));
         f.forward_index
             .add(oid, Assertion::Tag(music), TagOrigin::Direct);
 
@@ -983,7 +984,7 @@ mod tests {
 
         // Add a context subtree.
         let mut proj = PathProjection::new("test-ctx");
-        proj.add(ProjectedEntry::file(ObjectId::new(0, 99), "hello.txt"));
+        proj.add(ProjectedEntry::file(ObjectId::new(0, u48::from_u64(99)), "hello.txt"));
         let tree = VfsTree::from_projection(&proj);
         vfs.add_context("test-ctx".into(), tree);
 

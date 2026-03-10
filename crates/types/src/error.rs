@@ -43,12 +43,11 @@ pub enum Error {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::ObjectId;
+    use {super::*, crate::ObjectId, arbitrary_int::u48};
 
     #[test]
     fn error_display() {
-        let e = Error::ObjectNotFound(ObjectId::new(1, 42));
+        let e = Error::ObjectNotFound(ObjectId::new(1, u48::from_u64(42)));
         assert_eq!(format!("{e}"), "object not found: obj:1:42");
     }
 
