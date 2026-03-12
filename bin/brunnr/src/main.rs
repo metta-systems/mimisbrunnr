@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 
 use mimisbrunnr::{
     pool::{DiskDescriptor, MediaType, PoolConfig, PoolManager, StorageTier},
-    storage::{ExtentLayout, FileBlockDevice, Superblock, ZoneLayout, ZoneType},
+    storage::{ExtentLayout, FileBlockDevice, Superblock, ZoneType},
     wal::WriteAheadLog,
 };
 
@@ -183,7 +183,7 @@ fn cmd_create(disk_paths: &[PathBuf], sizes_mib: &[u64], node_id: u16, tiers: &[
         };
 
         // Compute zone layout
-        let layout = match ZoneLayout::compute(capacity) {
+        let layout = match ExtentLayout::compute(capacity) {
             Some(l) => l,
             None => {
                 eprintln!("error: disk too small (need at least ~68 MiB)");
@@ -192,7 +192,7 @@ fn cmd_create(disk_paths: &[PathBuf], sizes_mib: &[u64], node_id: u16, tiers: &[
         };
 
         // Write superblock
-        let sb = Superblock::new(node_id, disk_id, layout);
+        let sb = Superblock::new(node_id, disk_id, layout.clone());
         if let Err(e) = sb.write_to(&dev) {
             eprintln!(
                 "error: failed to write superblock to {}: {e}",
@@ -219,16 +219,15 @@ fn cmd_create(disk_paths: &[PathBuf], sizes_mib: &[u64], node_id: u16, tiers: &[
         pool_config.add_disk(disk_id, abs_path.to_string_lossy(), tier.name(), capacity);
 
         // Show zone layout
-        let el = ExtentLayout::from(&layout);
         println!(
             "  disk {disk_id}: {} ({size_mib} MiB, tier: {tier})",
             path.display(),
         );
         println!(
             "    zones: index {} KiB, meta {} KiB, blob {} KiB",
-            el.zone_size(ZoneType::Index) / 1024,
-            el.zone_size(ZoneType::Metadata) / 1024,
-            el.zone_size(ZoneType::Blob) / 1024,
+            layout.zone_size(ZoneType::Index) / 1024,
+            layout.zone_size(ZoneType::Metadata) / 1024,
+            layout.zone_size(ZoneType::Blob) / 1024,
         );
     }
 
@@ -272,9 +271,8 @@ fn cmd_status(disk_paths: &[PathBuf]) {
             }
         };
 
-        match Superblock::read_from(&dev) {
+        match Superblock::read_with_extents(&dev) {
             Ok(sb) => {
-                let el = ExtentLayout::from(&sb.layout);
                 let cap_mib = sb.layout.device_capacity / (1024 * 1024);
 
                 println!("  Disk {} (node={}, disk={}):", i, sb.node_id, sb.disk_id);
@@ -282,18 +280,18 @@ fn cmd_status(disk_paths: &[PathBuf]) {
                 println!("    Capacity:  {cap_mib} MiB");
                 println!(
                     "    Index:     {} KiB ({} extent(s))",
-                    el.zone_size(ZoneType::Index) / 1024,
-                    el.extents(ZoneType::Index).len(),
+                    sb.layout.zone_size(ZoneType::Index) / 1024,
+                    sb.layout.extents(ZoneType::Index).len(),
                 );
                 println!(
                     "    Metadata:  {} KiB ({} extent(s))",
-                    el.zone_size(ZoneType::Metadata) / 1024,
-                    el.extents(ZoneType::Metadata).len(),
+                    sb.layout.zone_size(ZoneType::Metadata) / 1024,
+                    sb.layout.extents(ZoneType::Metadata).len(),
                 );
                 println!(
                     "    Blob:      {} KiB ({} extent(s))",
-                    el.zone_size(ZoneType::Blob) / 1024,
-                    el.extents(ZoneType::Blob).len(),
+                    sb.layout.zone_size(ZoneType::Blob) / 1024,
+                    sb.layout.extents(ZoneType::Blob).len(),
                 );
                 if sb.zone_map_offset != 0 {
                     println!("    Zone map:  offset {:#x}", sb.zone_map_offset);
@@ -346,7 +344,7 @@ fn cmd_add_disk(disk_path: &Path, pool_disk: &Path, size_mib: u64, tier_str: &st
         }
     };
 
-    let layout = match ZoneLayout::compute(capacity) {
+    let layout = match ExtentLayout::compute(capacity) {
         Some(l) => l,
         None => {
             eprintln!("error: disk too small");
@@ -354,7 +352,7 @@ fn cmd_add_disk(disk_path: &Path, pool_disk: &Path, size_mib: u64, tier_str: &st
         }
     };
 
-    let sb = Superblock::new(existing.node_id, disk_id, layout);
+    let sb = Superblock::new(existing.node_id, disk_id, layout.clone());
     if let Err(e) = sb.write_to(&dev) {
         eprintln!("error: failed to write superblock: {e}");
         std::process::exit(1);

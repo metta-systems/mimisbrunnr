@@ -43,3 +43,34 @@ year = 1998
 
 [[objects]]
 tags = ["electronic", "portable", "discontinued"]
+
+# ── Generated content (objects with actual file data) ────────────
+
+[[generate]]
+name = "music tracks"
+count = 3
+content_type = "music"
+min_size = 10240    # 10 KB (small for demo)
+max_size = 51200    # 50 KB
+tags = ["electronic", "ambient"]
+[generate.attrs]
+artist = "Synth Artist {seq}"
+album = "Generated Album {seq}"
+
+[[generate]]
+name = "text notes"
+count = 5
+content_type = "text"
+min_size = 512
+max_size = 4096
+tags = ["media"]
+[generate.attrs]
+genre = "notes"
+
+[[generate]]
+name = "binary samples"
+count = 2
+content_type = "binary"
+min_size = 1024
+max_size = 8192
+tags = ["audio"]

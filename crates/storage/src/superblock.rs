@@ -1,5 +1,5 @@
 use {
-    crate::{StorageError, layout::ZoneLayout},
+    crate::{StorageError, layout::{ExtentLayout, ZoneExtent}},
     log::trace,
 };
 
@@ -22,35 +22,55 @@ const SUPERBLOCK_BYTES: usize = 128;
 ///  [12..14]  node_id
 ///  [14..16]  disk_id
 ///  [16..24]  device_capacity
-///  [24..32]  index_zone_offset
-///  [32..40]  index_zone_size
-///  [40..48]  metadata_zone_offset
-///  [48..56]  metadata_zone_size
-///  [56..64]  blob_zone_offset
-///  [64..72]  blob_zone_size
+///  [24..32]  index_zone_offset   (first extent)
+///  [32..40]  index_zone_size     (first extent)
+///  [40..48]  metadata_zone_offset (first extent)
+///  [48..56]  metadata_zone_size   (first extent)
+///  [56..64]  blob_zone_offset    (first extent)
+///  [64..72]  blob_zone_size      (first extent)
 ///  [72..80]  wal_offset
 ///  [80..88]  alloc_bitmap_offset
 ///  [88..96]  alloc_bitmap_size
 ///  [96..104] creation_timestamp_ns
 ///  [104..112] last_checkpoint_lsn
-///  [112..120] zone_map_offset (0 = no zone map, use inline layout)
+///  [112..120] zone_map_offset (0 = single-extent zones, >0 = read ZoneMap for full extents)
 ///  [120..124] checksum (CRC32C of bytes [0..120])
 ///  [124..128] padding
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Superblock {
     pub node_id: u16,
     pub disk_id: u16,
-    pub layout: ZoneLayout,
+    pub layout: ExtentLayout,
     pub creation_timestamp_ns: i64,
     pub last_checkpoint_lsn: u64,
-    /// Offset of the zone map block on disk. 0 means no zone map (single-extent zones).
+    /// Offset of the zone map block on disk. 0 means single-extent zones (inline in superblock).
     pub zone_map_offset: u64,
 }
 
+impl PartialEq for Superblock {
+    fn eq(&self, other: &Self) -> bool {
+        self.node_id == other.node_id
+            && self.disk_id == other.disk_id
+            && self.creation_timestamp_ns == other.creation_timestamp_ns
+            && self.last_checkpoint_lsn == other.last_checkpoint_lsn
+            && self.zone_map_offset == other.zone_map_offset
+            // Compare layout fields that are serialized
+            && self.layout.device_capacity == other.layout.device_capacity
+            && self.layout.wal_offset == other.layout.wal_offset
+            && self.layout.alloc_bitmap_offset == other.layout.alloc_bitmap_offset
+            && self.layout.alloc_bitmap_size == other.layout.alloc_bitmap_size
+            && self.layout.index_extents == other.layout.index_extents
+            && self.layout.metadata_extents == other.layout.metadata_extents
+            && self.layout.blob_extents == other.layout.blob_extents
+    }
+}
+
+impl Eq for Superblock {}
+
 impl Superblock {
     /// Create a new superblock for the given layout.
-    pub fn new(node_id: u16, disk_id: u16, layout: ZoneLayout) -> Self {
+    pub fn new(node_id: u16, disk_id: u16, layout: ExtentLayout) -> Self {
         Self {
             node_id,
             disk_id,
@@ -62,6 +82,10 @@ impl Superblock {
     }
 
     /// Serialize to a 128-byte buffer.
+    ///
+    /// Only the first extent of each zone is stored inline. If zones have
+    /// multiple extents, the caller must also write a ZoneMap block and set
+    /// `zone_map_offset` before calling this.
     pub fn to_bytes(&self) -> [u8; SUPERBLOCK_BYTES] {
         let mut buf = [0u8; SUPERBLOCK_BYTES];
         let l = &self.layout;
@@ -71,12 +95,13 @@ impl Superblock {
         buf[12..14].copy_from_slice(&self.node_id.to_le_bytes());
         buf[14..16].copy_from_slice(&self.disk_id.to_le_bytes());
         buf[16..24].copy_from_slice(&l.device_capacity.to_le_bytes());
-        buf[24..32].copy_from_slice(&l.index_zone_offset.to_le_bytes());
-        buf[32..40].copy_from_slice(&l.index_zone_size.to_le_bytes());
-        buf[40..48].copy_from_slice(&l.metadata_zone_offset.to_le_bytes());
-        buf[48..56].copy_from_slice(&l.metadata_zone_size.to_le_bytes());
-        buf[56..64].copy_from_slice(&l.blob_zone_offset.to_le_bytes());
-        buf[64..72].copy_from_slice(&l.blob_zone_size.to_le_bytes());
+        // First extent of each zone (bootstrap info)
+        buf[24..32].copy_from_slice(&l.index_zone_offset().to_le_bytes());
+        buf[32..40].copy_from_slice(&l.index_extents[0].size.to_le_bytes());
+        buf[40..48].copy_from_slice(&l.metadata_zone_offset().to_le_bytes());
+        buf[48..56].copy_from_slice(&l.metadata_extents[0].size.to_le_bytes());
+        buf[56..64].copy_from_slice(&l.blob_zone_offset().to_le_bytes());
+        buf[64..72].copy_from_slice(&l.blob_extents[0].size.to_le_bytes());
         buf[72..80].copy_from_slice(&l.wal_offset.to_le_bytes());
         buf[80..88].copy_from_slice(&l.alloc_bitmap_offset.to_le_bytes());
         buf[88..96].copy_from_slice(&l.alloc_bitmap_size.to_le_bytes());
@@ -91,6 +116,10 @@ impl Superblock {
     }
 
     /// Deserialize from a 128-byte buffer.
+    ///
+    /// Reconstructs the layout with single extents from the inline data.
+    /// If `zone_map_offset` is non-zero, the caller should read the ZoneMap
+    /// block and replace the extent lists with the full data.
     pub fn from_bytes(buf: &[u8; SUPERBLOCK_BYTES]) -> Result<Self, StorageError> {
         if buf[0..8] != MAGIC {
             return Err(StorageError::InvalidMagic);
@@ -126,21 +155,19 @@ impl Superblock {
         let last_checkpoint_lsn = u64::from_le_bytes(buf[104..112].try_into().unwrap());
         let zone_map_offset = u64::from_le_bytes(buf[112..120].try_into().unwrap());
 
-        // Reconstruct layout — we need the derived fields too
-        let layout = ZoneLayout {
+        let layout = ExtentLayout {
+            index_extents: vec![ZoneExtent::new(index_zone_offset, index_zone_size)],
+            metadata_extents: vec![ZoneExtent::new(metadata_zone_offset, metadata_zone_size)],
+            blob_extents: vec![ZoneExtent::new(blob_zone_offset, blob_zone_size)],
+            device_capacity,
             superblock_primary: 0,
             superblock_copy: crate::SUPERBLOCK_SIZE,
             wal_offset,
             alloc_bitmap_offset,
             alloc_bitmap_size,
-            index_zone_offset,
-            index_zone_size,
-            metadata_zone_offset,
-            metadata_zone_size,
-            blob_zone_offset,
-            blob_zone_size,
+            block_class_map_offset: 0,
+            block_class_map_size: 0,
             superblock_backup: device_capacity - crate::SUPERBLOCK_SIZE,
-            device_capacity,
         };
 
         Ok(Self {
@@ -175,6 +202,9 @@ impl Superblock {
 
     /// Read and validate superblock from the primary location.
     /// Falls back to copy and backup on failure.
+    ///
+    /// If `zone_map_offset` is non-zero, the caller should subsequently read
+    /// the ZoneMap block to get the full extent lists and update the layout.
     pub fn read_from(dev: &dyn crate::BlockDevice) -> Result<Self, StorageError> {
         let mut block = [0u8; crate::BLOCK_SIZE as usize];
 
@@ -215,6 +245,21 @@ impl Superblock {
 
         Err(StorageError::InvalidMagic)
     }
+
+    /// Read superblock and load full extent layout from ZoneMap if present.
+    ///
+    /// This is the preferred way to load a superblock — it handles the
+    /// two-phase read (superblock → zone map) automatically.
+    pub fn read_with_extents(dev: &dyn crate::BlockDevice) -> Result<Self, StorageError> {
+        let mut sb = Self::read_from(dev)?;
+        if sb.zone_map_offset != 0 {
+            let extents = crate::ZoneMap::read_from(dev, sb.zone_map_offset)?;
+            sb.layout.index_extents = extents.index;
+            sb.layout.metadata_extents = extents.metadata;
+            sb.layout.blob_extents = extents.blob;
+        }
+        Ok(sb)
+    }
 }
 
 #[cfg(test)]
@@ -225,7 +270,7 @@ mod tests {
     };
 
     fn test_superblock() -> Superblock {
-        let layout = ZoneLayout::compute(256 * 1024 * 1024).unwrap();
+        let layout = ExtentLayout::compute(256 * 1024 * 1024).unwrap();
         let mut sb = Superblock::new(1, 0, layout);
         sb.creation_timestamp_ns = 1_700_000_000_000_000_000;
         sb.last_checkpoint_lsn = 42;
@@ -270,7 +315,7 @@ mod tests {
         let cap = 256 * 1024 * 1024u64;
         let dev = FileBlockDevice::open(tmp.path(), cap).unwrap();
 
-        let layout = ZoneLayout::compute(cap).unwrap();
+        let layout = ExtentLayout::compute(cap).unwrap();
         let sb = Superblock::new(7, 0, layout);
         sb.write_to(&dev).unwrap();
 
@@ -286,7 +331,7 @@ mod tests {
         let cap = 256 * 1024 * 1024u64;
         let dev = FileBlockDevice::open(tmp.path(), cap).unwrap();
 
-        let layout = ZoneLayout::compute(cap).unwrap();
+        let layout = ExtentLayout::compute(cap).unwrap();
         let sb = Superblock::new(3, 0, layout);
         sb.write_to(&dev).unwrap();
 
@@ -305,7 +350,7 @@ mod tests {
         let cap = 256 * 1024 * 1024u64;
         let dev = FileBlockDevice::open(tmp.path(), cap).unwrap();
 
-        let layout = ZoneLayout::compute(cap).unwrap();
+        let layout = ExtentLayout::compute(cap).unwrap();
         let sb = Superblock::new(5, 0, layout);
         sb.write_to(&dev).unwrap();
 
@@ -319,10 +364,41 @@ mod tests {
 
     #[test]
     fn min_device_size_works() {
-        let layout = ZoneLayout::compute(MIN_DEVICE_SIZE).unwrap();
+        let layout = ExtentLayout::compute(MIN_DEVICE_SIZE).unwrap();
         let sb = Superblock::new(0, 0, layout);
         let bytes = sb.to_bytes();
         let sb2 = Superblock::from_bytes(&bytes).unwrap();
         assert_eq!(sb, sb2);
+    }
+
+    #[test]
+    fn read_with_extents_loads_zone_map() {
+        use crate::{FileBlockDevice, ZoneMap};
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let cap = 256 * 1024 * 1024u64;
+        let dev = FileBlockDevice::open(tmp.path(), cap).unwrap();
+
+        let mut layout = ExtentLayout::compute(cap).unwrap();
+        // Add a second extent to the index zone
+        let extra = crate::layout::ZoneExtent::new(100 * crate::BLOCK_SIZE, 10 * crate::BLOCK_SIZE);
+        layout.index_extents.push(extra);
+
+        // Write zone map at a known offset (use alloc_bitmap area for test simplicity)
+        let zone_map_offset = layout.alloc_bitmap_offset;
+        ZoneMap::write_to(&layout, &dev, zone_map_offset).unwrap();
+
+        let mut sb = Superblock::new(1, 0, layout.clone());
+        sb.zone_map_offset = zone_map_offset;
+        sb.write_to(&dev).unwrap();
+
+        // read_from only gets single inline extents
+        let sb_basic = Superblock::read_from(&dev).unwrap();
+        assert_eq!(sb_basic.layout.index_extents.len(), 1);
+
+        // read_with_extents loads the full zone map
+        let sb_full = Superblock::read_with_extents(&dev).unwrap();
+        assert_eq!(sb_full.layout.index_extents.len(), 2);
+        assert_eq!(sb_full.layout.index_extents[1], extra);
     }
 }

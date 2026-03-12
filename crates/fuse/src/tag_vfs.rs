@@ -1048,4 +1048,76 @@ mod tests {
         let elec_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
         assert!(vfs.lookup(elec_ino, "portable").is_none());
     }
+
+    #[test]
+    fn ctx_node_getattr_returns_blob_size() {
+        use mimisbrunnr_types::{PathProjection, ProjectedEntry};
+
+        let f = TestFixture::new();
+        let mut vfs = f.build_vfs();
+
+        let oid = ObjectId::new(0, u48::from_u64(42));
+        let mut proj = PathProjection::new("myctx");
+        proj.add(ProjectedEntry::file(oid, "data.bin"));
+        let tree = VfsTree::from_projection(&proj);
+        vfs.add_context("myctx".into(), tree);
+
+        // Before setting blob, size should be 0
+        let ctx_ino = vfs.lookup(INO_CTX, "myctx").unwrap();
+        let file_ino = vfs.lookup(ctx_ino, "data.bin").unwrap();
+        let attr = vfs.getattr(file_ino).unwrap();
+        assert_eq!(attr.size, 0, "size should be 0 before blob is set");
+
+        // Set blob data — getattr should now return the blob size
+        vfs.set_blob(oid.raw_value(), vec![0xAB; 5000]);
+        let attr = vfs.getattr(file_ino).unwrap();
+        assert_eq!(attr.size, 5000, "size should reflect blob data");
+        assert_eq!(attr.blocks, 5000u64.div_ceil(512));
+    }
+
+    #[test]
+    fn ctx_node_read_returns_blob_content() {
+        use mimisbrunnr_types::{PathProjection, ProjectedEntry};
+
+        let f = TestFixture::new();
+        let mut vfs = f.build_vfs();
+
+        let oid = ObjectId::new(0, u48::from_u64(77));
+        let mut proj = PathProjection::new("proj");
+        proj.add(ProjectedEntry::file(oid, "readme.txt"));
+        let tree = VfsTree::from_projection(&proj);
+        vfs.add_context("proj".into(), tree);
+
+        vfs.set_blob(oid.raw_value(), b"file content here".to_vec());
+
+        let ctx_ino = vfs.lookup(INO_CTX, "proj").unwrap();
+        let file_ino = vfs.lookup(ctx_ino, "readme.txt").unwrap();
+
+        // Full read
+        let data = vfs.read(file_ino, 0, 4096).unwrap();
+        assert_eq!(data, b"file content here");
+
+        // Partial read
+        let data = vfs.read(file_ino, 5, 7).unwrap();
+        assert_eq!(data, b"content");
+    }
+
+    #[test]
+    fn ctx_node_without_blob_returns_empty_read() {
+        use mimisbrunnr_types::{PathProjection, ProjectedEntry};
+
+        let f = TestFixture::new();
+        let mut vfs = f.build_vfs();
+
+        let oid = ObjectId::new(0, u48::from_u64(88));
+        let mut proj = PathProjection::new("ctx");
+        proj.add(ProjectedEntry::file(oid, "empty.bin"));
+        let tree = VfsTree::from_projection(&proj);
+        vfs.add_context("ctx".into(), tree);
+
+        // No blob set — read should return None
+        let ctx_ino = vfs.lookup(INO_CTX, "ctx").unwrap();
+        let file_ino = vfs.lookup(ctx_ino, "empty.bin").unwrap();
+        assert!(vfs.read(file_ino, 0, 4096).is_none());
+    }
 }

@@ -3,11 +3,19 @@ use std::path::Path;
 use {
     mimisbrunnr_meta::ObjectTable,
     mimisbrunnr_pool::PoolConfig,
-    mimisbrunnr_storage::{BlockDevice, FileBlockDevice, Superblock},
+    mimisbrunnr_storage::{
+        BlockDevice, ExtentLayout, FileBlockDevice, Superblock, ZoneExtent, ZoneMap, ZoneType,
+        BLOCK_SIZE,
+    },
 };
 
 use crate::{engine::Engine, error::EngineError};
 use log::trace;
+
+/// Round up `value` to the next multiple of `align`.
+fn align_up(value: u64, align: u64) -> u64 {
+    (value + align - 1) / align * align
+}
 
 /// Persistent state serialized to the index zone.
 ///
@@ -122,7 +130,9 @@ impl DiskEngine {
         let primary_device =
             FileBlockDevice::open(Path::new(&primary.path), 0).map_err(EngineError::Storage)?;
 
-        let superblock = Superblock::read_from(&primary_device).map_err(EngineError::Storage)?;
+        // Read superblock with full extent layout (handles ZoneMap if present)
+        let superblock =
+            Superblock::read_with_extents(&primary_device).map_err(EngineError::Storage)?;
 
         let mut engine = Engine::new(config.node_id);
 
@@ -130,8 +140,8 @@ impl DiskEngine {
         let layout = &superblock.layout;
         engine.object_table = ObjectTable::load(
             &primary_device,
-            layout.metadata_zone_offset,
-            layout.metadata_zone_size,
+            layout.metadata_zone_offset(),
+            layout.metadata_zone_size(),
         )
         .map_err(EngineError::Meta)?;
 
@@ -140,14 +150,17 @@ impl DiskEngine {
         let mut blobs = std::collections::HashMap::new();
         Self::load_index_state(
             &primary_device,
-            layout.index_zone_offset,
-            layout.index_zone_size,
+            layout,
+            ZoneType::Index,
             &mut engine,
             &mut context_mgr,
             &mut blobs,
         )?;
 
-        trace!("DiskEngine::open loaded {} objects", engine.object_table.count());
+        trace!(
+            "DiskEngine::open loaded {} objects",
+            engine.object_table.count()
+        );
 
         Ok(Self {
             engine,
@@ -168,9 +181,12 @@ impl DiskEngine {
     }
 
     /// Flush all in-memory state to disk.
+    ///
+    /// If the index state doesn't fit in the current index zone, grows
+    /// the index zone by adding a new extent carved from the end of the blob zone.
+    /// The updated extents are persisted via ZoneMap.
     pub fn flush(&mut self) -> Result<(), EngineError> {
         trace!("DiskEngine::flush");
-        let layout = &self.superblock.layout;
 
         // Flush object table to metadata zone
         self.engine
@@ -178,18 +194,97 @@ impl DiskEngine {
             .flush_all(&self.primary_device)
             .map_err(EngineError::Meta)?;
 
-        // Flush index state to index zone
-        Self::save_index_state(
-            &self.primary_device,
-            layout.index_zone_offset,
-            layout.index_zone_size,
-            &self.engine,
-            &self.context_mgr,
-            &self.blobs,
-        )?;
+        // Serialize index state and check if it fits
+        let json =
+            Self::serialize_index_state(&self.engine, &self.context_mgr, &self.blobs)?;
+
+        let needed = json.len() as u64 + 8; // 8 bytes for length prefix
+        let index_size = self.superblock.layout.zone_size(ZoneType::Index);
+
+        if needed > index_size {
+            self.grow_index_zone(needed, index_size)?;
+        }
+
+        // Write index state using extent-aware writer
+        Self::write_index_state(&self.primary_device, &self.superblock.layout, &json)?;
 
         self.primary_device.sync().map_err(EngineError::Storage)?;
         trace!("DiskEngine::flush complete");
+        Ok(())
+    }
+
+    /// Grow the index zone by stealing blocks from the end of the blob zone.
+    ///
+    /// Adds a new extent to the index zone and shrinks the last blob extent.
+    /// Persists the updated layout via ZoneMap and superblock.
+    fn grow_index_zone(&mut self, needed: u64, current_size: u64) -> Result<(), EngineError> {
+        let grow_by = align_up(needed - current_size, BLOCK_SIZE);
+        let blob_size = self.superblock.layout.zone_size(ZoneType::Blob);
+
+        if grow_by > blob_size / 2 {
+            return Err(EngineError::Io(std::io::Error::other(format!(
+                "index state too large ({needed} bytes), cannot grow index zone \
+                 without consuming more than half the blob zone",
+            ))));
+        }
+
+        // Steal from the end of the last blob extent
+        let blob_extents = self.superblock.layout.extents_mut(ZoneType::Blob);
+        let last_blob = blob_extents
+            .last_mut()
+            .ok_or_else(|| EngineError::Io(std::io::Error::other("no blob extents")))?;
+
+        if grow_by > last_blob.size {
+            return Err(EngineError::Io(std::io::Error::other(format!(
+                "cannot grow index zone by {} bytes: last blob extent is only {} bytes",
+                grow_by, last_blob.size,
+            ))));
+        }
+
+        // New index extent starts where the blob extent now ends
+        let new_extent_offset = last_blob.offset + last_blob.size - grow_by;
+        last_blob.size -= grow_by;
+
+        // Add the new extent to the index zone
+        let new_extent = ZoneExtent::new(new_extent_offset, grow_by);
+        self.superblock
+            .layout
+            .extents_mut(ZoneType::Index)
+            .push(new_extent);
+
+        // Write ZoneMap block. Use the block just before the backup superblock
+        // (or reuse existing zone_map_offset).
+        let zone_map_offset = if self.superblock.zone_map_offset != 0 {
+            self.superblock.zone_map_offset
+        } else {
+            // Allocate zone map block from the end of the blob zone
+            let blob_extents = self.superblock.layout.extents_mut(ZoneType::Blob);
+            let last_blob = blob_extents.last_mut().unwrap();
+            let offset = last_blob.offset + last_blob.size - BLOCK_SIZE;
+            last_blob.size -= BLOCK_SIZE;
+            offset
+        };
+
+        ZoneMap::write_to(&self.superblock.layout, &self.primary_device, zone_map_offset)
+            .map_err(EngineError::Storage)?;
+
+        self.superblock.zone_map_offset = zone_map_offset;
+
+        // Write updated superblock (with first extents inline + zone_map_offset)
+        self.superblock
+            .write_to(&self.primary_device)
+            .map_err(EngineError::Storage)?;
+
+        let new_index_size = self.superblock.layout.zone_size(ZoneType::Index);
+        let new_blob_size = self.superblock.layout.zone_size(ZoneType::Blob);
+        log::info!(
+            "grew index zone by {} KiB (now {} KiB across {} extent(s), blob zone now {} KiB)",
+            grow_by / 1024,
+            new_index_size / 1024,
+            self.superblock.layout.extents(ZoneType::Index).len(),
+            new_blob_size / 1024,
+        );
+
         Ok(())
     }
 
@@ -213,15 +308,12 @@ impl DiskEngine {
         self.blobs.get(&object_id).map(|v| v.as_slice())
     }
 
-    /// Save index state (forward index, ontology, contexts, blobs) to the index zone.
-    fn save_index_state(
-        dev: &FileBlockDevice,
-        zone_offset: u64,
-        zone_size: u64,
+    /// Serialize engine state to JSON bytes.
+    fn serialize_index_state(
         engine: &Engine,
         context_mgr: &mimisbrunnr_types::PathContextManager,
         blobs: &std::collections::HashMap<u64, Vec<u8>>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<Vec<u8>, EngineError> {
         let mut state = IndexState::default();
 
         // Serialize ontology tags
@@ -282,32 +374,33 @@ impl DiskEngine {
         }
 
         // Serialize path contexts
-        let serialize_entries = |proj: &mimisbrunnr_types::PathProjection| -> Vec<ProjectionEntryRecord> {
-            proj.entries
-                .iter()
-                .map(|e| ProjectionEntryRecord {
-                    object_id: e.object.map(|o| o.raw_value()),
-                    path: e.path.clone(),
-                    entry_type: match &e.entry_type {
-                        mimisbrunnr_types::ProjectedEntryType::File { mode, uid, gid } => {
-                            EntryTypeRecord::File {
-                                mode: *mode,
-                                uid: *uid,
-                                gid: *gid,
+        let serialize_entries =
+            |proj: &mimisbrunnr_types::PathProjection| -> Vec<ProjectionEntryRecord> {
+                proj.entries
+                    .iter()
+                    .map(|e| ProjectionEntryRecord {
+                        object_id: e.object.map(|o| o.raw_value()),
+                        path: e.path.clone(),
+                        entry_type: match &e.entry_type {
+                            mimisbrunnr_types::ProjectedEntryType::File { mode, uid, gid } => {
+                                EntryTypeRecord::File {
+                                    mode: *mode,
+                                    uid: *uid,
+                                    gid: *gid,
+                                }
                             }
-                        }
-                        mimisbrunnr_types::ProjectedEntryType::Symlink { target } => {
-                            EntryTypeRecord::Symlink {
-                                target: target.clone(),
+                            mimisbrunnr_types::ProjectedEntryType::Symlink { target } => {
+                                EntryTypeRecord::Symlink {
+                                    target: target.clone(),
+                                }
                             }
-                        }
-                        mimisbrunnr_types::ProjectedEntryType::Directory { mode } => {
-                            EntryTypeRecord::Directory { mode: *mode }
-                        }
-                    },
-                })
-                .collect()
-        };
+                            mimisbrunnr_types::ProjectedEntryType::Directory { mode } => {
+                                EntryTypeRecord::Directory { mode: *mode }
+                            }
+                        },
+                    })
+                    .collect()
+            };
 
         // Serialize unscoped projection
         let unscoped = context_mgr.unscoped();
@@ -338,9 +431,20 @@ impl DiskEngine {
 
         let json = serde_json::to_vec(&state)
             .map_err(|e| EngineError::Io(std::io::Error::other(e.to_string())))?;
-        trace!("DiskEngine::save_index_state json_len={} zone_size={zone_size}", json.len());
+        trace!("DiskEngine::serialize_index_state json_len={}", json.len());
 
-        if json.len() as u64 + 8 > zone_size {
+        Ok(json)
+    }
+
+    /// Write serialized index state to the index zone, spanning extents as needed.
+    fn write_index_state(
+        dev: &FileBlockDevice,
+        layout: &ExtentLayout,
+        json: &[u8],
+    ) -> Result<(), EngineError> {
+        let total_needed = json.len() as u64 + 8;
+        let zone_size = layout.zone_size(ZoneType::Index);
+        if total_needed > zone_size {
             return Err(EngineError::Io(std::io::Error::other(format!(
                 "index state too large: {} bytes, zone is {} bytes",
                 json.len(),
@@ -348,12 +452,21 @@ impl DiskEngine {
             ))));
         }
 
-        // Write: [length: u64][json bytes]
-        let len_bytes = (json.len() as u64).to_le_bytes();
-        dev.write_at(zone_offset, &len_bytes)
-            .map_err(EngineError::Storage)?;
-        dev.write_at(zone_offset + 8, &json)
-            .map_err(EngineError::Storage)?;
+        // Write length prefix + json data across extents
+        let mut data = Vec::with_capacity(total_needed as usize);
+        data.extend_from_slice(&(json.len() as u64).to_le_bytes());
+        data.extend_from_slice(json);
+
+        let mut remaining = &data[..];
+        for extent in layout.extents(ZoneType::Index) {
+            if remaining.is_empty() {
+                break;
+            }
+            let chunk_size = remaining.len().min(extent.size as usize);
+            dev.write_at(extent.offset, &remaining[..chunk_size])
+                .map_err(EngineError::Storage)?;
+            remaining = &remaining[chunk_size..];
+        }
 
         Ok(())
     }
@@ -361,15 +474,18 @@ impl DiskEngine {
     /// Load index state from the index zone and rebuild in-memory indexes.
     fn load_index_state(
         dev: &FileBlockDevice,
-        zone_offset: u64,
-        zone_size: u64,
+        layout: &ExtentLayout,
+        zone: ZoneType,
         engine: &mut Engine,
         context_mgr: &mut mimisbrunnr_types::PathContextManager,
         blobs: &mut std::collections::HashMap<u64, Vec<u8>>,
     ) -> Result<(), EngineError> {
-        // Read length
+        let zone_size = layout.zone_size(zone);
+
+        // Read length prefix from first extent
+        let first_offset = layout.zone_offset(zone);
         let mut len_buf = [0u8; 8];
-        dev.read_at(zone_offset, &mut len_buf)
+        dev.read_at(first_offset, &mut len_buf)
             .map_err(EngineError::Storage)?;
         let json_len = u64::from_le_bytes(len_buf);
         trace!("DiskEngine::load_index_state json_len={json_len} zone_size={zone_size}");
@@ -379,9 +495,27 @@ impl DiskEngine {
             return Ok(());
         }
 
+        // Read json data across extents
         let mut json_buf = vec![0u8; json_len as usize];
-        dev.read_at(zone_offset + 8, &mut json_buf)
-            .map_err(EngineError::Storage)?;
+        let mut bytes_read = 0usize;
+        let mut skip = 8u64; // skip length prefix
+
+        for extent in layout.extents(zone) {
+            if bytes_read >= json_buf.len() {
+                break;
+            }
+            if skip >= extent.size {
+                skip -= extent.size;
+                continue;
+            }
+            let read_offset = extent.offset + skip;
+            let available = (extent.size - skip) as usize;
+            let to_read = available.min(json_buf.len() - bytes_read);
+            dev.read_at(read_offset, &mut json_buf[bytes_read..bytes_read + to_read])
+                .map_err(EngineError::Storage)?;
+            bytes_read += to_read;
+            skip = 0;
+        }
 
         let state: IndexState = match serde_json::from_slice(&json_buf) {
             Ok(s) => s,
@@ -444,33 +578,34 @@ impl DiskEngine {
         }
 
         // Rebuild path contexts
-        let deserialize_entry = |entry_rec: &ProjectionEntryRecord| -> mimisbrunnr_types::ProjectedEntry {
-            let object = entry_rec
-                .object_id
-                .map(mimisbrunnr_types::ObjectId::from_raw);
-            let entry_type = match &entry_rec.entry_type {
-                EntryTypeRecord::File { mode, uid, gid } => {
-                    mimisbrunnr_types::ProjectedEntryType::File {
-                        mode: *mode,
-                        uid: *uid,
-                        gid: *gid,
+        let deserialize_entry =
+            |entry_rec: &ProjectionEntryRecord| -> mimisbrunnr_types::ProjectedEntry {
+                let object = entry_rec
+                    .object_id
+                    .map(mimisbrunnr_types::ObjectId::from_raw);
+                let entry_type = match &entry_rec.entry_type {
+                    EntryTypeRecord::File { mode, uid, gid } => {
+                        mimisbrunnr_types::ProjectedEntryType::File {
+                            mode: *mode,
+                            uid: *uid,
+                            gid: *gid,
+                        }
                     }
-                }
-                EntryTypeRecord::Symlink { target } => {
-                    mimisbrunnr_types::ProjectedEntryType::Symlink {
-                        target: target.clone(),
+                    EntryTypeRecord::Symlink { target } => {
+                        mimisbrunnr_types::ProjectedEntryType::Symlink {
+                            target: target.clone(),
+                        }
                     }
-                }
-                EntryTypeRecord::Directory { mode } => {
-                    mimisbrunnr_types::ProjectedEntryType::Directory { mode: *mode }
+                    EntryTypeRecord::Directory { mode } => {
+                        mimisbrunnr_types::ProjectedEntryType::Directory { mode: *mode }
+                    }
+                };
+                mimisbrunnr_types::ProjectedEntry {
+                    object,
+                    path: entry_rec.path.clone(),
+                    entry_type,
                 }
             };
-            mimisbrunnr_types::ProjectedEntry {
-                object,
-                path: entry_rec.path.clone(),
-                entry_type,
-            }
-        };
 
         for ctx_rec in &state.path_contexts {
             match &ctx_rec.name {
@@ -478,14 +613,16 @@ impl DiskEngine {
                     let _ = context_mgr.create_context(name);
                     for entry_rec in &ctx_rec.entries {
                         let entry = deserialize_entry(entry_rec);
-                        let oid = entry.object.unwrap_or(mimisbrunnr_types::ObjectId::from_raw(0));
+                        let oid =
+                            entry.object.unwrap_or(mimisbrunnr_types::ObjectId::from_raw(0));
                         let _ = context_mgr.set_path(name, oid, &entry_rec.path, entry);
                     }
                 }
                 None => {
                     for entry_rec in &ctx_rec.entries {
                         let entry = deserialize_entry(entry_rec);
-                        let oid = entry.object.unwrap_or(mimisbrunnr_types::ObjectId::from_raw(0));
+                        let oid =
+                            entry.object.unwrap_or(mimisbrunnr_types::ObjectId::from_raw(0));
                         context_mgr.set_unscoped_path(oid, &entry_rec.path, entry);
                     }
                 }
@@ -562,8 +699,8 @@ mod tests {
         let capacity = 128 * 1024 * 1024u64;
         let dev = FileBlockDevice::open(&disk_path, capacity).unwrap();
 
-        let layout = mimisbrunnr_storage::ZoneLayout::compute(capacity).unwrap();
-        let sb = Superblock::new(0, 0, layout);
+        let layout = ExtentLayout::compute(capacity).unwrap();
+        let sb = Superblock::new(0, 0, layout.clone());
         sb.write_to(&dev).unwrap();
 
         WriteAheadLog::create(&dev, layout.wal_offset, WAL_SIZE).unwrap();
@@ -730,6 +867,9 @@ mod tests {
             let oid = e.create_object(1000).unwrap();
             hash = e.write_blob(oid, b"hello world", 1000).unwrap();
 
+            // Store plaintext blob for retrieval
+            de.store_blob(oid.raw_value(), b"hello world".to_vec());
+
             de.flush().unwrap();
         }
 
@@ -741,6 +881,79 @@ mod tests {
             let rec = e.get_object(oid).unwrap();
             assert_eq!(rec.content_hash, hash);
             assert_eq!(rec.blob_length, 11);
+
+            // Verify actual blob content is retrievable after reload
+            let blob = de.get_blob(oid.raw_value());
+            assert!(blob.is_some(), "blob data should survive flush/reload");
+            assert_eq!(blob.unwrap(), b"hello world");
+        }
+    }
+
+    #[test]
+    fn index_zone_grows_when_data_exceeds_initial_size() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = create_test_pool(tmp.path());
+
+        // Read original index zone size
+        let original_index_size;
+        {
+            let de = DiskEngine::open(&config_path).unwrap();
+            original_index_size = de.superblock.layout.zone_size(ZoneType::Index);
+        }
+
+        // Store enough blob data to exceed the index zone
+        {
+            let mut de = DiskEngine::open(&config_path).unwrap();
+
+            // Each blob stored as JSON expands ~4x (byte array [0,1,2,...,255,...])
+            // so 1 MB of blobs becomes ~4 MB of JSON, exceeding the ~3.8 MiB index zone
+            for i in 0..5u64 {
+                let content = vec![(i as u8).wrapping_mul(37); 200 * 1024]; // 200 KB each = 1 MB total
+                let oid = {
+                    let e = de.engine_mut();
+                    let oid = e.create_object(1000).unwrap();
+                    e.write_blob(oid, &content, 1000).unwrap();
+                    oid
+                };
+                de.store_blob(oid.raw_value(), content);
+            }
+
+            // This should succeed by growing the index zone
+            de.flush().unwrap();
+
+            // Verify the zone grew (now has multiple extents)
+            let new_index_size = de.superblock.layout.zone_size(ZoneType::Index);
+            assert!(
+                new_index_size > original_index_size,
+                "index zone should have grown: was {}, now {}",
+                original_index_size,
+                new_index_size,
+            );
+            assert!(
+                de.superblock.layout.extents(ZoneType::Index).len() > 1,
+                "index zone should have multiple extents after growth"
+            );
+            assert!(
+                de.superblock.zone_map_offset != 0,
+                "zone_map_offset should be set after growth"
+            );
+        }
+
+        // Verify data survives reload
+        {
+            let de = DiskEngine::open(&config_path).unwrap();
+            // Verify zone map was loaded (multiple extents)
+            assert!(
+                de.superblock.layout.extents(ZoneType::Index).len() > 1,
+                "after reload, index zone should still have multiple extents"
+            );
+            for i in 0..5u64 {
+                let blob = de
+                    .get_blob(i)
+                    .unwrap_or_else(|| panic!("blob {i} should exist"));
+                assert_eq!(blob.len(), 200 * 1024);
+                assert!(blob.iter().all(|&b| b == (i as u8).wrapping_mul(37)));
+            }
         }
     }
 

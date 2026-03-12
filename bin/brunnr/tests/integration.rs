@@ -107,7 +107,7 @@ fn create_multi_disk_different_sizes() {
 
 #[test]
 fn zone_sizes_scale_with_disk_capacity() {
-    use mimisbrunnr::storage::{FileBlockDevice, Superblock, ExtentLayout, ZoneType};
+    use mimisbrunnr::storage::{FileBlockDevice, Superblock, ZoneType};
 
     let tmp = TempDir::new().unwrap();
     let small = tmp.path().join("small.mbrunnr");
@@ -124,29 +124,27 @@ fn zone_sizes_scale_with_disk_capacity() {
     // Read superblocks and compare zone sizes
     let dev_small = FileBlockDevice::open(&small, 0).unwrap();
     let sb_small = Superblock::read_from(&dev_small).unwrap();
-    let el_small = ExtentLayout::from(&sb_small.layout);
 
     let dev_large = FileBlockDevice::open(&large, 0).unwrap();
     let sb_large = Superblock::read_from(&dev_large).unwrap();
-    let el_large = ExtentLayout::from(&sb_large.layout);
 
     // Larger disk should have proportionally larger zones
     assert!(
-        el_large.zone_size(ZoneType::Index) > el_small.zone_size(ZoneType::Index),
+        sb_large.layout.zone_size(ZoneType::Index) > sb_small.layout.zone_size(ZoneType::Index),
         "large index {} should exceed small index {}",
-        el_large.zone_size(ZoneType::Index),
-        el_small.zone_size(ZoneType::Index),
+        sb_large.layout.zone_size(ZoneType::Index),
+        sb_small.layout.zone_size(ZoneType::Index),
     );
     assert!(
-        el_large.zone_size(ZoneType::Blob) > el_small.zone_size(ZoneType::Blob),
+        sb_large.layout.zone_size(ZoneType::Blob) > sb_small.layout.zone_size(ZoneType::Blob),
         "large blob {} should exceed small blob {}",
-        el_large.zone_size(ZoneType::Blob),
-        el_small.zone_size(ZoneType::Blob),
+        sb_large.layout.zone_size(ZoneType::Blob),
+        sb_small.layout.zone_size(ZoneType::Blob),
     );
 
     // Each zone should initially have exactly 1 extent
-    assert_eq!(el_small.extents(ZoneType::Index).len(), 1);
-    assert_eq!(el_large.extents(ZoneType::Blob).len(), 1);
+    assert_eq!(sb_small.layout.extents(ZoneType::Index).len(), 1);
+    assert_eq!(sb_large.layout.extents(ZoneType::Blob).len(), 1);
 }
 
 #[test]
@@ -408,4 +406,171 @@ fn pool_config_written_by_brunnr() {
     assert_eq!(config.disks[0].tier, "hot");
     assert_eq!(config.disks[1].tier, "warm");
     assert_eq!(config.disks[0].capacity_bytes, 128 * 1024 * 1024);
+}
+
+/// Verifies blob data round-trips through the full stack:
+/// create pool → store objects with blob data → flush → reopen → verify blobs.
+/// This is the same flow used by the populate tool and the FUSE mount.
+#[test]
+fn blob_content_survives_flush_and_reload() {
+    use mimisbrunnr::engine::DiskEngine;
+
+    let tmp = TempDir::new().unwrap();
+    let disk = tmp.path().join("disk0.mbrunnr");
+
+    run_brunnr(&["create", disk.to_str().unwrap(), "--size-mib", "128"]);
+
+    let pool_toml = tmp.path().join("pool.toml");
+
+    // Store objects with blob data (same pattern as populate tool)
+    {
+        let mut de = DiskEngine::open(&pool_toml).unwrap();
+
+        let oid = {
+            let e = de.engine_mut();
+            let oid = e.create_object(1000).unwrap();
+            e.write_blob(oid, b"hello world from blob", 1000).unwrap();
+            oid
+        };
+        de.store_blob(oid.raw_value(), b"hello world from blob".to_vec());
+
+        let oid2 = {
+            let e = de.engine_mut();
+            let oid2 = e.create_object(1000).unwrap();
+            let big_content = vec![0xABu8; 8192];
+            e.write_blob(oid2, &big_content, 1000).unwrap();
+            oid2
+        };
+        de.store_blob(oid2.raw_value(), vec![0xABu8; 8192]);
+
+        de.flush().unwrap();
+    }
+
+    // Reopen and verify blob data is retrievable
+    {
+        let de = DiskEngine::open(&pool_toml).unwrap();
+
+        let blob0 = de.get_blob(0).expect("blob 0 should exist after reload");
+        assert_eq!(blob0, b"hello world from blob");
+
+        let blob1 = de.get_blob(1).expect("blob 1 should exist after reload");
+        assert_eq!(blob1.len(), 8192);
+        assert!(blob1.iter().all(|&b| b == 0xAB));
+
+        // Verify metadata was also persisted
+        let e = de.engine();
+        let oid0 = mimisbrunnr::types::ObjectId::from_raw(0);
+        let rec0 = e.get_object(oid0).unwrap();
+        assert_eq!(rec0.blob_length, 21);
+
+        let oid1 = mimisbrunnr::types::ObjectId::from_raw(1);
+        let rec1 = e.get_object(oid1).unwrap();
+        assert_eq!(rec1.blob_length, 8192);
+    }
+}
+
+/// Verifies that larger blobs (like generated content) survive flush/reload.
+/// This catches the case where blob data serialized as JSON exceeds the index zone.
+#[test]
+fn large_blob_survives_flush_and_reload() {
+    use mimisbrunnr::engine::DiskEngine;
+
+    let tmp = TempDir::new().unwrap();
+    let disk = tmp.path().join("disk0.mbrunnr");
+
+    // Use a larger disk to ensure index zone can hold blob data
+    run_brunnr(&["create", disk.to_str().unwrap(), "--size-mib", "256"]);
+
+    let pool_toml = tmp.path().join("pool.toml");
+
+    // Store a 50 KB blob (simulates small generated content)
+    {
+        let mut de = DiskEngine::open(&pool_toml).unwrap();
+        let content = vec![0x42u8; 50 * 1024];
+
+        let oid = {
+            let e = de.engine_mut();
+            let oid = e.create_object(1000).unwrap();
+            e.write_blob(oid, &content, 1000).unwrap();
+            oid
+        };
+        de.store_blob(oid.raw_value(), content);
+
+        de.flush().unwrap();
+    }
+
+    {
+        let de = DiskEngine::open(&pool_toml).unwrap();
+        let blob = de.get_blob(0).expect("50 KB blob should survive flush");
+        assert_eq!(blob.len(), 50 * 1024);
+    }
+}
+
+/// Verifies that the FUSE layer can serve blob sizes and content
+/// for objects accessed via tag navigation (the /tags/ path).
+#[test]
+fn tag_vfs_serves_blob_data_after_reload() {
+    use mimisbrunnr::engine::DiskEngine;
+    use mimisbrunnr_fuse::TagVfs;
+
+    let tmp = TempDir::new().unwrap();
+    let disk = tmp.path().join("disk0.mbrunnr");
+
+    run_brunnr(&["create", disk.to_str().unwrap(), "--size-mib", "128"]);
+    run_mimir(tmp.path(), &["ontology", "register", "ambient"]);
+
+    let pool_toml = tmp.path().join("pool.toml");
+
+    // Populate: create tagged object with blob (same as populate tool)
+    {
+        let mut de = DiskEngine::open(&pool_toml).unwrap();
+
+        let oid = {
+            let e = de.engine_mut();
+            let ambient = e.dag.lookup("ambient").unwrap();
+            let oid = e.create_object(1000).unwrap();
+            e.add_tag(oid, ambient, 1000).unwrap();
+            e.write_blob(oid, b"ambient soundscape data", 1000).unwrap();
+            oid
+        };
+        de.store_blob(oid.raw_value(), b"ambient soundscape data".to_vec());
+
+        de.flush().unwrap();
+    }
+
+    // Reopen and build FUSE VFS (same as cmd_mount_unix)
+    {
+        let de = DiskEngine::open(&pool_toml).unwrap();
+        let engine = de.engine();
+
+        let mut tag_vfs = TagVfs::new(
+            engine.tag_index.clone(),
+            engine.kv_index.clone(),
+            engine.forward_index.clone(),
+            engine.dag.clone(),
+        );
+
+        // Load all blobs into TagVfs
+        for (&oid_raw, blob_data) in &de.blobs {
+            tag_vfs.set_blob(oid_raw, blob_data.clone());
+        }
+
+        // Navigate to /tags/ambient/obj_0
+        let tags_ino = tag_vfs.lookup(1, "tags").unwrap();
+        let ambient_ino = tag_vfs.lookup(tags_ino, "ambient").unwrap();
+        let entries = tag_vfs.readdir(ambient_ino).unwrap();
+
+        // Should have at least one file entry
+        let file_entry = entries.iter().find(|e| e.name.starts_with("obj_"))
+            .expect("should have an obj_ file in /tags/ambient/");
+        let file_ino = tag_vfs.lookup(ambient_ino, &file_entry.name).unwrap();
+
+        // getattr should return correct size
+        let attr = tag_vfs.getattr(file_ino).unwrap();
+        assert_eq!(attr.size, 23, "file size should be 23 bytes, got {}", attr.size);
+
+        // read should return content
+        let data = tag_vfs.read(file_ino, 0, 4096).unwrap();
+        assert_eq!(data, b"ambient soundscape data");
+    }
 }

@@ -53,7 +53,7 @@ impl ZoneExtent {
 /// Runtime representation of the zone layout using extent lists.
 ///
 /// Each logical zone (index, metadata, blob) is described by one or more extents.
-/// Initially each zone has a single extent (equivalent to `ZoneLayout`), but zones
+/// Initially each zone has a single extent, but zones
 /// can grow by appending additional extents carved from free space.
 #[derive(Debug, Clone)]
 pub struct ExtentLayout {
@@ -120,7 +120,7 @@ impl ExtentLayout {
         self.extents(zone).first().map_or(0, |e| e.offset)
     }
 
-    /// Convenience accessors matching the old ZoneLayout field names.
+    /// Convenience accessors for common zone offsets and sizes.
     pub fn index_zone_offset(&self) -> u64 { self.zone_offset(ZoneType::Index) }
     pub fn index_zone_size(&self) -> u64 { self.zone_size(ZoneType::Index) }
     pub fn metadata_zone_offset(&self) -> u64 { self.zone_offset(ZoneType::Metadata) }
@@ -129,76 +129,15 @@ impl ExtentLayout {
     pub fn blob_zone_size(&self) -> u64 { self.zone_size(ZoneType::Blob) }
 }
 
-impl From<&ZoneLayout> for ExtentLayout {
-    fn from(zl: &ZoneLayout) -> Self {
-        Self {
-            index_extents: vec![ZoneExtent::new(zl.index_zone_offset, zl.index_zone_size)],
-            metadata_extents: vec![ZoneExtent::new(zl.metadata_zone_offset, zl.metadata_zone_size)],
-            blob_extents: vec![ZoneExtent::new(zl.blob_zone_offset, zl.blob_zone_size)],
-            device_capacity: zl.device_capacity,
-            superblock_primary: zl.superblock_primary,
-            superblock_copy: zl.superblock_copy,
-            wal_offset: zl.wal_offset,
-            alloc_bitmap_offset: zl.alloc_bitmap_offset,
-            alloc_bitmap_size: zl.alloc_bitmap_size,
-            // v1 has no block class map — set to zero
-            block_class_map_offset: 0,
-            block_class_map_size: 0,
-            superblock_backup: zl.superblock_backup,
-        }
-    }
-}
-
-/// Describes the byte offsets of each zone on a single disk.
-///
-/// Layout (from design doc §6.1):
-/// ```text
-///  0                    Superblock (4KB)
-///  4K                   Superblock copy
-///  8K                   Write-Ahead Log (64MB circular buffer)
-///  8K+64M               Allocation bitmap
-///  ...                  Index Zone (~1-5% of disk)
-///  ...                  Metadata Zone (~1-2% of disk)
-///  ...                  Blob Zone (~95% of disk)
-///  end-4K               Superblock backup copy
-/// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ZoneLayout {
-    /// Offset of the primary superblock.
-    pub superblock_primary: u64,
-    /// Offset of the superblock copy (immediately after primary).
-    pub superblock_copy: u64,
-    /// Offset of the WAL region.
-    pub wal_offset: u64,
-    /// Offset of the allocation bitmap.
-    pub alloc_bitmap_offset: u64,
-    /// Size of the allocation bitmap in bytes.
-    pub alloc_bitmap_size: u64,
-    /// Offset of the index zone.
-    pub index_zone_offset: u64,
-    /// Size of the index zone in bytes.
-    pub index_zone_size: u64,
-    /// Offset of the metadata zone.
-    pub metadata_zone_offset: u64,
-    /// Size of the metadata zone in bytes.
-    pub metadata_zone_size: u64,
-    /// Offset of the blob zone.
-    pub blob_zone_offset: u64,
-    /// Size of the blob zone in bytes.
-    pub blob_zone_size: u64,
-    /// Offset of the backup superblock at end of disk.
-    pub superblock_backup: u64,
-    /// Total device capacity.
-    pub device_capacity: u64,
-}
-
-impl ZoneLayout {
-    /// Compute a zone layout for a device of the given capacity.
+impl ExtentLayout {
+    /// Compute an extent layout for a device of the given capacity.
     ///
-    /// Allocates:
+    /// Allocates initial single extents:
     /// - Index zone: 3% of usable space
     /// - Metadata zone: 2% of usable space
     /// - Blob zone: remainder (~95%)
+    ///
+    /// Zones can later grow by appending additional extents.
     pub fn compute(device_capacity: u64) -> Option<Self> {
         if device_capacity < MIN_DEVICE_SIZE {
             return None;
@@ -232,22 +171,22 @@ impl ZoneLayout {
         let blob_zone_offset = metadata_zone_offset + metadata_zone_size;
 
         Some(Self {
+            index_extents: vec![ZoneExtent::new(index_zone_offset, index_zone_size)],
+            metadata_extents: vec![ZoneExtent::new(metadata_zone_offset, metadata_zone_size)],
+            blob_extents: vec![ZoneExtent::new(blob_zone_offset, blob_zone_size)],
+            device_capacity,
             superblock_primary,
             superblock_copy,
             wal_offset,
             alloc_bitmap_offset,
             alloc_bitmap_size,
-            index_zone_offset,
-            index_zone_size,
-            metadata_zone_offset,
-            metadata_zone_size,
-            blob_zone_offset,
-            blob_zone_size,
+            block_class_map_offset: 0,
+            block_class_map_size: 0,
             superblock_backup,
-            device_capacity,
         })
     }
 }
+
 
 fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment
@@ -259,12 +198,12 @@ mod tests {
 
     #[test]
     fn too_small_returns_none() {
-        assert!(ZoneLayout::compute(1024).is_none());
+        assert!(ExtentLayout::compute(1024).is_none());
     }
 
     #[test]
     fn minimum_device() {
-        let layout = ZoneLayout::compute(MIN_DEVICE_SIZE).unwrap();
+        let layout = ExtentLayout::compute(MIN_DEVICE_SIZE).unwrap();
         assert_eq!(layout.superblock_primary, 0);
         assert_eq!(layout.superblock_copy, BLOCK_SIZE);
         assert_eq!(layout.wal_offset, BLOCK_SIZE * 2);
@@ -273,16 +212,16 @@ mod tests {
     #[test]
     fn one_gig_device() {
         let cap = 1024 * 1024 * 1024; // 1 GiB
-        let layout = ZoneLayout::compute(cap).unwrap();
+        let el = ExtentLayout::compute(cap).unwrap();
 
         // Zones should be within device
-        assert!(layout.blob_zone_offset + layout.blob_zone_size <= layout.superblock_backup);
-        assert_eq!(layout.superblock_backup, cap - SUPERBLOCK_SIZE);
+        assert!(el.blob_zone_offset() + el.blob_zone_size() <= el.superblock_backup);
+        assert_eq!(el.superblock_backup, cap - SUPERBLOCK_SIZE);
 
         // Index zone ~3%, metadata ~2%, blob ~95%
-        let data_size = layout.index_zone_size + layout.metadata_zone_size + layout.blob_zone_size;
-        let index_pct = layout.index_zone_size as f64 / data_size as f64;
-        let meta_pct = layout.metadata_zone_size as f64 / data_size as f64;
+        let data_size = el.index_zone_size() + el.metadata_zone_size() + el.blob_zone_size();
+        let index_pct = el.index_zone_size() as f64 / data_size as f64;
+        let meta_pct = el.metadata_zone_size() as f64 / data_size as f64;
 
         assert!(
             (index_pct - 0.03).abs() < 0.01,
@@ -297,89 +236,73 @@ mod tests {
     #[test]
     fn zones_are_block_aligned() {
         let cap = 256 * 1024 * 1024; // 256 MiB
-        let layout = ZoneLayout::compute(cap).unwrap();
+        let el = ExtentLayout::compute(cap).unwrap();
 
-        assert_eq!(layout.index_zone_offset % BLOCK_SIZE, 0);
-        assert_eq!(layout.index_zone_size % BLOCK_SIZE, 0);
-        assert_eq!(layout.metadata_zone_offset % BLOCK_SIZE, 0);
-        assert_eq!(layout.metadata_zone_size % BLOCK_SIZE, 0);
-        assert_eq!(layout.blob_zone_offset % BLOCK_SIZE, 0);
-        assert_eq!(layout.alloc_bitmap_size % BLOCK_SIZE, 0);
+        assert_eq!(el.index_zone_offset() % BLOCK_SIZE, 0);
+        assert_eq!(el.index_zone_size() % BLOCK_SIZE, 0);
+        assert_eq!(el.metadata_zone_offset() % BLOCK_SIZE, 0);
+        assert_eq!(el.metadata_zone_size() % BLOCK_SIZE, 0);
+        assert_eq!(el.blob_zone_offset() % BLOCK_SIZE, 0);
+        assert_eq!(el.alloc_bitmap_size % BLOCK_SIZE, 0);
     }
 
     #[test]
     fn zones_dont_overlap() {
         let cap = 512 * 1024 * 1024;
-        let layout = ZoneLayout::compute(cap).unwrap();
+        let el = ExtentLayout::compute(cap).unwrap();
 
         // WAL ends before alloc bitmap
-        assert!(layout.wal_offset + WAL_SIZE <= layout.alloc_bitmap_offset);
+        assert!(el.wal_offset + WAL_SIZE <= el.alloc_bitmap_offset);
         // Alloc bitmap ends before index zone
-        assert!(layout.alloc_bitmap_offset + layout.alloc_bitmap_size <= layout.index_zone_offset);
-        // Index zone ends before metadata zone
-        assert!(layout.index_zone_offset + layout.index_zone_size <= layout.metadata_zone_offset);
+        assert!(el.alloc_bitmap_offset + el.alloc_bitmap_size <= el.index_zone_offset());
+        // Index zone ends before metadata zone (first extents are contiguous)
+        assert!(el.index_zone_offset() + el.index_extents[0].size <= el.metadata_zone_offset());
         // Metadata zone ends before blob zone
-        assert!(layout.metadata_zone_offset + layout.metadata_zone_size <= layout.blob_zone_offset);
+        assert!(el.metadata_zone_offset() + el.metadata_extents[0].size <= el.blob_zone_offset());
         // Blob zone ends before backup superblock
-        assert!(layout.blob_zone_offset + layout.blob_zone_size <= layout.superblock_backup);
+        assert!(el.blob_zone_offset() + el.blob_extents[0].size <= el.superblock_backup);
     }
 
-    // --- ExtentLayout tests ---
-
     #[test]
-    fn extent_layout_from_zone_layout() {
+    fn single_extent_per_zone_initially() {
         let cap = 256 * 1024 * 1024;
-        let zl = ZoneLayout::compute(cap).unwrap();
-        let el = ExtentLayout::from(&zl);
+        let el = ExtentLayout::compute(cap).unwrap();
 
         assert_eq!(el.index_extents.len(), 1);
         assert_eq!(el.metadata_extents.len(), 1);
         assert_eq!(el.blob_extents.len(), 1);
-        assert_eq!(el.index_zone_offset(), zl.index_zone_offset);
-        assert_eq!(el.index_zone_size(), zl.index_zone_size);
-        assert_eq!(el.metadata_zone_offset(), zl.metadata_zone_offset);
-        assert_eq!(el.metadata_zone_size(), zl.metadata_zone_size);
-        assert_eq!(el.blob_zone_offset(), zl.blob_zone_offset);
-        assert_eq!(el.blob_zone_size(), zl.blob_zone_size);
     }
 
     #[test]
     fn logical_to_physical_single_extent() {
         let cap = 256 * 1024 * 1024;
-        let zl = ZoneLayout::compute(cap).unwrap();
-        let el = ExtentLayout::from(&zl);
+        let el = ExtentLayout::compute(cap).unwrap();
 
-        // Offset 0 in index zone = physical index_zone_offset
         assert_eq!(
             el.logical_to_physical(ZoneType::Index, 0),
-            Some(zl.index_zone_offset)
+            Some(el.index_zone_offset())
         );
-        // One block in
         assert_eq!(
             el.logical_to_physical(ZoneType::Index, BLOCK_SIZE),
-            Some(zl.index_zone_offset + BLOCK_SIZE)
+            Some(el.index_zone_offset() + BLOCK_SIZE)
         );
-        // Past end
         assert_eq!(
-            el.logical_to_physical(ZoneType::Index, zl.index_zone_size),
+            el.logical_to_physical(ZoneType::Index, el.index_zone_size()),
             None
         );
     }
 
     #[test]
     fn logical_to_physical_multi_extent() {
-        let mut el = ExtentLayout::from(&ZoneLayout::compute(256 * 1024 * 1024).unwrap());
-        // Simulate a second extent for the index zone
+        let mut el = ExtentLayout::compute(256 * 1024 * 1024).unwrap();
         let second = ZoneExtent::new(100 * BLOCK_SIZE, 10 * BLOCK_SIZE);
         let first_size = el.index_extents[0].size;
         el.index_extents.push(second);
 
-        // Logical offset at start of second extent
         assert_eq!(
             el.logical_to_physical(ZoneType::Index, first_size),
             Some(100 * BLOCK_SIZE)
         );
-        // One block into second extent
         assert_eq!(
             el.logical_to_physical(ZoneType::Index, first_size + BLOCK_SIZE),
             Some(100 * BLOCK_SIZE + BLOCK_SIZE)
@@ -397,7 +320,7 @@ mod tests {
 
     #[test]
     fn zone_total_size_multi_extent() {
-        let mut el = ExtentLayout::from(&ZoneLayout::compute(256 * 1024 * 1024).unwrap());
+        let mut el = ExtentLayout::compute(256 * 1024 * 1024).unwrap();
         let original = el.zone_size(ZoneType::Index);
         el.index_extents.push(ZoneExtent::new(0, 20 * BLOCK_SIZE));
         assert_eq!(el.zone_size(ZoneType::Index), original + 20 * BLOCK_SIZE);

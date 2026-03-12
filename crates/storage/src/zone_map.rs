@@ -23,6 +23,13 @@ const MAX_EXTENTS_PER_ZONE: usize = 80;
 ///  [4088..4092] checksum (CRC32C of bytes [0..4088])
 ///  [4092..4096] padding
 /// ```
+/// The three zone extent lists returned by zone map deserialization.
+pub struct ZoneExtents {
+    pub index: Vec<ZoneExtent>,
+    pub metadata: Vec<ZoneExtent>,
+    pub blob: Vec<ZoneExtent>,
+}
+
 pub struct ZoneMap;
 
 const HEADER_SIZE: usize = 16;
@@ -85,7 +92,7 @@ impl ZoneMap {
     /// Deserialize zone extents from a 4K block into the three extent lists.
     pub fn from_block(
         buf: &[u8; BLOCK_SIZE as usize],
-    ) -> Result<(Vec<ZoneExtent>, Vec<ZoneExtent>, Vec<ZoneExtent>), StorageError> {
+    ) -> Result<ZoneExtents, StorageError> {
         // Magic check
         if buf[0..8] != ZONE_MAP_MAGIC {
             return Err(StorageError::InvalidMagic);
@@ -121,7 +128,7 @@ impl ZoneMap {
         let metadata = read_extents(meta_count);
         let blob = read_extents(blob_count);
 
-        Ok((index, metadata, blob))
+        Ok(ZoneExtents { index, metadata, blob })
     }
 
     /// Write the zone map to disk at the given offset.
@@ -139,7 +146,7 @@ impl ZoneMap {
     pub fn read_from(
         dev: &dyn BlockDevice,
         offset: u64,
-    ) -> Result<(Vec<ZoneExtent>, Vec<ZoneExtent>, Vec<ZoneExtent>), StorageError> {
+    ) -> Result<ZoneExtents, StorageError> {
         let mut block = [0u8; BLOCK_SIZE as usize];
         dev.read_at(offset, &mut block)?;
         Self::from_block(&block)
@@ -149,24 +156,22 @@ impl ZoneMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::ZoneLayout;
-
     fn test_layout() -> ExtentLayout {
-        ExtentLayout::from(&ZoneLayout::compute(256 * 1024 * 1024).unwrap())
+        ExtentLayout::compute(256 * 1024 * 1024).unwrap()
     }
 
     #[test]
     fn roundtrip_single_extents() {
         let el = test_layout();
         let block = ZoneMap::to_block(&el).unwrap();
-        let (idx, meta, blob) = ZoneMap::from_block(&block).unwrap();
+        let extents = ZoneMap::from_block(&block).unwrap();
 
-        assert_eq!(idx.len(), 1);
-        assert_eq!(meta.len(), 1);
-        assert_eq!(blob.len(), 1);
-        assert_eq!(idx[0], el.index_extents[0]);
-        assert_eq!(meta[0], el.metadata_extents[0]);
-        assert_eq!(blob[0], el.blob_extents[0]);
+        assert_eq!(extents.index.len(), 1);
+        assert_eq!(extents.metadata.len(), 1);
+        assert_eq!(extents.blob.len(), 1);
+        assert_eq!(extents.index[0], el.index_extents[0]);
+        assert_eq!(extents.metadata[0], el.metadata_extents[0]);
+        assert_eq!(extents.blob[0], el.blob_extents[0]);
     }
 
     #[test]
@@ -176,12 +181,12 @@ mod tests {
         el.metadata_extents.push(ZoneExtent::new(200 * BLOCK_SIZE, 5 * BLOCK_SIZE));
 
         let block = ZoneMap::to_block(&el).unwrap();
-        let (idx, meta, blob) = ZoneMap::from_block(&block).unwrap();
+        let extents = ZoneMap::from_block(&block).unwrap();
 
-        assert_eq!(idx.len(), 2);
-        assert_eq!(meta.len(), 2);
-        assert_eq!(blob.len(), 1);
-        assert_eq!(idx[1], ZoneExtent::new(100 * BLOCK_SIZE, 10 * BLOCK_SIZE));
+        assert_eq!(extents.index.len(), 2);
+        assert_eq!(extents.metadata.len(), 2);
+        assert_eq!(extents.blob.len(), 1);
+        assert_eq!(extents.index[1], ZoneExtent::new(100 * BLOCK_SIZE, 10 * BLOCK_SIZE));
     }
 
     #[test]
@@ -210,10 +215,10 @@ mod tests {
 
         let el = test_layout();
         ZoneMap::write_to(&el, &dev, 0).unwrap();
-        let (idx, meta, blob) = ZoneMap::read_from(&dev, 0).unwrap();
+        let extents = ZoneMap::read_from(&dev, 0).unwrap();
 
-        assert_eq!(idx, el.index_extents);
-        assert_eq!(meta, el.metadata_extents);
-        assert_eq!(blob, el.blob_extents);
+        assert_eq!(extents.index, el.index_extents);
+        assert_eq!(extents.metadata, el.metadata_extents);
+        assert_eq!(extents.blob, el.blob_extents);
     }
 }
