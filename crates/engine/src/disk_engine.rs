@@ -32,7 +32,8 @@ struct IndexState {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PathContextRecord {
-    name: String,
+    #[serde(default)]
+    name: Option<String>,
     entries: Vec<ProjectionEntryRecord>,
 }
 
@@ -281,36 +282,48 @@ impl DiskEngine {
         }
 
         // Serialize path contexts
+        let serialize_entries = |proj: &mimisbrunnr_types::PathProjection| -> Vec<ProjectionEntryRecord> {
+            proj.entries
+                .iter()
+                .map(|e| ProjectionEntryRecord {
+                    object_id: e.object.map(|o| o.raw_value()),
+                    path: e.path.clone(),
+                    entry_type: match &e.entry_type {
+                        mimisbrunnr_types::ProjectedEntryType::File { mode, uid, gid } => {
+                            EntryTypeRecord::File {
+                                mode: *mode,
+                                uid: *uid,
+                                gid: *gid,
+                            }
+                        }
+                        mimisbrunnr_types::ProjectedEntryType::Symlink { target } => {
+                            EntryTypeRecord::Symlink {
+                                target: target.clone(),
+                            }
+                        }
+                        mimisbrunnr_types::ProjectedEntryType::Directory { mode } => {
+                            EntryTypeRecord::Directory { mode: *mode }
+                        }
+                    },
+                })
+                .collect()
+        };
+
+        // Serialize unscoped projection
+        let unscoped = context_mgr.unscoped();
+        if !unscoped.is_empty() {
+            state.path_contexts.push(PathContextRecord {
+                name: None,
+                entries: serialize_entries(unscoped),
+            });
+        }
+
+        // Serialize named contexts
         for ctx_name in context_mgr.list_contexts() {
             if let Ok(proj) = context_mgr.get_context(ctx_name) {
-                let entries = proj
-                    .entries
-                    .iter()
-                    .map(|e| ProjectionEntryRecord {
-                        object_id: e.object.map(|o| o.raw_value()),
-                        path: e.path.clone(),
-                        entry_type: match &e.entry_type {
-                            mimisbrunnr_types::ProjectedEntryType::File { mode, uid, gid } => {
-                                EntryTypeRecord::File {
-                                    mode: *mode,
-                                    uid: *uid,
-                                    gid: *gid,
-                                }
-                            }
-                            mimisbrunnr_types::ProjectedEntryType::Symlink { target } => {
-                                EntryTypeRecord::Symlink {
-                                    target: target.clone(),
-                                }
-                            }
-                            mimisbrunnr_types::ProjectedEntryType::Directory { mode } => {
-                                EntryTypeRecord::Directory { mode: *mode }
-                            }
-                        },
-                    })
-                    .collect();
                 state.path_contexts.push(PathContextRecord {
-                    name: ctx_name.to_string(),
-                    entries,
+                    name: Some(ctx_name.to_string()),
+                    entries: serialize_entries(proj),
                 });
             }
         }
@@ -431,36 +444,51 @@ impl DiskEngine {
         }
 
         // Rebuild path contexts
+        let deserialize_entry = |entry_rec: &ProjectionEntryRecord| -> mimisbrunnr_types::ProjectedEntry {
+            let object = entry_rec
+                .object_id
+                .map(mimisbrunnr_types::ObjectId::from_raw);
+            let entry_type = match &entry_rec.entry_type {
+                EntryTypeRecord::File { mode, uid, gid } => {
+                    mimisbrunnr_types::ProjectedEntryType::File {
+                        mode: *mode,
+                        uid: *uid,
+                        gid: *gid,
+                    }
+                }
+                EntryTypeRecord::Symlink { target } => {
+                    mimisbrunnr_types::ProjectedEntryType::Symlink {
+                        target: target.clone(),
+                    }
+                }
+                EntryTypeRecord::Directory { mode } => {
+                    mimisbrunnr_types::ProjectedEntryType::Directory { mode: *mode }
+                }
+            };
+            mimisbrunnr_types::ProjectedEntry {
+                object,
+                path: entry_rec.path.clone(),
+                entry_type,
+            }
+        };
+
         for ctx_rec in &state.path_contexts {
-            let _ = context_mgr.create_context(&ctx_rec.name);
-            for entry_rec in &ctx_rec.entries {
-                let object = entry_rec
-                    .object_id
-                    .map(mimisbrunnr_types::ObjectId::from_raw);
-                let entry_type = match &entry_rec.entry_type {
-                    EntryTypeRecord::File { mode, uid, gid } => {
-                        mimisbrunnr_types::ProjectedEntryType::File {
-                            mode: *mode,
-                            uid: *uid,
-                            gid: *gid,
-                        }
+            match &ctx_rec.name {
+                Some(name) => {
+                    let _ = context_mgr.create_context(name);
+                    for entry_rec in &ctx_rec.entries {
+                        let entry = deserialize_entry(entry_rec);
+                        let oid = entry.object.unwrap_or(mimisbrunnr_types::ObjectId::from_raw(0));
+                        let _ = context_mgr.set_path(name, oid, &entry_rec.path, entry);
                     }
-                    EntryTypeRecord::Symlink { target } => {
-                        mimisbrunnr_types::ProjectedEntryType::Symlink {
-                            target: target.clone(),
-                        }
+                }
+                None => {
+                    for entry_rec in &ctx_rec.entries {
+                        let entry = deserialize_entry(entry_rec);
+                        let oid = entry.object.unwrap_or(mimisbrunnr_types::ObjectId::from_raw(0));
+                        context_mgr.set_unscoped_path(oid, &entry_rec.path, entry);
                     }
-                    EntryTypeRecord::Directory { mode } => {
-                        mimisbrunnr_types::ProjectedEntryType::Directory { mode: *mode }
-                    }
-                };
-                let entry = mimisbrunnr_types::ProjectedEntry {
-                    object,
-                    path: entry_rec.path.clone(),
-                    entry_type,
-                };
-                let oid = object.unwrap_or(mimisbrunnr_types::ObjectId::from_raw(0));
-                let _ = context_mgr.set_path(&ctx_rec.name, oid, &entry_rec.path, entry);
+                }
             }
         }
 

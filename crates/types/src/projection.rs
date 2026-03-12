@@ -111,17 +111,28 @@ impl ProjectedEntry {
     }
 }
 
-/// A named Unix filesystem projection — a manifest of path-to-object mappings.
+/// A Unix filesystem projection — a manifest of path-to-object mappings.
+///
+/// Context is optional: unscoped projections represent unix paths that aren't
+/// tied to any particular named tree (e.g. a file's "canonical" unix path).
 #[derive(Debug, Clone)]
 pub struct PathProjection {
-    pub context: String,
+    pub context: Option<String>,
     pub entries: Vec<ProjectedEntry>,
 }
 
 impl PathProjection {
     pub fn new(context: impl Into<String>) -> Self {
         Self {
-            context: context.into(),
+            context: Some(context.into()),
+            entries: Vec::new(),
+        }
+    }
+
+    /// Create a projection without a named context.
+    pub fn unscoped() -> Self {
+        Self {
+            context: None,
             entries: Vec::new(),
         }
     }
@@ -214,7 +225,7 @@ mod tests {
     #[test]
     fn create_projection() {
         let proj = PathProjection::new("test-context");
-        assert_eq!(proj.context, "test-context");
+        assert_eq!(proj.context.as_deref(), Some("test-context"));
         assert!(proj.is_empty());
     }
 

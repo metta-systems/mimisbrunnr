@@ -7,7 +7,7 @@ use {
 
 use crate::error::UnixError;
 
-/// Imports a Unix directory tree into the engine and creates a path context.
+/// Imports a Unix directory tree into the engine, optionally into a named context.
 pub struct Importer;
 
 /// Result of importing a directory tree.
@@ -19,34 +19,39 @@ pub struct ImportResult {
     pub objects_deduped: usize,
     /// Total bytes imported.
     pub total_bytes: u64,
-    /// The context name.
-    pub context: String,
+    /// The context name, if any.
+    pub context: Option<String>,
 }
 
 impl Importer {
-    /// Import a directory tree, creating objects and populating a path context.
+    /// Import a directory tree, creating objects and populating path entries.
     ///
     /// Walks the directory recursively, creating an object for each regular file.
     /// Deduplicates by content hash. Auto-tags based on file extension if
     /// tag IDs are provided in `extension_tags`.
+    ///
+    /// If `context_name` is `Some`, entries are added to a named context.
+    /// If `None`, entries are added to the unscoped projection.
     pub fn import_directory(
         engine: &mut Engine,
         context_mgr: &mut PathContextManager,
         root: &Path,
-        context_name: &str,
+        context_name: Option<&str>,
         extension_tags: &HashMap<String, TagId>,
         now_ms: u64,
     ) -> Result<ImportResult, UnixError> {
-        // Create context if it doesn't exist
-        if context_mgr.get_context(context_name).is_err() {
-            context_mgr.create_context(context_name)?;
+        // Create context if needed
+        if let Some(name) = context_name {
+            if context_mgr.get_context(name).is_err() {
+                context_mgr.create_context(name)?;
+            }
         }
 
         let mut result = ImportResult {
             objects_created: 0,
             objects_deduped: 0,
             total_bytes: 0,
-            context: context_name.to_string(),
+            context: context_name.map(String::from),
         };
 
         // Track content hashes for dedup
@@ -73,7 +78,7 @@ impl Importer {
         context_mgr: &mut PathContextManager,
         root: &Path,
         dir: &Path,
-        context_name: &str,
+        context_name: Option<&str>,
         extension_tags: &HashMap<String, TagId>,
         hash_to_oid: &mut HashMap<[u8; 32], ObjectId>,
         result: &mut ImportResult,
@@ -130,7 +135,7 @@ impl Importer {
                     oid
                 };
 
-                // Add to path context
+                // Add to path context or unscoped
                 #[cfg(unix)]
                 let mode = {
                     use std::os::unix::fs::PermissionsExt;
@@ -139,8 +144,11 @@ impl Importer {
                 #[cfg(not(unix))]
                 let mode = 0o644u32;
 
-                let entry = ProjectedEntry::file_with_mode(oid, &relative, mode);
-                context_mgr.set_path(context_name, oid, &relative, entry)?;
+                let proj_entry = ProjectedEntry::file_with_mode(oid, &relative, mode);
+                match context_name {
+                    Some(name) => context_mgr.set_path(name, oid, &relative, proj_entry)?,
+                    None => context_mgr.set_unscoped_path(oid, &relative, proj_entry),
+                }
             }
             // Skip symlinks and other special files for now
         }
@@ -177,7 +185,7 @@ mod tests {
             &mut engine,
             &mut ctx_mgr,
             tmp.path(),
-            "test-project",
+            Some("test-project"),
             &ext_tags,
             1000,
         )
@@ -209,7 +217,7 @@ mod tests {
             &mut engine,
             &mut ctx_mgr,
             tmp.path(),
-            "ctx",
+            Some("ctx"),
             &ext_tags,
             1000,
         )
@@ -241,7 +249,7 @@ mod tests {
             &mut engine,
             &mut ctx_mgr,
             tmp.path(),
-            "ctx",
+            Some("ctx"),
             &ext_tags,
             1000,
         )
@@ -268,7 +276,7 @@ mod tests {
             &mut engine,
             &mut ctx_mgr,
             tmp.path(),
-            "empty",
+            Some("empty"),
             &ext_tags,
             1000,
         )
@@ -292,7 +300,7 @@ mod tests {
             &mut engine,
             &mut ctx_mgr,
             tmp.path(),
-            "nested",
+            Some("nested"),
             &ext_tags,
             1000,
         )
@@ -303,5 +311,31 @@ mod tests {
         let proj = ctx_mgr.get_context("nested").unwrap();
         assert!(proj.get("a/b/c/deep.txt").is_some());
         assert!(proj.get("a/top.txt").is_some());
+    }
+
+    #[test]
+    fn import_unscoped() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("file.txt"), "hello").unwrap();
+
+        let (mut engine, mut ctx_mgr) = setup();
+        let ext_tags = HashMap::new();
+
+        let result = Importer::import_directory(
+            &mut engine,
+            &mut ctx_mgr,
+            tmp.path(),
+            None,
+            &ext_tags,
+            1000,
+        )
+        .unwrap();
+
+        assert_eq!(result.objects_created, 1);
+        assert!(result.context.is_none());
+
+        // Should be in unscoped projection
+        assert!(ctx_mgr.unscoped().get("file.txt").is_some());
+        assert_eq!(ctx_mgr.context_count(), 0); // no named context created
     }
 }

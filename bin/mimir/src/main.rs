@@ -136,15 +136,29 @@ enum ProjectAction {
         /// Directory to import.
         path: PathBuf,
 
-        /// Context name.
+        /// Context name (omit for unscoped import).
         #[arg(long)]
-        context: String,
+        context: Option<String>,
     },
 
     /// Show a project tree.
     Tree {
-        /// Context name.
-        context: String,
+        /// Context name (omit to show unscoped entries).
+        context: Option<String>,
+    },
+
+    /// List all named contexts.
+    List,
+
+    /// Export a projection to a directory.
+    Export {
+        /// Context name (omit for unscoped).
+        #[arg(long)]
+        context: Option<String>,
+
+        /// Output directory.
+        #[arg(short, long)]
+        output: PathBuf,
     },
 }
 
@@ -465,13 +479,20 @@ fn cmd_project(
     match action {
         ProjectAction::Import { path, context } => {
             let ext_tags = HashMap::new();
-            match Importer::import_directory(engine, ctx_mgr, &path, &context, &ext_tags, now_ms())
-            {
+            match Importer::import_directory(
+                engine,
+                ctx_mgr,
+                &path,
+                context.as_deref(),
+                &ext_tags,
+                now_ms(),
+            ) {
                 Ok(result) => {
-                    println!(
-                        "Imported {} file(s) into context '{}'",
-                        result.objects_created, context
-                    );
+                    let label = context
+                        .as_deref()
+                        .map(|c| format!("context '{c}'"))
+                        .unwrap_or_else(|| "unscoped".to_string());
+                    println!("Imported {} file(s) into {label}", result.objects_created);
                     if result.objects_deduped > 0 {
                         println!(
                             "  ({} deduplicated by content hash)",
@@ -481,7 +502,11 @@ fn cmd_project(
                     println!("  Total bytes: {}", result.total_bytes);
 
                     // Store blob data for imported files so FUSE can serve them
-                    if let Ok(proj) = ctx_mgr.get_context(&context) {
+                    let proj = match context.as_deref() {
+                        Some(name) => ctx_mgr.get_context(name).ok(),
+                        None => Some(ctx_mgr.unscoped()),
+                    };
+                    if let Some(proj) = proj {
                         for entry in &proj.entries {
                             if let Some(oid) = entry.object
                                 && let Ok(content) = std::fs::read(path.join(&entry.path))
@@ -494,18 +519,67 @@ fn cmd_project(
                 Err(e) => eprintln!("error: {e}"),
             }
         }
-        ProjectAction::Tree { context } => match ctx_mgr.get_context(&context) {
-            Ok(proj) => {
-                let with_dirs = proj.with_synthesized_dirs();
-                let mut paths: Vec<_> = with_dirs.entries.iter().map(|e| &e.path).collect();
-                paths.sort();
-                println!("Context '{context}' ({} entries):", proj.len());
-                for p in paths {
-                    println!("  {p}");
+        ProjectAction::Tree { context } => {
+            let proj = match context.as_deref() {
+                Some(name) => match ctx_mgr.get_context(name) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return;
+                    }
+                },
+                None => ctx_mgr.unscoped(),
+            };
+            let label = context
+                .as_deref()
+                .unwrap_or("(unscoped)");
+            let with_dirs = proj.with_synthesized_dirs();
+            let mut paths: Vec<_> = with_dirs.entries.iter().map(|e| &e.path).collect();
+            paths.sort();
+            println!("{label} ({} entries):", proj.len());
+            for p in paths {
+                println!("  {p}");
+            }
+        }
+        ProjectAction::List => {
+            let contexts = ctx_mgr.list_contexts();
+            if contexts.is_empty() && ctx_mgr.unscoped().is_empty() {
+                println!("No projections.");
+                return;
+            }
+            if !ctx_mgr.unscoped().is_empty() {
+                println!("  (unscoped)  {} entries", ctx_mgr.unscoped().len());
+            }
+            let mut sorted = contexts;
+            sorted.sort();
+            for name in sorted {
+                if let Ok(proj) = ctx_mgr.get_context(name) {
+                    println!("  {name}  {} entries", proj.len());
                 }
             }
-            Err(e) => eprintln!("error: {e}"),
-        },
+        }
+        ProjectAction::Export { context, output } => {
+            let proj = match context.as_deref() {
+                Some(name) => match ctx_mgr.get_context(name) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return;
+                    }
+                },
+                None => ctx_mgr.unscoped(),
+            };
+            match mimisbrunnr::unix::Exporter::export_directory(proj, blobs, &output) {
+                Ok(result) => {
+                    println!(
+                        "Exported {} file(s) to {}",
+                        result.files_written,
+                        output.display()
+                    );
+                }
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
     }
 }
 

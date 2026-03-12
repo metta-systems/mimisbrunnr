@@ -677,6 +677,7 @@ dependencies = [
 name = "mimisbrunnr-unix"
 version = "0.1.0"
 dependencies = [
+ "arbitrary-int",
  "mimisbrunnr-engine",
  "mimisbrunnr-ontology",
  "mimisbrunnr-transform",

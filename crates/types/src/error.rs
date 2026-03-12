@@ -37,8 +37,8 @@ pub enum Error {
     #[error("context already exists: {0}")]
     ContextAlreadyExists(String),
 
-    #[error("path not found in context {context}: {path}")]
-    PathNotFound { context: String, path: String },
+    #[error("path not found{}: {path}", context.as_ref().map(|c| format!(" in context {c}")).unwrap_or_default())]
+    PathNotFound { context: Option<String>, path: String },
 }
 
 #[cfg(test)]
