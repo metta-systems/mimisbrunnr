@@ -181,6 +181,13 @@ impl TagVfs {
                     if let Some(node) = tree.get(*vfs_ino) {
                         let mut attr = node.attr.clone();
                         attr.ino = ino; // remap to global inode
+                        // Use blob size as authoritative file size
+                        if let Some(oid) = node.object {
+                            if let Some(blob) = self.blobs.get(&oid.raw_value()) {
+                                attr.size = blob.len() as u64;
+                                attr.blocks = (attr.size + 511) / 512;
+                            }
+                        }
                         return Some(attr);
                     }
                 }

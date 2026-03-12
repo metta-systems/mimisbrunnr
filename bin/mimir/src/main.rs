@@ -501,20 +501,8 @@ fn cmd_project(
                     }
                     println!("  Total bytes: {}", result.total_bytes);
 
-                    // Store blob data for imported files so FUSE can serve them
-                    let proj = match context.as_deref() {
-                        Some(name) => ctx_mgr.get_context(name).ok(),
-                        None => Some(ctx_mgr.unscoped()),
-                    };
-                    if let Some(proj) = proj {
-                        for entry in &proj.entries {
-                            if let Some(oid) = entry.object
-                                && let Ok(content) = std::fs::read(path.join(&entry.path))
-                            {
-                                blobs.insert(oid.raw_value(), content);
-                            }
-                        }
-                    }
+                    // Transfer blob data from import result for FUSE serving
+                    blobs.extend(result.blobs);
                 }
                 Err(e) => eprintln!("error: {e}"),
             }

@@ -3,9 +3,10 @@ use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
 use mimisbrunnr_meta::ObjectTable;
 use mimisbrunnr_ontology::{ImplicationDag, Materializer};
 use mimisbrunnr_query::QueryExecutor;
-use mimisbrunnr_transform::TransformPipeline;
+use mimisbrunnr_transform::{CompressionAlgo, TransformPipeline};
 use mimisbrunnr_types::{
-    Assertion, HybridTimestamp, ObjectId, ObjectState, Query, TagId, TagOrigin, Value,
+    Assertion, CompressionState, HybridTimestamp, ObjectId, ObjectState, Query, TagId, TagOrigin,
+    Value,
 };
 
 use crate::error::EngineError;
@@ -303,6 +304,11 @@ impl Engine {
             rec.blob_length = result.original_size as u64;
             rec.stored_size = result.stored_size as u64;
             rec.modified_ns = (now_ms as i64) * 1_000_000;
+            rec.compression = match self.transform.compression {
+                CompressionAlgo::None => CompressionState::None,
+                CompressionAlgo::Zstd(_) => CompressionState::Zstd,
+                CompressionAlgo::Lz4 => CompressionState::Lz4,
+            };
         }
 
         self.emit_op(now_ms, OpKind::WriteBlob { oid });

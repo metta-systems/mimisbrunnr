@@ -429,14 +429,10 @@ fn cmd_mount_unix(pool_path: &Path, context_name: &str, mountpoint: &Path) {
     let tree = VfsTree::from_projection(&projection);
     tag_vfs.add_context(context_name.to_string(), tree);
 
-    // Populate blob data for all objects
+    // Populate blob data for all objects (context files + tag-only objects)
     let fs = MimisbrunnrFs::from_tag_vfs(tag_vfs);
-    for entry in &projection.entries {
-        if let Some(oid) = entry.object
-            && let Some(blob_data) = disk_engine.get_blob(oid.raw_value())
-        {
-            fs.set_blob(oid.raw_value(), blob_data.to_vec());
-        }
+    for (oid_raw, blob_data) in &disk_engine.blobs {
+        fs.set_blob(*oid_raw, blob_data.clone());
     }
 
     // Create mountpoint if it doesn't exist

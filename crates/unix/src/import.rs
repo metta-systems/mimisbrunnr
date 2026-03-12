@@ -11,7 +11,6 @@ use crate::error::UnixError;
 pub struct Importer;
 
 /// Result of importing a directory tree.
-#[derive(Debug)]
 pub struct ImportResult {
     /// Number of objects created.
     pub objects_created: usize,
@@ -21,6 +20,8 @@ pub struct ImportResult {
     pub total_bytes: u64,
     /// The context name, if any.
     pub context: Option<String>,
+    /// Plaintext blob data for each imported object (for FUSE serving).
+    pub blobs: HashMap<u64, Vec<u8>>,
 }
 
 impl Importer {
@@ -52,6 +53,7 @@ impl Importer {
             objects_deduped: 0,
             total_bytes: 0,
             context: context_name.map(String::from),
+            blobs: HashMap::new(),
         };
 
         // Track content hashes for dedup
@@ -123,6 +125,7 @@ impl Importer {
                         .write_blob(oid, &content, now_ms)
                         .map_err(UnixError::Engine)?;
                     hash_to_oid.insert(hash, oid);
+                    result.blobs.insert(oid.raw_value(), content);
                     result.objects_created += 1;
 
                     // Auto-tag by extension
