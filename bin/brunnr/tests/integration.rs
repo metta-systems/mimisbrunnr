@@ -71,6 +71,85 @@ fn create_multi_disk_pool() {
 }
 
 #[test]
+fn create_multi_disk_different_sizes() {
+    let tmp = TempDir::new().unwrap();
+    let disk0 = tmp.path().join("fast.mbrunnr");
+    let disk1 = tmp.path().join("bulk.mbrunnr");
+
+    let output = run_brunnr(&[
+        "create",
+        disk0.to_str().unwrap(),
+        disk1.to_str().unwrap(),
+        "--size-mib", "128",
+        "--size-mib", "512",
+        "--tier", "hot",
+        "--tier", "cold",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("128 MiB"), "expected 128 MiB disk, stdout: {stdout}");
+    assert!(stdout.contains("512 MiB"), "expected 512 MiB disk, stdout: {stdout}");
+    assert!(stdout.contains("zones:"), "expected zone info, stdout: {stdout}");
+
+    // Verify files have correct different sizes
+    assert_eq!(std::fs::metadata(&disk0).unwrap().len(), 128 * 1024 * 1024);
+    assert_eq!(std::fs::metadata(&disk1).unwrap().len(), 512 * 1024 * 1024);
+
+    // Status should show different capacities
+    let status = run_brunnr(&["status", disk0.to_str().unwrap(), disk1.to_str().unwrap()]);
+    let status_out = String::from_utf8_lossy(&status.stdout);
+    assert!(status.status.success());
+    assert!(status_out.contains("128 MiB"), "status: {status_out}");
+    assert!(status_out.contains("512 MiB"), "status: {status_out}");
+    assert!(status_out.contains("640 MiB"), "total should be 640, status: {status_out}"); // 128 + 512
+}
+
+#[test]
+fn zone_sizes_scale_with_disk_capacity() {
+    use mimisbrunnr::storage::{FileBlockDevice, Superblock, ExtentLayout, ZoneType};
+
+    let tmp = TempDir::new().unwrap();
+    let small = tmp.path().join("small.mbrunnr");
+    let large = tmp.path().join("large.mbrunnr");
+
+    run_brunnr(&[
+        "create",
+        small.to_str().unwrap(),
+        large.to_str().unwrap(),
+        "--size-mib", "128",
+        "--size-mib", "1024",
+    ]);
+
+    // Read superblocks and compare zone sizes
+    let dev_small = FileBlockDevice::open(&small, 0).unwrap();
+    let sb_small = Superblock::read_from(&dev_small).unwrap();
+    let el_small = ExtentLayout::from(&sb_small.layout);
+
+    let dev_large = FileBlockDevice::open(&large, 0).unwrap();
+    let sb_large = Superblock::read_from(&dev_large).unwrap();
+    let el_large = ExtentLayout::from(&sb_large.layout);
+
+    // Larger disk should have proportionally larger zones
+    assert!(
+        el_large.zone_size(ZoneType::Index) > el_small.zone_size(ZoneType::Index),
+        "large index {} should exceed small index {}",
+        el_large.zone_size(ZoneType::Index),
+        el_small.zone_size(ZoneType::Index),
+    );
+    assert!(
+        el_large.zone_size(ZoneType::Blob) > el_small.zone_size(ZoneType::Blob),
+        "large blob {} should exceed small blob {}",
+        el_large.zone_size(ZoneType::Blob),
+        el_small.zone_size(ZoneType::Blob),
+    );
+
+    // Each zone should initially have exactly 1 extent
+    assert_eq!(el_small.extents(ZoneType::Index).len(), 1);
+    assert_eq!(el_large.extents(ZoneType::Blob).len(), 1);
+}
+
+#[test]
 fn status_shows_disk_info() {
     let tmp = TempDir::new().unwrap();
     let disk = tmp.path().join("disk.mbrunnr");
@@ -89,10 +168,11 @@ fn status_shows_disk_info() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    assert!(stdout.contains("Capacity:  128 MiB"));
-    assert!(stdout.contains("Index:"));
-    assert!(stdout.contains("Metadata:"));
-    assert!(stdout.contains("Blob:"));
+    assert!(stdout.contains("Capacity:  128 MiB"), "stdout: {stdout}");
+    assert!(stdout.contains("Index:"), "stdout: {stdout}");
+    assert!(stdout.contains("Metadata:"), "stdout: {stdout}");
+    assert!(stdout.contains("Blob:"), "stdout: {stdout}");
+    assert!(stdout.contains("extent(s)"), "stdout: {stdout}");
 }
 
 #[test]

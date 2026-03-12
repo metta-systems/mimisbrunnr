@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 
 use mimisbrunnr::{
     pool::{DiskDescriptor, MediaType, PoolConfig, PoolManager, StorageTier},
-    storage::{FileBlockDevice, Superblock, ZoneLayout},
+    storage::{ExtentLayout, FileBlockDevice, Superblock, ZoneLayout, ZoneType},
     wal::WriteAheadLog,
 };
 
@@ -23,9 +23,10 @@ enum Commands {
         #[arg(required = true)]
         disks: Vec<PathBuf>,
 
-        /// Size of each file-backed disk in MiB (ignored for block devices).
+        /// Size of each file-backed disk in MiB. Repeatable — one per disk.
+        /// If fewer sizes than disks, the last value is reused.
         #[arg(long, default_value = "256")]
-        size_mib: u64,
+        size_mib: Vec<u64>,
 
         /// Node ID for this machine.
         #[arg(long, default_value = "0")]
@@ -109,7 +110,7 @@ fn main() {
             size_mib,
             node_id,
             tier,
-        } => cmd_create(&disks, size_mib, node_id, &tier),
+        } => cmd_create(&disks, &size_mib, node_id, &tier),
         Commands::Status { disks } => cmd_status(&disks),
         Commands::AddDisk {
             disk,
@@ -126,13 +127,12 @@ fn main() {
     }
 }
 
-fn cmd_create(disk_paths: &[PathBuf], size_mib: u64, node_id: u16, tiers: &[String]) {
+fn cmd_create(disk_paths: &[PathBuf], sizes_mib: &[u64], node_id: u16, tiers: &[String]) {
     if disk_paths.is_empty() {
         eprintln!("error: at least one disk path required");
         std::process::exit(1);
     }
 
-    let capacity = size_mib * 1024 * 1024;
     let mut pool = PoolManager::new();
     let mut pool_config = PoolConfig::new(node_id);
 
@@ -142,6 +142,14 @@ fn cmd_create(disk_paths: &[PathBuf], size_mib: u64, node_id: u16, tiers: &[Stri
     );
 
     for (i, path) in disk_paths.iter().enumerate() {
+        // Per-disk size: use sizes_mib[i], or last value, or default 256
+        let size_mib = sizes_mib
+            .get(i)
+            .or_else(|| sizes_mib.last())
+            .copied()
+            .unwrap_or(256);
+        let capacity = size_mib * 1024 * 1024;
+
         let tier = tiers.get(i).map(|s| parse_tier(s)).unwrap_or_else(|| {
             if i == 0 {
                 StorageTier::Hot
@@ -210,10 +218,17 @@ fn cmd_create(disk_paths: &[PathBuf], size_mib: u64, node_id: u16, tiers: &[Stri
         pool.add_disk(desc).unwrap();
         pool_config.add_disk(disk_id, abs_path.to_string_lossy(), tier.name(), capacity);
 
+        // Show zone layout
+        let el = ExtentLayout::from(&layout);
         println!(
-            "  disk {disk_id}: {} ({} MiB, tier: {tier})",
+            "  disk {disk_id}: {} ({size_mib} MiB, tier: {tier})",
             path.display(),
-            size_mib,
+        );
+        println!(
+            "    zones: index {} KiB, meta {} KiB, blob {} KiB",
+            el.zone_size(ZoneType::Index) / 1024,
+            el.zone_size(ZoneType::Metadata) / 1024,
+            el.zone_size(ZoneType::Blob) / 1024,
         );
     }
 
@@ -259,17 +274,30 @@ fn cmd_status(disk_paths: &[PathBuf]) {
 
         match Superblock::read_from(&dev) {
             Ok(sb) => {
+                let el = ExtentLayout::from(&sb.layout);
                 let cap_mib = sb.layout.device_capacity / (1024 * 1024);
-                let idx_mib = sb.layout.index_zone_size / (1024 * 1024);
-                let meta_mib = sb.layout.metadata_zone_size / (1024 * 1024);
-                let blob_mib = sb.layout.blob_zone_size / (1024 * 1024);
 
                 println!("  Disk {} (node={}, disk={}):", i, sb.node_id, sb.disk_id);
                 println!("    Path:      {}", path.display());
                 println!("    Capacity:  {cap_mib} MiB");
-                println!("    Index:     {idx_mib} MiB");
-                println!("    Metadata:  {meta_mib} MiB");
-                println!("    Blob:      {blob_mib} MiB");
+                println!(
+                    "    Index:     {} KiB ({} extent(s))",
+                    el.zone_size(ZoneType::Index) / 1024,
+                    el.extents(ZoneType::Index).len(),
+                );
+                println!(
+                    "    Metadata:  {} KiB ({} extent(s))",
+                    el.zone_size(ZoneType::Metadata) / 1024,
+                    el.extents(ZoneType::Metadata).len(),
+                );
+                println!(
+                    "    Blob:      {} KiB ({} extent(s))",
+                    el.zone_size(ZoneType::Blob) / 1024,
+                    el.extents(ZoneType::Blob).len(),
+                );
+                if sb.zone_map_offset != 0 {
+                    println!("    Zone map:  offset {:#x}", sb.zone_map_offset);
+                }
                 println!("    Checkpoint: LSN {}", sb.last_checkpoint_lsn);
 
                 total_capacity += sb.layout.device_capacity;

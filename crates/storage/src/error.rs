@@ -20,4 +20,7 @@ pub enum StorageError {
 
     #[error("no free extents of size {requested} blocks")]
     NoFreeSpace { requested: u64 },
+
+    #[error("capacity exceeded: {message}")]
+    CapacityExceeded { message: String },
 }

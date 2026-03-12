@@ -33,7 +33,7 @@ const SUPERBLOCK_BYTES: usize = 128;
 ///  [88..96]  alloc_bitmap_size
 ///  [96..104] creation_timestamp_ns
 ///  [104..112] last_checkpoint_lsn
-///  [112..120] reserved
+///  [112..120] zone_map_offset (0 = no zone map, use inline layout)
 ///  [120..124] checksum (CRC32C of bytes [0..120])
 ///  [124..128] padding
 /// ```
@@ -44,6 +44,8 @@ pub struct Superblock {
     pub layout: ZoneLayout,
     pub creation_timestamp_ns: i64,
     pub last_checkpoint_lsn: u64,
+    /// Offset of the zone map block on disk. 0 means no zone map (single-extent zones).
+    pub zone_map_offset: u64,
 }
 
 impl Superblock {
@@ -55,6 +57,7 @@ impl Superblock {
             layout,
             creation_timestamp_ns: 0,
             last_checkpoint_lsn: 0,
+            zone_map_offset: 0,
         }
     }
 
@@ -79,7 +82,7 @@ impl Superblock {
         buf[88..96].copy_from_slice(&l.alloc_bitmap_size.to_le_bytes());
         buf[96..104].copy_from_slice(&self.creation_timestamp_ns.to_le_bytes());
         buf[104..112].copy_from_slice(&self.last_checkpoint_lsn.to_le_bytes());
-        // [112..120] reserved = 0
+        buf[112..120].copy_from_slice(&self.zone_map_offset.to_le_bytes());
 
         let crc = crc32fast::hash(&buf[0..120]);
         buf[120..124].copy_from_slice(&crc.to_le_bytes());
@@ -121,6 +124,7 @@ impl Superblock {
         let alloc_bitmap_size = u64::from_le_bytes(buf[88..96].try_into().unwrap());
         let creation_timestamp_ns = i64::from_le_bytes(buf[96..104].try_into().unwrap());
         let last_checkpoint_lsn = u64::from_le_bytes(buf[104..112].try_into().unwrap());
+        let zone_map_offset = u64::from_le_bytes(buf[112..120].try_into().unwrap());
 
         // Reconstruct layout — we need the derived fields too
         let layout = ZoneLayout {
@@ -145,6 +149,7 @@ impl Superblock {
             layout,
             creation_timestamp_ns,
             last_checkpoint_lsn,
+            zone_map_offset,
         })
     }
 
