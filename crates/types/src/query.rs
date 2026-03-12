@@ -34,7 +34,7 @@ pub enum Query {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, arbitrary_int::u48};
+    use super::*;
 
     #[test]
     fn simple_tag_query() {
@@ -86,13 +86,16 @@ mod tests {
 
     #[test]
     fn related_query() {
-        let target = ObjectId::new(1, u48::from_u64(42));
+        let target = ObjectId::new(1, 42);
         let q = Query::Related {
             predicate: TagId::new(5),
             target,
         };
         match &q {
-            Query::Related { predicate, target: t } => {
+            Query::Related {
+                predicate,
+                target: t,
+            } => {
                 assert_eq!(predicate.raw(), 5);
                 assert_eq!(*t, target);
             }
@@ -103,8 +106,14 @@ mod tests {
     #[test]
     fn all_cmp_ops() {
         let ops = [
-            CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le,
-            CmpOp::Gt, CmpOp::Ge, CmpOp::Prefix, CmpOp::Contains,
+            CmpOp::Eq,
+            CmpOp::Ne,
+            CmpOp::Lt,
+            CmpOp::Le,
+            CmpOp::Gt,
+            CmpOp::Ge,
+            CmpOp::Prefix,
+            CmpOp::Contains,
         ];
         // Ensure all variants are distinct
         for (i, a) in ops.iter().enumerate() {

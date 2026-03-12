@@ -38,16 +38,19 @@ pub enum Error {
     ContextAlreadyExists(String),
 
     #[error("path not found{}: {path}", context.as_ref().map(|c| format!(" in context {c}")).unwrap_or_default())]
-    PathNotFound { context: Option<String>, path: String },
+    PathNotFound {
+        context: Option<String>,
+        path: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::ObjectId, arbitrary_int::u48};
+    use {super::*, crate::ObjectId};
 
     #[test]
     fn error_display() {
-        let e = Error::ObjectNotFound(ObjectId::new(1, u48::from_u64(42)));
+        let e = Error::ObjectNotFound(ObjectId::new(1, 42));
         assert_eq!(format!("{e}"), "object not found: obj:1:42");
     }
 

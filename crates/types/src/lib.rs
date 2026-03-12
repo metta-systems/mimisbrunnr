@@ -1,26 +1,29 @@
-mod object_id;
-mod tag_id;
-mod value;
 mod assertion;
-mod query;
-mod object_state;
-mod timestamp;
-mod projection;
 mod context;
 mod error;
+mod object_id;
+mod object_states;
+mod projection;
+mod query;
+mod tag_id;
+mod timestamp;
+mod value;
 
-pub use object_id::ObjectId;
-pub use tag_id::TagId;
-pub use value::Value;
-pub use assertion::{Assertion, TagOrigin};
-pub use query::{Query, CmpOp};
-pub use object_state::{ObjectState, CompressionState, EncryptionState};
-pub use timestamp::HybridTimestamp;
-pub use projection::{PathProjection, ProjectedEntry, ProjectedEntryType};
-pub use context::PathContextManager;
-pub use error::Error;
+pub use {
+    assertion::{Assertion, TagOrigin},
+    context::PathContextManager,
+    error::Error,
+    object_id::ObjectId,
+    object_states::{CompressionState, EncryptionState, ObjectState},
+    projection::{PathProjection, ProjectedEntry, ProjectedEntryType},
+    query::{CmpOp, Query},
+    tag_id::TagId,
+    timestamp::HybridTimestamp,
+    value::Value,
+};
 
-pub type NodeId = u16;
+pub type NodeId = u64;
+
 pub type DiskId = u16;
 pub type SubscriptionId = u64;
 pub type ModuleId = String;
