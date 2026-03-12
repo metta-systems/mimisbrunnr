@@ -46,21 +46,28 @@ mimir tag obj:42 ambient chill           # add knowledge to the well
 Every file is an **object** with a globally unique ID and a bag of assertions about it. Objects have no intrinsic name — "name" is just another attribute.
 
 ```rust
-// Node-prefixed: top 16 bits = node ID, bottom 48 = local seq
-type ObjectId = u64;
-type TagId = u32;
+// Node-prefixed bitfield: top 16 bits = node ID, bottom 48 = local seq
+#[bitfield(u64)]
+struct ObjectId {
+    #[bits(0..=47, rw)]
+    local: u48,
+    #[bits(48..=63, rw)]
+    node: u16,
+}
+
+// Newtype wrapper
+struct TagId(u32);
 ```
 
-The node-prefix scheme allows independent creation across nodes with no coordination. Each node can create 281 trillion objects (48-bit local sequence) — at 1000 objects per second, that's ~8,900 years before exhaustion:
+The node-prefix scheme allows independent creation across nodes with no coordination. Each node can create 281 trillion objects (48-bit local sequence) — at 1000 objects per second, that's ~8,900 years before exhaustion.
+
+Additional type aliases used throughout:
 
 ```rust
-impl ObjectId {
-    fn new(node: u16, local_seq: u48) -> Self {
-        Self((node as u64) << 48 | local_seq as u64)
-    }
-    fn node(&self) -> u16 { (self.0 >> 48) as u16 }
-    fn local(&self) -> u64 { self.0 & 0x0000_FFFF_FFFF_FFFF }
-}
+type NodeId = u16;
+type DiskId = u16;
+type SubscriptionId = u64;
+type ModuleId = String;
 ```
 
 Object IDs are **never recycled**. The 48-bit space is sufficient, and non-recycling eliminates an entire class of stale-reference bugs across cluster sync. A generation counter provides insurance for a hypothetical future where recycling becomes necessary.
@@ -77,7 +84,7 @@ enum Assertion {
 }
 
 enum Value {
-    Text(CompactString),
+    Text(String),
     Int(i64),
     Float(f64),
     Timestamp(i64),
@@ -143,6 +150,8 @@ struct TagDefinition {
     implies: Vec<TagId>,
 }
 
+enum ValueType { Text, Int, Float, Timestamp, Blob }
+
 enum TagSemantics {
     Label,                    // simple label: "electronic", "favorite"
     Attribute { value_type: ValueType },  // key-value: "artist=Aphex Twin"
@@ -201,18 +210,26 @@ Ontologies are not monolithic. They are composed from **modules** — self-conta
 
 ```rust
 struct OntologyModule {
-    id: ModuleId,               // "systems.metta.music"
-    version: SemVer,
-    name: String,
-    tags: Vec<TagDeclaration>,
-    implications: Vec<Implication>,
-    mutex_groups: Vec<MutexGroup>,
-    constraints: Vec<Constraint>,
-    requires: Vec<ModuleDependency>,
-    installed_by: Vec<AppId>,   // refcount of installers
-    core: bool,                 // built-in, cannot be removed
+    id: Option<String>,                  // "systems.metta.music"
+    version: Option<String>,             // "2.1.0"
+    name: Option<String>,                // "Music Ontology"
+    tags: Vec<TagDefinition>,            // tags to register (IDs allocated during install)
+    implications: Vec<(String, String)>, // (from_name, to_name) pairs
+}
+
+/// Result of module installation
+struct InstallResult {
+    tags_registered: u32,
+    tags_skipped: u32,       // duplicates
+    implications_added: u32,
+    module_id: Option<String>,
+    module_name: Option<String>,
 }
 ```
+
+Installation is two-phase: (1) register all tags, skipping duplicates, allocating IDs; (2) add implications by name lookup. Tag IDs start as placeholders (0) in the TOML and are assigned sequentially during install.
+
+Future extensions (not yet implemented): `mutex_groups`, `constraints`, `requires` (dependency tracking), `installed_by` (refcount), `core` flag.
 
 ### 4.2 Distribution Format
 
@@ -224,23 +241,18 @@ id = "systems.metta.music"
 version = "2.1.0"
 name = "Music Ontology"
 
-[requires]
-"systems.metta.core" = ">=1.0, <4.0"
-
 [[tags]]
 name = "artist"
-semantics = "attribute"
-value_type = "text"
+semantics = "attribute"       # or "attr"
+value_type = "text"           # default; also "int", "float", "timestamp", "blob"
 
 [[tags]]
 name = "playlist"
-semantics = "ordered-collection"
-element_constraint = "audio"
+semantics = "ordered-collection"   # or "ordered"
 
 [[tags]]
 name = "genre"
 semantics = "grouping"
-extensible = true
 
 [[implications]]
 from = "rock"
@@ -249,13 +261,13 @@ to = "genre"
 [[implications]]
 from = "flac"
 to = "audio"
-
-[[constraints]]
-tag = "bpm"
-requires = "audio"
 ```
 
+Supported `semantics` values: `"label"`, `"attribute"`/`"attr"`, `"grouping"`, `"ordered-collection"`/`"ordered"`, `"hierarchical"`. The `value_type` field is only used with attribute semantics (defaults to `"text"`).
+
 Distribution channels: built-in (core ontology), app-bundled, community repository, or user-created.
+
+Future extensions (not yet implemented): `[requires]` for module dependencies, `[[constraints]]` for tag prerequisites, `extensible` flag on tags.
 
 ### 4.3 Module Hierarchy
 
@@ -360,7 +372,7 @@ A playlist with 500 tracks: 4 KB sequence + 2 KB bitmap. 10,000 playlists: ~40 M
 
 ### 5.3 KV Equality Index
 
-Treats `(key, value)` as a compound tag. Stored with composite keys `[tag_id: 4B][value_hash: 8B]`, enabling prefix scans over all values for a given key.
+Treats `(tag_id, value_hash)` as a compound key mapping to a roaring bitmap of matching objects. Implemented as `HashMap<(TagId, u64), RoaringBitmap>` where the `u64` is a `DefaultHasher` hash of the value with a type discriminator for collision avoidance. Supports exact-match queries and faceted exploration (enumerating distinct value hashes per tag).
 
 ### 5.4 Range B+ Tree
 
@@ -369,6 +381,19 @@ For ordered queries (`year > 2020`, `size BETWEEN 1MB AND 10MB`). Keyed by `(att
 ### 5.5 Forward Index
 
 Object → all its assertions. Used for tag listing, faceted exploration, sync, and distinguishing direct from materialized tags.
+
+```rust
+struct ForwardEntry {
+    assertion: Assertion,
+    origin: TagOrigin,   // Direct or Materialized
+}
+
+struct ForwardIndex {
+    entries: HashMap<u64, Vec<ForwardEntry>>,  // keyed by ObjectId raw value
+}
+```
+
+Methods: `direct_tags(oid)` and `materialized_tags(oid)` for per-origin filtering.
 
 ### 5.6 Faceted Exploration
 
@@ -383,24 +408,56 @@ Object → all its assertions. Used for tag listing, faceted exploration, sync, 
 The filesystem operates directly on raw block devices:
 
 ```
- 0                    Superblock (4KB, duplicated at end of disk)
- 4K                   Superblock copy
+ 0                    Superblock primary (4KB)
+ 4K                   Superblock copy (4KB)
  8K                   Write-Ahead Log (64MB circular buffer)
- 8K+64M               Allocation bitmap
+ 8K+64M               Allocation bitmap (1 bit per block, block-aligned)
+ ...                  Block class map (4 bits per block, nibble-packed)
  ...                  ┌───────────────────────────────────┐
                       │  Zone 1: INDEX ZONE               │
-                      │  Tag bitmaps, B+ trees, ontology  │
-                      │  ~1-5% of disk                    │
+                      │  Tag bitmaps, ontology, KV index   │
+                      │  3% of usable space (first extent)│
                       ├───────────────────────────────────┤
                       │  Zone 2: METADATA ZONE            │
                       │  Object records, location table   │
-                      │  ~1-2% of disk                    │
+                      │  2% of usable space (first extent)│
                       ├───────────────────────────────────┤
                       │  Zone 3: BLOB ZONE                │
                       │  File content, large values       │
-                      │  ~95% of disk                     │
+                      │  ~95% of usable space (1st extent)│
                       └───────────────────────────────────┘
+ ...                  [Optional additional zone extents]
  end-4K               Superblock backup copy
+```
+
+**Growable zones:** Each zone starts as a single contiguous extent but can grow by appending additional extents. When zones have multiple extents, a **ZoneMap** (4 KiB block with its own CRC32C) is written to track all extent offsets/sizes (up to 80 extents per zone). The superblock's `zone_map_offset` field points to this block (0 = single-extent layout, legacy).
+
+**Block classification:** A nibble-packed block class map (2 blocks per byte) tracks which zone owns each block: `Free(0)`, `Index(1)`, `Metadata(2)`, `Blob(3)`. This enables extent-based allocation within zones.
+
+**Allocation bitmap:** One bit per 4 KiB block. First-fit allocator for contiguous block ranges. Persisted to disk and loaded at mount time.
+
+**Superblock binary layout** (128 bytes, stored at 3 locations, all little-endian):
+
+```
+[0..8]      magic: b"MIMIR\x01\0\0"
+[8..12]     format_version: u32 (currently 1)
+[12..14]    node_id: u16
+[14..16]    disk_id: u16
+[16..24]    device_capacity: u64
+[24..32]    index_zone_offset: u64    (first extent)
+[32..40]    index_zone_size: u64      (first extent)
+[40..48]    metadata_zone_offset: u64 (first extent)
+[48..56]    metadata_zone_size: u64   (first extent)
+[56..64]    blob_zone_offset: u64     (first extent)
+[64..72]    blob_zone_size: u64       (first extent)
+[72..80]    wal_offset: u64
+[80..88]    alloc_bitmap_offset: u64
+[88..96]    alloc_bitmap_size: u64
+[96..104]   creation_timestamp_ns: i64
+[104..112]  last_checkpoint_lsn: u64
+[112..120]  zone_map_offset: u64      (0 = single-extent, >0 = read ZoneMap)
+[120..124]  checksum: CRC32C of bytes [0..120]
+[124..128]  padding
 ```
 
 ### 6.2 Object Records
@@ -408,45 +465,82 @@ The filesystem operates directly on raw block devices:
 Fixed-size, array-indexed by ID for O(1) lookup:
 
 ```rust
-#[repr(C)]
+#[repr(u8)]
+enum ObjectState {
+    Active = 0,       // visible to queries
+    Tombstoned = 1,   // marked deleted, invisible, sync op emitted
+    BlobReclaim = 2,  // indexes cleaned up, blob extents being reclaimed
+    Cleared = 3,      // slot zeroed, ID never reused
+}
+
+#[repr(u8)]
+enum CompressionState { None = 0, Zstd = 1, Lz4 = 2 }
+
+#[repr(u8)]
+enum EncryptionState { None = 0, Hctr2Aes128 = 1, XtsAes256 = 2 }
+
 struct ObjectRecord {       // 128 bytes, cache-line aligned
-    id: u64,
-    generation: u32,            // for future ID reuse safety
-    state: ObjectState,
-    content_hash: [u8; 32],     // BLAKE3 of plaintext
-    blob_offset: u64,
-    blob_length: u64,
-    created_ns: i64,
-    modified_ns: i64,
-    tag_count: u16,
-    attr_count: u16,
-    inline_tags: [u32; 8],      // covers 80%+ of objects
-    overflow_offset: u64,
-    compression: CompressionState,
-    encryption: EncryptionState,
-    stored_size: u64,
+    id: u64,                    // [0..8]
+    generation: u32,            // [8..12] for future ID reuse safety
+    state: ObjectState,         // [12..13]
+    content_hash: [u8; 32],     // [13..45] BLAKE3 of plaintext
+    blob_offset: u64,           // [45..53]
+    blob_length: u64,           // [53..61]
+    created_ns: i64,            // [61..69]
+    modified_ns: i64,           // [69..77]
+    tag_count: u16,             // [77..79]
+    attr_count: u16,            // [79..81]
+    inline_tags: [u32; 4],      // [81..97] 4 tags inline
+    overflow_offset: u64,       // [97..105]
+    compression: CompressionState,  // [105..106]
+    encryption: EncryptionState,    // [106..107]
+    stored_size: u64,           // [107..115]
+    // [115..128] reserved/padding
 }
 ```
 
-Lookup: single read at `zone2_base + id * 128`. 10M objects = 1.28 GB.
+Binary layout is packed little-endian (not `#[repr(C)]` aligned) to fit exactly 128 bytes. Lookup: single read at `zone2_base + id * 128`. 10M objects = 1.28 GB.
 
 ### 6.3 Location Table
 
 Maps objects to physical extents, supporting multi-disk pools:
 
 ```rust
-struct ObjectLocation {
-    disk_id: u16,
-    extent_offset: u64,
-    extent_length: u64,
-    replica_count: u8,
-    replicas: [ReplicaRef; 3],
+struct ObjectLocation {     // 40 bytes, little-endian packed
+    disk_id: u16,               // [0..2]
+    extent_offset: u64,         // [2..10]
+    extent_length: u64,         // [10..18]
+    replica_count: u8,          // [18..19]
+    replicas: [ReplicaRef; 3],  // [19..40] 3 × 7 bytes
+}
+
+struct ReplicaRef {         // 7 bytes
+    disk_id: u16,               // [0..2]
+    offset: u64,                // [2..7] stored as 5 bytes (lower 40 bits)
 }
 ```
 
 ### 6.4 Write-Ahead Log
 
 All mutations go through the WAL — 64 MB circular buffer on the fastest disk, mirrored to a second disk. Checkpointing flushes dirty bitmaps and metadata to their zones. Crash recovery replays from last checkpoint.
+
+```rust
+enum WalOpKind {
+    CreateObject = 1, DeleteObject = 2,
+    AddTag = 3, RemoveTag = 4,
+    SetAttr = 5, RemoveAttr = 6,
+    AddRelation = 7, RemoveRelation = 8,
+    WriteBlob = 9, Checkpoint = 10,
+}
+
+struct WalEntry {
+    lsn: u64,
+    op_kind: WalOpKind,
+    payload: Vec<u8>,
+}
+```
+
+**WAL header** (64 bytes): `magic(8) | next_lsn(8) | write_cursor(8) | read_cursor(8) | used(8) | last_checkpoint_lsn(8) | crc32(4) | reserved(12)`. **Entry format**: `lsn(8) | op_kind(1) | payload_length(4) | payload | crc32(4)`.
 
 Extended oplog retention (compressed segments on disk) supports dormant subscriptions catching up after being offline.
 
@@ -511,15 +605,28 @@ Deleting a tag (and all its associations) is a single bitmap removal. The member
 ### 8.1 Disk Topology
 
 ```rust
+enum MediaType { NVMe, Ssd, Hdd, SmrHdd, Remote }
+
+enum StorageTier { Hot = 0, Warm = 1, Cold = 2, Glacier = 3 }
+
+enum DiskState {
+    Online,   // reads & writes
+    Draining, // reads only, migrating data off
+    Removed,  // data migrated, safe to detach
+    Faulted,  // failed, needs resilver
+}
+
 struct DiskDescriptor {
     id: DiskId,
     capacity: u64,
     used: u64,
-    media_type: MediaType,    // NVMe, SSD, HDD, SMR_HDD
-    tier: StorageTier,        // Hot, Warm, Cold, Glacier
+    media_type: MediaType,
+    tier: StorageTier,
+    state: DiskState,
     seq_read_mbps: u32,
     random_iops: u32,
     latency_us: u32,
+    path: Option<String>,     // file path for file-backed devices
 }
 ```
 
@@ -593,6 +700,32 @@ Every write: **hash → compress → pad → encrypt**. Reversed on read.
 ```
 
 Content hash is always computed on original plaintext — dedup and integrity verification are independent of storage format.
+
+```rust
+enum CompressionAlgo { None, Zstd(i32 /* level 1-22 */), Lz4 }
+
+enum EncryptionMode {
+    None,
+    Hctr2 { object_id: u64 },    // wide-block, length-preserving
+    Xts,                          // narrow-block, length-preserving
+    AesGcm { nonce: u64 },       // authenticated, for WAL
+    ChaCha20Poly1305,             // network/sync messages
+}
+
+struct TransformPipeline {
+    compression: CompressionAlgo,
+    encryption: EncryptionMode,
+    key: [u8; 32],
+}
+
+struct TransformResult {
+    content_hash: [u8; 32],   // BLAKE3 of plaintext
+    data: Vec<u8>,            // transformed output
+    original_size: usize,
+    compressed_size: usize,
+    stored_size: usize,       // after padding + encryption
+}
+```
 
 ### 9.2 Compression
 
@@ -720,8 +853,17 @@ Hydration policy is ontology-driven — `Pin`, `StubOnly`, `Prefetch`, `AutoEvic
 Mutations generate sync operations replicated across nodes via hybrid logical clocks (HLC) for total ordering without coordination:
 
 ```rust
+/// Hybrid Logical Clock timestamp for total ordering without coordination
+struct HybridTimestamp {
+    wall_ms: u64,       // wall-clock milliseconds
+    logical: u16,       // logical counter for same-ms ordering
+    node_id: NodeId,    // originating node
+}
+// Packed to u64: [wall_ms: 48 bits][logical: 16 bits]
+// Total order: wall_ms → logical → node_id
+
 struct SyncOp {
-    timestamp: HybridTimestamp,   // wall_ms + logical + node_id
+    timestamp: HybridTimestamp,
     origin_node: NodeId,
     sequence: u64,
     op: SyncOpKind,
@@ -779,15 +921,31 @@ Mímisbrunnr replaces inotify with **query-based subscriptions** — persistent,
 ### 11.2 Subscription Structure
 
 ```rust
+/// Bitflags (u32) for event filtering
+struct ChangeInterest(u32);
+// Flags: TAG_ADDED | TAG_REMOVED | CONTENT_CHANGED | CREATED | DELETED | ENTERED | EXITED
+
+enum SubscriptionState { Active, Dormant }
+
 struct Subscription {
     id: SubscriptionId,
     name: String,
     query: Query,
-    interest: ChangeInterest,       // TAG_ADDED, CONTENT_CHANGED, ENTERED, EXITED, ...
-    cursor: HybridTimestamp,        // where we've read up to in the oplog
-    owner: SubscriptionOwner,
+    interest: ChangeInterest,
+    cursor: u64,                    // OpLog LSN position
     state: SubscriptionState,       // Active or Dormant
     retention: Duration,
+    cached_result: RoaringBitmap,   // cached query result set for diff-based catch-up
+}
+
+enum WatchEvent {
+    Entered { oid: ObjectId, timestamp: HybridTimestamp },
+    Exited { oid: ObjectId, timestamp: HybridTimestamp },
+    TagAdded { oid: ObjectId, tag: TagId, timestamp: HybridTimestamp },
+    TagRemoved { oid: ObjectId, tag: TagId, timestamp: HybridTimestamp },
+    ContentChanged { oid: ObjectId, timestamp: HybridTimestamp },
+    Deleted { oid: ObjectId, timestamp: HybridTimestamp },
+    Created { oid: ObjectId, timestamp: HybridTimestamp },
 }
 ```
 
@@ -799,9 +957,10 @@ Subscriptions are indexed by which tags they reference. When tag X changes, only
 
 ```rust
 struct SubscriptionEngine {
-    tag_to_subs: HashMap<TagId, Vec<SubscriptionId>>,
-    attr_to_subs: HashMap<TagId, Vec<SubscriptionId>>,
-    match_cache: HashMap<SubscriptionId, RoaringBitmap>,
+    subscriptions: HashMap<SubscriptionId, Subscription>,
+    tag_to_subs: HashMap<TagId, Vec<SubscriptionId>>,  // inverted index
+    pending_events: HashMap<SubscriptionId, Vec<WatchEvent>>,
+    next_id: SubscriptionId,
 }
 ```
 
@@ -897,12 +1056,12 @@ A **path context** is itself an object — a named Unix filesystem projection co
 
 ```rust
 struct PathProjection {
-    context: String,
+    context: Option<String>,        // named context, or None for unscoped
     entries: Vec<ProjectedEntry>,
 }
 
 struct ProjectedEntry {
-    object: ObjectId,
+    object: Option<ObjectId>,       // None for synthesized directories
     path: String,
     entry_type: ProjectedEntryType,
 }
@@ -911,6 +1070,12 @@ enum ProjectedEntryType {
     File { mode: u32, uid: u32, gid: u32 },
     Symlink { target: String },
     Directory { mode: u32 },    // virtual — synthesized from paths
+}
+
+/// Manages named contexts and an unscoped (context-free) projection
+struct PathContextManager {
+    contexts: HashMap<String, PathProjection>,
+    unscoped: PathProjection,
 }
 ```
 
@@ -947,6 +1112,31 @@ brunnr mount-unix --context project-vesper /mnt/vesper
 ```
 
 Read/write through the FUSE bridge goes through Mímisbrunnr — blobs updated, tags preserved.
+
+The FUSE VFS provides two navigation modes:
+
+- **`/tags/`** — TMSU/tagsistant-style tag navigation. Entering `/tags/electronic/ambient/` shows objects tagged with both. Tag paths use `BTreeSet<TagId>` for canonical ordering (path order doesn't matter). Faceted refinement only shows tags with non-empty intersection of the current result set.
+- **`/ctx/<context>/`** — Path context navigation, showing the projected Unix tree for a named context.
+
+```rust
+struct TagVfs {
+    // Indices (cloned from engine state)
+    tag_index: TagIndex,
+    kv_index: KvIndex,
+    forward_index: ForwardIndex,
+    dag: ImplicationDag,
+    // Context VFS trees
+    context_trees: HashMap<String, VfsTree>,
+    blobs: HashMap<u64, Vec<u8>>,
+    // Lazy inode allocation
+    entries: HashMap<u64, TagVfsEntry>,
+    next_ino: u64,
+}
+
+struct MimisbrunnrFs {
+    vfs: RwLock<TagVfs>,  // interior mutability for FUSE Sync requirement
+}
+```
 
 ### 12.7 Multiple Projections
 
@@ -1061,7 +1251,76 @@ Write (HDD)      ~10 ms          invisible      invisible     invisible
 
 ---
 
-## 15. Architecture
+## 15. Engine & Persistence
+
+The `Engine` struct is the central coordinator, holding all in-memory indices:
+
+```rust
+struct Engine {
+    object_table: ObjectTable,
+    tag_index: TagIndex,
+    forward_index: ForwardIndex,
+    kv_index: KvIndex,
+    dag: ImplicationDag,
+    oplog: OpLog,
+    clock: HybridTimestamp,
+    node_id: u16,
+    transform: TransformPipeline,
+}
+
+/// In-memory operation log for subscriptions and sync
+struct OpLog {
+    entries: Vec<OpLogEntry>,
+}
+
+struct OpLogEntry {
+    timestamp: HybridTimestamp,
+    lsn: u64,
+    op: OpKind,
+}
+
+enum OpKind {
+    CreateObject { oid: ObjectId },
+    DeleteObject { oid: ObjectId },
+    AddTag { oid: ObjectId, tag: TagId },
+    RemoveTag { oid: ObjectId, tag: TagId },
+    SetAttr { oid: ObjectId, tag: TagId },
+    RemoveAttr { oid: ObjectId, tag: TagId },
+    WriteBlob { oid: ObjectId },
+}
+```
+
+`DiskEngine` wraps `Engine` with persistence via `FileBlockDevice`:
+
+```rust
+struct DiskEngine {
+    engine: Engine,
+    context_mgr: PathContextManager,
+    blobs: HashMap<u64, Vec<u8>>,
+    primary_device: FileBlockDevice,
+    superblock: Superblock,
+    config: PoolConfig,
+    config_path: PathBuf,
+}
+```
+
+**Pool configuration** (`pool.toml`) links `brunnr` and `mimir` to the same pool:
+
+```toml
+node_id = 1
+
+[[disks]]
+id = 0
+path = "/path/to/device"
+tier = "hot"
+capacity_bytes = 1073741824
+```
+
+Index state is currently persisted as JSON in the index zone (correctness-first; binary serialization planned). Round-trip: `brunnr create` → `mimir tag/query` → `mimir` save/load works end-to-end.
+
+---
+
+## 16. Architecture
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -1117,7 +1376,7 @@ Write (HDD)      ~10 ms          invisible      invisible     invisible
 
 ---
 
-## 16. Comparison with Existing Systems
+## 17. Comparison with Existing Systems
 
 |Capability|ZFS|ext4/btrfs|Mímisbrunnr|
 |---|---|---|---|
@@ -1137,7 +1396,7 @@ Write (HDD)      ~10 ms          invisible      invisible     invisible
 
 ---
 
-## 17. Key Design Decisions
+## 18. Key Design Decisions
 
 |Decision|Choice|Rationale|
 |---|---|---|
