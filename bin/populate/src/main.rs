@@ -4,18 +4,19 @@
 //! TOML manifest. Supports generative population with synthetic content
 //! (music, video, text) with configurable size distributions.
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
-use clap::Parser;
-use rand::{Rng, RngExt};
-use serde::Deserialize;
+use {
+    clap::Parser,
+    rand::{Rng, RngExt},
+    serde::Deserialize,
+};
 
 use mimisbrunnr::{
-    engine::DiskEngine,
-    ontology::OntologyModule,
-    pool::PlacementRule,
-    types::Value,
+    engine::DiskEngine, ontology::OntologyModule, pool::PlacementRule, types::Value,
 };
 
 // ── CLI ──────────────────────────────────────────────────────────────
@@ -131,21 +132,143 @@ fn sample_size(rng: &mut impl Rng, min: u64, max: u64) -> usize {
 }
 
 const WORD_LIST: &[&str] = &[
-    "the", "be", "to", "of", "and", "a", "in", "that", "have", "I",
-    "it", "for", "not", "on", "with", "he", "as", "you", "do", "at",
-    "this", "but", "his", "by", "from", "they", "we", "say", "her", "she",
-    "or", "an", "will", "my", "one", "all", "would", "there", "their", "what",
-    "so", "up", "out", "if", "about", "who", "get", "which", "go", "me",
-    "when", "make", "can", "like", "time", "no", "just", "him", "know", "take",
-    "people", "into", "year", "your", "good", "some", "could", "them", "see", "other",
-    "than", "then", "now", "look", "only", "come", "its", "over", "think", "also",
-    "back", "after", "use", "two", "how", "our", "work", "first", "well", "way",
-    "even", "new", "want", "because", "any", "these", "give", "day", "most", "us",
-    "great", "between", "need", "large", "must", "home", "big", "still", "long",
-    "music", "sound", "wave", "signal", "frequency", "amplitude", "rhythm", "melody",
-    "harmony", "chord", "note", "beat", "tempo", "pitch", "tone", "resonance",
-    "spectrum", "filter", "oscillator", "synthesizer", "sampler", "sequencer",
-    "analog", "digital", "modular", "ambient", "electronic", "acoustic",
+    "the",
+    "be",
+    "to",
+    "of",
+    "and",
+    "a",
+    "in",
+    "that",
+    "have",
+    "I",
+    "it",
+    "for",
+    "not",
+    "on",
+    "with",
+    "he",
+    "as",
+    "you",
+    "do",
+    "at",
+    "this",
+    "but",
+    "his",
+    "by",
+    "from",
+    "they",
+    "we",
+    "say",
+    "her",
+    "she",
+    "or",
+    "an",
+    "will",
+    "my",
+    "one",
+    "all",
+    "would",
+    "there",
+    "their",
+    "what",
+    "so",
+    "up",
+    "out",
+    "if",
+    "about",
+    "who",
+    "get",
+    "which",
+    "go",
+    "me",
+    "when",
+    "make",
+    "can",
+    "like",
+    "time",
+    "no",
+    "just",
+    "him",
+    "know",
+    "take",
+    "people",
+    "into",
+    "year",
+    "your",
+    "good",
+    "some",
+    "could",
+    "them",
+    "see",
+    "other",
+    "than",
+    "then",
+    "now",
+    "look",
+    "only",
+    "come",
+    "its",
+    "over",
+    "think",
+    "also",
+    "back",
+    "after",
+    "use",
+    "two",
+    "how",
+    "our",
+    "work",
+    "first",
+    "well",
+    "way",
+    "even",
+    "new",
+    "want",
+    "because",
+    "any",
+    "these",
+    "give",
+    "day",
+    "most",
+    "us",
+    "great",
+    "between",
+    "need",
+    "large",
+    "must",
+    "home",
+    "big",
+    "still",
+    "long",
+    "music",
+    "sound",
+    "wave",
+    "signal",
+    "frequency",
+    "amplitude",
+    "rhythm",
+    "melody",
+    "harmony",
+    "chord",
+    "note",
+    "beat",
+    "tempo",
+    "pitch",
+    "tone",
+    "resonance",
+    "spectrum",
+    "filter",
+    "oscillator",
+    "synthesizer",
+    "sampler",
+    "sequencer",
+    "analog",
+    "digital",
+    "modular",
+    "ambient",
+    "electronic",
+    "acoustic",
 ];
 
 /// Generate text content from a word dictionary, forming sentences and paragraphs.
@@ -304,17 +427,17 @@ fn generate_content(rng: &mut impl Rng, content_type: &str, size: usize) -> Vec<
 /// Default size range for a content type.
 fn default_size_range(content_type: &str) -> (u64, u64) {
     match content_type {
-        "music" => (1024 * 1024, 15 * 1024 * 1024),           // 1 MB – 15 MB
-        "video" => (100 * 1024 * 1024, 1024 * 1024 * 1024),   // 100 MB – 1 GB
-        "text"  => (1024, 15 * 1024),                          // 1 KB – 15 KB
-        _       => (1024, 1024 * 1024),                        // 1 KB – 1 MB
+        "music" => (1024 * 1024, 15 * 1024 * 1024), // 1 MB – 15 MB
+        "video" => (100 * 1024 * 1024, 1024 * 1024 * 1024), // 100 MB – 1 GB
+        "text" => (1024, 15 * 1024),                // 1 KB – 15 KB
+        _ => (1024, 1024 * 1024),                   // 1 KB – 1 MB
     }
 }
 
 /// Substitute template variables in a string value.
 fn substitute(s: &str, seq: u64, content_type: &str) -> String {
     s.replace("{seq}", &seq.to_string())
-     .replace("{type}", content_type)
+        .replace("{type}", content_type)
 }
 
 // ── Main ─────────────────────────────────────────────────────────────
@@ -373,10 +496,7 @@ fn main() {
             let module = match OntologyModule::from_file(&resolved) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!(
-                        "error: failed to load ontology {}: {e}",
-                        resolved.display()
-                    );
+                    eprintln!("error: failed to load ontology {}: {e}", resolved.display());
                     std::process::exit(1);
                 }
             };
@@ -434,7 +554,9 @@ fn main() {
                         let algo = match mimisbrunnr::pool::parse_compression_algo(algo_str) {
                             Some(a) => a,
                             None => {
-                                eprintln!("warning: unknown compression '{algo_str}', skipping rule");
+                                eprintln!(
+                                    "warning: unknown compression '{algo_str}', skipping rule"
+                                );
                                 continue;
                             }
                         };
@@ -499,10 +621,7 @@ fn main() {
                                 if extras.is_empty() {
                                     println!("  {oid} +{tag_name}");
                                 } else {
-                                    println!(
-                                        "  {oid} +{tag_name} (→ {})",
-                                        extras.join(", ")
-                                    );
+                                    println!("  {oid} +{tag_name} (→ {})", extras.join(", "));
                                 }
                             }
                         }
@@ -552,10 +671,7 @@ fn main() {
     let mut rng = rand::rng();
 
     for gen_spec in &manifest.generate {
-        let label = gen_spec
-            .name
-            .as_deref()
-            .unwrap_or(&gen_spec.content_type);
+        let label = gen_spec.name.as_deref().unwrap_or(&gen_spec.content_type);
 
         let (default_min, default_max) = default_size_range(&gen_spec.content_type);
         let min_size = gen_spec.min_size.unwrap_or(default_min);
@@ -586,14 +702,21 @@ fn main() {
             };
 
             // Write blob through transform pipeline (updates record metadata)
-            if let Err(e) = engine.write_blob(oid, &content, now_ms()) {
-                eprintln!("error writing blob for {oid}: {e}");
+            let blob_result = match engine.write_blob(oid, &content, now_ms()) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error writing blob for {oid}: {e}");
+                    errors += 1;
+                    continue;
+                }
+            };
+
+            // Write transformed blob data to the blob zone on disk
+            if let Err(e) = disk_engine.store_blob(oid, &blob_result.data) {
+                eprintln!("error storing blob for {oid}: {e}");
                 errors += 1;
                 continue;
             }
-
-            // Store plaintext blob for FUSE access
-            disk_engine.store_blob((oid.node() << 48) | oid.local(), content.clone());
 
             // Apply tags
             {
@@ -647,7 +770,12 @@ fn main() {
             created += 1;
 
             if !cli.quiet && (seq + 1) % 100 == 0 {
-                println!("  ... {}/{} ({} so far)", seq + 1, gen_spec.count, human_size(gen_bytes));
+                println!(
+                    "  ... {}/{} ({} so far)",
+                    seq + 1,
+                    gen_spec.count,
+                    human_size(gen_bytes)
+                );
             }
         }
 
@@ -668,9 +796,7 @@ fn main() {
 
     // ── Summary ──────────────────────────────────────────────────────
 
-    println!(
-        "populated {created} object(s), {tagged} tag(s), {attrs_set} attr(s)",
-    );
+    println!("populated {created} object(s), {tagged} tag(s), {attrs_set} attr(s)",);
     if gen_bytes > 0 {
         println!("  generated content: {}", human_size(gen_bytes));
     }

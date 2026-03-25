@@ -20,8 +20,12 @@ pub struct ImportResult {
     pub total_bytes: u64,
     /// The context name, if any.
     pub context: Option<String>,
-    /// Plaintext blob data for each imported object (for FUSE serving).
-    pub blobs: HashMap<u64, Vec<u8>>,
+    /// Transformed blob data for each imported object, ready for blob zone storage.
+    /// Each entry is (ObjectId, transformed_bytes).
+    pub transformed_blobs: Vec<(ObjectId, Vec<u8>)>,
+    /// Original plaintext blob data (for in-memory / FUSE serving).
+    /// Key is `(node << 48) | local`.
+    pub original_blobs: HashMap<u64, Vec<u8>>,
 }
 
 impl Importer {
@@ -53,7 +57,8 @@ impl Importer {
             objects_deduped: 0,
             total_bytes: 0,
             context: context_name.map(String::from),
-            blobs: HashMap::new(),
+            transformed_blobs: Vec::new(),
+            original_blobs: HashMap::new(),
         };
 
         // Track content hashes for dedup
@@ -121,11 +126,12 @@ impl Importer {
                     existing
                 } else {
                     let oid = engine.create_object(now_ms).map_err(UnixError::Engine)?;
-                    engine
+                    let blob_result = engine
                         .write_blob(oid, &content, now_ms)
                         .map_err(UnixError::Engine)?;
                     hash_to_oid.insert(hash, oid);
-                    result.blobs.insert((oid.node() << 48) | oid.local(), content);
+                    result.transformed_blobs.push((oid, blob_result.data));
+                    result.original_blobs.insert((oid.node() << 48) | oid.local(), content);
                     result.objects_created += 1;
 
                     // Auto-tag by extension

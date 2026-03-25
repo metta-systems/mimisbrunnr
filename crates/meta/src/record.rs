@@ -24,7 +24,8 @@ use mimisbrunnr_types::{CompressionState, EncryptionState, ObjectState};
 ///  [82..83]   encryption (u8 → EncryptionState)
 ///  [83..84]   _pad (u8)
 ///  [84..116]  content_hash (32 bytes, BLAKE3)
-///  [116..128] _reserved (12 bytes)
+///  [116..120] _reserved (4 bytes)
+///  [120..128] compressed_size (u64, pre-padding size for transform_read)
 /// ```
 pub const RECORD_SIZE: usize = 128;
 
@@ -50,7 +51,8 @@ pub struct ObjectRecord {
     pub encryption: u8,
     pub _pad: u8,
     pub content_hash: [u8; 32],
-    pub _reserved: [u8; 12],
+    pub _reserved: [u8; 4],
+    pub compressed_size: u64,
 }
 
 const _: () = assert!(size_of::<ObjectRecord>() == RECORD_SIZE);
@@ -73,6 +75,7 @@ impl PartialEq for ObjectRecord {
             && self.compression == other.compression
             && self.encryption == other.encryption
             && self.content_hash == other.content_hash
+            && self.compressed_size == other.compressed_size
     }
 }
 

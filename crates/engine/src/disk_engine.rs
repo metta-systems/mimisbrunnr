@@ -33,9 +33,9 @@ struct IndexState {
     /// Path contexts: context_name → entries
     #[serde(default)]
     path_contexts: Vec<PathContextRecord>,
-    /// Blob data stored inline (for small blobs; production would use blob zone)
+    /// Next write offset in the blob zone (bump allocator state).
     #[serde(default)]
-    blobs: Vec<BlobRecord>,
+    blob_next_offset: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -57,12 +57,6 @@ enum EntryTypeRecord {
     File { mode: u32, uid: u32, gid: u32 },
     Symlink { target: String },
     Directory { mode: u32 },
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct BlobRecord {
-    object_id: u64,
-    data: Vec<u8>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -98,18 +92,19 @@ struct TagRecord {
 /// Disk-backed engine that persists state across invocations.
 ///
 /// Opens pool disks, loads the object table from the metadata zone and
-/// the index state from the index zone. Changes are flushed back on `flush()`.
+/// the index state from the index zone. Blob data is written directly
+/// to the blob zone via a bump allocator. Changes are flushed back on `flush()`.
 pub struct DiskEngine {
     /// The in-memory engine with all indexes loaded.
     pub engine: Engine,
     /// Path context manager (persisted).
     pub context_mgr: mimisbrunnr_types::PathContextManager,
-    /// Blob data store: object_id_raw → data.
-    pub blobs: std::collections::HashMap<u64, Vec<u8>>,
-    /// Primary disk device (holds index + metadata zones).
+    /// Primary disk device (holds index + metadata + blob zones).
     primary_device: FileBlockDevice,
     /// Superblock from the primary disk.
     superblock: Superblock,
+    /// Next write offset within the blob zone (bump allocator).
+    blob_next_offset: u64,
     /// Pool config (so we know about all disks).
     #[allow(dead_code)]
     config: PoolConfig,
@@ -147,14 +142,14 @@ impl DiskEngine {
 
         // Load index state from index zone
         let mut context_mgr = mimisbrunnr_types::PathContextManager::new();
-        let mut blobs = std::collections::HashMap::new();
+        let mut blob_next_offset = 0u64;
         Self::load_index_state(
             &primary_device,
             layout,
             ZoneType::Index,
             &mut engine,
             &mut context_mgr,
-            &mut blobs,
+            &mut blob_next_offset,
         )?;
 
         // Set default compression from config
@@ -172,9 +167,9 @@ impl DiskEngine {
         Ok(Self {
             engine,
             context_mgr,
-            blobs,
             primary_device,
             superblock,
+            blob_next_offset,
             config,
             config_path: config_path.to_path_buf(),
         })
@@ -203,7 +198,7 @@ impl DiskEngine {
 
         // Serialize index state and check if it fits
         let cbor =
-            Self::serialize_index_state(&self.engine, &self.context_mgr, &self.blobs)?;
+            Self::serialize_index_state(&self.engine, &self.context_mgr, self.blob_next_offset)?;
 
         let needed = cbor.len() as u64 + 8; // 8 bytes for length prefix
         let index_size = self.superblock.layout.zone_size(ZoneType::Index);
@@ -355,14 +350,126 @@ impl DiskEngine {
         &mut self.engine
     }
 
-    /// Store blob data for an object.
-    pub fn store_blob(&mut self, object_id: u64, data: Vec<u8>) {
-        self.blobs.insert(object_id, data);
+    /// Write transformed blob data to the blob zone using the bump allocator.
+    ///
+    /// Updates the object record's `blob_offset` to point to the written data.
+    /// The data should already be transformed (compressed/encrypted/padded)
+    /// via `Engine::write_blob`.
+    pub fn store_blob(
+        &mut self,
+        oid: mimisbrunnr_types::ObjectId,
+        data: &[u8],
+    ) -> Result<(), EngineError> {
+        let blob_zone_size = self.superblock.layout.zone_size(ZoneType::Blob);
+        let aligned_size = align_up(data.len() as u64, BLOCK_SIZE);
+
+        if self.blob_next_offset + aligned_size > blob_zone_size {
+            return Err(EngineError::Io(std::io::Error::other(format!(
+                "blob zone full: need {} bytes at offset {}, zone is {} bytes",
+                aligned_size, self.blob_next_offset, blob_zone_size,
+            ))));
+        }
+
+        // Convert blob zone logical offset to physical disk offset
+        let physical_offset = self
+            .superblock
+            .layout
+            .logical_to_physical(ZoneType::Blob, self.blob_next_offset)
+            .ok_or_else(|| {
+                EngineError::Io(std::io::Error::other(
+                    "blob zone offset out of range",
+                ))
+            })?;
+
+        self.primary_device
+            .write_at(physical_offset, data)
+            .map_err(EngineError::Storage)?;
+
+        // Update the object record with the blob offset
+        if let Some(rec) = self.engine.object_table.get_mut(oid) {
+            rec.blob_offset = self.blob_next_offset;
+        }
+
+        self.blob_next_offset += aligned_size;
+        Ok(())
     }
 
-    /// Retrieve blob data for an object.
-    pub fn get_blob(&self, object_id: u64) -> Option<&[u8]> {
-        self.blobs.get(&object_id).map(|v| v.as_slice())
+    /// Read raw (transformed) blob data from the blob zone.
+    ///
+    /// Returns the raw on-disk bytes (compressed/encrypted). Use
+    /// `read_blob_plaintext` for automatic decompression.
+    pub fn read_blob(
+        &self,
+        oid: mimisbrunnr_types::ObjectId,
+    ) -> Result<Vec<u8>, EngineError> {
+        let rec = self
+            .engine
+            .object_table
+            .get(oid)
+            .ok_or(EngineError::ObjectNotFound(oid))?;
+
+        if rec.stored_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let physical_offset = self
+            .superblock
+            .layout
+            .logical_to_physical(ZoneType::Blob, rec.blob_offset)
+            .ok_or_else(|| {
+                EngineError::Io(std::io::Error::other(
+                    "blob zone offset out of range",
+                ))
+            })?;
+
+        let mut buf = vec![0u8; rec.stored_size as usize];
+        self.primary_device
+            .read_at(physical_offset, &mut buf)
+            .map_err(EngineError::Storage)?;
+        Ok(buf)
+    }
+
+    /// Read and decompress blob data from the blob zone.
+    ///
+    /// Returns the original plaintext data.
+    pub fn read_blob_plaintext(
+        &self,
+        oid: mimisbrunnr_types::ObjectId,
+    ) -> Result<Vec<u8>, EngineError> {
+        let rec = self
+            .engine
+            .object_table
+            .get(oid)
+            .ok_or(EngineError::ObjectNotFound(oid))?;
+
+        if rec.stored_size == 0 {
+            return Ok(Vec::new());
+        }
+
+        let stored = self.read_blob(oid)?;
+
+        // Build the matching pipeline from the record's compression/encryption state
+        let compression = match rec.compression() {
+            mimisbrunnr_types::CompressionState::None => {
+                mimisbrunnr_transform::CompressionAlgo::None
+            }
+            mimisbrunnr_types::CompressionState::Zstd => {
+                mimisbrunnr_transform::CompressionAlgo::Zstd(3) // level doesn't matter for decompression
+            }
+            mimisbrunnr_types::CompressionState::Lz4 => {
+                mimisbrunnr_transform::CompressionAlgo::Lz4
+            }
+        };
+        // TODO: restore encryption mode from record when encryption is implemented
+        let pipeline = mimisbrunnr_transform::TransformPipeline::new(
+            compression,
+            mimisbrunnr_transform::EncryptionMode::None,
+            [0u8; 32],
+        );
+
+        let plaintext = pipeline
+            .transform_read(&stored, rec.compressed_size as usize, Some(&rec.content_hash))?;
+        Ok(plaintext)
     }
 
     /// Access the block device (for raw reads).
@@ -380,11 +487,16 @@ impl DiskEngine {
         &self.config
     }
 
+    /// Current blob zone write offset (bump allocator position).
+    pub fn blob_next_offset(&self) -> u64 {
+        self.blob_next_offset
+    }
+
     /// Serialize engine state to CBOR bytes.
     fn serialize_index_state(
         engine: &Engine,
         context_mgr: &mimisbrunnr_types::PathContextManager,
-        blobs: &std::collections::HashMap<u64, Vec<u8>>,
+        blob_next_offset: u64,
     ) -> Result<Vec<u8>, EngineError> {
         let mut state = IndexState::default();
 
@@ -493,13 +605,8 @@ impl DiskEngine {
             }
         }
 
-        // Serialize blobs
-        for (&oid_raw, data) in blobs {
-            state.blobs.push(BlobRecord {
-                object_id: oid_raw,
-                data: data.clone(),
-            });
-        }
+        // Persist blob zone allocator state
+        state.blob_next_offset = blob_next_offset;
 
         let mut cbor_buf = Vec::new();
         ciborium::into_writer(&state, &mut cbor_buf)
@@ -554,7 +661,7 @@ impl DiskEngine {
         zone: ZoneType,
         engine: &mut Engine,
         context_mgr: &mut mimisbrunnr_types::PathContextManager,
-        blobs: &mut std::collections::HashMap<u64, Vec<u8>>,
+        blob_next_offset: &mut u64,
     ) -> Result<(), EngineError> {
         let zone_size = layout.zone_size(zone);
 
@@ -705,10 +812,8 @@ impl DiskEngine {
             }
         }
 
-        // Rebuild blob store
-        for blob_rec in &state.blobs {
-            blobs.insert(blob_rec.object_id, blob_rec.data.clone());
-        }
+        // Restore blob zone allocator state
+        *blob_next_offset = state.blob_next_offset;
 
         Ok(())
     }
@@ -934,16 +1039,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config_path = create_test_pool(tmp.path());
 
-        let hash;
+        let content_hash;
         {
             let mut de = DiskEngine::open(&config_path).unwrap();
-            let e = de.engine_mut();
 
-            let oid = e.create_object(1000).unwrap();
-            hash = e.write_blob(oid, b"hello world", 1000).unwrap();
+            let oid = de.engine_mut().create_object(1000).unwrap();
+            let blob_result = de.engine_mut().write_blob(oid, b"hello world", 1000).unwrap();
+            content_hash = blob_result.content_hash;
 
-            // Store plaintext blob for retrieval
-            de.store_blob((oid.node() << 48) | oid.local(), b"hello world".to_vec());
+            // Write transformed blob to blob zone
+            de.store_blob(oid, &blob_result.data).unwrap();
 
             de.flush().unwrap();
         }
@@ -954,13 +1059,12 @@ mod tests {
 
             let oid = ObjectId::new(0, 0);
             let rec = e.get_object(oid).unwrap();
-            assert_eq!(rec.content_hash, hash);
+            assert_eq!(rec.content_hash, content_hash);
             assert_eq!(rec.blob_length, 11);
 
-            // Verify actual blob content is retrievable after reload
-            let blob = de.get_blob((oid.node() << 48) | oid.local());
-            assert!(blob.is_some(), "blob data should survive flush/reload");
-            assert_eq!(blob.unwrap(), b"hello world");
+            // Verify blob can be read back and decompressed
+            let plaintext = de.read_blob_plaintext(oid).unwrap();
+            assert_eq!(plaintext, b"hello world");
         }
     }
 
@@ -976,21 +1080,33 @@ mod tests {
             original_index_size = de.superblock.layout.zone_size(ZoneType::Index);
         }
 
-        // Store enough blob data to exceed the index zone
+        // Create enough objects with large attrs to exceed the index zone
         {
             let mut de = DiskEngine::open(&config_path).unwrap();
+            let e = de.engine_mut();
 
-            // Store enough blob data to exceed the ~1.9 MiB index zone
-            // CBOR stores byte arrays efficiently, so we need more data than JSON did
-            for i in 0..5u64 {
-                let content = vec![(i as u8).wrapping_mul(37); 500 * 1024]; // 500 KB each = 2.5 MB total
-                let oid = {
-                    let e = de.engine_mut();
-                    let oid = e.create_object(1000).unwrap();
-                    e.write_blob(oid, &content, 1000).unwrap();
-                    oid
-                };
-                de.store_blob((oid.node() << 48) | oid.local(), content);
+            // Register a text attribute tag
+            e.register_tag(TagDefinition::new(
+                TagId::new(1),
+                "description",
+                TagSemantics::Attribute {
+                    value_type: mimisbrunnr_ontology::ValueType::Text,
+                },
+            ))
+            .unwrap();
+
+            // Create objects with large text attributes to fill the index zone
+            // Each object gets ~50KB of text attrs, 50 objects = ~2.5 MB
+            for i in 0..50u64 {
+                let oid = e.create_object(1000).unwrap();
+                let large_text = format!("x{}", "a".repeat(50 * 1024));
+                e.set_attr(
+                    oid,
+                    TagId::new(1),
+                    Value::Text(format!("{i}:{large_text}")),
+                    1000,
+                )
+                .unwrap();
             }
 
             // This should succeed by growing the index zone
@@ -1022,13 +1138,7 @@ mod tests {
                 de.superblock.layout.extents(ZoneType::Index).len() > 1,
                 "after reload, index zone should still have multiple extents"
             );
-            for i in 0..5u64 {
-                let blob = de
-                    .get_blob(i)
-                    .unwrap_or_else(|| panic!("blob {i} should exist"));
-                assert_eq!(blob.len(), 500 * 1024);
-                assert!(blob.iter().all(|&b| b == (i as u8).wrapping_mul(37)));
-            }
+            assert_eq!(de.engine().object_table.count(), 50);
         }
     }
 

@@ -427,10 +427,21 @@ fn cmd_mount_unix(pool_path: &Path, context_name: &str, mountpoint: &Path) {
     let tree = VfsTree::from_projection(&projection);
     tag_vfs.add_context(context_name.to_string(), tree);
 
-    // Populate blob data for all objects (context files + tag-only objects)
+    // Populate blob data by reading and decompressing from blob zone
     let fs = MimisbrunnrFs::from_tag_vfs(tag_vfs);
-    for (oid_raw, blob_data) in &disk_engine.blobs {
-        fs.set_blob(*oid_raw, blob_data.clone());
+    for rec in disk_engine.engine().object_table.iter() {
+        if rec.stored_size == 0 {
+            continue;
+        }
+        let oid = mimisbrunnr::types::ObjectId::new(rec.id >> 48, rec.id & 0x0000_FFFF_FFFF_FFFF);
+        match disk_engine.read_blob_plaintext(oid) {
+            Ok(plaintext) => {
+                fs.set_blob(rec.id, plaintext);
+            }
+            Err(e) => {
+                eprintln!("warning: failed to read blob for {oid}: {e}");
+            }
+        }
     }
 
     // Create mountpoint if it doesn't exist

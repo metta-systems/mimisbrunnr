@@ -426,44 +426,44 @@ fn blob_content_survives_flush_and_reload() {
     {
         let mut de = DiskEngine::open(&pool_toml).unwrap();
 
-        let oid = {
+        let blob_data_0 = {
             let e = de.engine_mut();
             let oid = e.create_object(1000).unwrap();
-            e.write_blob(oid, b"hello world from blob", 1000).unwrap();
-            oid
+            let result = e.write_blob(oid, b"hello world from blob", 1000).unwrap();
+            (oid, result.data)
         };
-        de.store_blob((oid.node() << 48) | oid.local(), b"hello world from blob".to_vec());
+        de.store_blob(blob_data_0.0, &blob_data_0.1).unwrap();
 
-        let oid2 = {
+        let blob_data_1 = {
             let e = de.engine_mut();
             let oid2 = e.create_object(1000).unwrap();
             let big_content = vec![0xABu8; 8192];
-            e.write_blob(oid2, &big_content, 1000).unwrap();
-            oid2
+            let result = e.write_blob(oid2, &big_content, 1000).unwrap();
+            (oid2, result.data)
         };
-        de.store_blob((oid2.node() << 48) | oid2.local(), vec![0xABu8; 8192]);
+        de.store_blob(blob_data_1.0, &blob_data_1.1).unwrap();
 
         de.flush().unwrap();
     }
 
-    // Reopen and verify blob data is retrievable
+    // Reopen and verify blob data is retrievable (read + decompress)
     {
         let de = DiskEngine::open(&pool_toml).unwrap();
 
-        let blob0 = de.get_blob(0).expect("blob 0 should exist after reload");
+        let oid0 = mimisbrunnr::types::ObjectId::new(0, 0);
+        let blob0 = de.read_blob_plaintext(oid0).unwrap();
         assert_eq!(blob0, b"hello world from blob");
 
-        let blob1 = de.get_blob(1).expect("blob 1 should exist after reload");
+        let oid1 = mimisbrunnr::types::ObjectId::new(0, 1);
+        let blob1 = de.read_blob_plaintext(oid1).unwrap();
         assert_eq!(blob1.len(), 8192);
         assert!(blob1.iter().all(|&b| b == 0xAB));
 
         // Verify metadata was also persisted
         let e = de.engine();
-        let oid0 = mimisbrunnr::types::ObjectId::new(0, 0);
         let rec0 = e.get_object(oid0).unwrap();
         assert_eq!(rec0.blob_length, 21);
 
-        let oid1 = mimisbrunnr::types::ObjectId::new(0, 1);
         let rec1 = e.get_object(oid1).unwrap();
         assert_eq!(rec1.blob_length, 8192);
     }
@@ -488,20 +488,21 @@ fn large_blob_survives_flush_and_reload() {
         let mut de = DiskEngine::open(&pool_toml).unwrap();
         let content = vec![0x42u8; 50 * 1024];
 
-        let oid = {
+        let (oid, blob_data) = {
             let e = de.engine_mut();
             let oid = e.create_object(1000).unwrap();
-            e.write_blob(oid, &content, 1000).unwrap();
-            oid
+            let result = e.write_blob(oid, &content, 1000).unwrap();
+            (oid, result.data)
         };
-        de.store_blob((oid.node() << 48) | oid.local(), content);
+        de.store_blob(oid, &blob_data).unwrap();
 
         de.flush().unwrap();
     }
 
     {
         let de = DiskEngine::open(&pool_toml).unwrap();
-        let blob = de.get_blob(0).expect("50 KB blob should survive flush");
+        let oid = mimisbrunnr::types::ObjectId::new(0, 0);
+        let blob = de.read_blob_plaintext(oid).unwrap();
         assert_eq!(blob.len(), 50 * 1024);
     }
 }
@@ -511,6 +512,7 @@ fn large_blob_survives_flush_and_reload() {
 #[test]
 fn tag_vfs_serves_blob_data_after_reload() {
     use mimisbrunnr::engine::DiskEngine;
+    use mimisbrunnr::types::ObjectId;
     use mimisbrunnr_fuse::TagVfs;
 
     let tmp = TempDir::new().unwrap();
@@ -525,15 +527,15 @@ fn tag_vfs_serves_blob_data_after_reload() {
     {
         let mut de = DiskEngine::open(&pool_toml).unwrap();
 
-        let oid = {
+        let (oid, blob_data) = {
             let e = de.engine_mut();
             let ambient = e.dag.lookup("ambient").unwrap();
             let oid = e.create_object(1000).unwrap();
             e.add_tag(oid, ambient, 1000).unwrap();
-            e.write_blob(oid, b"ambient soundscape data", 1000).unwrap();
-            oid
+            let blob_result = e.write_blob(oid, b"ambient soundscape data", 1000).unwrap();
+            (oid, blob_result.data)
         };
-        de.store_blob((oid.node() << 48) | oid.local(), b"ambient soundscape data".to_vec());
+        de.store_blob(oid, &blob_data).unwrap();
 
         de.flush().unwrap();
     }
@@ -550,9 +552,15 @@ fn tag_vfs_serves_blob_data_after_reload() {
             engine.dag.clone(),
         );
 
-        // Load all blobs into TagVfs
-        for (&oid_raw, blob_data) in &de.blobs {
-            tag_vfs.set_blob(oid_raw, blob_data.clone());
+        // Load blobs from blob zone into TagVfs
+        for rec in engine.object_table.iter() {
+            if rec.stored_size == 0 {
+                continue;
+            }
+            let oid = ObjectId::new(rec.id >> 48, rec.id & 0x0000_FFFF_FFFF_FFFF);
+            if let Ok(plaintext) = de.read_blob_plaintext(oid) {
+                tag_vfs.set_blob(rec.id, plaintext);
+            }
         }
 
         // Navigate to /tags/ambient/obj_0

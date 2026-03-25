@@ -1,17 +1,37 @@
-use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
-use mimisbrunnr_meta::ObjectTable;
-use mimisbrunnr_ontology::{ImplicationDag, Materializer};
-use mimisbrunnr_pool::PlacementRule;
-use mimisbrunnr_query::QueryExecutor;
-use mimisbrunnr_transform::{CompressionAlgo, EncryptionMode, TransformPipeline};
-use mimisbrunnr_types::{
-    Assertion, CompressionState, HybridTimestamp, ObjectId, ObjectState, Query, TagId, TagOrigin,
-    Value,
+use {
+    mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex},
+    mimisbrunnr_meta::ObjectTable,
+    mimisbrunnr_ontology::{ImplicationDag, Materializer},
+    mimisbrunnr_pool::PlacementRule,
+    mimisbrunnr_query::QueryExecutor,
+    mimisbrunnr_transform::{CompressionAlgo, EncryptionMode, TransformPipeline},
+    mimisbrunnr_types::{
+        Assertion, CompressionState, HybridTimestamp, ObjectId, ObjectState, Query, TagId,
+        TagOrigin, Value,
+    },
 };
 
-use crate::error::EngineError;
-use crate::oplog::{OpKind, OpLog, OpLogEntry};
-use log::trace;
+use {
+    crate::{
+        error::EngineError,
+        oplog::{OpKind, OpLog, OpLogEntry},
+    },
+    log::trace,
+};
+
+/// Result of writing blob data through the transform pipeline.
+pub struct BlobWriteResult {
+    /// BLAKE3 hash of the original plaintext.
+    pub content_hash: [u8; 32],
+    /// Transformed (compressed/encrypted/padded) data ready for disk storage.
+    pub data: Vec<u8>,
+    /// Original plaintext size.
+    pub original_size: usize,
+    /// Size after compression (before padding).
+    pub compressed_size: usize,
+    /// Final on-disk size (after padding to sector alignment).
+    pub stored_size: usize,
+}
 
 /// The main storage engine, tying all layers together.
 ///
@@ -208,9 +228,17 @@ impl Engine {
             .add(oid, Assertion::Tag(tag), TagOrigin::Direct);
 
         // Materialize implied tags
-        let materialized =
-            Materializer::materialize_tag(&self.dag, &mut self.tag_index, &mut self.forward_index, oid, tag);
-        trace!("engine::add_tag materialized {} implied tags", materialized.len());
+        let materialized = Materializer::materialize_tag(
+            &self.dag,
+            &mut self.tag_index,
+            &mut self.forward_index,
+            oid,
+            tag,
+        );
+        trace!(
+            "engine::add_tag materialized {} implied tags",
+            materialized.len()
+        );
 
         // Update record
         if let Some(rec) = self.object_table.get_mut(oid) {
@@ -235,8 +263,7 @@ impl Engine {
 
         // Remove direct tag
         self.tag_index.untag_object(tag, obj_local);
-        self.forward_index
-            .remove(oid, &Assertion::Tag(tag));
+        self.forward_index.remove(oid, &Assertion::Tag(tag));
 
         // De-materialize tags no longer justified
         let dematerialized = Materializer::dematerialize_tag(
@@ -283,8 +310,13 @@ impl Engine {
             .collect();
         for old_val in &existing {
             self.kv_index.remove(key, old_val, obj_local);
-            self.forward_index
-                .remove(oid, &Assertion::Attr { key, value: old_val.clone() });
+            self.forward_index.remove(
+                oid,
+                &Assertion::Attr {
+                    key,
+                    value: old_val.clone(),
+                },
+            );
         }
 
         // Add new value
@@ -319,8 +351,13 @@ impl Engine {
         let obj_local = oid.local() as u32;
 
         self.kv_index.remove(key, value, obj_local);
-        self.forward_index
-            .remove(oid, &Assertion::Attr { key, value: value.clone() });
+        self.forward_index.remove(
+            oid,
+            &Assertion::Attr {
+                key,
+                value: value.clone(),
+            },
+        );
 
         if let Some(rec) = self.object_table.get_mut(oid) {
             rec.attr_count = self
@@ -344,13 +381,14 @@ impl Engine {
     /// against the object's current tags. First matching `Compress` rule
     /// wins; unmatched objects use the pool's default compression.
     ///
-    /// Returns the content hash.
+    /// Returns the transformed data and metadata. The caller is responsible
+    /// for writing the data to the blob zone on disk.
     pub fn write_blob(
         &mut self,
         oid: ObjectId,
         data: &[u8],
         now_ms: u64,
-    ) -> Result<[u8; 32], EngineError> {
+    ) -> Result<BlobWriteResult, EngineError> {
         trace!("engine::write_blob oid={oid} len={}", data.len());
         self.ensure_active(oid)?;
 
@@ -362,6 +400,7 @@ impl Engine {
             rec.content_hash = result.content_hash;
             rec.blob_length = result.original_size as u64;
             rec.stored_size = result.stored_size as u64;
+            rec.compressed_size = result.compressed_size as u64;
             rec.modified_ns = (now_ms as i64) * 1_000_000;
             rec.set_compression(match compression {
                 CompressionAlgo::None => CompressionState::None,
@@ -371,7 +410,13 @@ impl Engine {
         }
 
         self.emit_op(now_ms, OpKind::WriteBlob { oid });
-        Ok(result.content_hash)
+        Ok(BlobWriteResult {
+            content_hash: result.content_hash,
+            data: result.data,
+            original_size: result.original_size,
+            compressed_size: result.compressed_size,
+            stored_size: result.stored_size,
+        })
     }
 
     // ── Queries ────────────────────────────────────────────────────
@@ -405,7 +450,10 @@ impl Engine {
     // ── Info ───────────────────────────────────────────────────────
 
     /// Get all assertions for an object.
-    pub fn assertions(&self, oid: ObjectId) -> Result<&[mimisbrunnr_index::ForwardEntry], EngineError> {
+    pub fn assertions(
+        &self,
+        oid: ObjectId,
+    ) -> Result<&[mimisbrunnr_index::ForwardEntry], EngineError> {
         self.ensure_active(oid)?;
         Ok(self.forward_index.get(oid))
     }
@@ -459,9 +507,11 @@ impl Engine {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use mimisbrunnr_ontology::{TagDefinition, TagSemantics, ValueType};
-    use mimisbrunnr_types::CmpOp;
+    use {
+        super::*,
+        mimisbrunnr_ontology::{TagDefinition, TagSemantics, ValueType},
+        mimisbrunnr_types::CmpOp,
+    };
 
     fn tag(id: u32) -> TagId {
         TagId::new(id)
@@ -604,8 +654,10 @@ mod tests {
         let mut e = setup_engine();
         let oid = e.create_object(1000).unwrap();
 
-        e.set_attr(oid, tag(10), Value::Text("old".into()), 1000).unwrap();
-        e.set_attr(oid, tag(10), Value::Text("new".into()), 2000).unwrap();
+        e.set_attr(oid, tag(10), Value::Text("old".into()), 1000)
+            .unwrap();
+        e.set_attr(oid, tag(10), Value::Text("new".into()), 2000)
+            .unwrap();
 
         // Old value should not match
         let old_result = e.query(&Query::HasAttr {
@@ -646,7 +698,8 @@ mod tests {
         let oid = e.create_object(1000).unwrap();
         e.add_tag(oid, tag(1), 1000).unwrap();
         e.add_tag(oid, tag(2), 1000).unwrap();
-        e.set_attr(oid, tag(10), Value::Text("test".into()), 1000).unwrap();
+        e.set_attr(oid, tag(10), Value::Text("test".into()), 1000)
+            .unwrap();
 
         e.delete_object(oid, 2000).unwrap();
 
@@ -669,11 +722,13 @@ mod tests {
         let mut e = setup_engine();
         let oid = e.create_object(1000).unwrap();
 
-        let hash = e.write_blob(oid, b"hello world", 1000).unwrap();
-        assert_ne!(hash, [0u8; 32]);
+        let result = e.write_blob(oid, b"hello world", 1000).unwrap();
+        assert_ne!(result.content_hash, [0u8; 32]);
+        assert!(!result.data.is_empty());
+        assert_eq!(result.original_size, 11);
 
         let rec = e.get_object(oid).unwrap();
-        assert_eq!(rec.content_hash, hash);
+        assert_eq!(rec.content_hash, result.content_hash);
         assert_eq!(rec.blob_length, 11);
     }
 
@@ -710,7 +765,8 @@ mod tests {
         let mut e = setup_engine();
         let oid = e.create_object(1000).unwrap();
         e.add_tag(oid, tag(1), 1000).unwrap();
-        e.set_attr(oid, tag(10), Value::Text("test".into()), 1000).unwrap();
+        e.set_attr(oid, tag(10), Value::Text("test".into()), 1000)
+            .unwrap();
         e.delete_object(oid, 2000).unwrap();
 
         assert_eq!(e.oplog.len(), 4); // create + tag + attr + delete
@@ -721,7 +777,8 @@ mod tests {
         let mut e = setup_engine();
         let oid = e.create_object(1000).unwrap();
         e.add_tag(oid, tag(1), 1000).unwrap();
-        e.set_attr(oid, tag(10), Value::Text("hello".into()), 1000).unwrap();
+        e.set_attr(oid, tag(10), Value::Text("hello".into()), 1000)
+            .unwrap();
 
         let assertions = e.assertions(oid).unwrap();
         assert!(assertions.len() >= 2); // tag + attr (+ possible materialized)

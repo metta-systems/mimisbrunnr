@@ -195,16 +195,32 @@ fn run_with_pool(pool_path: &Path, command: Commands) {
         }
     };
 
-    // Take fields out temporarily to avoid double borrow
+    // Take ctx_mgr out temporarily to avoid double borrow
     let mut ctx_mgr = std::mem::take(&mut disk_engine.context_mgr);
-    let mut blobs = std::mem::take(&mut disk_engine.blobs);
-    dispatch(disk_engine.engine_mut(), &mut ctx_mgr, &mut blobs, command);
+    dispatch_disk(&mut disk_engine, &mut ctx_mgr, command);
     disk_engine.context_mgr = ctx_mgr;
-    disk_engine.blobs = blobs;
 
     if let Err(e) = disk_engine.flush() {
         eprintln!("error: failed to flush to disk: {e}");
         std::process::exit(1);
+    }
+}
+
+fn dispatch_disk(
+    disk_engine: &mut DiskEngine,
+    ctx_mgr: &mut PathContextManager,
+    command: Commands,
+) {
+    match command {
+        Commands::Create { count } => cmd_create(disk_engine.engine_mut(), count),
+        Commands::Tag { object, tags } => cmd_tag(disk_engine.engine_mut(), object, &tags),
+        Commands::Untag { object, tag } => cmd_untag(disk_engine.engine_mut(), object, &tag),
+        Commands::Set { object, attr } => cmd_set(disk_engine.engine_mut(), object, &attr),
+        Commands::Info { object } => cmd_info(disk_engine.engine_mut(), object),
+        Commands::Query { query } => cmd_query(disk_engine.engine_mut(), &query),
+        Commands::Ontology { action } => cmd_ontology(disk_engine.engine_mut(), action),
+        Commands::Project { action } => cmd_project_disk(disk_engine, ctx_mgr, action),
+        Commands::Sql { query } => cmd_sql(disk_engine.engine_mut(), query.as_deref()),
     }
 }
 
@@ -500,8 +516,8 @@ fn cmd_project(
                     }
                     println!("  Total bytes: {}", result.total_bytes);
 
-                    // Transfer blob data from import result for FUSE serving
-                    blobs.extend(result.blobs);
+                    // Transfer plaintext blob data for in-memory FUSE serving
+                    blobs.extend(result.original_blobs);
                 }
                 Err(e) => eprintln!("error: {e}"),
             }
@@ -517,9 +533,7 @@ fn cmd_project(
                 },
                 None => ctx_mgr.unscoped(),
             };
-            let label = context
-                .as_deref()
-                .unwrap_or("(unscoped)");
+            let label = context.as_deref().unwrap_or("(unscoped)");
             let with_dirs = proj.with_synthesized_dirs();
             let mut paths: Vec<_> = with_dirs.entries.iter().map(|e| &e.path).collect();
             paths.sort();
@@ -557,6 +571,111 @@ fn cmd_project(
                 None => ctx_mgr.unscoped(),
             };
             match mimisbrunnr::unix::Exporter::export_directory(proj, blobs, &output) {
+                Ok(result) => {
+                    println!(
+                        "Exported {} file(s) to {}",
+                        result.files_written,
+                        output.display()
+                    );
+                }
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+    }
+}
+
+fn cmd_project_disk(
+    disk_engine: &mut DiskEngine,
+    ctx_mgr: &mut PathContextManager,
+    action: ProjectAction,
+) {
+    match action {
+        ProjectAction::Import { path, context } => {
+            let ext_tags = HashMap::new();
+            match Importer::import_directory(
+                disk_engine.engine_mut(),
+                ctx_mgr,
+                &path,
+                context.as_deref(),
+                &ext_tags,
+                now_ms(),
+            ) {
+                Ok(result) => {
+                    let label = context
+                        .as_deref()
+                        .map(|c| format!("context '{c}'"))
+                        .unwrap_or_else(|| "unscoped".to_string());
+                    println!("Imported {} file(s) into {label}", result.objects_created);
+                    if result.objects_deduped > 0 {
+                        println!(
+                            "  ({} deduplicated by content hash)",
+                            result.objects_deduped
+                        );
+                    }
+                    println!("  Total bytes: {}", result.total_bytes);
+
+                    // Write transformed blobs to the blob zone on disk
+                    for (oid, data) in &result.transformed_blobs {
+                        if let Err(e) = disk_engine.store_blob(*oid, data) {
+                            eprintln!("error storing blob for {oid}: {e}");
+                        }
+                    }
+                }
+                Err(e) => eprintln!("error: {e}"),
+            }
+        }
+        ProjectAction::Tree { context } => {
+            let proj = match context.as_deref() {
+                Some(name) => match ctx_mgr.get_context(name) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return;
+                    }
+                },
+                None => ctx_mgr.unscoped(),
+            };
+            let label = context.as_deref().unwrap_or("(unscoped)");
+            let with_dirs = proj.with_synthesized_dirs();
+            let mut paths: Vec<_> = with_dirs.entries.iter().map(|e| &e.path).collect();
+            paths.sort();
+            println!("{label} ({} entries):", proj.len());
+            for p in paths {
+                println!("  {p}");
+            }
+        }
+        ProjectAction::List => {
+            let contexts = ctx_mgr.list_contexts();
+            if contexts.is_empty() && ctx_mgr.unscoped().is_empty() {
+                println!("No projections.");
+                return;
+            }
+            if !ctx_mgr.unscoped().is_empty() {
+                println!("  (unscoped)  {} entries", ctx_mgr.unscoped().len());
+            }
+            let mut sorted = contexts;
+            sorted.sort();
+            for name in sorted {
+                if let Ok(proj) = ctx_mgr.get_context(name) {
+                    println!("  {name}  {} entries", proj.len());
+                }
+            }
+        }
+        ProjectAction::Export { context, output } => {
+            let proj = match context.as_deref() {
+                Some(name) => match ctx_mgr.get_context(name) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return;
+                    }
+                },
+                None => ctx_mgr.unscoped(),
+            };
+            // Read and decompress blobs from blob zone for export
+            // TODO: implement decompression path for disk-backed export
+            let blobs = HashMap::new();
+            match mimisbrunnr::unix::Exporter::export_directory(proj, &blobs, &output) {
                 Ok(result) => {
                     println!(
                         "Exported {} file(s) to {}",
@@ -719,7 +838,11 @@ fn execute_sql_query(engine: &Engine, sql: &str) {
                     .collect();
                 println!("{}", vals.join(" | "));
             }
-            println!("({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+            println!(
+                "({} row{})",
+                rows.len(),
+                if rows.len() == 1 { "" } else { "s" }
+            );
         }
 
         Ok(QueryResult::Aggregate { columns, rows }) => {
@@ -768,7 +891,11 @@ fn execute_sql_query(engine: &Engine, sql: &str) {
                     .collect();
                 println!("{}", vals.join(" | "));
             }
-            println!("({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+            println!(
+                "({} row{})",
+                rows.len(),
+                if rows.len() == 1 { "" } else { "s" }
+            );
         }
 
         Ok(QueryResult::Scalar(value)) => {
