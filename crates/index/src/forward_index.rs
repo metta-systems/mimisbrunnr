@@ -49,10 +49,7 @@ impl ForwardIndex {
 
     /// Get all assertions for an object.
     pub fn get(&self, oid: ObjectId) -> &[ForwardEntry] {
-        self.entries
-            .get(&oid)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+        self.entries.get(&oid).map(|v| v.as_slice()).unwrap_or(&[])
     }
 
     /// Get only the tag IDs for an object (both direct and materialized).

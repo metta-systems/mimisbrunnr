@@ -70,7 +70,11 @@ pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024;
 
 impl WalEntry {
     pub fn new(lsn: u64, op_kind: WalOpKind, payload: Vec<u8>) -> Self {
-        Self { lsn, op_kind, payload }
+        Self {
+            lsn,
+            op_kind,
+            payload,
+        }
     }
 
     /// Total on-disk size of this entry.
@@ -102,7 +106,10 @@ impl WalEntry {
 
         let total = ENTRY_HEADER_SIZE + payload_len + ENTRY_TRAILER_SIZE;
         if buf.len() < total {
-            return Err(format!("buffer too small: need {total}, have {}", buf.len()));
+            return Err(format!(
+                "buffer too small: need {total}, have {}",
+                buf.len()
+            ));
         }
 
         let payload = buf[ENTRY_HEADER_SIZE..ENTRY_HEADER_SIZE + payload_len].to_vec();
@@ -111,10 +118,19 @@ impl WalEntry {
         let computed_crc = crc32fast::hash(&buf[..data_end]);
 
         if stored_crc != computed_crc {
-            return Err(format!("CRC mismatch: stored={stored_crc:#x}, computed={computed_crc:#x}"));
+            return Err(format!(
+                "CRC mismatch: stored={stored_crc:#x}, computed={computed_crc:#x}"
+            ));
         }
 
-        Ok((Self { lsn, op_kind, payload }, total))
+        Ok((
+            Self {
+                lsn,
+                op_kind,
+                payload,
+            },
+            total,
+        ))
     }
 }
 

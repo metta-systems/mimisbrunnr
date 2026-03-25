@@ -36,7 +36,11 @@ impl Encryptor {
     ///
     /// For length-preserving modes (HCTR2, XTS), output is same size as input.
     /// For AEAD modes (GCM, ChaCha20), output includes authentication tag.
-    pub fn encrypt(data: &[u8], key: &[u8; 32], mode: EncryptionMode) -> Result<Vec<u8>, TransformError> {
+    pub fn encrypt(
+        data: &[u8],
+        key: &[u8; 32],
+        mode: EncryptionMode,
+    ) -> Result<Vec<u8>, TransformError> {
         match mode {
             EncryptionMode::None => Ok(data.to_vec()),
             EncryptionMode::Hctr2 { object_id } => {
@@ -66,19 +70,23 @@ impl Encryptor {
     }
 
     /// Decrypt data.
-    pub fn decrypt(data: &[u8], key: &[u8; 32], mode: EncryptionMode) -> Result<Vec<u8>, TransformError> {
+    pub fn decrypt(
+        data: &[u8],
+        key: &[u8; 32],
+        mode: EncryptionMode,
+    ) -> Result<Vec<u8>, TransformError> {
         match mode {
             EncryptionMode::None => Ok(data.to_vec()),
             EncryptionMode::Hctr2 { object_id } => {
                 // XOR is its own inverse
                 Ok(xor_cipher(data, key, object_id))
             }
-            EncryptionMode::Xts => {
-                Ok(xor_cipher(data, key, 0))
-            }
+            EncryptionMode::Xts => Ok(xor_cipher(data, key, 0)),
             EncryptionMode::AesGcm { nonce } => {
                 if data.len() < 16 {
-                    return Err(TransformError::Decryption("data too short for auth tag".into()));
+                    return Err(TransformError::Decryption(
+                        "data too short for auth tag".into(),
+                    ));
                 }
                 let (ciphertext, tag) = data.split_at(data.len() - 16);
                 let plaintext = xor_cipher(ciphertext, key, nonce);
@@ -90,7 +98,9 @@ impl Encryptor {
             }
             EncryptionMode::ChaCha20Poly1305 => {
                 if data.len() < 16 {
-                    return Err(TransformError::Decryption("data too short for auth tag".into()));
+                    return Err(TransformError::Decryption(
+                        "data too short for auth tag".into(),
+                    ));
                 }
                 let (ciphertext, tag) = data.split_at(data.len() - 16);
                 let plaintext = xor_cipher(ciphertext, key, 0x5050);
@@ -105,12 +115,19 @@ impl Encryptor {
 
     /// Check if a mode is length-preserving (no authentication tag).
     pub fn is_length_preserving(mode: EncryptionMode) -> bool {
-        matches!(mode, EncryptionMode::None | EncryptionMode::Hctr2 { .. } | EncryptionMode::Xts)
+        matches!(
+            mode,
+            EncryptionMode::None | EncryptionMode::Hctr2 { .. } | EncryptionMode::Xts
+        )
     }
 
     /// Overhead in bytes for AEAD modes.
     pub fn overhead(mode: EncryptionMode) -> usize {
-        if Self::is_length_preserving(mode) { 0 } else { 16 }
+        if Self::is_length_preserving(mode) {
+            0
+        } else {
+            16
+        }
     }
 }
 
@@ -129,7 +146,10 @@ fn compute_fake_tag(plaintext: &[u8], key: &[u8; 32], nonce: u64) -> [u8; 16] {
     // Simple hash-like construction for the fake tag
     let mut acc = nonce;
     for (i, &b) in plaintext.iter().enumerate() {
-        acc = acc.wrapping_mul(31).wrapping_add(b as u64).wrapping_add(key[i % 32] as u64);
+        acc = acc
+            .wrapping_mul(31)
+            .wrapping_add(b as u64)
+            .wrapping_add(key[i % 32] as u64);
     }
     tag[..8].copy_from_slice(&acc.to_le_bytes());
     tag[8..16].copy_from_slice(&acc.wrapping_mul(0x517cc1b727220a95).to_le_bytes());
@@ -141,10 +161,9 @@ mod tests {
     use super::*;
 
     const TEST_KEY: [u8; 32] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-        0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-        0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20,
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
+        0x1F, 0x20,
     ];
 
     #[test]
@@ -172,8 +191,10 @@ mod tests {
     #[test]
     fn hctr2_different_objects_differ() {
         let data = b"same content";
-        let enc1 = Encryptor::encrypt(data, &TEST_KEY, EncryptionMode::Hctr2 { object_id: 1 }).unwrap();
-        let enc2 = Encryptor::encrypt(data, &TEST_KEY, EncryptionMode::Hctr2 { object_id: 2 }).unwrap();
+        let enc1 =
+            Encryptor::encrypt(data, &TEST_KEY, EncryptionMode::Hctr2 { object_id: 1 }).unwrap();
+        let enc2 =
+            Encryptor::encrypt(data, &TEST_KEY, EncryptionMode::Hctr2 { object_id: 2 }).unwrap();
         assert_ne!(enc1, enc2); // Different tweaks → different ciphertext
     }
 
@@ -225,16 +246,25 @@ mod tests {
     #[test]
     fn length_preserving_check() {
         assert!(Encryptor::is_length_preserving(EncryptionMode::None));
-        assert!(Encryptor::is_length_preserving(EncryptionMode::Hctr2 { object_id: 0 }));
+        assert!(Encryptor::is_length_preserving(EncryptionMode::Hctr2 {
+            object_id: 0
+        }));
         assert!(Encryptor::is_length_preserving(EncryptionMode::Xts));
-        assert!(!Encryptor::is_length_preserving(EncryptionMode::AesGcm { nonce: 0 }));
-        assert!(!Encryptor::is_length_preserving(EncryptionMode::ChaCha20Poly1305));
+        assert!(!Encryptor::is_length_preserving(EncryptionMode::AesGcm {
+            nonce: 0
+        }));
+        assert!(!Encryptor::is_length_preserving(
+            EncryptionMode::ChaCha20Poly1305
+        ));
     }
 
     #[test]
     fn overhead_bytes() {
         assert_eq!(Encryptor::overhead(EncryptionMode::None), 0);
-        assert_eq!(Encryptor::overhead(EncryptionMode::Hctr2 { object_id: 0 }), 0);
+        assert_eq!(
+            Encryptor::overhead(EncryptionMode::Hctr2 { object_id: 0 }),
+            0
+        );
         assert_eq!(Encryptor::overhead(EncryptionMode::AesGcm { nonce: 0 }), 16);
     }
 

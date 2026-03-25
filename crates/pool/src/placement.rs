@@ -1,5 +1,4 @@
-use mimisbrunnr_transform::CompressionAlgo;
-use mimisbrunnr_types::Query;
+use {mimisbrunnr_transform::CompressionAlgo, mimisbrunnr_types::Query};
 
 use crate::StorageTier;
 
@@ -11,10 +10,7 @@ use crate::StorageTier;
 #[derive(Debug, Clone)]
 pub enum PlacementRule {
     /// Force objects matching `query` onto a specific tier.
-    Pin {
-        query: Query,
-        tier: StorageTier,
-    },
+    Pin { query: Query, tier: StorageTier },
     /// Prefer placing matching objects on a tier (soft constraint).
     Prefer {
         query: Query,
@@ -28,9 +24,7 @@ pub enum PlacementRule {
         across_disks: bool,
     },
     /// Co-locate matching objects on the same disk for locality.
-    Colocate {
-        query: Query,
-    },
+    Colocate { query: Query },
     /// Automatic tiering based on access age.
     AutoTier {
         hot_threshold_days: u32,
@@ -41,10 +35,7 @@ pub enum PlacementRule {
     ///
     /// Ontology-driven: "video" → skip compression, "source" → zstd:3, etc.
     /// First matching Compress rule wins; unmatched objects use the pool default.
-    Compress {
-        query: Query,
-        algo: CompressionAlgo,
-    },
+    Compress { query: Query, algo: CompressionAlgo },
 }
 
 impl PlacementRule {
@@ -79,8 +70,7 @@ impl PlacementRule {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use mimisbrunnr_types::TagId;
+    use {super::*, mimisbrunnr_types::TagId};
 
     #[test]
     fn pin_rule() {

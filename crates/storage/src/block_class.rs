@@ -175,12 +175,12 @@ mod tests {
     fn nibble_packing() {
         let mut map = BlockClassMap::new(4, 0);
         // Even block in low nibble, odd block in high nibble
-        map.set(0, BlockClass::Index);   // byte 0 low
-        map.set(1, BlockClass::Blob);    // byte 0 high
+        map.set(0, BlockClass::Index); // byte 0 low
+        map.set(1, BlockClass::Blob); // byte 0 high
         assert_eq!(map.data[0], 0x31); // Blob=3 in high, Index=1 in low
 
         map.set(2, BlockClass::Metadata); // byte 1 low
-        map.set(3, BlockClass::Index);    // byte 1 high
+        map.set(3, BlockClass::Index); // byte 1 high
         assert_eq!(map.data[1], 0x12); // Index=1 in high, Metadata=2 in low
     }
 
@@ -244,7 +244,12 @@ mod tests {
 
     #[test]
     fn from_nibble_roundtrip() {
-        for class in [BlockClass::Free, BlockClass::Index, BlockClass::Metadata, BlockClass::Blob] {
+        for class in [
+            BlockClass::Free,
+            BlockClass::Index,
+            BlockClass::Metadata,
+            BlockClass::Blob,
+        ] {
             assert_eq!(BlockClass::from_nibble(class.as_nibble()), class);
         }
     }

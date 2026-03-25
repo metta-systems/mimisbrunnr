@@ -1,6 +1,4 @@
-use mimisbrunnr_index::TagIndex;
-use mimisbrunnr_types::TagId;
-use roaring::RoaringBitmap;
+use {mimisbrunnr_index::TagIndex, mimisbrunnr_types::TagId, roaring::RoaringBitmap};
 
 /// Faceted exploration: "Given my current result set, what tags exist on
 /// the matching objects?"
@@ -50,11 +48,7 @@ impl<'a> FacetedExplorer<'a> {
 
     /// Compute facets only for the given candidate tags (more efficient when
     /// you already know which tags to check).
-    pub fn facets_for(
-        &self,
-        result_set: &RoaringBitmap,
-        candidates: &[TagId],
-    ) -> Vec<Facet> {
+    pub fn facets_for(&self, result_set: &RoaringBitmap, candidates: &[TagId]) -> Vec<Facet> {
         if result_set.is_empty() {
             return Vec::new();
         }
@@ -89,7 +83,9 @@ mod tests {
     fn basic_facets() {
         let mut idx = TagIndex::new();
         // electronic: 1,2,3,4,5
-        for i in 1..=5 { idx.tag_object(tag(1), i); }
+        for i in 1..=5 {
+            idx.tag_object(tag(1), i);
+        }
         // portable: 2,3
         idx.tag_object(tag(2), 2);
         idx.tag_object(tag(2), 3);
@@ -124,7 +120,9 @@ mod tests {
     fn facets_sorted_by_count() {
         let mut idx = TagIndex::new();
         // tag1: 1,2,3 (count=3 in result)
-        for i in 1..=3 { idx.tag_object(tag(1), i); }
+        for i in 1..=3 {
+            idx.tag_object(tag(1), i);
+        }
         // tag2: 1 (count=1 in result)
         idx.tag_object(tag(2), 1);
         // tag3: 1,2 (count=2 in result)
@@ -133,7 +131,9 @@ mod tests {
 
         let explorer = FacetedExplorer::new(&idx);
         let mut result = RoaringBitmap::new();
-        for i in 1..=3 { result.insert(i); }
+        for i in 1..=3 {
+            result.insert(i);
+        }
 
         let facets = explorer.facets(&result);
         assert_eq!(facets[0].count, 3);
@@ -152,13 +152,19 @@ mod tests {
     #[test]
     fn facets_for_candidates() {
         let mut idx = TagIndex::new();
-        for i in 1..=5 { idx.tag_object(tag(1), i); }
-        for i in 1..=3 { idx.tag_object(tag(2), i); }
+        for i in 1..=5 {
+            idx.tag_object(tag(1), i);
+        }
+        for i in 1..=3 {
+            idx.tag_object(tag(2), i);
+        }
         idx.tag_object(tag(3), 1);
 
         let explorer = FacetedExplorer::new(&idx);
         let mut result = RoaringBitmap::new();
-        for i in 1..=5 { result.insert(i); }
+        for i in 1..=5 {
+            result.insert(i);
+        }
 
         // Only ask about tag(2) and tag(3)
         let facets = explorer.facets_for(&result, &[tag(2), tag(3)]);

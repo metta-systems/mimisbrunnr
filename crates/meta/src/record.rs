@@ -1,5 +1,7 @@
-use bytemuck::{Pod, Zeroable};
-use mimisbrunnr_types::{CompressionState, EncryptionState, ObjectState};
+use {
+    bytemuck::{Pod, Zeroable},
+    mimisbrunnr_types::{CompressionState, EncryptionState, ObjectState},
+};
 
 /// Fixed-size on-disk object record (128 bytes, cache-line aligned).
 ///

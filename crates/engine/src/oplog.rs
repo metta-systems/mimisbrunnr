@@ -1,4 +1,4 @@
-use mimisbrunnr_types::{ObjectId, TagId, HybridTimestamp};
+use mimisbrunnr_types::{HybridTimestamp, ObjectId, TagId};
 
 /// The kind of operation recorded in the oplog (for subscriptions and sync).
 #[derive(Debug, Clone, PartialEq)]
@@ -27,7 +27,9 @@ pub struct OpLog {
 
 impl OpLog {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     pub fn push(&mut self, entry: OpLogEntry) {
@@ -76,12 +78,17 @@ mod tests {
         log.push(OpLogEntry {
             timestamp: ts(100),
             lsn: 1,
-            op: OpKind::CreateObject { oid: ObjectId::new(0, 1) },
+            op: OpKind::CreateObject {
+                oid: ObjectId::new(0, 1),
+            },
         });
         log.push(OpLogEntry {
             timestamp: ts(200),
             lsn: 2,
-            op: OpKind::AddTag { oid: ObjectId::new(0, 1), tag: TagId::new(10) },
+            op: OpKind::AddTag {
+                oid: ObjectId::new(0, 1),
+                tag: TagId::new(10),
+            },
         });
 
         assert_eq!(log.len(), 2);
@@ -95,7 +102,9 @@ mod tests {
             log.push(OpLogEntry {
                 timestamp: ts(i * 100),
                 lsn: i,
-                op: OpKind::CreateObject { oid: ObjectId::new(0, i) },
+                op: OpKind::CreateObject {
+                    oid: ObjectId::new(0, i),
+                },
             });
         }
 
@@ -110,7 +119,9 @@ mod tests {
         log.push(OpLogEntry {
             timestamp: ts(100),
             lsn: 1,
-            op: OpKind::CreateObject { oid: ObjectId::new(0, 1) },
+            op: OpKind::CreateObject {
+                oid: ObjectId::new(0, 1),
+            },
         });
 
         let result = log.since_lsn(100);

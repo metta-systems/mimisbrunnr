@@ -410,10 +410,7 @@ impl<'a> SqlExecutor<'a> {
             let oid = ObjectId::new(0, obj_local as u64);
             if let Some(value) = self.get_attr(oid, group_tag) {
                 let key = value_to_string(&value);
-                groups
-                    .entry(key)
-                    .or_default()
-                    .insert(obj_local);
+                groups.entry(key).or_default().insert(obj_local);
             }
         }
 

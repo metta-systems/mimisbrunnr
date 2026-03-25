@@ -1,5 +1,7 @@
-use mimisbrunnr_ontology::ImplicationDag;
-use mimisbrunnr_types::{Query, CmpOp, Value, TagId};
+use {
+    mimisbrunnr_ontology::ImplicationDag,
+    mimisbrunnr_types::{CmpOp, Query, TagId, Value},
+};
 
 use crate::QueryError;
 
@@ -236,21 +238,42 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
 
         // Operators
         match bytes[i] {
-            b'(' => { tokens.push(Token::LParen); i += 1; }
-            b')' => { tokens.push(Token::RParen); i += 1; }
-            b':' => { tokens.push(Token::Colon); i += 1; }
-            b'=' => { tokens.push(Token::Eq); i += 1; }
+            b'(' => {
+                tokens.push(Token::LParen);
+                i += 1;
+            }
+            b')' => {
+                tokens.push(Token::RParen);
+                i += 1;
+            }
+            b':' => {
+                tokens.push(Token::Colon);
+                i += 1;
+            }
+            b'=' => {
+                tokens.push(Token::Eq);
+                i += 1;
+            }
             b'!' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
-                tokens.push(Token::Ne); i += 2;
+                tokens.push(Token::Ne);
+                i += 2;
             }
             b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
-                tokens.push(Token::Le); i += 2;
+                tokens.push(Token::Le);
+                i += 2;
             }
-            b'<' => { tokens.push(Token::Lt); i += 1; }
+            b'<' => {
+                tokens.push(Token::Lt);
+                i += 1;
+            }
             b'>' if i + 1 < bytes.len() && bytes[i + 1] == b'=' => {
-                tokens.push(Token::Ge); i += 2;
+                tokens.push(Token::Ge);
+                i += 2;
             }
-            b'>' => { tokens.push(Token::Gt); i += 1; }
+            b'>' => {
+                tokens.push(Token::Gt);
+                i += 1;
+            }
             b'"' => {
                 // Quoted string
                 i += 1;
@@ -268,7 +291,11 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
                 tokens.push(Token::Str(s));
                 i += 1; // skip closing quote
             }
-            _ if bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-' || bytes[i] == b'.' => {
+            _ if bytes[i].is_ascii_alphanumeric()
+                || bytes[i] == b'_'
+                || bytes[i] == b'-'
+                || bytes[i] == b'.' =>
+            {
                 let start = i;
                 while i < bytes.len()
                     && (bytes[i].is_ascii_alphanumeric()
@@ -300,8 +327,10 @@ fn tokenize(input: &str) -> Result<Vec<Token>, QueryError> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use mimisbrunnr_ontology::{TagDefinition, TagSemantics};
+    use {
+        super::*,
+        mimisbrunnr_ontology::{TagDefinition, TagSemantics},
+    };
 
     fn tag(id: u32) -> TagId {
         TagId::new(id)
@@ -309,22 +338,34 @@ mod tests {
 
     fn setup_dag() -> ImplicationDag {
         let mut dag = ImplicationDag::new();
-        dag.register_tag(TagDefinition::new(tag(1), "electronic", TagSemantics::Label))
-            .unwrap();
+        dag.register_tag(TagDefinition::new(
+            tag(1),
+            "electronic",
+            TagSemantics::Label,
+        ))
+        .unwrap();
         dag.register_tag(TagDefinition::new(tag(2), "portable", TagSemantics::Label))
             .unwrap();
-        dag.register_tag(TagDefinition::new(tag(3), "discontinued", TagSemantics::Label))
-            .unwrap();
+        dag.register_tag(TagDefinition::new(
+            tag(3),
+            "discontinued",
+            TagSemantics::Label,
+        ))
+        .unwrap();
         dag.register_tag(TagDefinition::new(
             tag(10),
             "year",
-            TagSemantics::Attribute { value_type: mimisbrunnr_ontology::ValueType::Int },
+            TagSemantics::Attribute {
+                value_type: mimisbrunnr_ontology::ValueType::Int,
+            },
         ))
         .unwrap();
         dag.register_tag(TagDefinition::new(
             tag(11),
             "project",
-            TagSemantics::Attribute { value_type: mimisbrunnr_ontology::ValueType::Text },
+            TagSemantics::Attribute {
+                value_type: mimisbrunnr_ontology::ValueType::Text,
+            },
         ))
         .unwrap();
         dag.register_tag(TagDefinition::new(tag(12), "source", TagSemantics::Label))
@@ -332,7 +373,9 @@ mod tests {
         dag.register_tag(TagDefinition::new(
             tag(13),
             "lang",
-            TagSemantics::Attribute { value_type: mimisbrunnr_ontology::ValueType::Text },
+            TagSemantics::Attribute {
+                value_type: mimisbrunnr_ontology::ValueType::Text,
+            },
         ))
         .unwrap();
         dag
@@ -494,7 +537,9 @@ mod tests {
     fn parse_case_insensitive_keywords() {
         let dag = setup_dag();
         let parser = QueryParser::new(&dag);
-        let q = parser.parse("electronic and portable or discontinued").unwrap();
+        let q = parser
+            .parse("electronic and portable or discontinued")
+            .unwrap();
         // "electronic AND portable" has higher precedence than OR
         assert!(matches!(q, Query::Or(_)));
     }

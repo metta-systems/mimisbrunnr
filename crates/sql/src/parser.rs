@@ -1,9 +1,8 @@
-use crate::ast::*;
-use crate::error::SqlError;
-use mimisbrunnr_types::Value;
-use sqlparser::ast as sp;
-use sqlparser::dialect::GenericDialect;
-use sqlparser::parser::Parser;
+use {
+    crate::{ast::*, error::SqlError},
+    mimisbrunnr_types::Value,
+    sqlparser::{ast as sp, dialect::GenericDialect, parser::Parser},
+};
 
 /// Parse a SQL string in Mímisbrunnr's dialect into our internal AST.
 pub fn parse_sql(input: &str) -> Result<Statement, SqlError> {
@@ -239,7 +238,9 @@ fn convert_statement(stmt: &sp::Statement) -> Result<Statement, SqlError> {
 
 fn convert_query(query: &sp::Query) -> Result<Statement, SqlError> {
     let sp::SetExpr::Select(select) = query.body.as_ref() else {
-        return Err(SqlError::Unsupported("only SELECT queries supported".into()));
+        return Err(SqlError::Unsupported(
+            "only SELECT queries supported".into(),
+        ));
     };
 
     let mut context = None;
@@ -404,9 +405,7 @@ fn extract_single_arg(args: &sp::FunctionArguments) -> Result<String, SqlError> 
     }
 }
 
-fn convert_selection(
-    selection: &Option<sp::Expr>,
-) -> Result<Option<Predicate>, SqlError> {
+fn convert_selection(selection: &Option<sp::Expr>) -> Result<Option<Predicate>, SqlError> {
     match selection {
         Some(expr) => convert_expr(expr).map(Some),
         None => Ok(None),
@@ -446,10 +445,7 @@ fn convert_expr(expr: &sp::Expr) -> Result<Predicate, SqlError> {
             negated,
         } => {
             let col = expr.to_string();
-            let values: Vec<Value> = list
-                .iter()
-                .map(expr_to_value)
-                .collect::<Result<_, _>>()?;
+            let values: Vec<Value> = list.iter().map(expr_to_value).collect::<Result<_, _>>()?;
             let pred = Predicate::In {
                 column: col,
                 values,
@@ -573,19 +569,17 @@ fn extract_single_string_arg(args: &sp::FunctionArguments) -> Result<String, Sql
 
 fn extract_string_args(args: &sp::FunctionArguments) -> Result<Vec<String>, SqlError> {
     match args {
-        sp::FunctionArguments::List(arg_list) => {
-            arg_list
-                .args
-                .iter()
-                .map(|arg| {
-                    if let sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(expr)) = arg {
-                        extract_string_value(expr)
-                    } else {
-                        Err(SqlError::Parse("expected string argument".into()))
-                    }
-                })
-                .collect()
-        }
+        sp::FunctionArguments::List(arg_list) => arg_list
+            .args
+            .iter()
+            .map(|arg| {
+                if let sp::FunctionArg::Unnamed(sp::FunctionArgExpr::Expr(expr)) = arg {
+                    extract_string_value(expr)
+                } else {
+                    Err(SqlError::Parse("expected string argument".into()))
+                }
+            })
+            .collect(),
         _ => Err(SqlError::Parse("expected function arguments".into())),
     }
 }
@@ -597,7 +591,10 @@ fn extract_string_value(expr: &sp::Expr) -> Result<String, SqlError> {
             sp::Value::DoubleQuotedString(s) => Ok(s.clone()),
             _ => Err(SqlError::Parse(format!("expected string, got: {}", val))),
         },
-        _ => Err(SqlError::Parse(format!("expected string literal, got: {}", expr))),
+        _ => Err(SqlError::Parse(format!(
+            "expected string literal, got: {}",
+            expr
+        ))),
     }
 }
 
@@ -626,7 +623,9 @@ fn expr_to_value(expr: &sp::Expr) -> Result<Value, SqlError> {
             match v {
                 Value::Int(i) => Ok(Value::Int(-i)),
                 Value::Float(f) => Ok(Value::Float(-f)),
-                _ => Err(SqlError::TypeError("cannot negate non-numeric value".into())),
+                _ => Err(SqlError::TypeError(
+                    "cannot negate non-numeric value".into(),
+                )),
             }
         }
         _ => Err(SqlError::Parse(format!(
@@ -666,7 +665,11 @@ fn flatten_or(pred: Predicate, out: &mut Vec<Predicate>) {
 }
 
 /// Extract IN CONTEXT / IN COLLECTION modifiers from the predicate tree.
-fn extract_modifiers(pred: &mut Predicate, context: &mut Option<String>, collection: &mut Option<String>) {
+fn extract_modifiers(
+    pred: &mut Predicate,
+    context: &mut Option<String>,
+    collection: &mut Option<String>,
+) {
     match pred {
         Predicate::Compare { column, value, .. } if column == "__context__" => {
             if let Value::Text(s) = value {

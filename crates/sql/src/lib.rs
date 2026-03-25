@@ -26,17 +26,21 @@ mod parser;
 mod planner;
 mod types;
 
-pub use ast::{
-    AggregateFunc, CompareOp, OrderBy, Predicate, Projection, SelectQuery, SortDir, Statement,
+pub use {
+    ast::{
+        AggregateFunc, CompareOp, OrderBy, Predicate, Projection, SelectQuery, SortDir, Statement,
+    },
+    error::SqlError,
+    executor::SqlExecutor,
+    parser::parse_sql,
+    planner::{FilterPredicate, PhysicalOp, plan},
+    types::{GroupRow, QueryResult, Row},
 };
-pub use error::SqlError;
-pub use executor::SqlExecutor;
-pub use parser::parse_sql;
-pub use planner::{plan, FilterPredicate, PhysicalOp};
-pub use types::{GroupRow, QueryResult, Row};
 
-use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
-use mimisbrunnr_ontology::ImplicationDag;
+use {
+    mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex},
+    mimisbrunnr_ontology::ImplicationDag,
+};
 
 /// Parse and execute a SQL query against Mímisbrunnr's index layer.
 ///
@@ -57,10 +61,12 @@ pub fn execute(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use mimisbrunnr_index::TagIndex;
-    use mimisbrunnr_ontology::{TagDefinition, TagSemantics, ValueType};
-    use mimisbrunnr_types::{Assertion, ObjectId, TagId, TagOrigin, Value};
+    use {
+        super::*,
+        mimisbrunnr_index::TagIndex,
+        mimisbrunnr_ontology::{TagDefinition, TagSemantics, ValueType},
+        mimisbrunnr_types::{Assertion, ObjectId, TagId, TagOrigin, Value},
+    };
 
     fn tag(id: u32) -> TagId {
         TagId::new(id)
@@ -151,7 +157,11 @@ mod tests {
 
         // Object 3: electronic
         db.add_tag(3, electronic);
-        db.set_attr(3, name, Value::Text("Music Has the Right to Children".into()));
+        db.set_attr(
+            3,
+            name,
+            Value::Text("Music Has the Right to Children".into()),
+        );
         db.set_attr(3, artist, Value::Text("Boards of Canada".into()));
         db.set_attr(3, year, Value::Int(1998));
         db.set_attr(3, bpm, Value::Int(100));
@@ -169,7 +179,9 @@ mod tests {
     #[test]
     fn end_to_end_select_star() {
         let db = music_db();
-        let result = db.query("SELECT * FROM objects WHERE HAS TAG 'electronic'").unwrap();
+        let result = db
+            .query("SELECT * FROM objects WHERE HAS TAG 'electronic'")
+            .unwrap();
         assert_eq!(result.row_count(), 3);
     }
 

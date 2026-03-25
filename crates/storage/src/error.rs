@@ -16,7 +16,11 @@ pub enum StorageError {
     DeviceTooSmall { need: u64, have: u64 },
 
     #[error("offset {offset} + length {length} exceeds device capacity {capacity}")]
-    OutOfBounds { offset: u64, length: u64, capacity: u64 },
+    OutOfBounds {
+        offset: u64,
+        length: u64,
+        capacity: u64,
+    },
 
     #[error("no free extents of size {requested} blocks")]
     NoFreeSpace { requested: u64 },

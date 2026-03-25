@@ -2,10 +2,12 @@ use std::collections::HashMap;
 
 use mimisbrunnr_types::DiskId;
 
-use crate::disk::{DiskDescriptor, DiskState};
-use crate::error::PoolError;
-use crate::placement::PlacementRule;
-use crate::tier::StorageTier;
+use crate::{
+    disk::{DiskDescriptor, DiskState},
+    error::PoolError,
+    placement::PlacementRule,
+    tier::StorageTier,
+};
 
 /// Manages a pool of disks with semantic placement and tiering.
 pub struct PoolManager {
@@ -48,14 +50,20 @@ impl PoolManager {
         if self.online_count() <= 1 {
             return Err(PoolError::LastDisk);
         }
-        let disk = self.disks.get_mut(&disk_id).ok_or(PoolError::DiskNotFound(disk_id))?;
+        let disk = self
+            .disks
+            .get_mut(&disk_id)
+            .ok_or(PoolError::DiskNotFound(disk_id))?;
         disk.state = DiskState::Draining;
         Ok(())
     }
 
     /// Complete removal of a drained disk.
     pub fn remove_disk(&mut self, disk_id: DiskId) -> Result<DiskDescriptor, PoolError> {
-        let disk = self.disks.get(&disk_id).ok_or(PoolError::DiskNotFound(disk_id))?;
+        let disk = self
+            .disks
+            .get(&disk_id)
+            .ok_or(PoolError::DiskNotFound(disk_id))?;
         if disk.state != DiskState::Draining && disk.state != DiskState::Removed {
             return Err(PoolError::DiskNotFound(disk_id)); // Must drain first
         }
@@ -64,7 +72,10 @@ impl PoolManager {
 
     /// Mark a disk as faulted.
     pub fn mark_faulted(&mut self, disk_id: DiskId) -> Result<(), PoolError> {
-        let disk = self.disks.get_mut(&disk_id).ok_or(PoolError::DiskNotFound(disk_id))?;
+        let disk = self
+            .disks
+            .get_mut(&disk_id)
+            .ok_or(PoolError::DiskNotFound(disk_id))?;
         disk.state = DiskState::Faulted;
         Ok(())
     }
@@ -135,7 +146,10 @@ impl PoolManager {
 
     /// Record that bytes were written to a disk.
     pub fn record_write(&mut self, disk_id: DiskId, bytes: u64) -> Result<(), PoolError> {
-        let disk = self.disks.get_mut(&disk_id).ok_or(PoolError::DiskNotFound(disk_id))?;
+        let disk = self
+            .disks
+            .get_mut(&disk_id)
+            .ok_or(PoolError::DiskNotFound(disk_id))?;
         if !disk.is_writable() {
             return Err(PoolError::DiskDraining(disk_id));
         }
@@ -145,7 +159,10 @@ impl PoolManager {
 
     /// Record that bytes were freed on a disk.
     pub fn record_free(&mut self, disk_id: DiskId, bytes: u64) -> Result<(), PoolError> {
-        let disk = self.disks.get_mut(&disk_id).ok_or(PoolError::DiskNotFound(disk_id))?;
+        let disk = self
+            .disks
+            .get_mut(&disk_id)
+            .ok_or(PoolError::DiskNotFound(disk_id))?;
         disk.used = disk.used.saturating_sub(bytes);
         Ok(())
     }
@@ -172,7 +189,10 @@ impl PoolManager {
 
     /// Number of online (writable) disks.
     pub fn online_count(&self) -> usize {
-        self.disks.values().filter(|d| d.state == DiskState::Online).count()
+        self.disks
+            .values()
+            .filter(|d| d.state == DiskState::Online)
+            .count()
     }
 
     /// Total capacity across all online disks.
@@ -195,13 +215,19 @@ impl PoolManager {
 
     /// Disks in a specific tier.
     pub fn disks_in_tier(&self, tier: StorageTier) -> Vec<&DiskDescriptor> {
-        self.disks.values().filter(|d| d.tier == tier && d.state == DiskState::Online).collect()
+        self.disks
+            .values()
+            .filter(|d| d.tier == tier && d.state == DiskState::Online)
+            .collect()
     }
 
     /// Plan objects that need migration from a draining disk.
     /// Returns a list of (object_extent_offset, suggested_destination_disk).
     pub fn plan_drain(&self, draining_disk: DiskId) -> Result<Vec<DiskId>, PoolError> {
-        let disk = self.disks.get(&draining_disk).ok_or(PoolError::DiskNotFound(draining_disk))?;
+        let disk = self
+            .disks
+            .get(&draining_disk)
+            .ok_or(PoolError::DiskNotFound(draining_disk))?;
         if disk.state != DiskState::Draining {
             return Err(PoolError::DiskNotFound(draining_disk));
         }
@@ -223,7 +249,12 @@ impl PoolManager {
 
     fn nearest_writable_tier(&self, preferred: StorageTier) -> Result<DiskId, PoolError> {
         // Try tiers in order of distance from preferred
-        let all_tiers = [StorageTier::Hot, StorageTier::Warm, StorageTier::Cold, StorageTier::Glacier];
+        let all_tiers = [
+            StorageTier::Hot,
+            StorageTier::Warm,
+            StorageTier::Cold,
+            StorageTier::Glacier,
+        ];
         let pref_idx = all_tiers.iter().position(|&t| t == preferred).unwrap_or(1);
 
         // Expand outward from preferred
@@ -256,9 +287,7 @@ impl Default for PoolManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::disk::MediaType;
-    use mimisbrunnr_types::Query;
+    use {super::*, crate::disk::MediaType, mimisbrunnr_types::Query};
 
     fn nvme(id: DiskId, cap: u64) -> DiskDescriptor {
         DiskDescriptor::new(id, cap, MediaType::NVMe)
@@ -452,7 +481,10 @@ mod tests {
         pool.add_disk(ssd(1, 1000)).unwrap();
 
         pool.begin_drain(0).unwrap();
-        assert!(matches!(pool.record_write(0, 100), Err(PoolError::DiskDraining(_))));
+        assert!(matches!(
+            pool.record_write(0, 100),
+            Err(PoolError::DiskDraining(_))
+        ));
     }
 
     #[test]
@@ -464,9 +496,12 @@ mod tests {
     #[test]
     fn multi_tier_pool() {
         let mut pool = PoolManager::new();
-        pool.add_disk(nvme(0, 100_000).with_perf(3000, 500_000, 10)).unwrap();
-        pool.add_disk(ssd(1, 500_000).with_perf(550, 100_000, 50)).unwrap();
-        pool.add_disk(hdd(2, 2_000_000).with_perf(150, 200, 5000)).unwrap();
+        pool.add_disk(nvme(0, 100_000).with_perf(3000, 500_000, 10))
+            .unwrap();
+        pool.add_disk(ssd(1, 500_000).with_perf(550, 100_000, 50))
+            .unwrap();
+        pool.add_disk(hdd(2, 2_000_000).with_perf(150, 200, 5000))
+            .unwrap();
 
         // Hot data goes to NVMe
         assert_eq!(pool.select_disk_for_tier(StorageTier::Hot).unwrap(), 0);

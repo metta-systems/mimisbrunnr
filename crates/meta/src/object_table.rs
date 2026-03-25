@@ -221,7 +221,10 @@ mod tests {
 
         // Modify a record
         table.get_mut(oid1).unwrap().content_hash = [0xAA; 32];
-        table.get_mut(oid2).unwrap().set_state(ObjectState::Tombstoned);
+        table
+            .get_mut(oid2)
+            .unwrap()
+            .set_state(ObjectState::Tombstoned);
 
         table.flush_all(&dev).unwrap();
 

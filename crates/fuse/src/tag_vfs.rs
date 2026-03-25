@@ -30,13 +30,17 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
-use mimisbrunnr_ontology::ImplicationDag;
-use mimisbrunnr_types::{Assertion, ObjectId, TagId};
-use roaring::RoaringBitmap;
+use {
+    mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex},
+    mimisbrunnr_ontology::ImplicationDag,
+    mimisbrunnr_types::{Assertion, ObjectId, TagId},
+    roaring::RoaringBitmap,
+};
 
-use crate::vfs::{VfsAttr, VfsFileType, VfsTree};
-use log::trace;
+use {
+    crate::vfs::{VfsAttr, VfsFileType, VfsTree},
+    log::trace,
+};
 
 // Fixed inode numbers for well-known entries.
 const INO_ROOT: u64 = 1;
@@ -237,9 +241,7 @@ impl TagVfs {
                 for obj_local in bitmap.iter() {
                     let file_name = self.object_display_name(obj_local, &bitmap);
                     if file_name == name {
-                        return Some(
-                            self.ensure_file(parent_tags.clone(), obj_local),
-                        );
+                        return Some(self.ensure_file(parent_tags.clone(), obj_local));
                     }
                 }
 
@@ -329,9 +331,7 @@ impl TagVfs {
                             .bitmap(*tag_id)
                             .is_some_and(|bm| !bm.is_empty())
                     })
-                    .filter_map(|tag_id| {
-                        self.dag.get(tag_id).map(|def| (tag_id, def.name.clone()))
-                    })
+                    .filter_map(|tag_id| self.dag.get(tag_id).map(|def| (tag_id, def.name.clone())))
                     .collect();
 
                 for (tag_id, name) in tags_with_names {
@@ -398,8 +398,7 @@ impl TagVfs {
             }
 
             TagVfsEntry::CtxRoot => {
-                let ctx_names: Vec<String> =
-                    self.context_trees.keys().cloned().collect();
+                let ctx_names: Vec<String> = self.context_trees.keys().cloned().collect();
                 for name in ctx_names {
                     let ino = self.ensure_ctx_dir(name.clone());
                     result.push(DirEntry {
@@ -569,11 +568,7 @@ impl TagVfs {
             Some(t) => t,
             None => return RoaringBitmap::new(),
         };
-        let mut result = self
-            .tag_index
-            .bitmap(*first)
-            .cloned()
-            .unwrap_or_default();
+        let mut result = self.tag_index.bitmap(*first).cloned().unwrap_or_default();
         for tag_id in iter {
             if let Some(bm) = self.tag_index.bitmap(*tag_id) {
                 result &= bm;
@@ -663,11 +658,9 @@ impl TagVfs {
                             .copied()
                             .unwrap_or(INO_TAGS)
                     }
-                    Some(TagVfsEntry::TagFile { tags, .. }) => self
-                        .tag_dir_inos
-                        .get(tags)
-                        .copied()
-                        .unwrap_or(INO_TAGS),
+                    Some(TagVfsEntry::TagFile { tags, .. }) => {
+                        self.tag_dir_inos.get(tags).copied().unwrap_or(INO_TAGS)
+                    }
                     Some(TagVfsEntry::CtxDir(_)) => INO_CTX,
                     Some(TagVfsEntry::CtxNode { ctx, vfs_ino }) => {
                         if *vfs_ino == 1 {
@@ -733,10 +726,12 @@ fn file_attr(ino: u64, size: u64) -> VfsAttr {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use mimisbrunnr_index::TagIndex;
-    use mimisbrunnr_ontology::{TagDefinition, TagSemantics, ValueType};
-    use mimisbrunnr_types::TagOrigin;
+    use {
+        super::*,
+        mimisbrunnr_index::TagIndex,
+        mimisbrunnr_ontology::{TagDefinition, TagSemantics, ValueType},
+        mimisbrunnr_types::TagOrigin,
+    };
 
     fn tag(id: u32) -> TagId {
         TagId::new(id)
@@ -792,8 +787,14 @@ mod tests {
                 if let Some(name_tag) = self.dag.lookup("name") {
                     let val = mimisbrunnr_types::Value::Text(n.to_string());
                     self.kv_index.insert(name_tag, &val, obj_local);
-                    self.forward_index
-                        .add(oid, Assertion::Attr { key: name_tag, value: val }, TagOrigin::Direct);
+                    self.forward_index.add(
+                        oid,
+                        Assertion::Attr {
+                            key: name_tag,
+                            value: val,
+                        },
+                        TagOrigin::Direct,
+                    );
                 }
             }
         }
@@ -1087,7 +1088,10 @@ mod tests {
         let tree = VfsTree::from_projection(&proj);
         vfs.add_context("proj".into(), tree);
 
-        vfs.set_blob((oid.node() << 48) | oid.local(), b"file content here".to_vec());
+        vfs.set_blob(
+            (oid.node() << 48) | oid.local(),
+            b"file content here".to_vec(),
+        );
 
         let ctx_ino = vfs.lookup(INO_CTX, "proj").unwrap();
         let file_ino = vfs.lookup(ctx_ino, "readme.txt").unwrap();

@@ -1,8 +1,12 @@
 use mimisbrunnr_storage::BlockDevice;
 
-use crate::entry::{WalEntry, WalOpKind, ENTRY_OVERHEAD, MAX_PAYLOAD_SIZE};
-use crate::WalError;
-use log::trace;
+use {
+    crate::{
+        WalError,
+        entry::{ENTRY_OVERHEAD, MAX_PAYLOAD_SIZE, WalEntry, WalOpKind},
+    },
+    log::trace,
+};
 
 /// Write-Ahead Log: a circular buffer on a block device region.
 ///
@@ -47,7 +51,10 @@ impl WriteAheadLog {
         region_offset: u64,
         region_size: u64,
     ) -> Result<Self, WalError> {
-        trace!("wal::create region_offset={:#x} region_size={:#x}", region_offset, region_size);
+        trace!(
+            "wal::create region_offset={:#x} region_size={:#x}",
+            region_offset, region_size
+        );
         let wal = Self {
             region_offset,
             region_size,
@@ -67,7 +74,10 @@ impl WriteAheadLog {
         region_offset: u64,
         region_size: u64,
     ) -> Result<Self, WalError> {
-        trace!("wal::open region_offset={:#x} region_size={:#x}", region_offset, region_size);
+        trace!(
+            "wal::open region_offset={:#x} region_size={:#x}",
+            region_offset, region_size
+        );
         let mut header = [0u8; WAL_HEADER_SIZE as usize];
         dev.read_at(region_offset, &mut header)?;
 
@@ -115,7 +125,12 @@ impl WriteAheadLog {
         op_kind: WalOpKind,
         payload: &[u8],
     ) -> Result<u64, WalError> {
-        trace!("wal::append op={:?} payload_len={} lsn={}", op_kind, payload.len(), self.next_lsn);
+        trace!(
+            "wal::append op={:?} payload_len={} lsn={}",
+            op_kind,
+            payload.len(),
+            self.next_lsn
+        );
         if payload.len() > MAX_PAYLOAD_SIZE {
             return Err(WalError::EntryTooLarge {
                 size: payload.len(),
@@ -228,7 +243,10 @@ impl WriteAheadLog {
     }
 
     fn write_header(&self, dev: &dyn BlockDevice) -> Result<(), WalError> {
-        trace!("wal::write_header next_lsn={} used={}", self.next_lsn, self.used);
+        trace!(
+            "wal::write_header next_lsn={} used={}",
+            self.next_lsn, self.used
+        );
         let mut header = [0u8; WAL_HEADER_SIZE as usize];
         header[0..8].copy_from_slice(&WAL_HEADER_MAGIC);
         header[8..16].copy_from_slice(&self.next_lsn.to_le_bytes());
@@ -265,9 +283,7 @@ impl WriteAheadLog {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use mimisbrunnr_storage::FileBlockDevice;
-    use tempfile::NamedTempFile;
+    use {super::*, mimisbrunnr_storage::FileBlockDevice, tempfile::NamedTempFile};
 
     fn test_wal() -> (NamedTempFile, FileBlockDevice, WriteAheadLog) {
         let tmp = NamedTempFile::new().unwrap();
@@ -353,7 +369,8 @@ mod tests {
         let (_tmp, dev, mut wal) = test_wal();
 
         for i in 0..100u32 {
-            wal.append(&dev, WalOpKind::AddTag, &i.to_le_bytes()).unwrap();
+            wal.append(&dev, WalOpKind::AddTag, &i.to_le_bytes())
+                .unwrap();
         }
 
         let entries = wal.read_all(&dev).unwrap();

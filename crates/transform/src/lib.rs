@@ -1,13 +1,15 @@
-mod hasher;
 mod compress;
-mod pad;
 mod encrypt;
-mod pipeline;
 mod error;
+mod hasher;
+mod pad;
+mod pipeline;
 
-pub use hasher::ContentHasher;
-pub use compress::{Compressor, CompressionAlgo};
-pub use pad::SectorPadder;
-pub use encrypt::{Encryptor, EncryptionMode};
-pub use pipeline::{TransformPipeline, TransformResult};
-pub use error::TransformError;
+pub use {
+    compress::{CompressionAlgo, Compressor},
+    encrypt::{EncryptionMode, Encryptor},
+    error::TransformError,
+    hasher::ContentHasher,
+    pad::SectorPadder,
+    pipeline::{TransformPipeline, TransformResult},
+};

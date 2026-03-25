@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
-use mimisbrunnr_types::TagId;
-use roaring::RoaringBitmap;
+use {mimisbrunnr_types::TagId, roaring::RoaringBitmap};
 
 use crate::tag_store::TagStore;
 
@@ -60,9 +59,7 @@ impl TagIndex {
 
     /// Check if an object has a tag.
     pub fn has_tag(&self, tag: TagId, obj_local: u32) -> bool {
-        self.stores
-            .get(&tag)
-            .is_some_and(|s| s.contains(obj_local))
+        self.stores.get(&tag).is_some_and(|s| s.contains(obj_local))
     }
 
     /// Get the bitmap for a tag (for bitmap algebra operations).
@@ -129,10 +126,7 @@ impl TagIndex {
 
     /// OR a bitmap into an existing tag's bitmap (used by materializer).
     pub fn bitmap_or(&mut self, tag: TagId, other: &RoaringBitmap) {
-        let store = self
-            .stores
-            .entry(tag)
-            .or_insert_with(TagStore::new_simple);
+        let store = self.stores.entry(tag).or_insert_with(TagStore::new_simple);
         *store.bitmap_mut() |= other;
     }
 }

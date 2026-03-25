@@ -1,5 +1,8 @@
 use {
-    crate::{StorageError, layout::{ExtentLayout, ZoneExtent}},
+    crate::{
+        StorageError,
+        layout::{ExtentLayout, ZoneExtent},
+    },
     log::trace,
 };
 

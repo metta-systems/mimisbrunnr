@@ -80,11 +80,15 @@ mod tests {
         let def = TagDefinition::new(
             TagId::new(2),
             "artist",
-            TagSemantics::Attribute { value_type: ValueType::Text },
+            TagSemantics::Attribute {
+                value_type: ValueType::Text,
+            },
         );
         assert!(matches!(
             def.semantics,
-            TagSemantics::Attribute { value_type: ValueType::Text }
+            TagSemantics::Attribute {
+                value_type: ValueType::Text
+            }
         ));
     }
 
@@ -100,7 +104,9 @@ mod tests {
         );
         assert!(matches!(
             def.semantics,
-            TagSemantics::OrderedCollection { element_constraint: Some(_) }
+            TagSemantics::OrderedCollection {
+                element_constraint: Some(_)
+            }
         ));
     }
 

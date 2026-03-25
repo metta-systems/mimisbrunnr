@@ -1,11 +1,13 @@
-mod tag_def;
+mod error;
 mod implication_dag;
 mod materializer;
 mod module;
-mod error;
+mod tag_def;
 
-pub use tag_def::{TagDefinition, TagSemantics, TagRelation, ValueType};
-pub use implication_dag::ImplicationDag;
-pub use materializer::Materializer;
-pub use module::{OntologyModule, InstallResult};
-pub use error::OntologyError;
+pub use {
+    error::OntologyError,
+    implication_dag::ImplicationDag,
+    materializer::Materializer,
+    module::{InstallResult, OntologyModule},
+    tag_def::{TagDefinition, TagRelation, TagSemantics, ValueType},
+};

@@ -131,7 +131,9 @@ impl Importer {
                         .map_err(UnixError::Engine)?;
                     hash_to_oid.insert(hash, oid);
                     result.transformed_blobs.push((oid, blob_result.data));
-                    result.original_blobs.insert((oid.node() << 48) | oid.local(), content);
+                    result
+                        .original_blobs
+                        .insert((oid.node() << 48) | oid.local(), content);
                     result.objects_created += 1;
 
                     // Auto-tag by extension

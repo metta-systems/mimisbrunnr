@@ -1,13 +1,15 @@
+mod config;
 mod disk;
-mod tier;
+mod error;
 mod placement;
 mod pool;
-mod config;
-mod error;
+mod tier;
 
-pub use disk::{DiskDescriptor, DiskState, MediaType};
-pub use tier::StorageTier;
-pub use placement::PlacementRule;
-pub use pool::PoolManager;
-pub use config::{PoolConfig, RuleConfig, parse_compression_algo};
-pub use error::PoolError;
+pub use {
+    config::{PoolConfig, RuleConfig, parse_compression_algo},
+    disk::{DiskDescriptor, DiskState, MediaType},
+    error::PoolError,
+    placement::PlacementRule,
+    pool::PoolManager,
+    tier::StorageTier,
+};

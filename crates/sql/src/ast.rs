@@ -74,15 +74,9 @@ pub enum Predicate {
         value: Value,
     },
     /// `attr LIKE pattern`
-    Like {
-        column: String,
-        pattern: String,
-    },
+    Like { column: String, pattern: String },
     /// `attr IN (v1, v2, ...)`
-    In {
-        column: String,
-        values: Vec<Value>,
-    },
+    In { column: String, values: Vec<Value> },
     /// `AND`
     And(Vec<Predicate>),
     /// `OR`

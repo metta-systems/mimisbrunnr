@@ -1,10 +1,14 @@
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
-use std::sync::Mutex;
+use std::{
+    fs::{File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
+    path::Path,
+    sync::Mutex,
+};
 
-use crate::{BlockDevice, StorageError};
-use log::trace;
+use {
+    crate::{BlockDevice, StorageError},
+    log::trace,
+};
 
 /// A block device backed by a regular file, for use in std environments.
 pub struct FileBlockDevice {
@@ -18,7 +22,11 @@ impl FileBlockDevice {
     /// If `capacity` is 0, uses the existing file size (for opening existing disks).
     /// Otherwise, extends the file to `capacity` bytes if needed.
     pub fn open(path: &Path, capacity: u64) -> Result<Self, StorageError> {
-        trace!("FileBlockDevice::open path={} capacity={}", path.display(), capacity);
+        trace!(
+            "FileBlockDevice::open path={} capacity={}",
+            path.display(),
+            capacity
+        );
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -58,7 +66,11 @@ impl FileBlockDevice {
 
 impl BlockDevice for FileBlockDevice {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
-        trace!("block_device::read_at offset={:#x} len={}", offset, buf.len());
+        trace!(
+            "block_device::read_at offset={:#x} len={}",
+            offset,
+            buf.len()
+        );
         let end = offset + buf.len() as u64;
         if end > self.capacity {
             return Err(StorageError::OutOfBounds {
@@ -75,7 +87,11 @@ impl BlockDevice for FileBlockDevice {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), StorageError> {
-        trace!("block_device::write_at offset={:#x} len={}", offset, buf.len());
+        trace!(
+            "block_device::write_at offset={:#x} len={}",
+            offset,
+            buf.len()
+        );
         let end = offset + buf.len() as u64;
         if end > self.capacity {
             return Err(StorageError::OutOfBounds {
@@ -105,8 +121,7 @@ impl BlockDevice for FileBlockDevice {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tempfile::NamedTempFile;
+    use {super::*, tempfile::NamedTempFile};
 
     fn test_device(capacity: u64) -> (NamedTempFile, FileBlockDevice) {
         let tmp = NamedTempFile::new().unwrap();

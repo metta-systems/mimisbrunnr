@@ -1,7 +1,9 @@
 mod entry;
-mod log;
 mod error;
+mod log;
 
-pub use entry::{WalEntry, WalOpKind};
-pub use log::WriteAheadLog;
-pub use error::WalError;
+pub use {
+    entry::{WalEntry, WalOpKind},
+    error::WalError,
+    log::WriteAheadLog,
+};

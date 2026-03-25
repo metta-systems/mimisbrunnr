@@ -1,4 +1,7 @@
-use crate::{BLOCK_SIZE, BlockDevice, StorageError, layout::{ZoneExtent, ExtentLayout}};
+use crate::{
+    BLOCK_SIZE, BlockDevice, StorageError,
+    layout::{ExtentLayout, ZoneExtent},
+};
 
 /// Magic bytes for the zone map block: "ZMAP\x01\x00\x00\x00"
 const ZONE_MAP_MAGIC: [u8; 8] = *b"ZMAP\x01\0\0\0";
@@ -73,7 +76,9 @@ impl ZoneMap {
 
         // Extent entries
         let mut pos = HEADER_SIZE;
-        for extent in layout.index_extents.iter()
+        for extent in layout
+            .index_extents
+            .iter()
             .chain(layout.metadata_extents.iter())
             .chain(layout.blob_extents.iter())
         {
@@ -90,16 +95,18 @@ impl ZoneMap {
     }
 
     /// Deserialize zone extents from a 4K block into the three extent lists.
-    pub fn from_block(
-        buf: &[u8; BLOCK_SIZE as usize],
-    ) -> Result<ZoneExtents, StorageError> {
+    pub fn from_block(buf: &[u8; BLOCK_SIZE as usize]) -> Result<ZoneExtents, StorageError> {
         // Magic check
         if buf[0..8] != ZONE_MAP_MAGIC {
             return Err(StorageError::InvalidMagic);
         }
 
         // Checksum
-        let expected_crc = u32::from_le_bytes(buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].try_into().unwrap());
+        let expected_crc = u32::from_le_bytes(
+            buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
         let actual_crc = crc32fast::hash(&buf[0..CHECKSUM_OFFSET]);
         if expected_crc != actual_crc {
             return Err(StorageError::ChecksumMismatch {
@@ -128,7 +135,11 @@ impl ZoneMap {
         let metadata = read_extents(meta_count);
         let blob = read_extents(blob_count);
 
-        Ok(ZoneExtents { index, metadata, blob })
+        Ok(ZoneExtents {
+            index,
+            metadata,
+            blob,
+        })
     }
 
     /// Write the zone map to disk at the given offset.
@@ -143,10 +154,7 @@ impl ZoneMap {
     }
 
     /// Read the zone map from disk at the given offset.
-    pub fn read_from(
-        dev: &dyn BlockDevice,
-        offset: u64,
-    ) -> Result<ZoneExtents, StorageError> {
+    pub fn read_from(dev: &dyn BlockDevice, offset: u64) -> Result<ZoneExtents, StorageError> {
         let mut block = [0u8; BLOCK_SIZE as usize];
         dev.read_at(offset, &mut block)?;
         Self::from_block(&block)
@@ -177,8 +185,10 @@ mod tests {
     #[test]
     fn roundtrip_multi_extents() {
         let mut el = test_layout();
-        el.index_extents.push(ZoneExtent::new(100 * BLOCK_SIZE, 10 * BLOCK_SIZE));
-        el.metadata_extents.push(ZoneExtent::new(200 * BLOCK_SIZE, 5 * BLOCK_SIZE));
+        el.index_extents
+            .push(ZoneExtent::new(100 * BLOCK_SIZE, 10 * BLOCK_SIZE));
+        el.metadata_extents
+            .push(ZoneExtent::new(200 * BLOCK_SIZE, 5 * BLOCK_SIZE));
 
         let block = ZoneMap::to_block(&el).unwrap();
         let extents = ZoneMap::from_block(&block).unwrap();
@@ -186,7 +196,10 @@ mod tests {
         assert_eq!(extents.index.len(), 2);
         assert_eq!(extents.metadata.len(), 2);
         assert_eq!(extents.blob.len(), 1);
-        assert_eq!(extents.index[1], ZoneExtent::new(100 * BLOCK_SIZE, 10 * BLOCK_SIZE));
+        assert_eq!(
+            extents.index[1],
+            ZoneExtent::new(100 * BLOCK_SIZE, 10 * BLOCK_SIZE)
+        );
     }
 
     #[test]
@@ -194,7 +207,10 @@ mod tests {
         let el = test_layout();
         let mut block = ZoneMap::to_block(&el).unwrap();
         block[0] = b'X';
-        assert!(matches!(ZoneMap::from_block(&block), Err(StorageError::InvalidMagic)));
+        assert!(matches!(
+            ZoneMap::from_block(&block),
+            Err(StorageError::InvalidMagic)
+        ));
     }
 
     #[test]

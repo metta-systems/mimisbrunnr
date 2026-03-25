@@ -25,15 +25,14 @@ fn create_single_disk_pool() {
     let tmp = TempDir::new().unwrap();
     let disk = tmp.path().join("disk0.mbrunnr");
 
-    let output = run_brunnr(&[
-        "create",
-        disk.to_str().unwrap(),
-        "--size-mib",
-        "128",
-    ]);
+    let output = run_brunnr(&["create", disk.to_str().unwrap(), "--size-mib", "128"]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("Pool created successfully"));
     assert!(stdout.contains("128 MiB"));
 
@@ -65,7 +64,11 @@ fn create_multi_disk_pool() {
     ]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("3 disk(s)"));
     assert!(stdout.contains("384 MiB")); // 3 × 128
 }
@@ -80,17 +83,34 @@ fn create_multi_disk_different_sizes() {
         "create",
         disk0.to_str().unwrap(),
         disk1.to_str().unwrap(),
-        "--size-mib", "128",
-        "--size-mib", "512",
-        "--tier", "hot",
-        "--tier", "cold",
+        "--size-mib",
+        "128",
+        "--size-mib",
+        "512",
+        "--tier",
+        "hot",
+        "--tier",
+        "cold",
     ]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    assert!(stdout.contains("128 MiB"), "expected 128 MiB disk, stdout: {stdout}");
-    assert!(stdout.contains("512 MiB"), "expected 512 MiB disk, stdout: {stdout}");
-    assert!(stdout.contains("zones:"), "expected zone info, stdout: {stdout}");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("128 MiB"),
+        "expected 128 MiB disk, stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("512 MiB"),
+        "expected 512 MiB disk, stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("zones:"),
+        "expected zone info, stdout: {stdout}"
+    );
 
     // Verify files have correct different sizes
     assert_eq!(std::fs::metadata(&disk0).unwrap().len(), 128 * 1024 * 1024);
@@ -102,7 +122,10 @@ fn create_multi_disk_different_sizes() {
     assert!(status.status.success());
     assert!(status_out.contains("128 MiB"), "status: {status_out}");
     assert!(status_out.contains("512 MiB"), "status: {status_out}");
-    assert!(status_out.contains("640 MiB"), "total should be 640, status: {status_out}"); // 128 + 512
+    assert!(
+        status_out.contains("640 MiB"),
+        "total should be 640, status: {status_out}"
+    ); // 128 + 512
 }
 
 #[test]
@@ -117,8 +140,10 @@ fn zone_sizes_scale_with_disk_capacity() {
         "create",
         small.to_str().unwrap(),
         large.to_str().unwrap(),
-        "--size-mib", "128",
-        "--size-mib", "1024",
+        "--size-mib",
+        "128",
+        "--size-mib",
+        "1024",
     ]);
 
     // Read superblocks and compare zone sizes
@@ -153,19 +178,18 @@ fn status_shows_disk_info() {
     let disk = tmp.path().join("disk.mbrunnr");
 
     // Create
-    let create_output = run_brunnr(&[
-        "create",
-        disk.to_str().unwrap(),
-        "--size-mib",
-        "128",
-    ]);
+    let create_output = run_brunnr(&["create", disk.to_str().unwrap(), "--size-mib", "128"]);
     assert!(create_output.status.success());
 
     // Status
     let output = run_brunnr(&["status", disk.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("Capacity:  128 MiB"), "stdout: {stdout}");
     assert!(stdout.contains("Index:"), "stdout: {stdout}");
     assert!(stdout.contains("Metadata:"), "stdout: {stdout}");
@@ -213,7 +237,11 @@ fn add_disk_to_pool() {
     ]);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(stdout.contains("Added disk"));
 
     // Verify both disks are valid
@@ -228,7 +256,14 @@ fn create_pool_superblock_survives_reopen() {
     let disk = tmp.path().join("persist.mbrunnr");
 
     // Create
-    run_brunnr(&["create", disk.to_str().unwrap(), "--size-mib", "128", "--node-id", "42"]);
+    run_brunnr(&[
+        "create",
+        disk.to_str().unwrap(),
+        "--size-mib",
+        "128",
+        "--node-id",
+        "42",
+    ]);
 
     // Read superblock directly to verify
     use mimisbrunnr::storage::{FileBlockDevice, Superblock};
@@ -248,8 +283,10 @@ fn create_pool_wal_is_valid() {
     run_brunnr(&["create", disk.to_str().unwrap(), "--size-mib", "128"]);
 
     // Open and verify WAL
-    use mimisbrunnr::storage::{FileBlockDevice, Superblock, WAL_SIZE};
-    use mimisbrunnr::wal::WriteAheadLog;
+    use mimisbrunnr::{
+        storage::{FileBlockDevice, Superblock, WAL_SIZE},
+        wal::WriteAheadLog,
+    };
 
     let dev = FileBlockDevice::open(&disk, 0).unwrap();
     let sb = Superblock::read_from(&dev).unwrap();
@@ -274,12 +311,17 @@ fn brunnr_create_then_mimir_ontology_register() {
     assert!(tmp.path().join("pool.toml").exists());
 
     // Register a tag via mimir
-    let output = run_mimir(tmp.path(), &[
-        "ontology", "register", "electronic",
-    ]);
+    let output = run_mimir(tmp.path(), &["ontology", "register", "electronic"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    assert!(stdout.contains("registered tag 'electronic'"), "stdout: {stdout}");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("registered tag 'electronic'"),
+        "stdout: {stdout}"
+    );
 
     // List tags — should show our tag persisted
     let output = run_mimir(tmp.path(), &["ontology", "list"]);
@@ -309,7 +351,10 @@ fn brunnr_create_then_mimir_create_tag_query_round_trip() {
         let e = de.engine_mut();
 
         // Tags were registered by mimir above, they should be persisted
-        let electronic = e.dag.lookup("electronic").expect("electronic tag should exist");
+        let electronic = e
+            .dag
+            .lookup("electronic")
+            .expect("electronic tag should exist");
         let ambient = e.dag.lookup("ambient").expect("ambient tag should exist");
 
         let oid = e.create_object(1000).unwrap();
@@ -325,14 +370,24 @@ fn brunnr_create_then_mimir_create_tag_query_round_trip() {
     // Query via mimir CLI
     let output = run_mimir(tmp.path(), &["query", "electronic"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    assert!(stdout.contains("2 result(s)"), "expected 2 results, stdout: {stdout}");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("2 result(s)"),
+        "expected 2 results, stdout: {stdout}"
+    );
 
     // Compound query
     let output = run_mimir(tmp.path(), &["query", "electronic AND ambient"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success());
-    assert!(stdout.contains("1 result(s)"), "expected 1 result, stdout: {stdout}");
+    assert!(
+        stdout.contains("1 result(s)"),
+        "expected 1 result, stdout: {stdout}"
+    );
 
     // Info on object 0
     let output = run_mimir(tmp.path(), &["info", "--object", "0"]);
@@ -350,14 +405,22 @@ fn brunnr_create_then_mimir_set_attr_and_query() {
     run_brunnr(&["create", disk.to_str().unwrap(), "--size-mib", "128"]);
 
     // Register an attribute tag
-    run_mimir(tmp.path(), &[
-        "ontology", "register", "artist", "--semantics", "attribute", "--value-type", "text",
-    ]);
+    run_mimir(
+        tmp.path(),
+        &[
+            "ontology",
+            "register",
+            "artist",
+            "--semantics",
+            "attribute",
+            "--value-type",
+            "text",
+        ],
+    );
 
     // Create object and set attribute via API
     {
-        use mimisbrunnr::engine::DiskEngine;
-        use mimisbrunnr::types::Value;
+        use mimisbrunnr::{engine::DiskEngine, types::Value};
 
         let pool_toml = tmp.path().join("pool.toml");
         let mut de = DiskEngine::open(&pool_toml).unwrap();
@@ -366,10 +429,17 @@ fn brunnr_create_then_mimir_set_attr_and_query() {
         let artist_tag = e.dag.lookup("artist").unwrap();
 
         let oid = e.create_object(1000).unwrap();
-        e.set_attr(oid, artist_tag, Value::Text("Aphex Twin".into()), 1000).unwrap();
+        e.set_attr(oid, artist_tag, Value::Text("Aphex Twin".into()), 1000)
+            .unwrap();
 
         let oid2 = e.create_object(1000).unwrap();
-        e.set_attr(oid2, artist_tag, Value::Text("Boards of Canada".into()), 1000).unwrap();
+        e.set_attr(
+            oid2,
+            artist_tag,
+            Value::Text("Boards of Canada".into()),
+            1000,
+        )
+        .unwrap();
 
         de.flush().unwrap();
     }
@@ -377,8 +447,15 @@ fn brunnr_create_then_mimir_set_attr_and_query() {
     // Query for artist=Aphex Twin
     let output = run_mimir(tmp.path(), &["query", "artist=\"Aphex Twin\""]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
-    assert!(stdout.contains("1 result(s)"), "expected 1 result, stdout: {stdout}");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 result(s)"),
+        "expected 1 result, stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -391,10 +468,14 @@ fn pool_config_written_by_brunnr() {
         "create",
         disk0.to_str().unwrap(),
         disk1.to_str().unwrap(),
-        "--size-mib", "128",
-        "--tier", "hot",
-        "--tier", "warm",
-        "--node-id", "7",
+        "--size-mib",
+        "128",
+        "--tier",
+        "hot",
+        "--tier",
+        "warm",
+        "--node-id",
+        "7",
     ]);
 
     // Verify pool.toml contents
@@ -511,9 +592,10 @@ fn large_blob_survives_flush_and_reload() {
 /// for objects accessed via tag navigation (the /tags/ path).
 #[test]
 fn tag_vfs_serves_blob_data_after_reload() {
-    use mimisbrunnr::engine::DiskEngine;
-    use mimisbrunnr::types::ObjectId;
-    use mimisbrunnr_fuse::TagVfs;
+    use {
+        mimisbrunnr::{engine::DiskEngine, types::ObjectId},
+        mimisbrunnr_fuse::TagVfs,
+    };
 
     let tmp = TempDir::new().unwrap();
     let disk = tmp.path().join("disk0.mbrunnr");
@@ -569,13 +651,19 @@ fn tag_vfs_serves_blob_data_after_reload() {
         let entries = tag_vfs.readdir(ambient_ino).unwrap();
 
         // Should have at least one file entry
-        let file_entry = entries.iter().find(|e| e.name.starts_with("obj_"))
+        let file_entry = entries
+            .iter()
+            .find(|e| e.name.starts_with("obj_"))
             .expect("should have an obj_ file in /tags/ambient/");
         let file_ino = tag_vfs.lookup(ambient_ino, &file_entry.name).unwrap();
 
         // getattr should return correct size
         let attr = tag_vfs.getattr(file_ino).unwrap();
-        assert_eq!(attr.size, 23, "file size should be 23 bytes, got {}", attr.size);
+        assert_eq!(
+            attr.size, 23,
+            "file size should be 23 bytes, got {}",
+            attr.size
+        );
 
         // read should return content
         let data = tag_vfs.read(file_ino, 0, 4096).unwrap();

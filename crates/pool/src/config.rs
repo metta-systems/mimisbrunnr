@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::PoolError;
-use log::trace;
+use {crate::error::PoolError, log::trace};
 
 /// On-disk pool configuration, persisted as TOML alongside the pool.
 ///

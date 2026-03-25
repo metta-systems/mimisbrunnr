@@ -1,15 +1,17 @@
-use std::sync::RwLock;
-use std::ffi::OsStr;
-use std::time::Duration;
+use std::{ffi::OsStr, sync::RwLock, time::Duration};
 
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner,
-    OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, LockOwner, OpenFlags,
+    ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
 
-use crate::tag_vfs::TagVfs;
-use crate::vfs::{VfsFileType, VfsTree};
-use log::trace;
+use {
+    crate::{
+        tag_vfs::TagVfs,
+        vfs::{VfsFileType, VfsTree},
+    },
+    log::trace,
+};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -65,8 +67,10 @@ impl MimisbrunnrFs {
     /// Create from a legacy VfsTree (for backwards compatibility).
     /// The tree is installed as a context named "default".
     pub fn new(tree: VfsTree) -> Self {
-        use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
-        use mimisbrunnr_ontology::ImplicationDag;
+        use {
+            mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex},
+            mimisbrunnr_ontology::ImplicationDag,
+        };
 
         let mut vfs = TagVfs::new(
             TagIndex::new(),
@@ -99,13 +103,7 @@ impl Filesystem for MimisbrunnrFs {
         }
     }
 
-    fn getattr(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: Option<FileHandle>,
-        reply: ReplyAttr,
-    ) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         trace!("fuse::getattr ino={}", ino.0);
         match self.vfs.read().unwrap().getattr(ino.0) {
             Some(attr) => reply.attr(&TTL, &vfs_attr_to_fuse(&attr)),

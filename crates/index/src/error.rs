@@ -7,5 +7,8 @@ pub enum IndexError {
     ObjectNotFound(mimisbrunnr_types::ObjectId),
 
     #[error("duplicate key-value entry for tag {tag}, value hash {value_hash:#x}")]
-    DuplicateKv { tag: mimisbrunnr_types::TagId, value_hash: u64 },
+    DuplicateKv {
+        tag: mimisbrunnr_types::TagId,
+        value_hash: u64,
+    },
 }

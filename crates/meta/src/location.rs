@@ -92,8 +92,14 @@ mod tests {
     fn round_trip() {
         let mut loc = ObjectLocation::new(3, 0xDEAD_BEEF, 0x1_0000);
         loc.replica_count = 2;
-        loc.replicas[0] = ReplicaRef { disk_id: 1, offset: 0x5000 };
-        loc.replicas[1] = ReplicaRef { disk_id: 2, offset: 0x6000 };
+        loc.replicas[0] = ReplicaRef {
+            disk_id: 1,
+            offset: 0x5000,
+        };
+        loc.replicas[1] = ReplicaRef {
+            disk_id: 2,
+            offset: 0x6000,
+        };
 
         let bytes = loc.to_bytes();
         assert_eq!(bytes.len(), LOCATION_SIZE);

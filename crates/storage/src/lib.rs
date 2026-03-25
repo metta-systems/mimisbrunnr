@@ -1,17 +1,19 @@
-mod block_device;
-mod file_device;
-mod superblock;
-mod layout;
 mod alloc_bitmap;
 mod block_class;
-mod zone_map;
+mod block_device;
 mod error;
+mod file_device;
+mod layout;
+mod superblock;
+mod zone_map;
 
-pub use block_device::BlockDevice;
-pub use file_device::FileBlockDevice;
-pub use superblock::Superblock;
-pub use layout::{ExtentLayout, ZoneExtent, ZoneType, BLOCK_SIZE, SUPERBLOCK_SIZE, WAL_SIZE};
-pub use alloc_bitmap::AllocBitmap;
-pub use block_class::{BlockClass, BlockClassMap};
-pub use zone_map::{ZoneExtents, ZoneMap};
-pub use error::StorageError;
+pub use {
+    alloc_bitmap::AllocBitmap,
+    block_class::{BlockClass, BlockClassMap},
+    block_device::BlockDevice,
+    error::StorageError,
+    file_device::FileBlockDevice,
+    layout::{BLOCK_SIZE, ExtentLayout, SUPERBLOCK_SIZE, WAL_SIZE, ZoneExtent, ZoneType},
+    superblock::Superblock,
+    zone_map::{ZoneExtents, ZoneMap},
+};

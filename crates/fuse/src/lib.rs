@@ -1,11 +1,13 @@
-mod vfs;
-mod tag_vfs;
 mod error;
 #[cfg(feature = "fuse")]
 mod fuse_impl;
+mod tag_vfs;
+mod vfs;
 
-pub use vfs::{VfsNode, VfsTree, VfsAttr, VfsFileType};
-pub use tag_vfs::TagVfs;
-pub use error::FuseError;
 #[cfg(feature = "fuse")]
 pub use fuse_impl::MimisbrunnrFs;
+pub use {
+    error::FuseError,
+    tag_vfs::TagVfs,
+    vfs::{VfsAttr, VfsFileType, VfsNode, VfsTree},
+};

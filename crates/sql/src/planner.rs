@@ -1,5 +1,4 @@
-use crate::ast::*;
-use crate::error::SqlError;
+use crate::{ast::*, error::SqlError};
 
 /// Physical execution plan — a tree of operations that the executor walks.
 ///
@@ -9,7 +8,6 @@ use crate::error::SqlError;
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalOp {
     // -- Leaf: fetch a bitmap from an index --
-
     /// Tag membership bitmap.
     TagBitmap(String),
     /// KV equality bitmap: `attr = value`.
@@ -20,7 +18,6 @@ pub enum PhysicalOp {
     AllObjects,
 
     // -- Combine bitmaps --
-
     /// AND — intersect.
     Intersect(Vec<PhysicalOp>),
     /// OR — union.
@@ -29,22 +26,18 @@ pub enum PhysicalOp {
     Complement(Box<PhysicalOp>),
 
     // -- Post-filter --
-
     /// Post-filter for predicates not directly in an index (e.g. LIKE).
     Filter(Box<PhysicalOp>, FilterPredicate),
 
     // -- Projection --
-
     /// Select specific columns from the result set.
     Project(Box<PhysicalOp>, Vec<Projection>),
 
     // -- Sort --
-
     /// Sort the result set by a column.
     Sort(Box<PhysicalOp>, String, SortDir),
 
     // -- Aggregate --
-
     /// GROUP BY with aggregate functions.
     GroupBy {
         input: Box<PhysicalOp>,
@@ -60,7 +53,6 @@ pub enum PhysicalOp {
     },
 
     // -- Limit/Offset --
-
     /// LIMIT and OFFSET.
     Limit(Box<PhysicalOp>, usize, usize),
 }
@@ -68,9 +60,19 @@ pub enum PhysicalOp {
 /// A predicate for post-filtering (not pushable to index).
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterPredicate {
-    Like { column: String, pattern: String },
-    In { column: String, values: Vec<mimisbrunnr_types::Value> },
-    Compare { column: String, op: CompareOp, value: mimisbrunnr_types::Value },
+    Like {
+        column: String,
+        pattern: String,
+    },
+    In {
+        column: String,
+        values: Vec<mimisbrunnr_types::Value>,
+    },
+    Compare {
+        column: String,
+        op: CompareOp,
+        value: mimisbrunnr_types::Value,
+    },
     And(Vec<FilterPredicate>),
     Or(Vec<FilterPredicate>),
     Not(Box<FilterPredicate>),
@@ -111,7 +113,10 @@ pub fn plan(query: &SelectQuery) -> Result<PhysicalOp, SqlError> {
     } else {
         // 3. Projection (only for non-aggregate queries)
         if !query.projection.is_empty()
-            && !query.projection.iter().all(|p| matches!(p, Projection::Star))
+            && !query
+                .projection
+                .iter()
+                .all(|p| matches!(p, Projection::Star))
         {
             plan = PhysicalOp::Project(Box::new(plan), query.projection.clone());
         }
@@ -141,12 +146,18 @@ fn plan_predicate(pred: &Predicate) -> Result<PhysicalOp, SqlError> {
         Predicate::HasTag(tag) => Ok(PhysicalOp::TagBitmap(tag.clone())),
 
         Predicate::HasAllTags(tags) => {
-            let ops: Vec<PhysicalOp> = tags.iter().map(|t| PhysicalOp::TagBitmap(t.clone())).collect();
+            let ops: Vec<PhysicalOp> = tags
+                .iter()
+                .map(|t| PhysicalOp::TagBitmap(t.clone()))
+                .collect();
             Ok(PhysicalOp::Intersect(ops))
         }
 
         Predicate::HasAnyTag(tags) => {
-            let ops: Vec<PhysicalOp> = tags.iter().map(|t| PhysicalOp::TagBitmap(t.clone())).collect();
+            let ops: Vec<PhysicalOp> = tags
+                .iter()
+                .map(|t| PhysicalOp::TagBitmap(t.clone()))
+                .collect();
             Ok(PhysicalOp::Union(ops))
         }
 
@@ -231,10 +242,8 @@ fn plan_predicate(pred: &Predicate) -> Result<PhysicalOp, SqlError> {
         }
 
         Predicate::Or(terms) => {
-            let ops: Vec<PhysicalOp> = terms
-                .iter()
-                .map(plan_predicate)
-                .collect::<Result<_, _>>()?;
+            let ops: Vec<PhysicalOp> =
+                terms.iter().map(plan_predicate).collect::<Result<_, _>>()?;
             Ok(PhysicalOp::Union(ops))
         }
 
@@ -270,9 +279,7 @@ fn predicate_to_filter(pred: &Predicate) -> Result<FilterPredicate, SqlError> {
                 .collect::<Result<_, _>>()?;
             Ok(FilterPredicate::Or(filters))
         }
-        Predicate::Not(inner) => {
-            Ok(FilterPredicate::Not(Box::new(predicate_to_filter(inner)?)))
-        }
+        Predicate::Not(inner) => Ok(FilterPredicate::Not(Box::new(predicate_to_filter(inner)?))),
         _ => Err(SqlError::Unsupported(format!(
             "HAVING predicate: {:?}",
             pred
@@ -308,8 +315,7 @@ fn extract_aggregates(projection: &[Projection]) -> Vec<(AggregateFunc, Option<S
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::parser::parse_sql;
+    use {super::*, crate::parser::parse_sql};
 
     #[test]
     fn plan_simple_tag_query() {

@@ -13,11 +13,19 @@ pub struct HybridTimestamp {
 
 impl HybridTimestamp {
     pub fn new(wall_ms: u64, logical: u16, node_id: NodeId) -> Self {
-        Self { wall_ms, logical, node_id }
+        Self {
+            wall_ms,
+            logical,
+            node_id,
+        }
     }
 
     pub fn zero() -> Self {
-        Self { wall_ms: 0, logical: 0, node_id: 0 }
+        Self {
+            wall_ms: 0,
+            logical: 0,
+            node_id: 0,
+        }
     }
 
     /// Pack into a u64 for compact storage.

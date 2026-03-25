@@ -36,15 +36,12 @@ impl Compressor {
     pub fn compress(data: &[u8], algo: CompressionAlgo) -> Result<Vec<u8>, TransformError> {
         match algo {
             CompressionAlgo::None => Ok(data.to_vec()),
-            CompressionAlgo::Zstd(level) => {
-                zstd::encode_all(data, level)
-                    .map_err(|e| TransformError::Compression(e.to_string()))
-            }
+            CompressionAlgo::Zstd(level) => zstd::encode_all(data, level)
+                .map_err(|e| TransformError::Compression(e.to_string())),
             CompressionAlgo::Lz4 => {
                 // Use zstd level 1 as a fast stand-in until lz4 crate is added.
                 // In production, we'd use the lz4 crate directly.
-                zstd::encode_all(data, 1)
-                    .map_err(|e| TransformError::Compression(e.to_string()))
+                zstd::encode_all(data, 1).map_err(|e| TransformError::Compression(e.to_string()))
             }
         }
     }
@@ -54,8 +51,7 @@ impl Compressor {
         match algo {
             CompressionAlgo::None => Ok(data.to_vec()),
             CompressionAlgo::Zstd(_) | CompressionAlgo::Lz4 => {
-                zstd::decode_all(data)
-                    .map_err(|e| TransformError::Decompression(e.to_string()))
+                zstd::decode_all(data).map_err(|e| TransformError::Decompression(e.to_string()))
             }
         }
     }
@@ -90,8 +86,7 @@ mod tests {
         let data = b"The quick brown fox jumps over the lazy dog. ".repeat(100);
         let compressed = Compressor::compress(&data, CompressionAlgo::Zstd(3)).unwrap();
         assert!(compressed.len() < data.len()); // Should actually compress
-        let decompressed =
-            Compressor::decompress(&compressed, CompressionAlgo::Zstd(3)).unwrap();
+        let decompressed = Compressor::decompress(&compressed, CompressionAlgo::Zstd(3)).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -112,8 +107,7 @@ mod tests {
     #[test]
     fn empty_data() {
         let compressed = Compressor::compress(b"", CompressionAlgo::Zstd(3)).unwrap();
-        let decompressed =
-            Compressor::decompress(&compressed, CompressionAlgo::Zstd(3)).unwrap();
+        let decompressed = Compressor::decompress(&compressed, CompressionAlgo::Zstd(3)).unwrap();
         assert!(decompressed.is_empty());
     }
 
@@ -122,8 +116,7 @@ mod tests {
         let data = vec![0x42u8; 1024 * 1024]; // 1 MiB of same byte
         let compressed = Compressor::compress(&data, CompressionAlgo::Zstd(3)).unwrap();
         assert!(compressed.len() < 1024); // Highly compressible
-        let decompressed =
-            Compressor::decompress(&compressed, CompressionAlgo::Zstd(3)).unwrap();
+        let decompressed = Compressor::decompress(&compressed, CompressionAlgo::Zstd(3)).unwrap();
         assert_eq!(decompressed, data);
     }
 

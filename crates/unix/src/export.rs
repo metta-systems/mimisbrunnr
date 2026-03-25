@@ -59,18 +59,18 @@ impl Exporter {
                     if let Some(oid) = entry.object
                         && let Some(data) = blobs.get(&((oid.node() << 48) | oid.local()))
                     {
-                            std::fs::write(&target_path, data)?;
-                            result.total_bytes += data.len() as u64;
-                            result.files_written += 1;
+                        std::fs::write(&target_path, data)?;
+                        result.total_bytes += data.len() as u64;
+                        result.files_written += 1;
 
-                            // Set permissions on unix
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                let perms = std::fs::Permissions::from_mode(*mode);
-                                let _ = std::fs::set_permissions(&target_path, perms);
-                            }
+                        // Set permissions on unix
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            let perms = std::fs::Permissions::from_mode(*mode);
+                            let _ = std::fs::set_permissions(&target_path, perms);
                         }
+                    }
                 }
                 ProjectedEntryType::Symlink { target } => {
                     if let Some(parent) = target_path.parent() {
@@ -178,7 +178,10 @@ mod tests {
 
         let link = tmp.path().join("usr/bin/bash");
         assert!(link.is_symlink());
-        assert_eq!(std::fs::read_link(&link).unwrap().to_str().unwrap(), "../../bin/bash");
+        assert_eq!(
+            std::fs::read_link(&link).unwrap().to_str().unwrap(),
+            "../../bin/bash"
+        );
     }
 
     #[test]

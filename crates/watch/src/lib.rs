@@ -1,9 +1,11 @@
-mod subscription;
 mod engine;
-mod event;
 mod error;
+mod event;
+mod subscription;
 
-pub use subscription::{Subscription, SubscriptionState, ChangeInterest};
-pub use engine::SubscriptionEngine;
-pub use event::WatchEvent;
-pub use error::WatchError;
+pub use {
+    engine::SubscriptionEngine,
+    error::WatchError,
+    event::WatchEvent,
+    subscription::{ChangeInterest, Subscription, SubscriptionState},
+};

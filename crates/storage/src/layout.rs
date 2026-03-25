@@ -121,12 +121,24 @@ impl ExtentLayout {
     }
 
     /// Convenience accessors for common zone offsets and sizes.
-    pub fn index_zone_offset(&self) -> u64 { self.zone_offset(ZoneType::Index) }
-    pub fn index_zone_size(&self) -> u64 { self.zone_size(ZoneType::Index) }
-    pub fn metadata_zone_offset(&self) -> u64 { self.zone_offset(ZoneType::Metadata) }
-    pub fn metadata_zone_size(&self) -> u64 { self.zone_size(ZoneType::Metadata) }
-    pub fn blob_zone_offset(&self) -> u64 { self.zone_offset(ZoneType::Blob) }
-    pub fn blob_zone_size(&self) -> u64 { self.zone_size(ZoneType::Blob) }
+    pub fn index_zone_offset(&self) -> u64 {
+        self.zone_offset(ZoneType::Index)
+    }
+    pub fn index_zone_size(&self) -> u64 {
+        self.zone_size(ZoneType::Index)
+    }
+    pub fn metadata_zone_offset(&self) -> u64 {
+        self.zone_offset(ZoneType::Metadata)
+    }
+    pub fn metadata_zone_size(&self) -> u64 {
+        self.zone_size(ZoneType::Metadata)
+    }
+    pub fn blob_zone_offset(&self) -> u64 {
+        self.zone_offset(ZoneType::Blob)
+    }
+    pub fn blob_zone_size(&self) -> u64 {
+        self.zone_size(ZoneType::Blob)
+    }
 }
 
 impl ExtentLayout {
@@ -186,7 +198,6 @@ impl ExtentLayout {
         })
     }
 }
-
 
 fn align_up(value: u64, alignment: u64) -> u64 {
     value.div_ceil(alignment) * alignment

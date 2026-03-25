@@ -2,8 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use mimisbrunnr_types::TagId;
 
-use crate::tag_def::TagDefinition;
-use crate::OntologyError;
+use crate::{OntologyError, tag_def::TagDefinition};
 
 /// Directed Acyclic Graph of tag implications.
 ///
@@ -195,8 +194,7 @@ impl Default for ImplicationDag {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tag_def::TagSemantics;
+    use {super::*, crate::tag_def::TagSemantics};
 
     fn tag(id: u32) -> TagId {
         TagId::new(id)

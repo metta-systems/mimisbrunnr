@@ -1,5 +1,7 @@
-use mimisbrunnr_types::{ObjectId, TagId, Assertion, TagOrigin};
-use mimisbrunnr_index::{TagIndex, ForwardIndex};
+use {
+    mimisbrunnr_index::{ForwardIndex, TagIndex},
+    mimisbrunnr_types::{Assertion, ObjectId, TagId, TagOrigin},
+};
 
 use crate::ImplicationDag;
 
@@ -33,11 +35,7 @@ impl Materializer {
             // Only add if not already present (avoid duplicating)
             if !tag_index.has_tag(implied_tag, obj_local) {
                 tag_index.tag_object(implied_tag, obj_local);
-                forward_index.add(
-                    oid,
-                    Assertion::Tag(implied_tag),
-                    TagOrigin::Materialized,
-                );
+                forward_index.add(oid, Assertion::Tag(implied_tag), TagOrigin::Materialized);
                 added.push(implied_tag);
             }
         }
@@ -50,11 +48,7 @@ impl Materializer {
     ///
     /// This is a bitmap OR: `bitmap_audio |= bitmap_flac` — microseconds even
     /// for millions of objects.
-    pub fn materialize_implication(
-        tag_index: &mut TagIndex,
-        from: TagId,
-        to: TagId,
-    ) {
+    pub fn materialize_implication(tag_index: &mut TagIndex, from: TagId, to: TagId) {
         if let Some(from_bm) = tag_index.bitmap(from) {
             let from_bm = from_bm.clone();
             tag_index.bitmap_or(to, &from_bm);
@@ -102,8 +96,10 @@ impl Materializer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::tag_def::{TagDefinition, TagSemantics};
+    use {
+        super::*,
+        crate::tag_def::{TagDefinition, TagSemantics},
+    };
 
     fn tag(id: u32) -> TagId {
         TagId::new(id)
@@ -143,9 +139,8 @@ mod tests {
         fwd_index.add(obj, Assertion::Tag(tag(1)), TagOrigin::Direct);
 
         // Materialize
-        let added = Materializer::materialize_tag(
-            &dag, &mut tag_index, &mut fwd_index, obj, tag(1),
-        );
+        let added =
+            Materializer::materialize_tag(&dag, &mut tag_index, &mut fwd_index, obj, tag(1));
 
         // Should have added "vehicle" and "physical_object"
         assert_eq!(added.len(), 2);
@@ -196,9 +191,8 @@ mod tests {
         tag_index.untag_object(tag(1), 1);
         fwd_index.remove(obj, &Assertion::Tag(tag(1)));
 
-        let removed = Materializer::dematerialize_tag(
-            &dag, &mut tag_index, &mut fwd_index, obj, tag(1),
-        );
+        let removed =
+            Materializer::dematerialize_tag(&dag, &mut tag_index, &mut fwd_index, obj, tag(1));
 
         // Vehicle and physical_object should be removed
         assert_eq!(removed.len(), 2);
@@ -227,9 +221,8 @@ mod tests {
         tag_index.untag_object(tag(1), 1);
         fwd_index.remove(obj, &Assertion::Tag(tag(1)));
 
-        let removed = Materializer::dematerialize_tag(
-            &dag, &mut tag_index, &mut fwd_index, obj, tag(1),
-        );
+        let removed =
+            Materializer::dematerialize_tag(&dag, &mut tag_index, &mut fwd_index, obj, tag(1));
 
         // Nothing should be removed — truck still justifies vehicle and physical_object
         assert!(removed.is_empty());
@@ -248,17 +241,15 @@ mod tests {
         // Tag as "car" and materialize
         tag_index.tag_object(tag(1), 1);
         fwd_index.add(obj, Assertion::Tag(tag(1)), TagOrigin::Direct);
-        let added1 = Materializer::materialize_tag(
-            &dag, &mut tag_index, &mut fwd_index, obj, tag(1),
-        );
+        let added1 =
+            Materializer::materialize_tag(&dag, &mut tag_index, &mut fwd_index, obj, tag(1));
         assert_eq!(added1.len(), 2);
 
         // Tag as "truck" and materialize — vehicle is already present, shouldn't duplicate
         tag_index.tag_object(tag(2), 1);
         fwd_index.add(obj, Assertion::Tag(tag(2)), TagOrigin::Direct);
-        let added2 = Materializer::materialize_tag(
-            &dag, &mut tag_index, &mut fwd_index, obj, tag(2),
-        );
+        let added2 =
+            Materializer::materialize_tag(&dag, &mut tag_index, &mut fwd_index, obj, tag(2));
         // Vehicle and physical_object already present
         assert!(added2.is_empty());
     }

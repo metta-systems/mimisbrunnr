@@ -1,9 +1,11 @@
-mod engine;
 mod disk_engine;
+mod engine;
 mod error;
 mod oplog;
 
-pub use engine::{Engine, BlobWriteResult};
-pub use disk_engine::DiskEngine;
-pub use error::EngineError;
-pub use oplog::{OpLogEntry, OpKind};
+pub use {
+    disk_engine::DiskEngine,
+    engine::{BlobWriteResult, Engine},
+    error::EngineError,
+    oplog::{OpKind, OpLogEntry},
+};

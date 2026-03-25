@@ -1,5 +1,7 @@
-use mimisbrunnr_types::{Query, SubscriptionId};
-use roaring::RoaringBitmap;
+use {
+    mimisbrunnr_types::{Query, SubscriptionId},
+    roaring::RoaringBitmap,
+};
 
 use std::time::Duration;
 
@@ -81,8 +83,7 @@ impl Subscription {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use mimisbrunnr_types::TagId;
+    use {super::*, mimisbrunnr_types::TagId};
 
     #[test]
     fn change_interest_flags() {

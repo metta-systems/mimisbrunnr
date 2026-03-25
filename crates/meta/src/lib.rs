@@ -1,9 +1,11 @@
-mod record;
-mod object_table;
-mod location;
 mod error;
+mod location;
+mod object_table;
+mod record;
 
-pub use record::{ObjectRecord, RECORD_SIZE};
-pub use object_table::ObjectTable;
-pub use location::ObjectLocation;
-pub use error::MetaError;
+pub use {
+    error::MetaError,
+    location::ObjectLocation,
+    object_table::ObjectTable,
+    record::{ObjectRecord, RECORD_SIZE},
+};

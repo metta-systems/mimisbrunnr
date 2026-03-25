@@ -5,13 +5,15 @@ use {
     mimisbrunnr_pool::{PlacementRule, PoolConfig, parse_compression_algo},
     mimisbrunnr_query::QueryParser,
     mimisbrunnr_storage::{
-        BlockDevice, ExtentLayout, FileBlockDevice, Superblock, ZoneExtent, ZoneMap, ZoneType,
-        BLOCK_SIZE,
+        BLOCK_SIZE, BlockDevice, ExtentLayout, FileBlockDevice, Superblock, ZoneExtent, ZoneMap,
+        ZoneType,
     },
 };
 
-use crate::{engine::Engine, error::EngineError};
-use log::trace;
+use {
+    crate::{engine::Engine, error::EngineError},
+    log::trace,
+};
 
 /// Round up `value` to the next multiple of `align`.
 fn align_up(value: u64, align: u64) -> u64 {
@@ -267,8 +269,12 @@ impl DiskEngine {
             offset
         };
 
-        ZoneMap::write_to(&self.superblock.layout, &self.primary_device, zone_map_offset)
-            .map_err(EngineError::Storage)?;
+        ZoneMap::write_to(
+            &self.superblock.layout,
+            &self.primary_device,
+            zone_map_offset,
+        )
+        .map_err(EngineError::Storage)?;
 
         self.superblock.zone_map_offset = zone_map_offset;
 
@@ -376,9 +382,7 @@ impl DiskEngine {
             .layout
             .logical_to_physical(ZoneType::Blob, self.blob_next_offset)
             .ok_or_else(|| {
-                EngineError::Io(std::io::Error::other(
-                    "blob zone offset out of range",
-                ))
+                EngineError::Io(std::io::Error::other("blob zone offset out of range"))
             })?;
 
         self.primary_device
@@ -398,10 +402,7 @@ impl DiskEngine {
     ///
     /// Returns the raw on-disk bytes (compressed/encrypted). Use
     /// `read_blob_plaintext` for automatic decompression.
-    pub fn read_blob(
-        &self,
-        oid: mimisbrunnr_types::ObjectId,
-    ) -> Result<Vec<u8>, EngineError> {
+    pub fn read_blob(&self, oid: mimisbrunnr_types::ObjectId) -> Result<Vec<u8>, EngineError> {
         let rec = self
             .engine
             .object_table
@@ -417,9 +418,7 @@ impl DiskEngine {
             .layout
             .logical_to_physical(ZoneType::Blob, rec.blob_offset)
             .ok_or_else(|| {
-                EngineError::Io(std::io::Error::other(
-                    "blob zone offset out of range",
-                ))
+                EngineError::Io(std::io::Error::other("blob zone offset out of range"))
             })?;
 
         let mut buf = vec![0u8; rec.stored_size as usize];
@@ -456,9 +455,7 @@ impl DiskEngine {
             mimisbrunnr_types::CompressionState::Zstd => {
                 mimisbrunnr_transform::CompressionAlgo::Zstd(3) // level doesn't matter for decompression
             }
-            mimisbrunnr_types::CompressionState::Lz4 => {
-                mimisbrunnr_transform::CompressionAlgo::Lz4
-            }
+            mimisbrunnr_types::CompressionState::Lz4 => mimisbrunnr_transform::CompressionAlgo::Lz4,
         };
         // TODO: restore encryption mode from record when encryption is implemented
         let pipeline = mimisbrunnr_transform::TransformPipeline::new(
@@ -467,8 +464,11 @@ impl DiskEngine {
             [0u8; 32],
         );
 
-        let plaintext = pipeline
-            .transform_read(&stored, rec.compressed_size as usize, Some(&rec.content_hash))?;
+        let plaintext = pipeline.transform_read(
+            &stored,
+            rec.compressed_size as usize,
+            Some(&rec.content_hash),
+        )?;
         Ok(plaintext)
     }
 
@@ -520,7 +520,8 @@ impl DiskEngine {
 
         // Serialize forward index
         for rec in engine.object_table.iter() {
-            let oid = mimisbrunnr_types::ObjectId::new(rec.id >> 48, rec.id & 0x0000_FFFF_FFFF_FFFF);
+            let oid =
+                mimisbrunnr_types::ObjectId::new(rec.id >> 48, rec.id & 0x0000_FFFF_FFFF_FFFF);
             let entries = engine.forward_index.get(oid);
             if entries.is_empty() {
                 continue;
@@ -725,7 +726,10 @@ impl DiskEngine {
 
         // Rebuild forward index, tag index, and kv index from forward records
         for fwd in &state.forward {
-            let oid = mimisbrunnr_types::ObjectId::new(fwd.object_id >> 48, fwd.object_id & 0x0000_FFFF_FFFF_FFFF);
+            let oid = mimisbrunnr_types::ObjectId::new(
+                fwd.object_id >> 48,
+                fwd.object_id & 0x0000_FFFF_FFFF_FFFF,
+            );
             let obj_local = oid.local() as u32;
 
             for &tag_raw in &fwd.tag_ids_direct {
@@ -763,9 +767,9 @@ impl DiskEngine {
         // Rebuild path contexts
         let deserialize_entry =
             |entry_rec: &ProjectionEntryRecord| -> mimisbrunnr_types::ProjectedEntry {
-                let object = entry_rec
-                    .object_id
-                    .map(|raw| mimisbrunnr_types::ObjectId::new(raw >> 48, raw & 0x0000_FFFF_FFFF_FFFF));
+                let object = entry_rec.object_id.map(|raw| {
+                    mimisbrunnr_types::ObjectId::new(raw >> 48, raw & 0x0000_FFFF_FFFF_FFFF)
+                });
                 let entry_type = match &entry_rec.entry_type {
                     EntryTypeRecord::File { mode, uid, gid } => {
                         mimisbrunnr_types::ProjectedEntryType::File {
@@ -796,16 +800,18 @@ impl DiskEngine {
                     let _ = context_mgr.create_context(name);
                     for entry_rec in &ctx_rec.entries {
                         let entry = deserialize_entry(entry_rec);
-                        let oid =
-                            entry.object.unwrap_or(mimisbrunnr_types::ObjectId::new(0, 0));
+                        let oid = entry
+                            .object
+                            .unwrap_or(mimisbrunnr_types::ObjectId::new(0, 0));
                         let _ = context_mgr.set_path(name, oid, &entry_rec.path, entry);
                     }
                 }
                 None => {
                     for entry_rec in &ctx_rec.entries {
                         let entry = deserialize_entry(entry_rec);
-                        let oid =
-                            entry.object.unwrap_or(mimisbrunnr_types::ObjectId::new(0, 0));
+                        let oid = entry
+                            .object
+                            .unwrap_or(mimisbrunnr_types::ObjectId::new(0, 0));
                         context_mgr.set_unscoped_path(oid, &entry_rec.path, entry);
                     }
                 }
@@ -1044,7 +1050,10 @@ mod tests {
             let mut de = DiskEngine::open(&config_path).unwrap();
 
             let oid = de.engine_mut().create_object(1000).unwrap();
-            let blob_result = de.engine_mut().write_blob(oid, b"hello world", 1000).unwrap();
+            let blob_result = de
+                .engine_mut()
+                .write_blob(oid, b"hello world", 1000)
+                .unwrap();
             content_hash = blob_result.content_hash;
 
             // Write transformed blob to blob zone

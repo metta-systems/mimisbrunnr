@@ -1,7 +1,9 @@
-use mimisbrunnr_index::{TagIndex, KvIndex, RoaringBitmap};
-use mimisbrunnr_ontology::ImplicationDag;
-use mimisbrunnr_types::{Query, CmpOp, Value, TagId};
-use log::trace;
+use {
+    log::trace,
+    mimisbrunnr_index::{KvIndex, RoaringBitmap, TagIndex},
+    mimisbrunnr_ontology::ImplicationDag,
+    mimisbrunnr_types::{CmpOp, Query, TagId, Value},
+};
 
 /// Executes queries against the index layer using bitmap algebra.
 ///
@@ -14,12 +16,12 @@ pub struct QueryExecutor<'a> {
 }
 
 impl<'a> QueryExecutor<'a> {
-    pub fn new(
-        tag_index: &'a TagIndex,
-        kv_index: &'a KvIndex,
-        dag: &'a ImplicationDag,
-    ) -> Self {
-        Self { tag_index, kv_index, dag }
+    pub fn new(tag_index: &'a TagIndex, kv_index: &'a KvIndex, dag: &'a ImplicationDag) -> Self {
+        Self {
+            tag_index,
+            kv_index,
+            dag,
+        }
     }
 
     /// Execute a query and return the matching object IDs as a bitmap.
@@ -46,10 +48,7 @@ impl<'a> QueryExecutor<'a> {
     }
 
     fn eval_has_tag(&self, tag: TagId) -> RoaringBitmap {
-        self.tag_index
-            .bitmap(tag)
-            .cloned()
-            .unwrap_or_default()
+        self.tag_index.bitmap(tag).cloned().unwrap_or_default()
     }
 
     fn eval_has_attr(&self, key: TagId, op: CmpOp, value: &Value) -> RoaringBitmap {
@@ -159,9 +158,11 @@ impl<'a> QueryExecutor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use mimisbrunnr_index::TagIndex;
-    use mimisbrunnr_ontology::{ImplicationDag, TagDefinition, TagSemantics};
+    use {
+        super::*,
+        mimisbrunnr_index::TagIndex,
+        mimisbrunnr_ontology::{ImplicationDag, TagDefinition, TagSemantics},
+    };
 
     fn tag(id: u32) -> TagId {
         TagId::new(id)
@@ -376,11 +377,17 @@ mod tests {
     fn nested_compound_query() {
         let mut f = TestFixture::new();
         // a: 1,2,3,4,5
-        for i in 1..=5 { f.tag_index.tag_object(tag(1), i); }
+        for i in 1..=5 {
+            f.tag_index.tag_object(tag(1), i);
+        }
         // b: 3,4,5,6,7
-        for i in 3..=7 { f.tag_index.tag_object(tag(2), i); }
+        for i in 3..=7 {
+            f.tag_index.tag_object(tag(2), i);
+        }
         // c: 5,6,7,8,9
-        for i in 5..=9 { f.tag_index.tag_object(tag(3), i); }
+        for i in 5..=9 {
+            f.tag_index.tag_object(tag(3), i);
+        }
 
         // (a AND b) OR c = {3,4,5} OR {5,6,7,8,9} = {3,4,5,6,7,8,9}
         let q = Query::Or(vec![
