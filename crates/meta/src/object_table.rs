@@ -221,7 +221,7 @@ mod tests {
 
         // Modify a record
         table.get_mut(oid1).unwrap().content_hash = [0xAA; 32];
-        table.get_mut(oid2).unwrap().state = ObjectState::Tombstoned;
+        table.get_mut(oid2).unwrap().set_state(ObjectState::Tombstoned);
 
         table.flush_all(&dev).unwrap();
 
@@ -233,7 +233,7 @@ mod tests {
         assert_eq!(rec1.content_hash, [0xAA; 32]);
 
         let rec2 = table2.get(oid2).unwrap();
-        assert_eq!(rec2.state, ObjectState::Tombstoned);
+        assert_eq!(rec2.state(), ObjectState::Tombstoned);
     }
 
     #[test]

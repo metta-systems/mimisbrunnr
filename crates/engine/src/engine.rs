@@ -152,12 +152,12 @@ impl Engine {
             .get_mut(oid)
             .ok_or(EngineError::ObjectNotFound(oid))?;
 
-        if rec.state != ObjectState::Active {
+        if rec.state() != ObjectState::Active {
             return Err(EngineError::ObjectDeleted(oid));
         }
 
         // Phase 1: Tombstone
-        rec.state = ObjectState::Tombstoned;
+        rec.set_state(ObjectState::Tombstoned);
 
         // Phase 2: Index cleanup — remove from all bitmaps using forward index
         let entries = self.forward_index.remove_object(oid);
@@ -185,7 +185,7 @@ impl Engine {
     ) -> Result<&mimisbrunnr_meta::ObjectRecord, EngineError> {
         self.object_table
             .get(oid)
-            .filter(|r| r.state == ObjectState::Active)
+            .filter(|r| r.state() == ObjectState::Active)
             .ok_or(EngineError::ObjectNotFound(oid))
     }
 
@@ -363,11 +363,11 @@ impl Engine {
             rec.blob_length = result.original_size as u64;
             rec.stored_size = result.stored_size as u64;
             rec.modified_ns = (now_ms as i64) * 1_000_000;
-            rec.compression = match compression {
+            rec.set_compression(match compression {
                 CompressionAlgo::None => CompressionState::None,
                 CompressionAlgo::Zstd(_) => CompressionState::Zstd,
                 CompressionAlgo::Lz4 => CompressionState::Lz4,
-            };
+            });
         }
 
         self.emit_op(now_ms, OpKind::WriteBlob { oid });
@@ -388,7 +388,7 @@ impl Engine {
                 // Only return active objects
                 self.object_table
                     .get(oid)
-                    .filter(|r| r.state == ObjectState::Active)
+                    .filter(|r| r.state() == ObjectState::Active)
                     .map(|_| oid)
             })
             .collect()
@@ -450,7 +450,7 @@ impl Engine {
 
     fn ensure_active(&self, oid: ObjectId) -> Result<(), EngineError> {
         match self.object_table.get(oid) {
-            Some(rec) if rec.state == ObjectState::Active => Ok(()),
+            Some(rec) if rec.state() == ObjectState::Active => Ok(()),
             Some(_) => Err(EngineError::ObjectDeleted(oid)),
             None => Err(EngineError::ObjectNotFound(oid)),
         }
