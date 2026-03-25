@@ -365,6 +365,21 @@ impl DiskEngine {
         self.blobs.get(&object_id).map(|v| v.as_slice())
     }
 
+    /// Access the block device (for raw reads).
+    pub fn device(&self) -> &FileBlockDevice {
+        &self.primary_device
+    }
+
+    /// Access the superblock (for zone layout info).
+    pub fn superblock(&self) -> &Superblock {
+        &self.superblock
+    }
+
+    /// Access the pool config.
+    pub fn config(&self) -> &PoolConfig {
+        &self.config
+    }
+
     /// Serialize engine state to CBOR bytes.
     fn serialize_index_state(
         engine: &Engine,

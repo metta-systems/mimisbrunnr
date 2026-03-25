@@ -18,6 +18,7 @@ members = [
     "bin/mimir",
     "bin/brunnr",
     "bin/populate",
+    "bin/analyze",
 ]
 resolver = "3"
 
@@ -49,6 +50,8 @@ blake3 = "1"
 bytemuck = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
 crc32fast = "1"
+eframe = "0.33"
+egui_extras = "0.33"
 env_logger = "0.11"
 fuser = { version = "0.17" }
 log = "0.4"
