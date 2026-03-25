@@ -3,7 +3,6 @@ use {
         error::MetaError,
         record::{ObjectRecord, RECORD_SIZE},
     },
-    arbitrary_int::u48,
     mimisbrunnr_storage::BlockDevice,
     mimisbrunnr_types::ObjectId,
 };
@@ -56,7 +55,7 @@ impl ObjectTable {
             } else {
                 match ObjectRecord::from_bytes(&buf) {
                     Ok(rec) => {
-                        let local: u64 = ObjectId::from_raw(rec.id).local().value();
+                        let local: u64 = rec.id & 0x0000_FFFF_FFFF_FFFF;
                         if local >= next_local_seq {
                             next_local_seq = local + 1;
                         }
@@ -78,7 +77,7 @@ impl ObjectTable {
     }
 
     /// Allocate a new object, returning its ObjectId.
-    pub fn create(&mut self, node_id: u16) -> Result<ObjectId, MetaError> {
+    pub fn create(&mut self, node_id: u64) -> Result<ObjectId, MetaError> {
         let local = self.next_local_seq;
         if local >= self.capacity {
             return Err(MetaError::TableFull {
@@ -86,8 +85,8 @@ impl ObjectTable {
             });
         }
 
-        let oid = ObjectId::new(node_id, u48::from_u64(local));
-        let rec = ObjectRecord::new(oid.raw_value());
+        let oid = ObjectId::new(node_id, local);
+        let rec = ObjectRecord::new((oid.node() << 48) | oid.local());
 
         // Ensure records vec is large enough
         while self.records.len() <= local as usize {
@@ -101,19 +100,19 @@ impl ObjectTable {
 
     /// Get a record by ObjectId (O(1) lookup).
     pub fn get(&self, oid: ObjectId) -> Option<&ObjectRecord> {
-        let local: usize = oid.local().value() as usize;
+        let local: usize = oid.local() as usize;
         self.records.get(local).and_then(|r| r.as_ref())
     }
 
     /// Get a mutable record by ObjectId.
     pub fn get_mut(&mut self, oid: ObjectId) -> Option<&mut ObjectRecord> {
-        let local: usize = oid.local().value() as usize;
+        let local: usize = oid.local() as usize;
         self.records.get_mut(local).and_then(|r| r.as_mut())
     }
 
     /// Flush a single record to disk.
     pub fn flush_record(&self, dev: &dyn BlockDevice, oid: ObjectId) -> Result<(), MetaError> {
-        let local: usize = oid.local().value() as usize;
+        let local: usize = oid.local() as usize;
         let offset = self.zone_offset + local as u64 * RECORD_SIZE as u64;
         match &self.records[local] {
             Some(rec) => {
@@ -174,8 +173,8 @@ mod tests {
         let oid2 = table.create(1).unwrap();
 
         assert_eq!(oid1.node(), 1);
-        assert_eq!(oid1.local(), u48::from_u64(0));
-        assert_eq!(oid2.local(), u48::from_u64(1));
+        assert_eq!(oid1.local(), 0);
+        assert_eq!(oid2.local(), 1);
         assert_eq!(table.count(), 2);
     }
 
@@ -185,7 +184,7 @@ mod tests {
         let oid = table.create(1).unwrap();
 
         let rec = table.get(oid).unwrap();
-        assert_eq!(rec.id, oid.raw_value());
+        assert_eq!(rec.id, (oid.node() << 48) | oid.local());
         assert!(rec.is_active());
     }
 
@@ -206,7 +205,7 @@ mod tests {
     #[test]
     fn get_nonexistent_returns_none() {
         let table = test_table();
-        let oid = ObjectId::new(1, u48::from_u64(999));
+        let oid = ObjectId::new(1, 999);
         assert!(table.get(oid).is_none());
     }
 

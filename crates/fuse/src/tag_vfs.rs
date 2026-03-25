@@ -32,7 +32,6 @@ use std::collections::{BTreeSet, HashMap};
 
 use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
 use mimisbrunnr_ontology::ImplicationDag;
-use arbitrary_int::u48;
 use mimisbrunnr_types::{Assertion, ObjectId, TagId};
 use roaring::RoaringBitmap;
 
@@ -167,29 +166,29 @@ impl TagVfs {
             | TagVfsEntry::CtxDir(_) => Some(dir_attr(ino)),
 
             TagVfsEntry::TagFile { obj_local, .. } => {
-                let oid = ObjectId::new(0, u48::from_u64(*obj_local as u64));
+                let oid = ObjectId::new(0, *obj_local as u64);
                 let size = self
                     .blobs
-                    .get(&oid.raw_value())
+                    .get(&((oid.node() << 48) | oid.local()))
                     .map(|b| b.len() as u64)
                     .unwrap_or(0);
                 Some(file_attr(ino, size))
             }
 
             TagVfsEntry::CtxNode { ctx, vfs_ino } => {
-                if let Some(tree) = self.context_trees.get(ctx) {
-                    if let Some(node) = tree.get(*vfs_ino) {
-                        let mut attr = node.attr.clone();
-                        attr.ino = ino; // remap to global inode
-                        // Use blob size as authoritative file size
-                        if let Some(oid) = node.object {
-                            if let Some(blob) = self.blobs.get(&oid.raw_value()) {
-                                attr.size = blob.len() as u64;
-                                attr.blocks = (attr.size + 511) / 512;
-                            }
-                        }
-                        return Some(attr);
+                if let Some(tree) = self.context_trees.get(ctx)
+                    && let Some(node) = tree.get(*vfs_ino)
+                {
+                    let mut attr = node.attr.clone();
+                    attr.ino = ino; // remap to global inode
+                    // Use blob size as authoritative file size
+                    if let Some(oid) = node.object
+                        && let Some(blob) = self.blobs.get(&((oid.node() << 48) | oid.local()))
+                    {
+                        attr.size = blob.len() as u64;
+                        attr.blocks = attr.size.div_ceil(512);
                     }
+                    return Some(attr);
                 }
                 None
             }
@@ -272,10 +271,10 @@ impl TagVfs {
             } => {
                 let ctx = ctx.clone();
                 let vfs_ino = *vfs_ino;
-                if let Some(tree) = self.context_trees.get(&ctx) {
-                    if let Some(node) = tree.lookup(vfs_ino, name) {
-                        return Some(self.ensure_ctx_node(ctx, node.ino));
-                    }
+                if let Some(tree) = self.context_trees.get(&ctx)
+                    && let Some(node) = tree.lookup(vfs_ino, name)
+                {
+                    return Some(self.ensure_ctx_node(ctx, node.ino));
                 }
                 None
             }
@@ -471,8 +470,8 @@ impl TagVfs {
         let entry = self.entries.get(&ino)?;
         match entry {
             TagVfsEntry::TagFile { obj_local, .. } => {
-                let oid = ObjectId::new(0, u48::from_u64(*obj_local as u64));
-                let data = self.blobs.get(&oid.raw_value())?;
+                let oid = ObjectId::new(0, *obj_local as u64);
+                let data = self.blobs.get(&((oid.node() << 48) | oid.local()))?;
                 let start = (offset as usize).min(data.len());
                 let end = (start + size as usize).min(data.len());
                 Some(&data[start..end])
@@ -481,7 +480,7 @@ impl TagVfs {
                 let tree = self.context_trees.get(ctx)?;
                 let node = tree.get(*vfs_ino)?;
                 let oid = node.object?;
-                let data = self.blobs.get(&oid.raw_value())?;
+                let data = self.blobs.get(&((oid.node() << 48) | oid.local()))?;
                 let start = (offset as usize).min(data.len());
                 let end = (start + size as usize).min(data.len());
                 Some(&data[start..end])
@@ -594,7 +593,7 @@ impl TagVfs {
     /// If multiple objects in the same bitmap share a name, disambiguates
     /// with `_<id>` suffix.
     fn object_display_name(&self, obj_local: u32, bitmap: &RoaringBitmap) -> String {
-        let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+        let oid = ObjectId::new(0, obj_local as u64);
         let base_name = self.get_name_attr(oid);
 
         let name = match base_name {
@@ -608,11 +607,11 @@ impl TagVfs {
             if other == obj_local {
                 continue;
             }
-            let other_oid = ObjectId::new(0, u48::from_u64(other as u64));
-            if let Some(other_name) = self.get_name_attr(other_oid) {
-                if other_name == name {
-                    count += 1;
-                }
+            let other_oid = ObjectId::new(0, other as u64);
+            if let Some(other_name) = self.get_name_attr(other_oid)
+                && other_name == name
+            {
+                count += 1;
             }
         }
 
@@ -633,13 +632,13 @@ impl TagVfs {
         use mimisbrunnr_types::Value;
         let name_tag = self.dag.lookup("name")?;
         for entry in self.forward_index.get(oid) {
-            if let Assertion::Attr { key, value } = &entry.assertion {
-                if *key == name_tag {
-                    return match value {
-                        Value::Text(s) => Some(s.clone()),
-                        other => Some(other.to_string()),
-                    };
-                }
+            if let Assertion::Attr { key, value } = &entry.assertion
+                && *key == name_tag
+            {
+                return match value {
+                    Value::Text(s) => Some(s.clone()),
+                    other => Some(other.to_string()),
+                };
             }
         }
         None
@@ -676,14 +675,14 @@ impl TagVfs {
                             self.ctx_dir_inos.get(ctx).copied().unwrap_or(INO_CTX)
                         } else {
                             // Find parent in context tree
-                            if let Some(tree) = self.context_trees.get(ctx) {
-                                if let Some(node) = tree.get(*vfs_ino) {
-                                    return self
-                                        .ctx_node_inos
-                                        .get(&(ctx.clone(), node.parent))
-                                        .copied()
-                                        .unwrap_or(INO_CTX);
-                                }
+                            if let Some(tree) = self.context_trees.get(ctx)
+                                && let Some(node) = tree.get(*vfs_ino)
+                            {
+                                return self
+                                    .ctx_node_inos
+                                    .get(&(ctx.clone(), node.parent))
+                                    .copied()
+                                    .unwrap_or(INO_CTX);
                             }
                             INO_CTX
                         }
@@ -783,7 +782,7 @@ mod tests {
         }
 
         fn add_object(&mut self, obj_local: u32, tags: &[TagId], name: Option<&str>) {
-            let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+            let oid = ObjectId::new(0, obj_local as u64);
             for &tag_id in tags {
                 self.tag_index.tag_object(tag_id, obj_local);
                 self.forward_index
@@ -897,8 +896,8 @@ mod tests {
         let mut vfs = f.build_vfs();
 
         // Set blob data for obj 1.
-        let oid = ObjectId::new(0, u48::from_u64(1));
-        vfs.set_blob(oid.raw_value(), vec![0u8; 1024]);
+        let oid = ObjectId::new(0, 1);
+        vfs.set_blob((oid.node() << 48) | oid.local(), vec![0u8; 1024]);
 
         let tag_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
         let file_ino = vfs.lookup(tag_ino, "track1.flac").unwrap();
@@ -911,8 +910,8 @@ mod tests {
     #[test]
     fn read_file_content() {
         let mut vfs = music_fixture().build_vfs();
-        let oid = ObjectId::new(0, u48::from_u64(1));
-        vfs.set_blob(oid.raw_value(), b"hello world".to_vec());
+        let oid = ObjectId::new(0, 1);
+        vfs.set_blob((oid.node() << 48) | oid.local(), b"hello world".to_vec());
 
         let tag_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
         let file_ino = vfs.lookup(tag_ino, "track1.flac").unwrap();
@@ -931,7 +930,7 @@ mod tests {
         let music = f.register_tag(1, "music");
         // No "name" attribute registered, so obj has no name.
         f.tag_index.tag_object(music, 42);
-        let oid = ObjectId::new(0, u48::from_u64(42));
+        let oid = ObjectId::new(0, 42);
         f.forward_index
             .add(oid, Assertion::Tag(music), TagOrigin::Direct);
 
@@ -991,7 +990,7 @@ mod tests {
 
         // Add a context subtree.
         let mut proj = PathProjection::new("test-ctx");
-        proj.add(ProjectedEntry::file(ObjectId::new(0, u48::from_u64(99)), "hello.txt"));
+        proj.add(ProjectedEntry::file(ObjectId::new(0, 99), "hello.txt"));
         let tree = VfsTree::from_projection(&proj);
         vfs.add_context("test-ctx".into(), tree);
 
@@ -1056,7 +1055,7 @@ mod tests {
         let f = TestFixture::new();
         let mut vfs = f.build_vfs();
 
-        let oid = ObjectId::new(0, u48::from_u64(42));
+        let oid = ObjectId::new(0, 42);
         let mut proj = PathProjection::new("myctx");
         proj.add(ProjectedEntry::file(oid, "data.bin"));
         let tree = VfsTree::from_projection(&proj);
@@ -1069,7 +1068,7 @@ mod tests {
         assert_eq!(attr.size, 0, "size should be 0 before blob is set");
 
         // Set blob data — getattr should now return the blob size
-        vfs.set_blob(oid.raw_value(), vec![0xAB; 5000]);
+        vfs.set_blob((oid.node() << 48) | oid.local(), vec![0xAB; 5000]);
         let attr = vfs.getattr(file_ino).unwrap();
         assert_eq!(attr.size, 5000, "size should reflect blob data");
         assert_eq!(attr.blocks, 5000u64.div_ceil(512));
@@ -1082,13 +1081,13 @@ mod tests {
         let f = TestFixture::new();
         let mut vfs = f.build_vfs();
 
-        let oid = ObjectId::new(0, u48::from_u64(77));
+        let oid = ObjectId::new(0, 77);
         let mut proj = PathProjection::new("proj");
         proj.add(ProjectedEntry::file(oid, "readme.txt"));
         let tree = VfsTree::from_projection(&proj);
         vfs.add_context("proj".into(), tree);
 
-        vfs.set_blob(oid.raw_value(), b"file content here".to_vec());
+        vfs.set_blob((oid.node() << 48) | oid.local(), b"file content here".to_vec());
 
         let ctx_ino = vfs.lookup(INO_CTX, "proj").unwrap();
         let file_ino = vfs.lookup(ctx_ino, "readme.txt").unwrap();
@@ -1109,7 +1108,7 @@ mod tests {
         let f = TestFixture::new();
         let mut vfs = f.build_vfs();
 
-        let oid = ObjectId::new(0, u48::from_u64(88));
+        let oid = ObjectId::new(0, 88);
         let mut proj = PathProjection::new("ctx");
         proj.add(ProjectedEntry::file(oid, "empty.bin"));
         let tree = VfsTree::from_projection(&proj);

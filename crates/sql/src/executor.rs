@@ -5,7 +5,6 @@ use {
         planner::{FilterPredicate, PhysicalOp},
         types::{GroupRow, QueryResult, Row},
     },
-    arbitrary_int::u48,
     mimisbrunnr_index::{ForwardIndex, KvIndex, RoaringBitmap, TagIndex},
     mimisbrunnr_ontology::ImplicationDag,
     mimisbrunnr_types::{Assertion, ObjectId, TagId, Value},
@@ -164,11 +163,11 @@ impl<'a> SqlExecutor<'a> {
                 let all_with_key = self.all_objects_with_key(key);
                 let mut result = RoaringBitmap::new();
                 for obj_local in all_with_key.iter() {
-                    let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
-                    if let Some(obj_value) = self.get_attr(oid, key) {
-                        if compare_values(&obj_value, value, op) {
-                            result.insert(obj_local);
-                        }
+                    let oid = ObjectId::new(0, obj_local as u64);
+                    if let Some(obj_value) = self.get_attr(oid, key)
+                        && compare_values(&obj_value, value, op)
+                    {
+                        result.insert(obj_local);
                     }
                 }
                 Ok(result)
@@ -188,7 +187,7 @@ impl<'a> SqlExecutor<'a> {
         for tag_id in self.tag_index.all_tags() {
             if let Some(bm) = self.tag_index.bitmap(tag_id) {
                 for obj_local in bm.iter() {
-                    let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+                    let oid = ObjectId::new(0, obj_local as u64);
                     if self.get_attr(oid, key).is_some() {
                         result.insert(obj_local);
                     }
@@ -223,10 +222,9 @@ impl<'a> SqlExecutor<'a> {
                 key: k,
                 value: ref v,
             } = entry.assertion
+                && k == key
             {
-                if k == key {
-                    return Some(v.clone());
-                }
+                return Some(v.clone());
             }
         }
         None
@@ -246,7 +244,7 @@ impl<'a> SqlExecutor<'a> {
         let rows: Vec<Row> = bitmap
             .iter()
             .map(|obj_local| {
-                let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+                let oid = ObjectId::new(0, obj_local as u64);
                 let cols = if columns.is_empty() || columns.contains(&"*".to_string()) {
                     // Return all attributes
                     self.all_attrs(oid)
@@ -255,7 +253,7 @@ impl<'a> SqlExecutor<'a> {
                         .iter()
                         .filter_map(|col| {
                             if col == "id" {
-                                Some(("id".to_string(), Value::Int(oid.raw_value() as i64)))
+                                Some(("id".to_string(), Value::Int(oid.local() as i64)))
                             } else {
                                 let tag_id = self.dag.lookup(col)?;
                                 let value = self.get_attr(oid, tag_id)?;
@@ -299,7 +297,7 @@ impl<'a> SqlExecutor<'a> {
     }
 
     fn all_attrs(&self, oid: ObjectId) -> Vec<(String, Value)> {
-        let mut attrs = vec![("id".to_string(), Value::Int(oid.raw_value() as i64))];
+        let mut attrs = vec![("id".to_string(), Value::Int(oid.local() as i64))];
         for entry in self.forward_index.get(oid) {
             match &entry.assertion {
                 Assertion::Attr { key, value } => {
@@ -318,7 +316,7 @@ impl<'a> SqlExecutor<'a> {
     fn apply_filter(&self, bitmap: &RoaringBitmap, filter: &FilterPredicate) -> RoaringBitmap {
         let mut result = RoaringBitmap::new();
         for obj_local in bitmap.iter() {
-            let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+            let oid = ObjectId::new(0, obj_local as u64);
             if self.eval_filter(oid, filter) {
                 result.insert(obj_local);
             }
@@ -329,26 +327,26 @@ impl<'a> SqlExecutor<'a> {
     fn eval_filter(&self, oid: ObjectId, filter: &FilterPredicate) -> bool {
         match filter {
             FilterPredicate::Like { column, pattern } => {
-                if let Some(tag_id) = self.dag.lookup(column) {
-                    if let Some(Value::Text(s)) = self.get_attr(oid, tag_id) {
-                        return like_match(&s, pattern);
-                    }
+                if let Some(tag_id) = self.dag.lookup(column)
+                    && let Some(Value::Text(s)) = self.get_attr(oid, tag_id)
+                {
+                    return like_match(&s, pattern);
                 }
                 false
             }
             FilterPredicate::In { column, values } => {
-                if let Some(tag_id) = self.dag.lookup(column) {
-                    if let Some(val) = self.get_attr(oid, tag_id) {
-                        return values.contains(&val);
-                    }
+                if let Some(tag_id) = self.dag.lookup(column)
+                    && let Some(val) = self.get_attr(oid, tag_id)
+                {
+                    return values.contains(&val);
                 }
                 false
             }
             FilterPredicate::Compare { column, op, value } => {
-                if let Some(tag_id) = self.dag.lookup(column) {
-                    if let Some(val) = self.get_attr(oid, tag_id) {
-                        return compare_values(&val, value, *op);
-                    }
+                if let Some(tag_id) = self.dag.lookup(column)
+                    && let Some(val) = self.get_attr(oid, tag_id)
+                {
+                    return compare_values(&val, value, *op);
                 }
                 false
             }
@@ -409,12 +407,12 @@ impl<'a> SqlExecutor<'a> {
         // Build groups: value → bitmap of objects with that value
         let mut groups: HashMap<String, RoaringBitmap> = HashMap::new();
         for obj_local in bitmap.iter() {
-            let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+            let oid = ObjectId::new(0, obj_local as u64);
             if let Some(value) = self.get_attr(oid, group_tag) {
                 let key = value_to_string(&value);
                 groups
                     .entry(key)
-                    .or_insert_with(RoaringBitmap::new)
+                    .or_default()
                     .insert(obj_local);
             }
         }
@@ -437,10 +435,10 @@ impl<'a> SqlExecutor<'a> {
             }
 
             // Apply HAVING filter
-            if let Some(filter) = having {
-                if !self.eval_having_filter(&cols, filter) {
-                    continue;
-                }
+            if let Some(filter) = having
+                && !self.eval_having_filter(&cols, filter)
+            {
+                continue;
             }
 
             rows.push(GroupRow {
@@ -481,7 +479,7 @@ impl<'a> SqlExecutor<'a> {
         Ok(QueryResult::Select {
             columns: col_names,
             rows: vec![Row {
-                id: ObjectId::new(0, u48::from_u64(0)),
+                id: ObjectId::new(0, 0),
                 columns: cols,
             }],
         })
@@ -500,7 +498,7 @@ impl<'a> SqlExecutor<'a> {
                 let mut distinct: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 for obj_local in bitmap.iter() {
-                    let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+                    let oid = ObjectId::new(0, obj_local as u64);
                     if let Some(val) = self.get_attr(oid, tag_id) {
                         distinct.insert(value_to_string(&val));
                     }
@@ -512,7 +510,7 @@ impl<'a> SqlExecutor<'a> {
                 let tag_id = self.resolve_tag(col)?;
                 let mut sum: i64 = 0;
                 for obj_local in bitmap.iter() {
-                    let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+                    let oid = ObjectId::new(0, obj_local as u64);
                     if let Some(Value::Int(v)) = self.get_attr(oid, tag_id) {
                         sum += v;
                     } else if let Some(Value::Float(v)) = self.get_attr(oid, tag_id) {
@@ -527,7 +525,7 @@ impl<'a> SqlExecutor<'a> {
                 let mut sum: f64 = 0.0;
                 let mut count: usize = 0;
                 for obj_local in bitmap.iter() {
-                    let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+                    let oid = ObjectId::new(0, obj_local as u64);
                     if let Some(val) = self.get_attr(oid, tag_id) {
                         match val {
                             Value::Int(v) => {
@@ -551,7 +549,7 @@ impl<'a> SqlExecutor<'a> {
                 let is_max = matches!(func, AggregateFunc::Max(_));
                 let mut best: Option<Value> = None;
                 for obj_local in bitmap.iter() {
-                    let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+                    let oid = ObjectId::new(0, obj_local as u64);
                     if let Some(val) = self.get_attr(oid, tag_id) {
                         best = Some(match best {
                             None => val,
@@ -796,13 +794,13 @@ mod tests {
 
         fn add_object_with_tag(&mut self, obj_local: u32, tag_id: TagId) {
             self.tag_index.tag_object(tag_id, obj_local);
-            let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+            let oid = ObjectId::new(0, obj_local as u64);
             self.forward_index
                 .add(oid, Assertion::Tag(tag_id), TagOrigin::Direct);
         }
 
         fn set_attr(&mut self, obj_local: u32, key: TagId, value: Value) {
-            let oid = ObjectId::new(0, u48::from_u64(obj_local as u64));
+            let oid = ObjectId::new(0, obj_local as u64);
             self.kv_index.insert(key, &value, obj_local);
             self.forward_index
                 .add(oid, Assertion::Attr { key, value }, TagOrigin::Direct);

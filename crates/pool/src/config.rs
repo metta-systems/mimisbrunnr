@@ -13,6 +13,61 @@ use log::trace;
 pub struct PoolConfig {
     pub node_id: u16,
     pub disks: Vec<DiskEntry>,
+    /// Default compression for objects not matching any Compress rule.
+    /// Format: "none", "zstd:LEVEL" (e.g. "zstd:3"), "lz4".
+    #[serde(default = "default_compression")]
+    pub default_compression: String,
+    /// Placement rules (serialized as TOML-friendly records).
+    #[serde(default)]
+    pub rules: Vec<RuleConfig>,
+}
+
+fn default_compression() -> String {
+    "zstd:3".to_string()
+}
+
+/// A placement rule in TOML-serializable form.
+///
+/// Query strings are resolved against the ontology DAG at load time.
+/// Example:
+/// ```toml
+/// [[rules]]
+/// type = "compress"
+/// query = "video OR image"
+/// algo = "none"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleConfig {
+    /// Rule type: "compress", "pin", "prefer", "replicate", "colocate", "auto-tier".
+    #[serde(rename = "type")]
+    pub rule_type: String,
+    /// Query string to match objects (not used for auto-tier).
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Compression algorithm: "none", "zstd:LEVEL", "lz4" (for compress rules).
+    #[serde(default)]
+    pub algo: Option<String>,
+    /// Storage tier: "hot", "warm", "cold", "glacier" (for pin/prefer rules).
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// Priority 0-255 (for prefer rules).
+    #[serde(default)]
+    pub priority: Option<u8>,
+    /// Minimum replica count (for replicate rules).
+    #[serde(default)]
+    pub min_replicas: Option<u8>,
+    /// Whether to replicate across different disks (for replicate rules).
+    #[serde(default)]
+    pub across_disks: Option<bool>,
+    /// Hot threshold in days (for auto-tier rules).
+    #[serde(default)]
+    pub hot_threshold_days: Option<u32>,
+    /// Warm threshold in days (for auto-tier rules).
+    #[serde(default)]
+    pub warm_threshold_days: Option<u32>,
+    /// Cold-after threshold in days (for auto-tier rules).
+    #[serde(default)]
+    pub cold_after: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,12 +78,40 @@ pub struct DiskEntry {
     pub capacity_bytes: u64,
 }
 
+/// Parse a compression algo string like "none", "zstd:3", "lz4".
+pub fn parse_compression_algo(s: &str) -> Option<mimisbrunnr_transform::CompressionAlgo> {
+    use mimisbrunnr_transform::CompressionAlgo;
+    let s = s.trim().to_lowercase();
+    if s == "none" || s == "skip" {
+        Some(CompressionAlgo::None)
+    } else if s == "lz4" {
+        Some(CompressionAlgo::Lz4)
+    } else if let Some(rest) = s.strip_prefix("zstd") {
+        let level = if let Some(level_str) = rest.strip_prefix(':') {
+            level_str.trim().parse::<i32>().ok()?
+        } else {
+            3 // default zstd level
+        };
+        Some(CompressionAlgo::Zstd(level))
+    } else {
+        None
+    }
+}
+
 impl PoolConfig {
     pub fn new(node_id: u16) -> Self {
         Self {
             node_id,
             disks: Vec::new(),
+            default_compression: default_compression(),
+            rules: Vec::new(),
         }
+    }
+
+    /// Parse the default_compression field into a CompressionAlgo.
+    pub fn default_compression_algo(&self) -> mimisbrunnr_transform::CompressionAlgo {
+        parse_compression_algo(&self.default_compression)
+            .unwrap_or(mimisbrunnr_transform::CompressionAlgo::Zstd(3))
     }
 
     pub fn add_disk(&mut self, id: u16, path: impl Into<String>, tier: &str, capacity: u64) {
@@ -37,6 +120,22 @@ impl PoolConfig {
             path: path.into(),
             tier: tier.to_string(),
             capacity_bytes: capacity,
+        });
+    }
+
+    /// Add a compression rule in config format.
+    pub fn add_compress_rule(&mut self, query: &str, algo: &str) {
+        self.rules.push(RuleConfig {
+            rule_type: "compress".to_string(),
+            query: Some(query.to_string()),
+            algo: Some(algo.to_string()),
+            tier: None,
+            priority: None,
+            min_replicas: None,
+            across_disks: None,
+            hot_threshold_days: None,
+            warm_threshold_days: None,
+            cold_after: None,
         });
     }
 

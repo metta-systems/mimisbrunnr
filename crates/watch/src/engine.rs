@@ -84,7 +84,7 @@ impl SubscriptionEngine {
         kv_index: &KvIndex,
         dag: &ImplicationDag,
     ) {
-        let obj_local = oid.local().value() as u32;
+        let obj_local = oid.local() as u32;
         let affected = self.subscriptions_for_tag(tag);
 
         for sub_id in affected {
@@ -134,7 +134,7 @@ impl SubscriptionEngine {
         kv_index: &KvIndex,
         dag: &ImplicationDag,
     ) {
-        let obj_local = oid.local().value() as u32;
+        let obj_local = oid.local() as u32;
         let affected = self.subscriptions_for_tag(tag);
 
         for sub_id in affected {
@@ -182,7 +182,7 @@ impl SubscriptionEngine {
         kv_index: &KvIndex,
         dag: &ImplicationDag,
     ) {
-        let obj_local = oid.local().value() as u32;
+        let obj_local = oid.local() as u32;
         let executor = QueryExecutor::new(tag_index, kv_index, dag);
 
         for (sub_id, sub) in &mut self.subscriptions {
@@ -203,7 +203,7 @@ impl SubscriptionEngine {
 
     /// Notify that an object was deleted.
     pub fn notify_deleted(&mut self, oid: ObjectId, timestamp: HybridTimestamp) {
-        let obj_local = oid.local().value() as u32;
+        let obj_local = oid.local() as u32;
 
         for (sub_id, sub) in &mut self.subscriptions {
             if !sub.is_active() {
@@ -221,7 +221,7 @@ impl SubscriptionEngine {
 
     /// Notify that blob content changed.
     pub fn notify_content_changed(&mut self, oid: ObjectId, timestamp: HybridTimestamp) {
-        let obj_local = oid.local().value() as u32;
+        let obj_local = oid.local() as u32;
 
         for (sub_id, sub) in &mut self.subscriptions {
             if !sub.is_active() {
@@ -349,7 +349,6 @@ fn extract_tags(query: &Query) -> Vec<TagId> {
 mod tests {
     use {
         super::*,
-        arbitrary_int::u48,
         mimisbrunnr_index::TagIndex,
         mimisbrunnr_ontology::{ImplicationDag, TagDefinition, TagSemantics},
     };
@@ -359,7 +358,7 @@ mod tests {
     }
 
     fn oid(local: u64) -> ObjectId {
-        ObjectId::new(0, u48::from_u64(local))
+        ObjectId::new(0, local)
     }
 
     fn ts(ms: u64) -> HybridTimestamp {

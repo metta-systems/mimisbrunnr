@@ -68,11 +68,11 @@ impl TagStore {
         // Also remove from sequence/ranked if applicable
         match self {
             Self::Ordered { sequence, .. } => {
-                let oid = ObjectId::from_raw(obj_local as u64);
+                let oid = ObjectId::new(0, obj_local as u64);
                 sequence.retain(|o| *o != oid);
             }
             Self::Ranked { ranked, .. } => {
-                let oid = ObjectId::from_raw(obj_local as u64);
+                let oid = ObjectId::new(0, obj_local as u64);
                 ranked.retain(|(o, _)| *o != oid);
             }
             Self::Simple(_) => {}
@@ -97,7 +97,7 @@ impl TagStore {
     /// For ordered collections: append an object to the sequence.
     pub fn push_ordered(&mut self, oid: ObjectId) {
         if let Self::Ordered { members, sequence } = self {
-            members.insert(oid.local().value() as u32);
+            members.insert(oid.local() as u32);
             sequence.push(oid);
         }
     }
@@ -113,7 +113,7 @@ impl TagStore {
     /// For ranked collections: insert with score.
     pub fn insert_ranked(&mut self, oid: ObjectId, score: f32) {
         if let Self::Ranked { members, ranked } = self {
-            members.insert(oid.local().value() as u32); // u32 cuts off local sequence high bits!
+            members.insert(oid.local() as u32); // u32 cuts off local sequence high bits!
             ranked.push((oid, score));
             ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         }
@@ -130,7 +130,7 @@ impl TagStore {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, arbitrary_int::u48};
+    use super::*;
 
     #[test]
     fn simple_store() {
@@ -159,9 +159,9 @@ mod tests {
     #[test]
     fn ordered_store() {
         let mut store = TagStore::new_ordered();
-        let oid1 = ObjectId::new(0, u48::from_u64(1));
-        let oid2 = ObjectId::new(0, u48::from_u64(2));
-        let oid3 = ObjectId::new(0, u48::from_u64(3));
+        let oid1 = ObjectId::new(0, 1);
+        let oid2 = ObjectId::new(0, 2);
+        let oid3 = ObjectId::new(0, 3);
 
         store.push_ordered(oid1);
         store.push_ordered(oid2);
@@ -179,8 +179,8 @@ mod tests {
     #[test]
     fn ranked_store() {
         let mut store = TagStore::new_ranked();
-        let oid1 = ObjectId::new(0, u48::from_u64(1));
-        let oid2 = ObjectId::new(0, u48::from_u64(2));
+        let oid1 = ObjectId::new(0, 1);
+        let oid2 = ObjectId::new(0, 2);
 
         store.insert_ranked(oid1, 3.5);
         store.insert_ranked(oid2, 9.0);

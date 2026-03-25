@@ -65,7 +65,6 @@ impl Default for OpLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arbitrary_int::u48;
 
     fn ts(ms: u64) -> HybridTimestamp {
         HybridTimestamp::new(ms, 0, 0)
@@ -77,12 +76,12 @@ mod tests {
         log.push(OpLogEntry {
             timestamp: ts(100),
             lsn: 1,
-            op: OpKind::CreateObject { oid: ObjectId::new(0, u48::from_u64(1)) },
+            op: OpKind::CreateObject { oid: ObjectId::new(0, 1) },
         });
         log.push(OpLogEntry {
             timestamp: ts(200),
             lsn: 2,
-            op: OpKind::AddTag { oid: ObjectId::new(0, u48::from_u64(1)), tag: TagId::new(10) },
+            op: OpKind::AddTag { oid: ObjectId::new(0, 1), tag: TagId::new(10) },
         });
 
         assert_eq!(log.len(), 2);
@@ -96,7 +95,7 @@ mod tests {
             log.push(OpLogEntry {
                 timestamp: ts(i * 100),
                 lsn: i,
-                op: OpKind::CreateObject { oid: ObjectId::new(0, u48::from_u64(i)) },
+                op: OpKind::CreateObject { oid: ObjectId::new(0, i) },
             });
         }
 
@@ -111,7 +110,7 @@ mod tests {
         log.push(OpLogEntry {
             timestamp: ts(100),
             lsn: 1,
-            op: OpKind::CreateObject { oid: ObjectId::new(0, u48::from_u64(1)) },
+            op: OpKind::CreateObject { oid: ObjectId::new(0, 1) },
         });
 
         let result = log.since_lsn(100);

@@ -2,7 +2,8 @@ use std::path::Path;
 
 use {
     mimisbrunnr_meta::ObjectTable,
-    mimisbrunnr_pool::PoolConfig,
+    mimisbrunnr_pool::{PlacementRule, PoolConfig, parse_compression_algo},
+    mimisbrunnr_query::QueryParser,
     mimisbrunnr_storage::{
         BlockDevice, ExtentLayout, FileBlockDevice, Superblock, ZoneExtent, ZoneMap, ZoneType,
         BLOCK_SIZE,
@@ -14,7 +15,7 @@ use log::trace;
 
 /// Round up `value` to the next multiple of `align`.
 fn align_up(value: u64, align: u64) -> u64 {
-    (value + align - 1) / align * align
+    value.div_ceil(align) * align
 }
 
 /// Persistent state serialized to the index zone.
@@ -134,7 +135,7 @@ impl DiskEngine {
         let superblock =
             Superblock::read_with_extents(&primary_device).map_err(EngineError::Storage)?;
 
-        let mut engine = Engine::new(config.node_id);
+        let mut engine = Engine::new(config.node_id as u64);
 
         // Load object table from metadata zone
         let layout = &superblock.layout;
@@ -157,9 +158,16 @@ impl DiskEngine {
             &mut blobs,
         )?;
 
+        // Set default compression from config
+        engine.set_default_compression(config.default_compression_algo());
+
+        // Resolve placement rules from config (needs ontology to be loaded first)
+        Self::resolve_config_rules(&config, &mut engine);
+
         trace!(
-            "DiskEngine::open loaded {} objects",
-            engine.object_table.count()
+            "DiskEngine::open loaded {} objects, {} rules",
+            engine.object_table.count(),
+            engine.rules().len(),
         );
 
         Ok(Self {
@@ -288,6 +296,56 @@ impl DiskEngine {
         Ok(())
     }
 
+    /// Resolve string-based rules from PoolConfig into PlacementRules.
+    ///
+    /// Must be called after the ontology is loaded so tag name lookups work.
+    fn resolve_config_rules(config: &PoolConfig, engine: &mut Engine) {
+        // Parse all rules first to avoid borrowing engine.dag and engine mutably at the same time.
+        let parsed_rules: Vec<PlacementRule> = {
+            let parser = QueryParser::new(&engine.dag);
+            let mut rules = Vec::new();
+            for rule_config in &config.rules {
+                match rule_config.rule_type.as_str() {
+                    "compress" => {
+                        let query_str = match &rule_config.query {
+                            Some(q) => q,
+                            None => {
+                                log::warn!("compress rule missing query, skipping");
+                                continue;
+                            }
+                        };
+                        let algo_str = rule_config.algo.as_deref().unwrap_or("zstd:3");
+                        let algo = match parse_compression_algo(algo_str) {
+                            Some(a) => a,
+                            None => {
+                                log::warn!("unknown compression algo '{algo_str}', skipping rule");
+                                continue;
+                            }
+                        };
+                        match parser.parse(query_str) {
+                            Ok(query) => {
+                                rules.push(PlacementRule::Compress { query, algo });
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "failed to parse rule query '{query_str}': {e}, skipping"
+                                );
+                            }
+                        }
+                    }
+                    other => {
+                        log::warn!("unsupported rule type '{other}', skipping");
+                    }
+                }
+            }
+            rules
+        };
+
+        for rule in parsed_rules {
+            engine.add_rule(rule);
+        }
+    }
+
     /// Access the underlying engine.
     pub fn engine(&self) -> &Engine {
         &self.engine
@@ -336,7 +394,7 @@ impl DiskEngine {
 
         // Serialize forward index
         for rec in engine.object_table.iter() {
-            let oid = mimisbrunnr_types::ObjectId::from_raw(rec.id);
+            let oid = mimisbrunnr_types::ObjectId::new(rec.id >> 48, rec.id & 0x0000_FFFF_FFFF_FFFF);
             let entries = engine.forward_index.get(oid);
             if entries.is_empty() {
                 continue;
@@ -379,7 +437,7 @@ impl DiskEngine {
                 proj.entries
                     .iter()
                     .map(|e| ProjectionEntryRecord {
-                        object_id: e.object.map(|o| o.raw_value()),
+                        object_id: e.object.map(|o| (o.node() << 48) | o.local()),
                         path: e.path.clone(),
                         entry_type: match &e.entry_type {
                             mimisbrunnr_types::ProjectedEntryType::File { mode, uid, gid } => {
@@ -542,8 +600,8 @@ impl DiskEngine {
 
         // Rebuild forward index, tag index, and kv index from forward records
         for fwd in &state.forward {
-            let oid = mimisbrunnr_types::ObjectId::from_raw(fwd.object_id);
-            let obj_local = oid.local().value() as u32;
+            let oid = mimisbrunnr_types::ObjectId::new(fwd.object_id >> 48, fwd.object_id & 0x0000_FFFF_FFFF_FFFF);
+            let obj_local = oid.local() as u32;
 
             for &tag_raw in &fwd.tag_ids_direct {
                 let tag = mimisbrunnr_types::TagId::new(tag_raw);
@@ -582,7 +640,7 @@ impl DiskEngine {
             |entry_rec: &ProjectionEntryRecord| -> mimisbrunnr_types::ProjectedEntry {
                 let object = entry_rec
                     .object_id
-                    .map(mimisbrunnr_types::ObjectId::from_raw);
+                    .map(|raw| mimisbrunnr_types::ObjectId::new(raw >> 48, raw & 0x0000_FFFF_FFFF_FFFF));
                 let entry_type = match &entry_rec.entry_type {
                     EntryTypeRecord::File { mode, uid, gid } => {
                         mimisbrunnr_types::ProjectedEntryType::File {
@@ -614,7 +672,7 @@ impl DiskEngine {
                     for entry_rec in &ctx_rec.entries {
                         let entry = deserialize_entry(entry_rec);
                         let oid =
-                            entry.object.unwrap_or(mimisbrunnr_types::ObjectId::from_raw(0));
+                            entry.object.unwrap_or(mimisbrunnr_types::ObjectId::new(0, 0));
                         let _ = context_mgr.set_path(name, oid, &entry_rec.path, entry);
                     }
                 }
@@ -622,7 +680,7 @@ impl DiskEngine {
                     for entry_rec in &ctx_rec.entries {
                         let entry = deserialize_entry(entry_rec);
                         let oid =
-                            entry.object.unwrap_or(mimisbrunnr_types::ObjectId::from_raw(0));
+                            entry.object.unwrap_or(mimisbrunnr_types::ObjectId::new(0, 0));
                         context_mgr.set_unscoped_path(oid, &entry_rec.path, entry);
                     }
                 }
@@ -684,7 +742,6 @@ fn parse_semantics(s: &str) -> mimisbrunnr_ontology::TagSemantics {
 mod tests {
     use {
         super::*,
-        arbitrary_int::u48,
         mimisbrunnr_ontology::{TagDefinition, TagSemantics},
         mimisbrunnr_storage::WAL_SIZE,
         mimisbrunnr_types::{ObjectId, Query, TagId, Value},
@@ -868,7 +925,7 @@ mod tests {
             hash = e.write_blob(oid, b"hello world", 1000).unwrap();
 
             // Store plaintext blob for retrieval
-            de.store_blob(oid.raw_value(), b"hello world".to_vec());
+            de.store_blob((oid.node() << 48) | oid.local(), b"hello world".to_vec());
 
             de.flush().unwrap();
         }
@@ -877,13 +934,13 @@ mod tests {
             let de = DiskEngine::open(&config_path).unwrap();
             let e = de.engine();
 
-            let oid = ObjectId::new(0, u48::from_u64(0));
+            let oid = ObjectId::new(0, 0);
             let rec = e.get_object(oid).unwrap();
             assert_eq!(rec.content_hash, hash);
             assert_eq!(rec.blob_length, 11);
 
             // Verify actual blob content is retrievable after reload
-            let blob = de.get_blob(oid.raw_value());
+            let blob = de.get_blob((oid.node() << 48) | oid.local());
             assert!(blob.is_some(), "blob data should survive flush/reload");
             assert_eq!(blob.unwrap(), b"hello world");
         }
@@ -915,7 +972,7 @@ mod tests {
                     e.write_blob(oid, &content, 1000).unwrap();
                     oid
                 };
-                de.store_blob(oid.raw_value(), content);
+                de.store_blob((oid.node() << 48) | oid.local(), content);
             }
 
             // This should succeed by growing the index zone

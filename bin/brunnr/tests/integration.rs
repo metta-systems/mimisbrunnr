@@ -432,7 +432,7 @@ fn blob_content_survives_flush_and_reload() {
             e.write_blob(oid, b"hello world from blob", 1000).unwrap();
             oid
         };
-        de.store_blob(oid.raw_value(), b"hello world from blob".to_vec());
+        de.store_blob((oid.node() << 48) | oid.local(), b"hello world from blob".to_vec());
 
         let oid2 = {
             let e = de.engine_mut();
@@ -441,7 +441,7 @@ fn blob_content_survives_flush_and_reload() {
             e.write_blob(oid2, &big_content, 1000).unwrap();
             oid2
         };
-        de.store_blob(oid2.raw_value(), vec![0xABu8; 8192]);
+        de.store_blob((oid2.node() << 48) | oid2.local(), vec![0xABu8; 8192]);
 
         de.flush().unwrap();
     }
@@ -459,11 +459,11 @@ fn blob_content_survives_flush_and_reload() {
 
         // Verify metadata was also persisted
         let e = de.engine();
-        let oid0 = mimisbrunnr::types::ObjectId::from_raw(0);
+        let oid0 = mimisbrunnr::types::ObjectId::new(0, 0);
         let rec0 = e.get_object(oid0).unwrap();
         assert_eq!(rec0.blob_length, 21);
 
-        let oid1 = mimisbrunnr::types::ObjectId::from_raw(1);
+        let oid1 = mimisbrunnr::types::ObjectId::new(0, 1);
         let rec1 = e.get_object(oid1).unwrap();
         assert_eq!(rec1.blob_length, 8192);
     }
@@ -494,7 +494,7 @@ fn large_blob_survives_flush_and_reload() {
             e.write_blob(oid, &content, 1000).unwrap();
             oid
         };
-        de.store_blob(oid.raw_value(), content);
+        de.store_blob((oid.node() << 48) | oid.local(), content);
 
         de.flush().unwrap();
     }
@@ -533,7 +533,7 @@ fn tag_vfs_serves_blob_data_after_reload() {
             e.write_blob(oid, b"ambient soundscape data", 1000).unwrap();
             oid
         };
-        de.store_blob(oid.raw_value(), b"ambient soundscape data".to_vec());
+        de.store_blob((oid.node() << 48) | oid.local(), b"ambient soundscape data".to_vec());
 
         de.flush().unwrap();
     }

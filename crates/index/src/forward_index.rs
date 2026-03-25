@@ -18,7 +18,7 @@ pub struct ForwardEntry {
 /// - Sync (replicate the full assertion set)
 #[derive(Clone)]
 pub struct ForwardIndex {
-    entries: HashMap<u64, Vec<ForwardEntry>>,
+    entries: HashMap<ObjectId, Vec<ForwardEntry>>,
 }
 
 impl ForwardIndex {
@@ -31,14 +31,14 @@ impl ForwardIndex {
     /// Add an assertion to an object.
     pub fn add(&mut self, oid: ObjectId, assertion: Assertion, origin: TagOrigin) {
         self.entries
-            .entry(oid.raw_value())
+            .entry(oid)
             .or_default()
             .push(ForwardEntry { assertion, origin });
     }
 
     /// Remove a specific assertion from an object.
     pub fn remove(&mut self, oid: ObjectId, assertion: &Assertion) -> bool {
-        if let Some(entries) = self.entries.get_mut(&oid.raw_value()) {
+        if let Some(entries) = self.entries.get_mut(&oid) {
             let len_before = entries.len();
             entries.retain(|e| &e.assertion != assertion);
             entries.len() < len_before
@@ -50,7 +50,7 @@ impl ForwardIndex {
     /// Get all assertions for an object.
     pub fn get(&self, oid: ObjectId) -> &[ForwardEntry] {
         self.entries
-            .get(&oid.raw_value())
+            .get(&oid)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
@@ -92,7 +92,7 @@ impl ForwardIndex {
 
     /// Remove all assertions for an object (used during deletion).
     pub fn remove_object(&mut self, oid: ObjectId) -> Vec<ForwardEntry> {
-        self.entries.remove(&oid.raw_value()).unwrap_or_default()
+        self.entries.remove(&oid).unwrap_or_default()
     }
 
     /// Number of objects in the forward index.
@@ -109,10 +109,10 @@ impl Default for ForwardIndex {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, arbitrary_int::u48, mimisbrunnr_types::Value};
+    use {super::*, mimisbrunnr_types::Value};
 
     fn oid(local: u64) -> ObjectId {
-        ObjectId::new(0, u48::from_u64(local))
+        ObjectId::new(0, local)
     }
 
     fn tag(id: u32) -> TagId {

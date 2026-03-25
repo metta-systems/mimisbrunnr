@@ -24,7 +24,7 @@ impl Exporter {
     /// Export a projection to `output_dir`, creating files from blob data.
     ///
     /// Synthesizes directories from paths automatically. Writes files using
-    /// blob data looked up by `ObjectId::raw_value()`. Creates symlinks where
+    /// blob data looked up by `(node << 48) | local`. Creates symlinks where
     /// the projection specifies them.
     pub fn export_directory(
         projection: &PathProjection,
@@ -56,8 +56,9 @@ impl Exporter {
                     if let Some(parent) = target_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    if let Some(oid) = entry.object {
-                        if let Some(data) = blobs.get(&oid.raw_value()) {
+                    if let Some(oid) = entry.object
+                        && let Some(data) = blobs.get(&((oid.node() << 48) | oid.local()))
+                    {
                             std::fs::write(&target_path, data)?;
                             result.total_bytes += data.len() as u64;
                             result.files_written += 1;
@@ -70,7 +71,6 @@ impl Exporter {
                                 let _ = std::fs::set_permissions(&target_path, perms);
                             }
                         }
-                    }
                 }
                 ProjectedEntryType::Symlink { target } => {
                     if let Some(parent) = target_path.parent() {
@@ -97,12 +97,11 @@ impl Exporter {
 mod tests {
     use {
         super::*,
-        arbitrary_int::u48,
         mimisbrunnr_types::{ObjectId, ProjectedEntry},
     };
 
     fn oid(n: u64) -> ObjectId {
-        ObjectId::new(0, u48::from_u64(n))
+        ObjectId::new(0, n)
     }
 
     #[test]
@@ -116,8 +115,8 @@ mod tests {
         proj.add(ProjectedEntry::file(o2, "src/main.rs"));
 
         let mut blobs = HashMap::new();
-        blobs.insert(o1.raw_value(), b"# Hello".to_vec());
-        blobs.insert(o2.raw_value(), b"fn main() {}".to_vec());
+        blobs.insert((o1.node() << 48) | o1.local(), b"# Hello".to_vec());
+        blobs.insert((o2.node() << 48) | o2.local(), b"fn main() {}".to_vec());
 
         let result = Exporter::export_directory(&proj, &blobs, tmp.path()).unwrap();
         assert_eq!(result.files_written, 2);
@@ -142,7 +141,7 @@ mod tests {
         proj.add(ProjectedEntry::file(o1, "a/b/c/deep.txt"));
 
         let mut blobs = HashMap::new();
-        blobs.insert(o1.raw_value(), b"deep".to_vec());
+        blobs.insert((o1.node() << 48) | o1.local(), b"deep".to_vec());
 
         let result = Exporter::export_directory(&proj, &blobs, tmp.path()).unwrap();
         assert_eq!(result.files_written, 1);
@@ -171,7 +170,7 @@ mod tests {
         proj.add(ProjectedEntry::symlink("usr/bin/bash", "../../bin/bash"));
 
         let mut blobs = HashMap::new();
-        blobs.insert(o1.raw_value(), b"#!/bin/bash".to_vec());
+        blobs.insert((o1.node() << 48) | o1.local(), b"#!/bin/bash".to_vec());
 
         let result = Exporter::export_directory(&proj, &blobs, tmp.path()).unwrap();
         assert_eq!(result.files_written, 1);
@@ -191,7 +190,7 @@ mod tests {
         proj.add(ProjectedEntry::file(o1, "file.txt"));
 
         let mut blobs = HashMap::new();
-        blobs.insert(o1.raw_value(), b"content".to_vec());
+        blobs.insert((o1.node() << 48) | o1.local(), b"content".to_vec());
 
         let result = Exporter::export_directory(&proj, &blobs, tmp.path()).unwrap();
         assert_eq!(result.files_written, 1);

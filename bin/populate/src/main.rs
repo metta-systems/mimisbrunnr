@@ -8,15 +8,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use serde::Deserialize;
 
 use mimisbrunnr::{
     engine::DiskEngine,
     ontology::OntologyModule,
+    pool::PlacementRule,
     types::Value,
 };
-use mimisbrunnr_transform::{CompressionAlgo, EncryptionMode, TransformPipeline};
 
 // ── CLI ──────────────────────────────────────────────────────────────
 
@@ -36,10 +36,6 @@ struct Cli {
     /// Quiet mode — suppress per-object output.
     #[arg(short, long)]
     quiet: bool,
-
-    /// Zstd compression level (0 = no compression).
-    #[arg(long, default_value = "3")]
-    compress_level: i32,
 }
 
 // ── Manifest format ──────────────────────────────────────────────────
@@ -50,6 +46,15 @@ struct Manifest {
     #[serde(default)]
     ontology: Vec<PathBuf>,
 
+    /// Default compression: "none", "zstd:LEVEL", "lz4".
+    /// Overrides pool.toml default for this populate session.
+    #[serde(default)]
+    default_compression: Option<String>,
+
+    /// Placement rules (compression, etc.) applied during this populate.
+    #[serde(default)]
+    rules: Vec<ManifestRule>,
+
     /// Objects to create.
     #[serde(default)]
     objects: Vec<ObjectSpec>,
@@ -57,6 +62,18 @@ struct Manifest {
     /// Generative population templates.
     #[serde(default)]
     generate: Vec<GenerateSpec>,
+}
+
+#[derive(Deserialize)]
+struct ManifestRule {
+    /// Rule type: currently only "compress" is supported.
+    #[serde(rename = "type")]
+    rule_type: String,
+    /// Query string to match objects.
+    query: String,
+    /// Compression algorithm: "none", "zstd:LEVEL", "lz4".
+    #[serde(default)]
+    algo: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -144,8 +161,12 @@ fn generate_text(rng: &mut impl Rng, size: usize) -> Vec<u8> {
             // Capitalize first word
             let mut chars = word.chars();
             if let Some(c) = chars.next() {
-                buf.extend(c.to_uppercase());
-                buf.extend(chars);
+                for ch in c.to_uppercase() {
+                    buf.push(ch);
+                }
+                for ch in chars {
+                    buf.push(ch);
+                }
             }
         } else {
             buf.push(' ');
@@ -234,7 +255,7 @@ fn generate_video(rng: &mut impl Rng, size: usize) -> Vec<u8> {
         let remaining = size - buf.len();
         let write_len = remaining.min(frame_size + 8);
 
-        if frame_num % 30 == 0 {
+        if frame_num.is_multiple_of(30) {
             // I-frame: fully random (keyframe)
             buf.push(b'I');
             buf.extend_from_slice(&frame_num.to_le_bytes());
@@ -340,17 +361,6 @@ fn main() {
         }
     };
 
-    // Configure engine's transform pipeline
-    {
-        let compression = if cli.compress_level > 0 {
-            CompressionAlgo::Zstd(cli.compress_level)
-        } else {
-            CompressionAlgo::None
-        };
-        let pipeline = TransformPipeline::new(compression, EncryptionMode::None, [0u8; 32]);
-        disk_engine.engine_mut().set_transform(pipeline);
-    }
-
     // ── Load ontology modules ────────────────────────────────────────
 
     let mut ont_tags = 0u32;
@@ -385,14 +395,74 @@ fn main() {
                             result.tags_registered, result.implications_added
                         );
                     }
-                    ont_tags += result.tags_registered as u32;
-                    ont_impls += result.implications_added as u32;
+                    ont_tags += result.tags_registered;
+                    ont_impls += result.implications_added;
                 }
                 Err(e) => {
                     eprintln!("error: failed to install ontology '{label}': {e}");
                     std::process::exit(1);
                 }
             }
+        }
+    }
+
+    // ── Apply placement rules from manifest ─────────────────────────────
+    {
+        let engine = disk_engine.engine_mut();
+
+        // Override default compression if specified in manifest
+        if let Some(ref default_comp) = manifest.default_compression {
+            if let Some(algo) = mimisbrunnr::pool::parse_compression_algo(default_comp) {
+                engine.set_default_compression(algo);
+                if !cli.quiet {
+                    println!("default compression: {default_comp}");
+                }
+            } else {
+                eprintln!("warning: unknown compression '{default_comp}', using pool default");
+            }
+        }
+
+        // Resolve manifest rules against loaded ontology.
+        // Parse all rules first to avoid borrowing engine.dag and engine mutably at the same time.
+        let parsed_rules: Vec<(PlacementRule, String, String)> = {
+            let parser = mimisbrunnr::query::QueryParser::new(&engine.dag);
+            let mut rules = Vec::new();
+            for rule in &manifest.rules {
+                match rule.rule_type.as_str() {
+                    "compress" => {
+                        let algo_str = rule.algo.as_deref().unwrap_or("zstd:3");
+                        let algo = match mimisbrunnr::pool::parse_compression_algo(algo_str) {
+                            Some(a) => a,
+                            None => {
+                                eprintln!("warning: unknown compression '{algo_str}', skipping rule");
+                                continue;
+                            }
+                        };
+                        match parser.parse(&rule.query) {
+                            Ok(query) => {
+                                rules.push((
+                                    PlacementRule::Compress { query, algo },
+                                    rule.query.clone(),
+                                    algo_str.to_string(),
+                                ));
+                            }
+                            Err(e) => {
+                                eprintln!("warning: bad rule query '{}': {e}", rule.query);
+                            }
+                        }
+                    }
+                    other => {
+                        eprintln!("warning: unsupported rule type '{other}'");
+                    }
+                }
+            }
+            rules
+        };
+        for (rule, query_str, algo_str) in parsed_rules {
+            if !cli.quiet {
+                println!("rule: compress '{query_str}' → {algo_str}");
+            }
+            engine.add_rule(rule);
         }
     }
 
@@ -523,7 +593,7 @@ fn main() {
             }
 
             // Store plaintext blob for FUSE access
-            disk_engine.store_blob(oid.raw_value(), content.clone());
+            disk_engine.store_blob((oid.node() << 48) | oid.local(), content.clone());
 
             // Apply tags
             {

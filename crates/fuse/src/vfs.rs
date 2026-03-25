@@ -265,10 +265,10 @@ impl VfsTree {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, arbitrary_int::u48, mimisbrunnr_types::ProjectedEntry};
+    use {super::*, mimisbrunnr_types::ProjectedEntry};
 
     fn oid(n: u64) -> ObjectId {
-        ObjectId::new(0, u48::from_u64(n))
+        ObjectId::new(0, n)
     }
 
     fn sample_projection() -> PathProjection {

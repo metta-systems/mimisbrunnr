@@ -1,23 +1,23 @@
 [workspace]
 members = [
     "crates/types",
-    # "crates/storage",
-    # "crates/wal",
-    # "crates/meta",
-    # "crates/index",
-    # "crates/ontology",
-    # "crates/query",
-    # "crates/transform",
-    # "crates/watch",
-    # "crates/pool",
-    # "crates/engine",
-    # "crates/unix",
-    # "crates/fuse",
-    # "crates/sql",
-    # "crates/mimisbrunnr",
-    # "bin/mimir",
-    # "bin/brunnr",
-    # "bin/populate",
+    "crates/storage",
+    "crates/wal",
+    "crates/meta",
+    "crates/index",
+    "crates/ontology",
+    "crates/query",
+    "crates/transform",
+    "crates/watch",
+    "crates/pool",
+    "crates/engine",
+    "crates/unix",
+    "crates/fuse",
+    "crates/sql",
+    "crates/mimisbrunnr",
+    "bin/mimir",
+    "bin/brunnr",
+    "bin/populate",
 ]
 resolver = "3"
 
@@ -28,20 +28,20 @@ license = "MIT"
 
 [workspace.dependencies]
 mimisbrunnr-types = { path = "crates/types" }
-# mimisbrunnr-storage = { path = "crates/storage" }
-# mimisbrunnr-wal = { path = "crates/wal" }
-# mimisbrunnr-meta = { path = "crates/meta" }
-# mimisbrunnr-index = { path = "crates/index" }
-# mimisbrunnr-ontology = { path = "crates/ontology" }
-# mimisbrunnr-query = { path = "crates/query" }
-# mimisbrunnr-transform = { path = "crates/transform" }
-# mimisbrunnr-watch = { path = "crates/watch" }
-# mimisbrunnr-pool = { path = "crates/pool" }
-# mimisbrunnr-engine = { path = "crates/engine" }
-# mimisbrunnr-unix = { path = "crates/unix" }
-# mimisbrunnr-fuse = { path = "crates/fuse" }
-# mimisbrunnr-sql = { path = "crates/sql" }
-# mimisbrunnr = { path = "crates/mimisbrunnr" }
+mimisbrunnr-storage = { path = "crates/storage" }
+mimisbrunnr-wal = { path = "crates/wal" }
+mimisbrunnr-meta = { path = "crates/meta" }
+mimisbrunnr-index = { path = "crates/index" }
+mimisbrunnr-ontology = { path = "crates/ontology" }
+mimisbrunnr-query = { path = "crates/query" }
+mimisbrunnr-transform = { path = "crates/transform" }
+mimisbrunnr-watch = { path = "crates/watch" }
+mimisbrunnr-pool = { path = "crates/pool" }
+mimisbrunnr-engine = { path = "crates/engine" }
+mimisbrunnr-unix = { path = "crates/unix" }
+mimisbrunnr-fuse = { path = "crates/fuse" }
+mimisbrunnr-sql = { path = "crates/sql" }
+mimisbrunnr = { path = "crates/mimisbrunnr" }
 
 arbitrary-int = "2.1"
 bitbybit = "2.0"
@@ -52,7 +52,7 @@ crc32fast = "1"
 env_logger = "0.11"
 fuser = { version = "0.17" }
 log = "0.4"
-rand = "0.9"
+rand = "0.10"
 roaring = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

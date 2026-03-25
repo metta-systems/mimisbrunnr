@@ -70,12 +70,12 @@ impl WatchEvent {
 
 #[cfg(test)]
 mod tests {
-    use {super::*, arbitrary_int::u48};
+    use super::*;
 
     #[test]
     fn event_accessors() {
         let ts = HybridTimestamp::new(1000, 0, 0);
-        let oid = ObjectId::new(0, u48::from_u64(42));
+        let oid = ObjectId::new(0, 42);
         let event = WatchEvent::Entered { oid, timestamp: ts };
         assert_eq!(event.object_id(), oid);
         assert_eq!(event.timestamp(), ts);

@@ -1,9 +1,9 @@
-use arbitrary_int::u48;
 use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
 use mimisbrunnr_meta::ObjectTable;
 use mimisbrunnr_ontology::{ImplicationDag, Materializer};
+use mimisbrunnr_pool::PlacementRule;
 use mimisbrunnr_query::QueryExecutor;
-use mimisbrunnr_transform::{CompressionAlgo, TransformPipeline};
+use mimisbrunnr_transform::{CompressionAlgo, EncryptionMode, TransformPipeline};
 use mimisbrunnr_types::{
     Assertion, CompressionState, HybridTimestamp, ObjectId, ObjectState, Query, TagId, TagOrigin,
     Value,
@@ -17,6 +17,8 @@ use log::trace;
 ///
 /// Provides object CRUD, tagging, querying, and the 4-phase deletion protocol.
 /// All mutations are recorded in the oplog for subscription catch-up.
+/// Compression is determined per-object by evaluating placement rules
+/// against the object's tags (ontology-driven storage).
 pub struct Engine {
     /// Object metadata table.
     pub object_table: ObjectTable,
@@ -33,14 +35,20 @@ pub struct Engine {
     /// HLC clock for this node.
     clock: HybridTimestamp,
     /// This node's ID.
-    node_id: u16,
-    /// Transform pipeline for blob data.
-    transform: TransformPipeline,
+    node_id: u64,
+    /// Placement rules (including compression rules).
+    placement_rules: Vec<PlacementRule>,
+    /// Default compression for objects not matching any Compress rule.
+    default_compression: CompressionAlgo,
+    /// Encryption mode for blob data.
+    encryption: EncryptionMode,
+    /// Encryption key.
+    encryption_key: [u8; 32],
 }
 
 impl Engine {
     /// Create a new in-memory engine (no disk backing yet).
-    pub fn new(node_id: u16) -> Self {
+    pub fn new(node_id: u64) -> Self {
         Self {
             // 1M record capacity for in-memory use
             object_table: ObjectTable::new(0, 128 * 1024 * 1024),
@@ -51,13 +59,57 @@ impl Engine {
             oplog: OpLog::new(),
             clock: HybridTimestamp::new(0, 0, node_id),
             node_id,
-            transform: TransformPipeline::passthrough(),
+            placement_rules: Vec::new(),
+            default_compression: CompressionAlgo::Zstd(3),
+            encryption: EncryptionMode::None,
+            encryption_key: [0u8; 32],
         }
     }
 
-    /// Set the transform pipeline.
-    pub fn set_transform(&mut self, transform: TransformPipeline) {
-        self.transform = transform;
+    /// Set the default compression algorithm for objects not matching any rule.
+    pub fn set_default_compression(&mut self, algo: CompressionAlgo) {
+        self.default_compression = algo;
+    }
+
+    /// Set encryption mode and key for blob data.
+    pub fn set_encryption(&mut self, mode: EncryptionMode, key: [u8; 32]) {
+        self.encryption = mode;
+        self.encryption_key = key;
+    }
+
+    /// Add a placement rule.
+    pub fn add_rule(&mut self, rule: PlacementRule) {
+        self.placement_rules.push(rule);
+    }
+
+    /// Get all placement rules.
+    pub fn rules(&self) -> &[PlacementRule] {
+        &self.placement_rules
+    }
+
+    /// Resolve the compression algorithm for an object based on placement rules.
+    ///
+    /// Evaluates Compress rules in order against the object's current tags.
+    /// First matching rule wins. Returns default_compression if no rule matches.
+    pub fn resolve_compression(&self, oid: ObjectId) -> CompressionAlgo {
+        let executor = QueryExecutor::new(&self.tag_index, &self.kv_index, &self.dag);
+        let obj_local = oid.local() as u32;
+
+        for rule in &self.placement_rules {
+            if let PlacementRule::Compress { query, algo } = rule {
+                let result = executor.execute(query);
+                if result.contains(obj_local) {
+                    return *algo;
+                }
+            }
+        }
+
+        self.default_compression
+    }
+
+    /// Build a transform pipeline for a specific compression algorithm.
+    fn pipeline_for(&self, compression: CompressionAlgo) -> TransformPipeline {
+        TransformPipeline::new(compression, self.encryption, self.encryption_key)
     }
 
     /// Advance the clock and return the new timestamp.
@@ -109,7 +161,7 @@ impl Engine {
 
         // Phase 2: Index cleanup — remove from all bitmaps using forward index
         let entries = self.forward_index.remove_object(oid);
-        let obj_local = oid.local().value() as u32;
+        let obj_local = oid.local() as u32;
         for entry in &entries {
             match &entry.assertion {
                 Assertion::Tag(tag) => {
@@ -148,7 +200,7 @@ impl Engine {
     ) -> Result<Vec<TagId>, EngineError> {
         trace!("engine::add_tag oid={oid} tag={tag}");
         self.ensure_active(oid)?;
-        let obj_local = oid.local().value() as u32;
+        let obj_local = oid.local() as u32;
 
         // Add direct tag
         self.tag_index.tag_object(tag, obj_local);
@@ -179,7 +231,7 @@ impl Engine {
     ) -> Result<Vec<TagId>, EngineError> {
         trace!("engine::remove_tag oid={oid} tag={tag}");
         self.ensure_active(oid)?;
-        let obj_local = oid.local().value() as u32;
+        let obj_local = oid.local() as u32;
 
         // Remove direct tag
         self.tag_index.untag_object(tag, obj_local);
@@ -217,7 +269,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         trace!("engine::set_attr oid={oid} key={key}");
         self.ensure_active(oid)?;
-        let obj_local = oid.local().value() as u32;
+        let obj_local = oid.local() as u32;
 
         // Remove previous value for this key (if any) from kv index
         let existing: Vec<_> = self
@@ -264,7 +316,7 @@ impl Engine {
     ) -> Result<(), EngineError> {
         trace!("engine::remove_attr oid={oid} key={key}");
         self.ensure_active(oid)?;
-        let obj_local = oid.local().value() as u32;
+        let obj_local = oid.local() as u32;
 
         self.kv_index.remove(key, value, obj_local);
         self.forward_index
@@ -287,6 +339,11 @@ impl Engine {
     // ── Blob data ──────────────────────────────────────────────────
 
     /// Write blob data for an object through the transform pipeline.
+    ///
+    /// Compression is resolved per-object by evaluating placement rules
+    /// against the object's current tags. First matching `Compress` rule
+    /// wins; unmatched objects use the pool's default compression.
+    ///
     /// Returns the content hash.
     pub fn write_blob(
         &mut self,
@@ -297,14 +354,16 @@ impl Engine {
         trace!("engine::write_blob oid={oid} len={}", data.len());
         self.ensure_active(oid)?;
 
-        let result = self.transform.transform_write(data)?;
+        let compression = self.resolve_compression(oid);
+        let pipeline = self.pipeline_for(compression);
+        let result = pipeline.transform_write(data)?;
 
         if let Some(rec) = self.object_table.get_mut(oid) {
             rec.content_hash = result.content_hash;
             rec.blob_length = result.original_size as u64;
             rec.stored_size = result.stored_size as u64;
             rec.modified_ns = (now_ms as i64) * 1_000_000;
-            rec.compression = match self.transform.compression {
+            rec.compression = match compression {
                 CompressionAlgo::None => CompressionState::None,
                 CompressionAlgo::Zstd(_) => CompressionState::Zstd,
                 CompressionAlgo::Lz4 => CompressionState::Lz4,
@@ -325,7 +384,7 @@ impl Engine {
             .execute(query)
             .iter()
             .filter_map(|local| {
-                let oid = ObjectId::new(self.node_id, u48::from_u64(local as u64));
+                let oid = ObjectId::new(self.node_id, local as u64);
                 // Only return active objects
                 self.object_table
                     .get(oid)
@@ -383,7 +442,7 @@ impl Engine {
     }
 
     /// This node's ID.
-    pub fn node_id(&self) -> u16 {
+    pub fn node_id(&self) -> u64 {
         self.node_id
     }
 
@@ -453,7 +512,7 @@ mod tests {
         let oid = e.create_object(1000).unwrap();
 
         let rec = e.get_object(oid).unwrap();
-        assert_eq!(rec.id, oid.raw_value());
+        assert_eq!(rec.id, (oid.node() << 48) | oid.local());
         assert!(rec.is_active());
     }
 
@@ -592,8 +651,8 @@ mod tests {
         e.delete_object(oid, 2000).unwrap();
 
         // All indexes should be clean
-        assert!(!e.tag_index.has_tag(tag(1), oid.local().value() as u32));
-        assert!(!e.tag_index.has_tag(tag(2), oid.local().value() as u32));
+        assert!(!e.tag_index.has_tag(tag(1), oid.local() as u32));
+        assert!(!e.tag_index.has_tag(tag(2), oid.local() as u32));
         assert!(e.forward_index.get(oid).is_empty());
     }
 

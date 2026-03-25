@@ -1,10 +1,12 @@
+use mimisbrunnr_transform::CompressionAlgo;
 use mimisbrunnr_types::Query;
 
 use crate::StorageTier;
 
-/// Semantic placement rules that bind tag queries to physical topology.
+/// Semantic placement rules that bind tag queries to physical topology
+/// and storage policies (tier, compression, encryption).
 ///
-/// These rules drive where blobs are stored based on their metadata,
+/// These rules drive where and how blobs are stored based on their metadata,
 /// replacing the per-dataset approach of traditional filesystems.
 #[derive(Debug, Clone)]
 pub enum PlacementRule {
@@ -35,6 +37,14 @@ pub enum PlacementRule {
         warm_threshold_days: u32,
         cold_after: u32,
     },
+    /// Set compression algorithm for matching objects.
+    ///
+    /// Ontology-driven: "video" → skip compression, "source" → zstd:3, etc.
+    /// First matching Compress rule wins; unmatched objects use the pool default.
+    Compress {
+        query: Query,
+        algo: CompressionAlgo,
+    },
 }
 
 impl PlacementRule {
@@ -44,7 +54,8 @@ impl PlacementRule {
             Self::Pin { query, .. }
             | Self::Prefer { query, .. }
             | Self::Replicate { query, .. }
-            | Self::Colocate { query } => Some(query),
+            | Self::Colocate { query }
+            | Self::Compress { query, .. } => Some(query),
             Self::AutoTier { .. } => None,
         }
     }
@@ -53,6 +64,14 @@ impl PlacementRule {
     pub fn target_tier(&self) -> Option<StorageTier> {
         match self {
             Self::Pin { tier, .. } | Self::Prefer { tier, .. } => Some(*tier),
+            _ => None,
+        }
+    }
+
+    /// Get the compression algorithm for this rule, if it specifies one.
+    pub fn compression_algo(&self) -> Option<CompressionAlgo> {
+        match self {
+            Self::Compress { algo, .. } => Some(*algo),
             _ => None,
         }
     }
@@ -103,5 +122,25 @@ mod tests {
         };
         assert!(rule.target_tier().is_none());
         assert!(rule.query().is_none());
+    }
+
+    #[test]
+    fn compress_rule() {
+        let rule = PlacementRule::Compress {
+            query: Query::HasTag(TagId::new(10)),
+            algo: CompressionAlgo::Zstd(9),
+        };
+        assert_eq!(rule.compression_algo(), Some(CompressionAlgo::Zstd(9)));
+        assert!(rule.query().is_some());
+        assert!(rule.target_tier().is_none());
+    }
+
+    #[test]
+    fn compress_skip_rule() {
+        let rule = PlacementRule::Compress {
+            query: Query::HasTag(TagId::new(20)),
+            algo: CompressionAlgo::None,
+        };
+        assert_eq!(rule.compression_algo(), Some(CompressionAlgo::None));
     }
 }

@@ -42,10 +42,10 @@ impl Importer {
         now_ms: u64,
     ) -> Result<ImportResult, UnixError> {
         // Create context if needed
-        if let Some(name) = context_name {
-            if context_mgr.get_context(name).is_err() {
-                context_mgr.create_context(name)?;
-            }
+        if let Some(name) = context_name
+            && context_mgr.get_context(name).is_err()
+        {
+            context_mgr.create_context(name)?;
         }
 
         let mut result = ImportResult {
@@ -125,7 +125,7 @@ impl Importer {
                         .write_blob(oid, &content, now_ms)
                         .map_err(UnixError::Engine)?;
                     hash_to_oid.insert(hash, oid);
-                    result.blobs.insert(oid.raw_value(), content);
+                    result.blobs.insert((oid.node() << 48) | oid.local(), content);
                     result.objects_created += 1;
 
                     // Auto-tag by extension

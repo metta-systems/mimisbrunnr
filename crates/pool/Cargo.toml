@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 mimisbrunnr-meta = { workspace = true }
 mimisbrunnr-storage = { workspace = true }
+mimisbrunnr-transform = { workspace = true }
 mimisbrunnr-types = { workspace = true }
 log = { workspace = true }
 serde = { workspace = true }
