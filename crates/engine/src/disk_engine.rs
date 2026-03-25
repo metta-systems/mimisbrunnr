@@ -20,14 +20,13 @@ fn align_up(value: u64, align: u64) -> u64 {
 
 /// Persistent state serialized to the index zone.
 ///
-/// Stores the forward index entries and ontology tag definitions as JSON
-/// at the start of the index zone. This is a simple approach for correctness;
-/// a production system would use a more compact binary format.
+/// Stores the forward index entries and ontology tag definitions as CBOR
+/// at the start of the index zone, length-prefixed with a u64 LE header.
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct IndexState {
-    /// Forward index: object_id_raw → vec of (assertion_json, origin)
+    /// Forward index: object_id_raw → vec of (assertion, origin)
     forward: Vec<ForwardRecord>,
-    /// Tag definitions: id → (name, semantics_json, implies)
+    /// Tag definitions: id → (name, semantics, implies)
     tags: Vec<TagRecord>,
     /// Implications: (from, to)
     implications: Vec<(u32, u32)>,
@@ -203,10 +202,10 @@ impl DiskEngine {
             .map_err(EngineError::Meta)?;
 
         // Serialize index state and check if it fits
-        let json =
+        let cbor =
             Self::serialize_index_state(&self.engine, &self.context_mgr, &self.blobs)?;
 
-        let needed = json.len() as u64 + 8; // 8 bytes for length prefix
+        let needed = cbor.len() as u64 + 8; // 8 bytes for length prefix
         let index_size = self.superblock.layout.zone_size(ZoneType::Index);
 
         if needed > index_size {
@@ -214,7 +213,7 @@ impl DiskEngine {
         }
 
         // Write index state using extent-aware writer
-        Self::write_index_state(&self.primary_device, &self.superblock.layout, &json)?;
+        Self::write_index_state(&self.primary_device, &self.superblock.layout, &cbor)?;
 
         self.primary_device.sync().map_err(EngineError::Storage)?;
         trace!("DiskEngine::flush complete");
@@ -366,7 +365,7 @@ impl DiskEngine {
         self.blobs.get(&object_id).map(|v| v.as_slice())
     }
 
-    /// Serialize engine state to JSON bytes.
+    /// Serialize engine state to CBOR bytes.
     fn serialize_index_state(
         engine: &Engine,
         context_mgr: &mimisbrunnr_types::PathContextManager,
@@ -487,33 +486,37 @@ impl DiskEngine {
             });
         }
 
-        let json = serde_json::to_vec(&state)
+        let mut cbor_buf = Vec::new();
+        ciborium::into_writer(&state, &mut cbor_buf)
             .map_err(|e| EngineError::Io(std::io::Error::other(e.to_string())))?;
-        trace!("DiskEngine::serialize_index_state json_len={}", json.len());
+        trace!(
+            "DiskEngine::serialize_index_state cbor_len={}",
+            cbor_buf.len()
+        );
 
-        Ok(json)
+        Ok(cbor_buf)
     }
 
     /// Write serialized index state to the index zone, spanning extents as needed.
     fn write_index_state(
         dev: &FileBlockDevice,
         layout: &ExtentLayout,
-        json: &[u8],
+        cbor: &[u8],
     ) -> Result<(), EngineError> {
-        let total_needed = json.len() as u64 + 8;
+        let total_needed = cbor.len() as u64 + 8;
         let zone_size = layout.zone_size(ZoneType::Index);
         if total_needed > zone_size {
             return Err(EngineError::Io(std::io::Error::other(format!(
                 "index state too large: {} bytes, zone is {} bytes",
-                json.len(),
+                cbor.len(),
                 zone_size
             ))));
         }
 
-        // Write length prefix + json data across extents
+        // Write length prefix + CBOR data across extents
         let mut data = Vec::with_capacity(total_needed as usize);
-        data.extend_from_slice(&(json.len() as u64).to_le_bytes());
-        data.extend_from_slice(json);
+        data.extend_from_slice(&(cbor.len() as u64).to_le_bytes());
+        data.extend_from_slice(cbor);
 
         let mut remaining = &data[..];
         for extent in layout.extents(ZoneType::Index) {
@@ -545,21 +548,21 @@ impl DiskEngine {
         let mut len_buf = [0u8; 8];
         dev.read_at(first_offset, &mut len_buf)
             .map_err(EngineError::Storage)?;
-        let json_len = u64::from_le_bytes(len_buf);
-        trace!("DiskEngine::load_index_state json_len={json_len} zone_size={zone_size}");
+        let cbor_len = u64::from_le_bytes(len_buf);
+        trace!("DiskEngine::load_index_state cbor_len={cbor_len} zone_size={zone_size}");
 
-        if json_len == 0 || json_len > zone_size - 8 {
+        if cbor_len == 0 || cbor_len > zone_size - 8 {
             // Empty or invalid — fresh pool, nothing to load
             return Ok(());
         }
 
-        // Read json data across extents
-        let mut json_buf = vec![0u8; json_len as usize];
+        // Read CBOR data across extents
+        let mut cbor_buf = vec![0u8; cbor_len as usize];
         let mut bytes_read = 0usize;
         let mut skip = 8u64; // skip length prefix
 
         for extent in layout.extents(zone) {
-            if bytes_read >= json_buf.len() {
+            if bytes_read >= cbor_buf.len() {
                 break;
             }
             if skip >= extent.size {
@@ -568,14 +571,14 @@ impl DiskEngine {
             }
             let read_offset = extent.offset + skip;
             let available = (extent.size - skip) as usize;
-            let to_read = available.min(json_buf.len() - bytes_read);
-            dev.read_at(read_offset, &mut json_buf[bytes_read..bytes_read + to_read])
+            let to_read = available.min(cbor_buf.len() - bytes_read);
+            dev.read_at(read_offset, &mut cbor_buf[bytes_read..bytes_read + to_read])
                 .map_err(EngineError::Storage)?;
             bytes_read += to_read;
             skip = 0;
         }
 
-        let state: IndexState = match serde_json::from_slice(&json_buf) {
+        let state: IndexState = match ciborium::from_reader(&cbor_buf[..]) {
             Ok(s) => s,
             Err(_) => return Ok(()), // Corrupt or empty, start fresh
         };
@@ -962,10 +965,10 @@ mod tests {
         {
             let mut de = DiskEngine::open(&config_path).unwrap();
 
-            // Each blob stored as JSON expands ~4x (byte array [0,1,2,...,255,...])
-            // so 1 MB of blobs becomes ~4 MB of JSON, exceeding the ~3.8 MiB index zone
+            // Store enough blob data to exceed the ~1.9 MiB index zone
+            // CBOR stores byte arrays efficiently, so we need more data than JSON did
             for i in 0..5u64 {
-                let content = vec![(i as u8).wrapping_mul(37); 200 * 1024]; // 200 KB each = 1 MB total
+                let content = vec![(i as u8).wrapping_mul(37); 500 * 1024]; // 500 KB each = 2.5 MB total
                 let oid = {
                     let e = de.engine_mut();
                     let oid = e.create_object(1000).unwrap();
@@ -1008,7 +1011,7 @@ mod tests {
                 let blob = de
                     .get_blob(i)
                     .unwrap_or_else(|| panic!("blob {i} should exist"));
-                assert_eq!(blob.len(), 200 * 1024);
+                assert_eq!(blob.len(), 500 * 1024);
                 assert!(blob.iter().all(|&b| b == (i as u8).wrapping_mul(37)));
             }
         }
