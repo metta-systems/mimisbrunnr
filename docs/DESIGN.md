@@ -415,7 +415,7 @@ The filesystem operates directly on raw block devices:
  ...                  Block class map (4 bits per block, nibble-packed)
  ...                  ┌───────────────────────────────────┐
                       │  Zone 1: INDEX ZONE               │
-                      │  Tag bitmaps, ontology, KV index   │
+                      │  Tag bitmaps, ontology, KV index  │
                       │  3% of usable space (first extent)│
                       ├───────────────────────────────────┤
                       │  Zone 2: METADATA ZONE            │
@@ -479,22 +479,22 @@ enum CompressionState { None = 0, Zstd = 1, Lz4 = 2 }
 #[repr(u8)]
 enum EncryptionState { None = 0, Hctr2Aes128 = 1, XtsAes256 = 2 }
 
-struct ObjectRecord {       // 128 bytes, cache-line aligned
-    id: u64,                    // [0..8]
-    generation: u32,            // [8..12] for future ID reuse safety
-    state: ObjectState,         // [12..13]
-    content_hash: [u8; 32],     // [13..45] BLAKE3 of plaintext
-    blob_offset: u64,           // [45..53]
-    blob_length: u64,           // [53..61]
-    created_ns: i64,            // [61..69]
-    modified_ns: i64,           // [69..77]
-    tag_count: u16,             // [77..79]
-    attr_count: u16,            // [79..81]
-    inline_tags: [u32; 4],      // [81..97] 4 tags inline
-    overflow_offset: u64,       // [97..105]
+struct ObjectRecord {               // 128 bytes, cache-line aligned
+    id: u64,                        // [0..8]
+    generation: u32,                // [8..12] for future ID reuse safety
+    state: ObjectState,             // [12..13]
+    content_hash: [u8; 32],         // [13..45] BLAKE3 of plaintext
+    blob_offset: u64,               // [45..53]
+    blob_length: u64,               // [53..61]
+    created_ns: i64,                // [61..69]
+    modified_ns: i64,               // [69..77]
+    tag_count: u16,                 // [77..79]
+    attr_count: u16,                // [79..81]
+    inline_tags: [u32; 4],          // [81..97] 4 tags inline
+    overflow_offset: u64,           // [97..105]
     compression: CompressionState,  // [105..106]
     encryption: EncryptionState,    // [106..107]
-    stored_size: u64,           // [107..115]
+    stored_size: u64,               // [107..115]
     // [115..128] reserved/padding
 }
 ```
@@ -506,7 +506,7 @@ Binary layout is packed little-endian (not `#[repr(C)]` aligned) to fit exactly 
 Maps objects to physical extents, supporting multi-disk pools:
 
 ```rust
-struct ObjectLocation {     // 40 bytes, little-endian packed
+struct ObjectLocation {         // 40 bytes, little-endian packed
     disk_id: u16,               // [0..2]
     extent_offset: u64,         // [2..10]
     extent_length: u64,         // [10..18]
@@ -514,7 +514,7 @@ struct ObjectLocation {     // 40 bytes, little-endian packed
     replicas: [ReplicaRef; 3],  // [19..40] 3 × 7 bytes
 }
 
-struct ReplicaRef {         // 7 bytes
+struct ReplicaRef {             // 7 bytes
     disk_id: u16,               // [0..2]
     offset: u64,                // [2..7] stored as 5 bytes (lower 40 bits)
 }
@@ -526,11 +526,16 @@ All mutations go through the WAL — 64 MB circular buffer on the fastest disk, 
 
 ```rust
 enum WalOpKind {
-    CreateObject = 1, DeleteObject = 2,
-    AddTag = 3, RemoveTag = 4,
-    SetAttr = 5, RemoveAttr = 6,
-    AddRelation = 7, RemoveRelation = 8,
-    WriteBlob = 9, Checkpoint = 10,
+    CreateObject = 1,
+    DeleteObject = 2,
+    AddTag = 3,
+    RemoveTag = 4,
+    SetAttr = 5,
+    RemoveAttr = 6,
+    AddRelation = 7,
+    RemoveRelation = 8,
+    WriteBlob = 9,
+    Checkpoint = 10,
 }
 
 struct WalEntry {
@@ -540,7 +545,13 @@ struct WalEntry {
 }
 ```
 
-**WAL header** (64 bytes): `magic(8) | next_lsn(8) | write_cursor(8) | read_cursor(8) | used(8) | last_checkpoint_lsn(8) | crc32(4) | reserved(12)`. **Entry format**: `lsn(8) | op_kind(1) | payload_length(4) | payload | crc32(4)`.
+**WAL header** (64 bytes): 
+
+`magic(8) | next_lsn(8) | write_cursor(8) | read_cursor(8) | used(8) | last_checkpoint_lsn(8) | crc32(4) | reserved(12)`. 
+
+**Entry format**: 
+
+`lsn(8) | op_kind(1) | payload_length(4) | payload | crc32(4)`.
 
 Extended oplog retention (compressed segments on disk) supports dormant subscriptions catching up after being offline.
 
@@ -769,8 +780,8 @@ User Passphrase / Hardware Key
          ▼
     Master KEK (256b)
          │
-    ┌────┴────────────────────────────┐
-    ▼                                 ▼
+    ┌────┴───────────────────────────┐
+    ▼                                ▼
  Disk Keys                      Message Keys
     │                                │
     ├── XTS-AES-256 (512b)           ├── AES-GCM-256 (WAL)
@@ -803,7 +814,7 @@ Content-defined chunking (FastCDC) is only applied where the ontology indicates 
 |VM images, databases|Yes (CDC)|Large, small edits, massive sync savings|
 |Large immutable transfers|Maybe|Fixed-chunk for resumability|
 
-Only ~1% of objects are typically chunked, keeping the chunk index small (~5 MB vs 4 GB if everything were chunked). When active: chunk plaintext, hash each chunk, compress per-chunk, encrypt.
+Only ~1% of objects are typically chunked, keeping the chunk index small (~5 MB vs 4 GB if everything were chunked). When active: chunk plaintext, hash each chunk, compress per-chunk, encrypt. 
 
 ---
 
@@ -831,7 +842,7 @@ Content  │ ░░░░ 30%       │    │ ████████ 80%   �
 |---|---|
 |**Full**|Metadata + local blobs + syncs with peers|
 |**Thin**|Metadata + stubs only (phones, small SSDs)|
-|**BlobStore**|Blobs only (S3, NAS without compute)|
+|**BlobStore**|Blobs only (IPFS, S3, NAS without compute)|
 |**Hub**|Always-on relay for intermittently connected nodes|
 
 ### 10.3 Content Presence (Hydration Model)
@@ -842,7 +853,7 @@ enum ContentPresence {
     Remote { origin_node: NodeId, mirrors: Vec<NodeId> },
     Hydrating { source: NodeId, progress_bytes: u64, total_bytes: u64 },
     Cached { disk_id: u16, extent_offset: u64, fetched_at: Timestamp },
-    Partial { stub_length: u64, full_length: u64, origin_node: NodeId },
+    Partial { stub_length: u64, full_length: u64, origin_node: NodeId }, // why? how is it diff from Hydrating
 }
 ```
 
@@ -949,7 +960,7 @@ enum WatchEvent {
 }
 ```
 
-The key events `ENTERED` and `EXITED` don't exist in inotify. When a file gains a tag that makes it match your query, that's `ENTERED`. When it loses a tag and falls out, that's `EXITED`.
+The key events `ENTERED` and `EXITED` don't exist in inotify. When a file gains a tag that makes it match your query, that's `ENTERED`. When it loses a tag and falls out, that's `EXITED`. -- necessary for ontology changes (e.g. widened audio->mp4 implication means all MP4 files will now have ENTERED the query)
 
 ### 11.3 Inverted Subscription Index
 
