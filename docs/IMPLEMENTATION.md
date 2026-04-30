@@ -80,19 +80,22 @@ of type `BtreeKind` instead of `BlockHeader.kind`:
 
 ```rust
 enum BtreeKind {
-    ObjectTable,        // §5 radix leaves & inners
-    LocationTable,      // §6.1 radix leaves & inners
-    Backpointer,        // §6.2 reverse-mapping B+ tree
-    Forward,            // §7 forward index B+ tree
-    TagDirectory,       // §8.1 tag directory B+ tree
-    Range,              // §9.2 range index B+ tree
-    ChunkIndex,         // §9.3 chunk index B+ tree
-    ValueSpill,         // value-hash → CBOR(Value) B+ tree
-    Ontology,           // §10.1 ontology / dag B+ tree
-    PathContext,        // §10.3 path context B+ tree
-    Subscriptions,      // §10.2 subscription B+ tree
-    BucketAlloc,        // §12.2 per-disk bucket alloc B+ tree
-    FreespaceLru,       // §12.4 per-disk freespace LRU B+ tree
+    ObjectTable,        // §5 radix leaves & inners (current view)
+    ObjectHistory,      // §11.2 sidecar: (oid, snapshot) → ObjectRecord overrides
+    LocationTable,      // §6.1 radix leaves & inners (current view)
+    LocationHistory,    // §11.2 sidecar: (oid, snapshot) → ObjectLocation overrides
+    Backpointer,        // §6.2 reverse-mapping B+ tree (snapshot-agnostic)
+    Forward,            // §7 forward index B+ tree (snapshot-aware key)
+    TagDirectory,       // §8.1 tag directory B+ tree (snapshot-aware)
+    Range,              // §9.2 range index B+ tree (snapshot-aware)
+    ChunkIndex,         // §9.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
+    ValueSpill,         // value-hash → CBOR(Value); content-addressed
+    Ontology,           // §10.1 ontology / dag B+ tree (snapshot-aware)
+    PathContext,        // §10.3 path context B+ tree (snapshot-aware)
+    Subscriptions,      // §10.2 subscription B+ tree (snapshot-aware)
+    Snapshots,          // §11.1 snapshot tree (SnapshotId → SnapshotNode)
+    BucketAlloc,        // §12.2 per-disk bucket alloc B+ tree (physical)
+    FreespaceLru,       // §12.4 per-disk freespace LRU B+ tree (physical)
 }
 ```
 
@@ -283,16 +286,18 @@ width, the flush either:
 Format upgrades are journalled as a `FormatPromote` WAL op so recovery can reconstruct the
 in-memory bset state.
 
-**Typical savings across our key shapes:**
+**Typical savings across our key shapes** (snapshot-aware btrees include a trailing
+`snapshot: u32` field, typically 0–4 bits per leaf since one snapshot dominates):
 
 | Index             | Unpacked key | Typical packed | Saving | Driver                            |
 | ----------------- | ------------ | -------------- | ------ | --------------------------------- |
-| Forward leaf      | 8 B (oid)    | 2–3 B          | 60–75% | Sequential oid allocation         |
-| Forward inner     | 8 B          | 2–3 B          | 60–75% | Same                              |
-| Range leaf        | 28 B         | 8–14 B         | 50–70% | `attr_id` constant per leaf       |
-| Tag directory     | 4 B          | 2–3 B          | 25–50% | Sparse tag-id distribution        |
+| Forward leaf      | 12 B (oid + snapshot) | 2–4 B  | 65–80% | Sequential oid; snapshot mostly constant |
+| Forward inner     | 12 B         | 2–4 B          | 65–80% | Same                              |
+| Range leaf        | 32 B         | 8–14 B         | 55–75% | `attr_id` constant; snapshot mostly constant |
+| Tag directory     | 8 B          | 2–4 B          | 50–75% | Sparse tag-id; snapshot constant  |
 | Alloc table       | 4 B (bkt_no) | 2 B            | 50%    | Sequential bucket numbers         |
-| Subscriptions     | 8 B (sub_id) | 2–4 B          | 50–75% | Sequential ids                    |
+| Subscriptions     | 12 B (sub_id + snap) | 2–4 B  | 65–85% | Sequential ids                    |
+| Snapshots btree   | 4 B (snap_id) | 2 B           | 50%    | Sequential snapshot ids           |
 | Path / chunk hash | 8 / 32 B     | unchanged      | 0%     | Random-looking hashes — packing skipped |
 
 Random-looking content hashes (chunk index, path-string hashes) bypass packing via
@@ -389,7 +394,7 @@ RootPointer {                                // 64 bytes
     path_context_root:    BlockRef,
     subscriptions_root:   BlockRef,
     pool_state_root:      BlockRef,
-    snapshot_chain_root:  BlockRef,          // chain of historical roots — §11
+    snapshot_chain_root:  BlockRef,          // root of the snapshots btree — §11.1
     flags: u32,
     crc: u32,                                // CRC32C of bytes [0..60]
 }
@@ -517,6 +522,12 @@ BackpointerInsert: { key: BackpointerKey, value: BackpointerValue }
 BackpointerRemove: { key: BackpointerKey }                                // explicit removal
 // Implicit removal: a BucketGenBump invalidates all of that bucket's backpointers lazily
 // (stale entries detected by gen mismatch on the next scan, no per-bp WAL op needed).
+
+// Snapshot lifecycle (§11)
+SnapshotCreate   : { new_id: u32, parent_id: u32, current_replacement: u32, label: Option<String> }
+SnapshotDelete   : { id: u32 }                                            // marks for async cleanup
+SnapshotKeyMove  : { from_snap: u32, to_snap: u32, btree: BtreeKind, key: bytes }
+                   // re-tags a key during deletion's runtime phase (§11.5)
 
 // Bset format mutations (§1.5.6)
 FormatPromote    : { node_ref: BlockRef, bset_seq: u32, new_format: BsetKeyFormat }
@@ -1222,104 +1233,240 @@ allocation state.
 
 ## 11. Snapshots and Cluster Sync
 
-Every committed `RootPointer` is itself a snapshot — by construction, all index roots inside it
-form a self-consistent COW tree. Snapshots are made cheap to retain and diff:
+Snapshots are **key-level**, modelled on bcachefs: a snapshot is a 32-bit ID embedded in the
+position of every key in a snapshot-aware btree. Multiple versions of the "same" logical key
+coexist in one btree, distinguished by their `snapshot` field. Visibility is determined by walking
+the snapshot tree (§11.1).
 
-### 11.1 Snapshot chain
+This replaces the page-COW snapshot model. Creation is **O(1)** regardless of pool size — no
+keys are copied, no checkpoint forced. Many thousands or millions of snapshots can exist
+simultaneously, limited only by the disk space their per-key overhead consumes.
+
+### 11.1 Snapshot tree
+
+A `SnapshotId` is a `u32` (4 G snapshots before recycling concerns). Snapshot relationships are
+stored in the **snapshots btree** (`BtreeKind::Snapshots`, a §1.5 B+ tree keyed by `SnapshotId`):
+
+```rust
+#[repr(C, packed)]
+struct SnapshotNode {                        // 64 bytes
+    id: u32,                                 // self-id (also the btree key)
+    parent: u32,                             // 0 = root snapshot
+    children: [u32; 2],                      // bcachefs-style binary structure
+    depth: u16,                              // distance from root
+    flags: u8,                               // bit 0 = leaf (subvolume-bearing)
+    _pad: u8,
+    ancestor_bitmap: u128,                   // bits[i] = "id − i is an ancestor", i ∈ 0..128
+    skiplist: [u32; 3],                      // randomised ancestor IDs for O(log n) deep checks
+    created_ns: i64,
+    label_offset: u32,                       // into a string heap; 0 = unlabelled
+    _reserved: u32,
+}
+```
+
+**Ancestry check.** The 128-bit `ancestor_bitmap` answers `is X an ancestor of Y?` in O(1) when
+`Y.id − X.id ≤ 128` — which covers the vast majority of cases (most snapshots reference recent
+ancestors). For older queries, the 3-entry randomised skiplist provides O(log n) traversal to
+the root. During early recovery, before this data is validated, queries fall back to a simple
+parent-pointer walk.
+
+`RootPointer.snapshot_chain_root` is repurposed as the snapshots btree root — the chain is no
+longer a linked list of `SnapshotRecord` blocks but a btree of `SnapshotNode` keys.
+
+### 11.2 Snapshot-aware bkey position
+
+In snapshot-aware btrees, every bkey position carries an extra `snapshot: u32` field appended
+to the kind-specific key fields. With §1.5.6 packing, `snapshot` is typically a 0-bit field in a
+leaf bset (one snapshot dominates the bset's keys), or a few bits at most — its overhead is in
+the noise.
+
+| Btree              | Snapshot-aware? | Notes                                         |
+| ------------------ | --------------- | --------------------------------------------- |
+| `Forward`          | yes             | per-object assertions diverge across snapshots |
+| `Range`            | yes             | per-object attributes diverge                  |
+| `KvIndex`          | yes             | same                                           |
+| `TagDirectory`     | yes             | tags exist or don't per snapshot               |
+| `ChunkIndex`       | no              | content-addressed; refcount handles divergence |
+| `Backpointer`      | no              | physical state, not logical                    |
+| `BucketAlloc`, `FreespaceLru` | no | physical state                              |
+| `Ontology`         | yes             | snapshot freezes the ontology version          |
+| `PathContext`      | yes             | path projections diverge                       |
+| `Subscriptions`    | yes             | per-snapshot watch state                       |
+| `ValueSpill`       | no              | content-addressed by `value_hash`              |
+
+For the **positional radix tables** (`ObjectTable` §5, `LocationTable` §6.1), snapshot-versioning
+uses a sidecar btree `(BtreeKind::ObjectHistory)`: keyed by `(oid, snapshot)` with values that
+shadow the radix entry. The radix always holds the **current** view; reads in a non-current
+snapshot consult the sidecar first, falling through to the radix only if no shadowing record
+applies. This keeps the hot path (current-snapshot reads) at single-radix-lookup cost while
+preserving the snapshot model for older views.
+
+For **roaring tag bitmaps** (§8.2), each tag's `store_root` resolves through the snapshot tree:
+the `TagDirectory` is snapshot-aware (the directory itself has snapshot-tagged keys), so each
+snapshot has its own pointer to a (possibly shared) bitmap. New writes that diverge a tag bitmap
+allocate a fresh `TagBitmap` region and update the directory at the writing snapshot's ID.
+
+### 11.3 Visibility rules (snapshot iteration)
+
+When reading at snapshot `S`, the iterator walks the btree in order. For keys with the same
+non-snapshot prefix, it picks the one with the highest `snapshot ≤ S` that is an ancestor of `S`.
+A key with a `KEY_TYPE_whiteout` value in an ancestor snapshot blocks visibility of older
+versions for descendants of that snapshot.
+
+Pseudocode:
 
 ```
-SnapshotChainRoot (4 KiB):
-   chain_length: u32
-   newest_snapshot: BlockRef         → SnapshotRecord (linked list, newest-first)
+fn visible_at(key: &Bkey, snapshot: SnapshotId) -> bool {
+    // key.snapshot must be S itself or an ancestor of S
+    snapshot_tree.is_ancestor(key.snapshot, snapshot)
+}
 
-SnapshotRecord (4 KiB):
-   header
-   seq: u64
-   lsn: u64
-   created_ns: i64
-   label: [u8; 64]                   // optional human label
-   root: RootPointer                  // 64 bytes
-   parent: BlockRef                   // previous SnapshotRecord, or zero
-   pinned_buckets: BlockRef          // B+ tree of (disk_id, bucket_no, generation) pinned by this snapshot
-   sync_metadata: BlockRef            // peer-watermarks, HLC, see below
+fn lookup(prefix: &KeyPrefix, snapshot: SnapshotId) -> Option<Value> {
+    let mut best: Option<&Bkey> = None;
+    for k in btree.range(prefix..) {
+        if k.prefix() != prefix { break; }
+        if !visible_at(k, snapshot) { continue; }
+        if best.is_none() || k.snapshot > best.unwrap().snapshot {
+            best = Some(k);
+        }
+    }
+    best.and_then(|k| match k.value {
+        KEY_TYPE_whiteout => None,                      // explicitly deleted in snapshot
+        v                 => Some(v),
+    })
+}
 ```
 
-A snapshot is created by:
-1. Performing a normal checkpoint.
-2. Linking the new `RootPointer` into the snapshot chain instead of (or in addition to)
-   discarding the old root.
+In practice, this is implemented as a single forward iteration — keys with the same prefix
+cluster together in the btree leaf, and the iterator scans them in `(prefix, snapshot)` order,
+choosing the closest ancestor as it goes.
 
-**Bucket-level retention.** With bucket-based allocation (§12), each snapshot pins the buckets
-referenced by its `RootPointer`'s tree. A bucket is reclaimable only when *no* live snapshot's
-`pinned_buckets` set contains its `(disk_id, bucket_no, generation)`. On snapshot deletion, the
-allocator subtracts that snapshot's pinned set from the union and is free to bump the generation
-of any newly-released bucket. This replaces per-block freed-bitmap tracking with a much smaller
-per-snapshot bucket reference set (a 16 TiB / 1 MiB pool has 16 M buckets vs. 4 G blocks).
+### 11.4 Snapshot creation
 
-### 11.2 Cluster diff between snapshots
+Snapshot creation is O(1): allocate two new `SnapshotId`s as children of the current snapshot's
+node — one becomes the new snapshot's ID; the other replaces the current view's ID. No keys are
+copied. Both children inherit visibility of all ancestor keys through the tree.
 
-Two snapshots `A` and `B` (with `A.lsn < B.lsn`) produce a delta. With the journal-of-btree-updates
-model (§3.4), there are two diff paths:
+```
+Before snapshot:                After snapshot:
 
-**Hot path — journal streaming.** If the journal still retains entries spanning
-`(A.lsn, B.lsn]` (i.e. neither snapshot has been reclaimed past the journal's `read_cursor`),
-the diff is the journal range itself: every entry is already a key-level mutation in canonical
-HLC order. This is the cheapest possible diff — no tree walking, no bitmap computation. Snapshots
-within the journal's retention window benefit from this path.
+       N (current)                       N
+                                         │
+                                       split
+                                       /   \
+                                     N₁     N₂  (N₁ = new "current", N₂ = the snapshot)
+```
 
-**Cold path — COW tree walk.** When at least one snapshot's LSN precedes the current journal
-range, walk the COW trees of `A.root` and `B.root` in parallel:
+Subsequent writes to the current view are tagged with `N₁`; reads against the snapshot use `N₂`.
+Divergence happens only where modifications occur.
 
-1. Identical `BlockRef.generation` → skip subtree (entire branch unchanged).
-2. Differing branches recurse to the leaf level:
-   - `ObjectTable` leaf diff → list of (oid, new ObjectRecord).
-   - `TagBitmap` diff → roaring `xor` produces added/removed bitmaps directly (Δsize ≪ |bitmap|).
-   - `Forward` leaf bset diff → per-oid assertion delta.
+A new `BackpointerInsert` is **not** issued for shared extents — the underlying blob is unchanged
+and its existing backpointer is valid for both snapshots. Backpointers are physical, not logical
+(§6.2 / §11.2 table), so they're snapshot-agnostic.
 
-A snapshot retention policy (§11.3) that keeps recent snapshots inside the journal window makes
-near-real-time cluster sync free of tree-walk overhead; older diffs fall through to the COW path.
+### 11.5 Snapshot deletion
 
-**Resilver path.** When a peer comes back from a degraded state with one disk missing, the
-recovery is **backpointer-driven** (§6.2): the resilver enumerates all buckets that lived on the
-recovered disk, then for each bucket range-scans the backpointers btree to learn which objects'
-extents need to be re-fetched. Cost is proportional to data on the affected disk, not pool size.
+Deleting a snapshot marks it for asynchronous cleanup by a background pass (DESIGN §7.5
+analogue). The cost is proportional to the volume of data unique to the deleted snapshot:
 
-Either way, the result is a `SyncBundle`:
+1. **Runtime phase**: walk every snapshot-aware btree. For keys with `snapshot == deleted_id`,
+   either drop them outright (if a child snapshot has a newer overriding key) or convert them to
+   whiteouts (if ancestor visibility must be preserved for siblings). For interior nodes that
+   lose all but one child, keys are moved to the surviving child (re-tagging from
+   `deleted_id` to the surviving descendant's id).
+2. **Next-mount phase**: interior `SnapshotNode` removal — updating `depth` and `skiplist` fields
+   atomically across the affected subtree — is deferred to recovery's single-threaded context.
+
+A snapshot with two children cannot be deleted directly; one child must be deleted first.
+Multiple snapshot deletions are batched and processed in a single pass.
+
+### 11.6 Bucket retention under key-level snapshots
+
+A bucket is reclaimable when no live snapshot references its contents. Because backpointers
+record `bucket_gen` at insertion (§6.2), and snapshots only delay extent-deletion (they don't
+prevent generation bumps once *all* snapshots have moved on), retention is enforced
+**at the extent level**, not at the bucket level:
+
+- An extent's owning key carries a `snapshot` ID; the extent is logically alive as long as any
+  ancestor of any live snapshot can see that key.
+- Copy GC (§12.6) treats an extent as live if any backpointer's `bucket_gen` matches the bucket
+  *and* its owner's snapshot is still reachable through the snapshot tree.
+- When the deleting snapshot pass (§11.5) removes a key, the corresponding backpointer is
+  removed too. Once a bucket has no live backpointers, its generation can be bumped.
+
+This eliminates the per-snapshot `pinned_buckets` set the page-COW model used. Snapshot
+retention now scales with **logical changes**, not bucket counts.
+
+### 11.7 Cluster diff between snapshots
+
+With key-level snapshots, the cluster-sync diff between two snapshots `A` and `B` becomes a
+**snapshot-set difference**: stream every key whose `snapshot` is in `ancestors(B) \ ancestors(A)`.
+
+```
+let from_set = ancestors(A);            // 128-bit bitmap + skiplist walk; small
+let to_set   = ancestors(B);
+let new_only = to_set - from_set;       // snapshot IDs unique to B's lineage
+
+for tree in snapshot_aware_btrees {
+    for key in tree.iter() {
+        if new_only.contains(key.snapshot) {
+            emit(SyncOp::from(key));
+        }
+    }
+}
+```
+
+This subsumes both former diff paths:
+
+- The **hot path** (formerly journal streaming) is now "iterate keys with `snapshot ∈ new_only`"
+  — equivalent to a btree range scan filtered by the small `new_only` set.
+- The **cold path** (formerly COW tree walk) is the same operation; no special case needed.
+
+The result is the same `SyncBundle` shape:
 
 ```
 SyncBundle (CBOR):
-   from_lsn: u64
-   to_lsn: u64
+   from_snapshot: u32
+   to_snapshot: u32
    from_node: NodeId
    ops: [SyncOp]                       // canonical, HLC-ordered
-   bitmap_deltas: [{ tag_id, added: TagBitmap, removed: TagBitmap }]
-   metadata_pages: [{ oid_range, records: [ObjectRecord] }]    // changed records only
    ontology_delta: Option<OntologyDelta>
+   bitmap_deltas: [{ tag_id, snapshot, added/removed }]   // for tag bitmap divergences
 ```
 
-The bundle is signed (per §9.4 key hierarchy in DESIGN.md) and shipped to peers. The bitmap
-`xor`-based diff is what makes daily incremental sync ~850 KB regardless of pool size.
+The bundle is signed and shipped to peers (per §9.4 key hierarchy in DESIGN.md).
 
-### 11.3 Snapshot retention policy
+**Resilver path.** Unchanged from the prior section: when a peer comes back from a degraded
+state with one disk missing, recovery is **backpointer-driven** (§6.2). Backpointers are
+snapshot-agnostic, so resilver enumerates all backpointers on the affected disk and re-fetches
+the corresponding extents irrespective of which snapshot owns them.
 
-- Default: keep snapshots for **min(grace_period, 7 days)** to satisfy the deletion grace window
-  (DESIGN §7.2).
-- Configurable: pin snapshots by label for backups.
-- Each retained snapshot costs the changed-page footprint between it and its successor — typically
-  <1% of pool size per day on a normal workload.
+### 11.8 Retention policy
 
-### 11.4 Recovering to a previous snapshot
+Snapshot space cost is now per-key (not per-page). Per-snapshot overhead in steady state:
+
+- Keys unique to each snapshot: typically a few KB for an "idle" snapshot, scaling with logical
+  changes since the parent.
+- Snapshot tree node: 64 B + ancestor bitmap maintenance.
+
+**Defaults:**
+
+- Auto-created sync snapshots: kept for `min(grace_period, 7 days)`. Tens of thousands of these
+  are cheap because divergence is small.
+- Labelled / pinned snapshots: kept until explicitly removed. Cost = sum of unique keys.
+
+### 11.9 Rollback
 
 ```
 brunnr rollback --to <snapshot_label>
 ```
 
-1. Verify the snapshot's `RootPointer` and all reachable BlockRefs validate (deep CRC check).
-2. Mark all current-but-not-in-target pages as freed in a new checkpoint.
-3. Atomically swap `active_root` in the superblock to the snapshot's root.
+1. Resolve the label to a `SnapshotId` `S`.
+2. Atomically retag the "current" pointer to `S`'s child slot (or create a new child of `S`).
+3. The current view now reflects `S`'s state; subsequent writes diverge at the new child.
 
-This is the same primitive that drives cluster-sync conflict resolution: a node can revert to a
-known-good snapshot, then re-apply HLC-ordered ops from peers.
+No data is copied. The rollback is O(1); subsequent reads pay the snapshot-iteration cost
+(§11.3) until garbage collection (§11.5) tidies away the abandoned-side keys.
 
 ---
 
@@ -1514,6 +1661,7 @@ queries:
 | `WritePoints` (`HashMap<(DiskId, DataType, StreamTag), OpenBucket>`) | derived             | resident; ~hundreds of entries |
 | `BTreeNodeCache` (`HashMap<BlockRef, LoadedNode>` + LRU) | §1.5 large nodes (256 KiB each) | journal-pinned nodes never evicted; clean nodes LRU. Working-set ≈ 100–500 hot nodes ⇒ 25–125 MiB. |
 | `BackpointerCache` (LRU of bucket-prefix scan results) | §6.2 backpointer btree leaves | populated on demand by copygc / scrub / resilver |
+| `SnapshotTree` (`BTreeMap<SnapshotId, SnapshotNode>` + ancestor cache) | §11.1 snapshots btree | fully resident — typically thousands of entries; ancestor checks must be in-cache |
 | `JournalReclaim` (`BinaryHeap` of (pin_pressure, BlockRef)) | derived from BTreeNodeCache | resident; rebuilt on demand |
 | `OpLog` (`VecDeque<OpLogEntry>`)             | recent WAL tail                           | trimmed at checkpoint  |
 
@@ -1522,11 +1670,13 @@ superblock, allocator, and snapshot manager. All mutations follow:
 
 ```
 1. Acquire engine write lock
-2. Append WAL entry (fsync if durability mode = sync)
-3. Apply to in-memory mirror (idempotent on lsn)
-4. Update affected btree nodes' journal pins: set/extend `pending_lsn_max`, increment
+2. Tag the mutation with the **current snapshot id** (§11.2) — for snapshot-aware btrees, the
+   key includes `snapshot = current_snapshot_id`
+3. Append WAL entry (fsync if durability mode = sync)
+4. Apply to in-memory mirror (idempotent on lsn)
+5. Update affected btree nodes' journal pins: set/extend `pending_lsn_max`, increment
    `pending_count`. Page rewrites are deferred to the journal-reclaim thread (§3.4).
-5. Release write lock
+6. Release write lock
 ```
 
 Reads are mostly lock-free against an `arc-swap`'d snapshot of the relevant index handle.
@@ -1586,12 +1736,13 @@ the migration is crash-safe and resumable.
 
 ---
 
-## 16. Summary of On-Disk Footprint (10 M objects, 5 000 tags)
+## 16. Summary of On-Disk Footprint (10 M objects, 5 000 tags, ~100 live snapshots)
 
-Steady-state footprint with the journal-of-btree-updates model and packed-key bsets (§1.5.6):
-B+ tree footprints reflect the ~30 % compression from key packing; positional radix tables
-(object/location) and bitmap structures are unaffected. The WAL ring holds the unmaterialised
-tail (≤ 64 MiB).
+Steady-state footprint with the journal-of-btree-updates model, packed-key bsets (§1.5.6), and
+key-level snapshots (§11): per-snapshot overhead is per-key, not per-page, so 100 sync
+snapshots add a few MB of unique keys rather than hundreds of MB of COW pages. B+ tree
+footprints reflect the ~30 % compression from key packing; positional radix tables and bitmap
+structures are unaffected. The WAL ring holds the unmaterialised tail (≤ 64 MiB).
 
 | Structure              | Size      | Notes                                              |
 | ---------------------- | --------- | -------------------------------------------------- |
@@ -1610,8 +1761,9 @@ tail (≤ 64 MiB).
 | Ontology               | <10 MiB   | Modules + DAG                                      |
 | Subscriptions          | ~700 KiB  | Per 1 000 subs with packed `sub_id`                |
 | Path contexts          | 50 MiB    | One large project; path hashes don't pack          |
-| Snapshot chain (7 days) | ~500 MiB | Diff-only                                          |
-| **Total metadata**     | **~3.0 GiB** | Includes backpointers (+280 MiB); still ~3 % smaller than pre-packing |
+| Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
+| Snapshot key overhead  | ~50 MiB   | Per-snapshot unique keys across all snapshot-aware btrees (vs. 500 MiB COW chain) |
+| **Total metadata**     | **~2.5 GiB** | Net win: snapshot overhead drops by ~450 MiB vs. page-COW model |
 
 This is the "few hundred megabytes" of the design intent at moderate scale, and at the upper end
 of practical scale still well under 1% of pool storage.
