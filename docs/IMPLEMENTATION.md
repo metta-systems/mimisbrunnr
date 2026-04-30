@@ -67,17 +67,31 @@ construction. CRC is computed with the CRC slot itself zeroed.
 enum BlockKind {
     Superblock,
     ZoneMap,
-    WalSegment,
-    ObjectTablePage,
-    LocationTablePage,
-    ForwardIndexPage,
-    TagBitmapPage,
-    BPlusInner,                              // generic B+ tree inner page
-    BPlusLeaf,                               // generic B+ tree leaf page
-    KvHashBucket,                            // extendible-hash bucket (KV index)
-    OntologyPage,
-    PathContextPage,
-    Checkpoint,
+    WalSegment,                              // WAL header / segment marker
+    TagBitmapPage,                           // roaring bitmap framing (4 KiB; §8.2)
+    KvHashBucket,                            // extendible-hash bucket (4 KiB; §9.1)
+    OverflowRecord,                          // per-object tag/attr overflow (4 KiB; §5.2)
+    Checkpoint,                              // checkpoint block within the WAL
+}
+```
+
+Large-node regions (256 KiB B+ tree nodes and radix leaves; §1.5) carry **`BtreeNodeHeader.kind`**
+of type `BtreeKind` instead of `BlockHeader.kind`:
+
+```rust
+enum BtreeKind {
+    ObjectTable,        // §5 radix leaves & inners
+    LocationTable,      // §6 radix leaves & inners
+    Forward,            // §7 forward index B+ tree
+    TagDirectory,       // §8.1 tag directory B+ tree
+    Range,              // §9.2 range index B+ tree
+    ChunkIndex,         // §9.3 chunk index B+ tree
+    ValueSpill,         // value-hash → CBOR(Value) B+ tree
+    Ontology,           // §10.1 ontology / dag B+ tree
+    PathContext,        // §10.3 path context B+ tree
+    Subscriptions,      // §10.2 subscription B+ tree
+    BucketAlloc,        // §12.2 per-disk bucket alloc B+ tree
+    FreespaceLru,       // §12.4 per-disk freespace LRU B+ tree
 }
 ```
 
@@ -89,6 +103,129 @@ that encounters an unknown `(kind, format_version)` aborts with a clear "format 
 CRC32C (Castagnoli, hardware-accelerated on x86 SSE 4.2 and ARMv8 CRC). Sufficient for 4 KiB blocks
 and faster than CRC32. BLAKE3 is used for *content* integrity (per-object), not for block
 checksums.
+
+### 1.5 Large node format
+
+All B+ tree nodes and radix-tree leaves are **256 KiB** (configurable 128–512 KiB at format time;
+`Superblock.btree_node_size_log2`, default 18 = 256 KiB). This is the bcachefs model: shallow
+trees, large sequential reads/writes, and node-internal log structure that lets a flush append
+new keys without rewriting the whole node.
+
+A 256 KiB node in a 1 MiB bucket means **4 nodes per bucket**, which is the typical packing.
+Nodes do not span buckets; if a node would fill its region, it triggers a split or full
+compaction (§1.5.4) that writes the new node(s) into a fresh bucket region.
+
+Two large-node variants share the same outer envelope but differ in their internal layout:
+
+- **B+ tree node** (forward index, range index, alloc table, freespace LRU, ontology, path
+  contexts, subscriptions): a sequence of **bsets** — sorted runs of keyed records. New updates
+  append a new bset; periodic full compaction merges all bsets back into one.
+- **Radix leaf** (object table, location table): a positional array of fixed-size records. No
+  internal bsets — the WAL journal (§3.4) serves as the per-leaf update log; on flush the leaf
+  is rewritten from the merged in-memory state.
+
+#### 1.5.1 Region envelope
+
+Every large node begins with a 64-byte `BtreeNodeHeader`:
+
+```rust
+#[repr(C, packed)]
+struct BtreeNodeHeader {                     // 64 bytes
+    magic: [u8; 4],                          // "MIMB"
+    kind: u16,                               // BtreeKind: ObjectTable, Forward, Range, …
+    format_version: u16,                     // per-kind structural version
+    seq: u64,                                // monotonic per-region; bumped on each rewrite
+    last_persisted_lsn: u64,                 // BlockHeader.lsn analogue
+    region_size_log2: u8,                    // 18 = 256 KiB
+    level: u8,                               // 0 = leaf, ≥1 = inner
+    bset_count: u8,                          // number of bsets present
+    flags: u8,                               // bit 0 = compaction-in-progress (recovery hint)
+    payload_used: u32,                       // bytes consumed by all bsets so far (≤ region_size − 64)
+    min_key: [u8; 16],                       // covered key range (interpreted per-kind)
+    max_key: [u8; 16],                       // ditto
+}
+```
+
+Subsequent bytes are a **stream of bsets**, each preceded by:
+
+```rust
+#[repr(C, packed)]
+struct BsetHeader {                          // 32 bytes
+    magic: u32,                              // "BSET"
+    seq: u32,                                // monotonic within the region
+    journal_seq: u64,                        // newest WAL LSN merged into this bset (recovery)
+    entry_count: u32,                        // entries in this bset
+    payload_length: u32,                     // bytes of bset payload
+    flags: u32,                              // bit 0 = packed-keys, bit 1 = encrypted
+    crc: u32,                                // CRC32C over (BsetHeader || payload), CRC slot zeroed
+}
+```
+
+The CRC scope is **per-bset**, not per-4 KiB-block. Each bset is therefore an independently
+verifiable, append-only commit unit. A torn write of a partial bset fails its CRC and is
+discarded — earlier bsets remain valid. There is no trailing CRC over the whole region.
+
+#### 1.5.2 Append-only growth
+
+When the journal-reclaim thread (§3.4) decides to flush a node:
+
+1. Materialise the pending journal entries that target this node into a new sorted bset.
+2. Append `BsetHeader` + bset payload at offset `payload_used` within the region.
+3. Update `BtreeNodeHeader.bset_count`, `payload_used`, `last_persisted_lsn`.
+4. Rewrite **only** the modified bytes (the new bset, plus a re-checksummed header) — typically
+   a few hundred KB, not the whole 256 KiB.
+
+Because the bucket is write-once-then-recycle (§12), the new bset lands at the next free sectors
+of the bucket. The header rewrite at offset 0 is a single 4 KiB-sector overwrite — a permitted
+operation because the region is reserved within the bucket and only the header sector is
+re-touched.
+
+> **Note.** Strictly write-once buckets cannot accept overwriting the header sector. Buckets
+> hosting btree nodes are flagged `BucketDataType::BtreeNode` and tolerate **header-sector
+> overwrites only** (the rest of the region remains append-only). On SMR / zoned drives this
+> constraint moves header rewrites to a separate co-located header bucket; see §12.5 for the
+> zoned variant.
+
+#### 1.5.3 In-memory representation
+
+Loaded nodes are decoded into:
+
+```rust
+struct LoadedNode {
+    header: BtreeNodeHeader,
+    bsets: SmallVec<[Bset; 4]>,              // typically 1–3 active bsets
+    merged_view: BTreeMap<Key, Value>,       // lazy: built on first lookup
+    pending_journal: Vec<JournalEntry>,      // §3.4 entries past last_persisted_lsn
+    dirty: bool,
+    pin: JournalPin,
+}
+```
+
+Lookups merge-search across bsets; bsets are kept sorted at write time. With ≤ 3 active bsets
+each binary-searched, lookup cost is `O(3 × log(n))` per node — equivalent to a single sorted
+search at the constant-factor bcachefs measures at < 5% overhead.
+
+#### 1.5.4 Full compaction
+
+When a node's `payload_used` exceeds 75 % of region size, or `bset_count > 4`, full compaction
+runs:
+
+1. Allocate a fresh region in a new bucket (via the standard write-point mechanism, §12.5).
+2. Merge-sort all bsets into a single bset; write it as bset 0 in the new region.
+3. Update the parent inner node's child pointer (which itself may need a flush — propagates
+   up the tree).
+4. Old region is abandoned; its bucket's `dirty_sectors` decreases. The bucket becomes a copygc
+   candidate (§12.6) when fragmentation is high enough.
+
+Full compactions are O(node_size) per node but rare — bcachefs measures ~1 per 100–1000 flushes
+on typical workloads.
+
+#### 1.5.5 Why this matters
+
+For a 10 M-object pool, the radix object table goes from 4 levels (4 KiB pages) to **2 levels**
+(256 KiB pages). Tag, range, and forward indexes drop from 4 levels to **2–3 levels**. Cache
+working set shrinks by 64× in page count, with the same total bytes. Sequential I/O on every
+node access — critical for HDD performance.
 
 ---
 
@@ -128,7 +265,8 @@ struct Superblock {                          // 4096 bytes total
     wal_size: u64,                           // [256..264]
     bucket_size_log2: u8,                    // [264..265]   e.g. 20 = 1 MiB bucket
     copygc_reserve_pct: u8,                  // [265..266]   default 8 (range 5..=21)
-    _pad3: [u8; 6],                          // [266..272]
+    btree_node_size_log2: u8,                // [266..267]   default 18 = 256 KiB (§1.5)
+    _pad3: [u8; 5],                          // [267..272]
     bootstrap_buckets: u32,                  // [272..276]   reserved leading buckets (sb + WAL + …)
     _pad4: [u8; 4],                          // [276..280]
     _reserved_alloc: [u8; 16],               // [280..296]   space freed by removed bitmap fields
@@ -407,76 +545,79 @@ flooding.
 
 ## 5. Object Record Table
 
-Logically a flat array indexed by `ObjectId.local`. Physically, a **COW radix tree** of 4 KiB
-pages whose depth grows with the populated id space.
+Logically a flat array indexed by `ObjectId.local`. Physically, a **COW radix tree** of large
+nodes (§1.5) whose depth grows with the populated id space.
 
-### Page capacities
+### Node capacities
 
-A 4 KiB block carries a 32-byte `BlockHeader` plus a 4-byte trailing CRC, leaving **4060 bytes**
-of payload.
+Each node is a 256 KiB region (§1.5) with a 64-byte `BtreeNodeHeader` and per-bset framing.
+For the radix variants, the header is followed by a single positional payload (no internal bsets
+— positional updates are journalled via §3.4 and merged on flush):
 
-- **Leaf page** (`ObjectTablePage`): 31 × `ObjectRecord` (128 B) = 3968 B, followed by a 92-byte
-  tail holding a 31-bit occupancy bitmap, a leaf generation counter, and reserved space.
-  → **31 records per leaf.**
-- **Inner page** (`ObjectTableInner`): up to 253 × `BlockRef` (16 B) = 4048 B, with the page's
-  tree level encoded in `BlockHeader.flags` (4 bits, supports depths 0–15) and 12 bytes of
-  trailing pad.
-  → **253 children per inner page.**
+- **Leaf node** (`BtreeKind::ObjectTable`, level 0): up to **2044** × `ObjectRecord` (128 B)
+  packed as a positional array. With a 64 B header + 32 B leaf metadata trailer (occupancy
+  bitmap, generation, reserved): 256 KiB − 96 B = 261 952 B / 128 B = 2046, rounded down to 2044
+  for alignment headroom.
+- **Inner node** (level ≥ 1): up to **16 380** × `BlockRef` (16 B) = 262 080 B; minus the 64 B
+  header that's 16 376 effective entries, rounded to 16 380 with a small trailing slot table.
 
 ### Tree depth and capacity
 
-| Depth (inner levels + leaf) | Max objects                      |
-| --------------------------- | -------------------------------- |
-| 0 inner (leaf only)         | 31                               |
-| 1 inner                     | 31 × 253 ≈ 7 843                 |
-| 2 inner                     | 31 × 253² ≈ 1.98 M               |
-| 3 inner                     | 31 × 253³ ≈ 502 M                |
-| 4 inner                     | 31 × 253⁴ ≈ 127 G                |
+| Depth (inner levels + leaf) | Max objects                              |
+| --------------------------- | ---------------------------------------- |
+| 0 inner (leaf only)         | 2 044                                    |
+| 1 inner                     | 2 044 × 16 380 ≈ 33 M                    |
+| 2 inner                     | 2 044 × 16 380² ≈ 549 G                  |
 
-A 10 M-object pool sits comfortably in a 3-inner-level tree (≤ 502 M). The 48-bit local id space
-is reachable at 5 inner levels (≈ 32 T objects) — well below the 16-level limit imposed by the
-4-bit level field.
+A 10 M-object pool sits in a **single-inner-level tree** (root inner + leaves; depth 2). The
+full 48-bit local-id space is reachable at depth 3 (≈ 9 P objects). The 4-bit `level` field in
+`BtreeNodeHeader` supports depths 0–15.
 
-`RootPointer.object_table_root` is a `BlockRef` to the topmost page; its `BlockHeader.flags`
-identify whether it is a leaf (small pool) or an inner page at level *N*.
+`RootPointer.object_table_root` is a `BlockRef` to the topmost node; the node's
+`BtreeNodeHeader.level` identifies whether it is a leaf (very small pool) or an inner node.
 
 ### Address translation (oid → leaf slot)
 
 ```rust
 let mut idx = oid_local;
-let leaf_slot = (idx % 31) as usize;  idx /= 31;
+let leaf_slot  = (idx % 2044) as u16; idx /= 2044;
 let mut child_path = [0u16; MAX_LEVELS];
 for level in 0..root_level {
-    child_path[level] = (idx % 253) as u16;
-    idx /= 253;
+    child_path[level] = (idx % 16380) as u16;
+    idx /= 16380;
 }
-debug_assert_eq!(idx, 0);  // any remaining bits would mean the tree is too shallow
+debug_assert_eq!(idx, 0);  // remaining bits would mean the tree is too shallow
 ```
 
-Object IDs are allocated sequentially per node, so populated leaves cluster densely and the tree
-stays compact. A missing child pointer in any inner page marks an unallocated id range (cleared
-slots are likewise sparse — the leaf occupancy bitmap distinguishes "never allocated" from
-"cleared", §5.1 / DESIGN §7.3).
+Object IDs are allocated sequentially per node (DESIGN §2.1), so populated leaves cluster densely
+and the tree stays compact. A missing child pointer in any inner node marks an unallocated id
+range; cleared slots are sparse and distinguished from "never allocated" by the leaf occupancy
+bitmap (§5.1 / DESIGN §7.3).
 
 ### Tree growth
 
-When the root is full and a new id falls outside its range, a new inner page one level higher is
+When the root is full and a new id falls outside its range, a new inner node one level higher is
 allocated, populated with the previous root as its first child, and committed as the new
-`object_table_root` in the next `Checkpoint`. Tree growth is therefore log-amortised and never
-requires a wholesale rewrite.
+`object_table_root` at the next checkpoint. Tree growth is log-amortised — never a wholesale
+rewrite.
 
 ### COW write path
 
-Pages are rewritten copy-on-write **only when the journal-reclaim thread flushes them** (§3.4) —
-never per mutation. A flush at depth *D* (= root level + 1) costs *D* × 4 KiB writes; for a
-10 M-object pool that's **4 page writes per flush** (leaf + 3 inner), amortised across however
-many mutations have accumulated against that leaf since its last flush (typically tens to
-thousands).
+Nodes are rewritten copy-on-write **only when the journal-reclaim thread flushes them** (§3.4),
+never per mutation. A flush at depth *D* costs roughly *D* × 256 KiB of writes (each level's
+node is rewritten into a fresh region). For the 10 M-object pool that's **2 node rewrites per
+flush** (leaf + root inner), amortised across however many mutations have accumulated against
+that leaf since its last flush.
 
-Per-mutation cost is just the WAL append (~80 bytes). Reads consult the in-memory dirty-node
-mirror, which holds the merged on-disk state plus pending journal entries; cold reads materialise
-this view by replaying the journal range `[node.last_persisted_lsn, journal_head]` against the
-loaded page.
+Per-mutation cost is still the WAL append (~80 B). Reads consult the in-memory `LoadedNode`
+(§1.5.3), which holds the on-disk state plus pending journal entries past
+`BtreeNodeHeader.last_persisted_lsn`; cold reads materialise the merged view at load time.
+
+Because positional radix leaves don't use internal bsets, every flush rewrites the whole leaf
+into a fresh region. This is acceptable here: a leaf holding 2044 records absorbs hundreds to
+thousands of pending mutations before journal-reclaim chooses to flush it, so the per-mutation
+amortised write cost is well under 1 KiB. (The B+ tree variants in §7+ avoid even this by
+appending bsets — for keyed structures that's cheaper than rebuilding a sorted run.)
 
 ### 5.1 ObjectRecord (128 bytes, version 1)
 
@@ -518,7 +659,7 @@ metadata zone, addressed by `overflow_offset`. It is a self-contained 4 KiB bloc
 
 ```
 struct OverflowRecord {
-    header: BlockHeader,                     // kind = ObjectTablePage, but flag = overflow
+    header: BlockHeader,                     // kind = OverflowRecord (§1.3)
     object_id: u64,
     tag_count: u32,
     attr_count: u32,
@@ -542,18 +683,27 @@ for the rare wide objects (≥ 200 tags).
 ## 6. Location Table
 
 Same COW radix-tree machinery as the object table (§5), parameterised for 48-byte
-`ObjectLocation` records:
+`ObjectLocation` records and using the same large-node format (§1.5):
 
-- **Leaf page** (`LocationTablePage`): 84 × `ObjectLocation` (48 B) = 4032 B, followed by a
-  28-byte tail (84-bit occupancy bitmap = 11 B, leaf generation, reserved).
-  → **84 records per leaf.**
-- **Inner page**: 253 × `BlockRef`, identical to §5's `ObjectTableInner`.
+- **Leaf node** (`BtreeKind::LocationTable`, level 0): 256 KiB region holds 5 458 ×
+  `ObjectLocation` (48 B) = 261 984 B, with a 64 B `BtreeNodeHeader` and a small trailer.
+  → **5 458 records per leaf.**
+- **Inner node**: identical to §5's inner — 16 380 × `BlockRef`.
 
-Capacity at depth *d* (= inner levels above the leaf, plus the leaf): 84 × 253^(d−1). A 10 M-pool
-fits in 4 levels (≈ 1.36 G capacity); the 48-bit local id space is reachable at 5 levels.
+Capacity:
+
+| Depth | Max objects                              |
+| ----- | ---------------------------------------- |
+| 0     | 5 458                                    |
+| 1     | 5 458 × 16 380 ≈ 89 M                    |
+| 2     | 5 458 × 16 380² ≈ 1.46 T                 |
+
+A 10 M-object pool fits in **depth 1** (single inner node + leaves). The 48-bit local id space
+is reachable at depth 2.
 
 The radix is keyed by the same `ObjectId.local`, so the location table tracks the object table
-slot-for-slot — a record edit costs the same 4 page writes at 10 M scale.
+slot-for-slot. A flush at depth 1 costs **2 node rewrites** at 10 M scale (leaf + root inner),
+amortised across pending mutations.
 
 ```rust
 #[repr(C, align(8))]
@@ -585,19 +735,29 @@ referencing N (chunk_hash, BlobRef) pairs — see §9.
 The forward index maps `oid → [ForwardEntry]` and must support fast per-object listing and
 per-object diffing for sync.
 
-On disk, it is a **B+ tree** keyed by `oid`, with leaf values that are **inline-or-spill** vectors:
+On disk it is a **B+ tree of large nodes** (§1.5), keyed by `oid`. Each node uses the standard
+multi-bset envelope: new mutations are appended as a fresh bset; lookups merge-search across
+all bsets in the node.
 
-```
-B+ Tree:
-  Inner page (4 KiB): { keys: [u64; N], children: [BlockRef; N+1] }, N ~= 250
-  Leaf  page (4 KiB): { entries: [LeafEntry] }
-                      LeafEntry { oid: u64, count: u16, _pad: u16,
-                                  inline: [PackedAssertion; 8] | spill: BlockRef }
-```
+### 7.1 Node layout
 
-A `PackedAssertion` is fixed at 16 bytes:
+- **Inner node** (`BtreeKind::Forward`, level ≥ 1): one or more bsets of `(key: u64, child:
+  BlockRef)` pairs (24 B per entry). One full bset packs ~10 900 children; with up to 4 active
+  bsets the effective fanout averages ~5 000 (post-merge ~10 900). Tree depth at 10 M objects:
+  **2 levels** (1 inner + leaves).
+- **Leaf node** (level 0): bsets of `LeafEntry` records:
 
-```
+```rust
+struct LeafEntry {                           // variable length
+    oid: u64,                                // 8 B  (sort key)
+    count: u16,                              // 2 B  number of inline assertions
+    spill: u16,                              //  bit 15 = is_spill; lower 15 bits unused
+    body: union {
+        inline: [PackedAssertion; count],    // count × 16 B (when not spilled)
+        spill_ref: BlockRef,                 // 16 B BlockRef into ForwardOverflow region
+    },
+}
+
 struct PackedAssertion {                     // 16 bytes
     kind: u8,                                // 0=Tag, 1=Attr, 2=Relation
     origin: u8,                              // 0=Direct, 1=Materialized
@@ -607,18 +767,36 @@ struct PackedAssertion {                     // 16 bytes
 }
 ```
 
+A leaf with 8 assertions per object (typical) packs ~1 800 entries per bset; with 4 active bsets
+the leaf carries up to ~7 000 entries before full compaction. Merged-leaf occupancy is similar
+to a single bset (duplicates collapse).
+
+### 7.2 Spill
+
+Objects with more than 8 assertions store a `BlockRef` to a `ForwardOverflow` region (also a
+256 KiB large-node region; positional, no bsets — single rewrite on growth). Each overflow region
+holds up to 16 380 × `PackedAssertion`. Further overflow chains via the trailing `BlockRef` slot.
+
+### 7.3 Bset behaviour
+
+- **Append on flush.** When journal-reclaim flushes a forward-index leaf, only the new bset is
+  written — typically a few KB to a few tens of KB, not the whole 256 KiB node.
+- **In-memory merge.** `LoadedNode.merged_view` builds a `BTreeMap<u64, SmallVec<[PackedAssertion;
+  8]>>` lazily on first lookup; subsequent lookups are direct hits.
+- **Full compaction** triggers when `payload_used > 75%` or `bset_count > 4`, rewriting the node
+  into a fresh region with a single merged bset.
+
 For attributes whose actual `Value` matters (not just its hash), the `value_hash` indirects into
 the **value spill table** (a separate B+ tree keyed by `value_hash → CBOR(Value)`), shared with
 the KV index (§8). Tag and Relation entries are self-contained.
 
-Spill threshold: more than 8 assertions per object → leaf entry stores `BlockRef` to a 4 KiB
-**ForwardOverflow** block holding up to 252 `PackedAssertion`s; further overflow chains.
+### 7.4 Properties
 
-This layout supports:
-
-- O(log N) lookup by oid.
-- O(1) per-assertion diffing via `last_modify_lsn` on the object record.
-- Compact in-memory mirror: a `HashMap<u64, SmallVec<[PackedAssertion; 8]>>` mirrors hot pages.
+- O(log N) lookup by oid (depth 2 at 10 M scale ⇒ ≤ 2 large-node loads).
+- O(1) per-assertion diffing via `BsetHeader.journal_seq` — sync streams bsets newer than
+  the peer's watermark, exactly the journal-streaming fast path of §11.2.
+- Compact in-memory mirror: a `HashMap<u64, SmallVec<[PackedAssertion; 8]>>` over the loaded
+  node's `merged_view`.
 
 ---
 
@@ -632,21 +810,38 @@ The tag index is the heart of query performance. Its on-disk form must:
 
 ### 8.1 TagIndexDirectory
 
+A **B+ tree of large nodes** (§1.5) keyed by `TagId: u32`. Leaf entries are 32 B:
+
 ```
-TagIndexDirectory (B+ tree, key = TagId u32):
-   leaf entry: { tag_id: u32, store_kind: u8, _pad: u8,
-                 stats: TagStats (16 bytes),
-                 store_root: BlockRef }
+TagIndexLeafEntry {                          // 32 bytes
+    tag_id: u32,                             // sort key
+    store_kind: u8,                          // Simple / Ordered / Ranked
+    _pad: u8,
+    cardinality: u32,                        // for fast snapshot stats
+    last_modify_lsn: u64,
+    generation: u32,                         // bumped on bitmap rewrite
+    store_root: BlockRef,                    // 16 B → §8.2 / §8.3
+}
 ```
 
-`store_kind` ∈ { `Simple`, `Ordered`, `Ranked` } selects the layout pointed to by `store_root`.
-`TagStats { cardinality: u32, last_modify_lsn: u64, generation: u32 }` enables fast snapshot
-diffing without dereferencing the bitmap.
+A 256 KiB leaf packs ~8 100 entries per bset. The full ontology of 5 000 tags fits in **a
+single leaf** (depth 0). For pools with hundreds of thousands of tags the tree extends to depth 1
+(~130 M-tag capacity).
+
+`(cardinality, last_modify_lsn, generation)` enables fast snapshot diffing without dereferencing
+the bitmap — the directory's bset stream alone tells a peer which tags changed and how.
 
 ### 8.2 Roaring bitmaps on disk
 
-We adopt the **Roaring portable serialization spec** (the same format used by the `roaring` crate
-and Apache Lucene) but framed inside `BlockHeader`-prefixed pages:
+Roaring bitmaps stay on the **4 KiB block format** (not 256 KiB nodes) because:
+
+- The portable Roaring spec is already container-addressable and mmap-friendly at any offset.
+- Per-tag bitmaps vary from a few hundred bytes to many megabytes; the 4 KiB granularity matches
+  Roaring's natural 4 KiB-class bitmap container.
+- Bitmaps are referenced as opaque blobs from the directory; their internal format is a stable
+  external standard (Apache Lucene + the `roaring` crate).
+
+We adopt the **Roaring portable serialization spec** framed inside `BlockHeader`-prefixed pages:
 
 ```
 TagBitmap (one or more 4 KiB blocks):
@@ -659,9 +854,8 @@ TagBitmap (one or more 4 KiB blocks):
 ```
 
 Containers larger than ~64 KiB span multiple consecutive blocks; the directory records the
-absolute block_no of each container so they can be loaded individually (mmap-friendly random
-access). For small bitmaps that fit in one block, the directory and containers are co-located in
-the single block.
+absolute block_no of each container so they can be loaded individually. For small bitmaps that
+fit in one block, the directory and containers are co-located.
 
 ### 8.3 Ordered & ranked stores
 
@@ -687,29 +881,38 @@ checkpoint).
 
 ### 9.1 KV Equality Index
 
-Hash-based on disk via **extendible hashing** keyed by `(tag_id, value_hash)`:
+Hash-based on disk via **extendible hashing** keyed by `(tag_id, value_hash)`. The KV index is
+the one structure that does **not** use the §1.5 large-node B+ tree format — point-equality
+lookups benefit more from hash-bucket addressing.
 
 ```
-KvDirectory (BlockRef array, 4 KiB block, doubles when global depth grows):
+KvDirectory (4 KiB block, doubles when global depth grows):
+   header (BlockHeader, kind = KvHashBucket with directory flag in BlockHeader.flags)
+   global_depth: u8
+   _pad: u8
+   bucket_count: u16
    entries: [BlockRef; 512]    // local-depth tagged buckets
+
 KvBucket (4 KiB):
-   header
+   header (BlockHeader, kind = KvHashBucket)
    local_depth: u8
    entry_count: u16
+   _pad: u8
    entries: [{ tag_id: u32, value_hash: u64, bitmap_ref: BlockRef }; ~120]
 ```
 
-The bitmap referenced by each entry is itself a `TagBitmap` (§8.2), reused via the same machinery.
-Extendible hashing is chosen over a B+ tree here because lookups are exact-match only and the
-constant factor on point queries is roughly half that of a B+ tree.
+The bitmap referenced by each entry is a `TagBitmap` (§8.2), reused via the same machinery.
 
-The accompanying **value spill table** is a B+ tree `value_hash → CBOR(Value)` so the actual value
-can be reconstructed when needed (display, faceted enumeration, range comparisons).
+The accompanying **value spill table** uses the standard §1.5 large-node B+ tree:
+`value_hash → CBOR(Value)`, so the actual value can be reconstructed when needed (display,
+faceted enumeration, range comparisons).
 
 ### 9.2 Range Index
 
-Standard **B+ tree** keyed by `(attr_id: u32, value: NormalisedKey, oid: u64)`. `NormalisedKey`
-is a fixed-size order-preserving encoding:
+A **B+ tree of large nodes** (§1.5) keyed by `(attr_id: u32, value: NormalisedKey, oid: u64)` —
+28 B per key. Leaf bsets store key → `BlockRef` to a roaring bitmap; ~7 500 entries per bset.
+
+`NormalisedKey` is a fixed-size order-preserving encoding:
 
 | ValueType | Encoding (16 bytes)                                                                       |
 | --------- | ----------------------------------------------------------------------------------------- |
@@ -722,11 +925,21 @@ Leaf values are roaring bitmaps (per `(attr_id, value_prefix)`), enabling cheap 
 
 ### 9.3 Chunk Index (for FastCDC objects)
 
+A **B+ tree of large nodes** (§1.5) keyed by `chunk_hash: [u8; 32]`:
+
 ```
-ChunkIndex (B+ tree, key = chunk_hash [u8; 32]):
-   leaf entry: { chunk_hash, ref_count: u32, blob: BlobRef, length: u32 }
-ChunkList per object: array of (chunk_hash, length) — referenced from ObjectLocation when chunked.
+ChunkIndexLeafEntry {                        // 56 bytes
+    chunk_hash: [u8; 32],
+    ref_count: u32,
+    length: u32,
+    blob: BlobRef,                           // 16 B
+}
 ```
+
+A 256 KiB leaf packs ~4 600 chunk entries per bset.
+
+`ChunkList` per object: array of `(chunk_hash, length)` referenced from `ObjectLocation` when
+chunked (a positional `ChunkList` region; see §1.5 for the radix layout).
 
 Chunk hashes use BLAKE3 of plaintext (pre-compression) so dedup is content-defined.
 
@@ -747,10 +960,10 @@ OntologyRoot (4 KiB):
   module_count: u32
   tag_count: u32
   implication_count: u32
-  modules_root: BlockRef     → B+ tree key = module_id_hash → CBOR(ModuleManifest)
-  tags_root:    BlockRef     → B+ tree key = TagId          → TagDefRecord (fixed, 64 bytes)
-  tag_names:    BlockRef     → B+ tree key = name_hash      → (TagId, BlockRef → CBOR(TagDef))
-  dag_root:     BlockRef     → ImplicationDagPages (sparse adjacency lists)
+  modules_root: BlockRef     → §1.5 B+ tree, key = module_id_hash → CBOR(ModuleManifest)
+  tags_root:    BlockRef     → §1.5 B+ tree, key = TagId          → TagDefRecord (fixed, 64 bytes)
+  tag_names:    BlockRef     → §1.5 B+ tree, key = name_hash      → (TagId, BlockRef → CBOR(TagDef))
+  dag_root:     BlockRef     → ImplicationDagPages (sparse adjacency lists, §1.5 large nodes)
 ```
 
 `TagDefRecord` is 64 bytes with `name_offset` pointing into `tag_names`. The variable-shape parts
@@ -764,7 +977,7 @@ CBOR at install time. TOML is never seen by the read path.
 
 ```
 SubscriptionsRoot:
-  B+ tree, key = SubscriptionId u64 → SubscriptionRecord (variable, CBOR)
+  §1.5 B+ tree, key = SubscriptionId u64 → SubscriptionRecord (variable, CBOR)
 ```
 
 A subscription's `cached_result` is a roaring bitmap stored in a `TagBitmap` (§8.2) referenced
@@ -776,9 +989,9 @@ overhead is negligible.
 
 ```
 PathContextRoot:
-  B+ tree, key = name_hash → PathContextHeader { name_offset, manifest_root, _stats }
-  Manifest is a B+ tree keyed by path-string-hash → ProjectedEntry (96 bytes inline + spill for
-  Symlink targets and long paths).
+  §1.5 B+ tree, key = name_hash → PathContextHeader { name_offset, manifest_root, _stats }
+  Manifest is a §1.5 B+ tree keyed by path-string-hash → ProjectedEntry (96 bytes inline +
+  spill for Symlink targets and long paths).
 ```
 
 Per-object reverse mappings (which object → which paths in which contexts) live in the forward
@@ -873,9 +1086,9 @@ range, walk the COW trees of `A.root` and `B.root` in parallel:
 
 1. Identical `BlockRef.generation` → skip subtree (entire branch unchanged).
 2. Differing branches recurse to the leaf level:
-   - `ObjectTablePage` diff → list of (oid, new ObjectRecord).
+   - `ObjectTable` leaf diff → list of (oid, new ObjectRecord).
    - `TagBitmap` diff → roaring `xor` produces added/removed bitmaps directly (Δsize ≪ |bitmap|).
-   - `ForwardIndex` leaf diff → per-oid assertion delta.
+   - `Forward` leaf bset diff → per-oid assertion delta.
 
 A snapshot retention policy (§11.3) that keeps recent snapshots inside the journal window makes
 near-real-time cluster sync free of tree-walk overhead; older diffs fall through to the COW path.
@@ -956,7 +1169,9 @@ freespace LRU.
 
 ### 12.2 Bucket alloc table
 
-One B+ tree per disk, rooted at `DiskDescriptorOnDisk.buckets_root`, keyed by `bucket_no: u32`:
+One **§1.5 B+ tree** per disk, rooted at `DiskDescriptorOnDisk.buckets_root`, keyed by
+`bucket_no: u32`. A 256 KiB leaf packs ~13 100 BucketAllocKey entries per bset; a 16 M-bucket
+disk fits in **depth 1** (single inner node + ~1 250 leaves):
 
 ```rust
 #[repr(C, packed)]
@@ -1008,7 +1223,7 @@ in-bucket corruption independently.
 
 ### 12.4 Freespace LRU
 
-A second B+ tree per disk (`DiskDescriptorOnDisk.freespace_root`), keyed by
+A second **§1.5 B+ tree** per disk (`DiskDescriptorOnDisk.freespace_root`), keyed by
 `(fragmentation_band, bucket_no)`:
 
 ```
@@ -1099,7 +1314,7 @@ queries:
 | `PoolManager`                                | PoolStateRoot                             | fully resident         |
 | `BucketCache` (`HashMap<(DiskId, u32), BucketAllocKey>`) | per-disk buckets B+ tree    | hot buckets pinned, cold paged in |
 | `WritePoints` (`HashMap<(DiskId, DataType, StreamTag), OpenBucket>`) | derived             | resident; ~hundreds of entries |
-| `BTreeNodeCache` (`HashMap<BlockRef, DirtyNode>` + LRU) | every B+ tree (object/loc/forward/tag/kv/range) | journal-pinned nodes never evicted; clean nodes LRU |
+| `BTreeNodeCache` (`HashMap<BlockRef, LoadedNode>` + LRU) | §1.5 large nodes (256 KiB each) | journal-pinned nodes never evicted; clean nodes LRU. Working-set ≈ 100–500 hot nodes ⇒ 25–125 MiB. |
 | `JournalReclaim` (`BinaryHeap` of (pin_pressure, BlockRef)) | derived from BTreeNodeCache | resident; rebuilt on demand |
 | `OpLog` (`VecDeque<OpLogEntry>`)             | recent WAL tail                           | trimmed at checkpoint  |
 
@@ -1184,13 +1399,13 @@ the unmaterialised tail (≤ 64 MiB).
 | WAL                    | 64 MiB    | Btree-update journal (§3); mirrored across devices |
 | Bucket alloc table     | 256 MiB   | Per 16 TiB at 1 MiB buckets (16 M × 16 B)          |
 | Freespace LRU          | ~16 MiB   | Sparse — only non-empty + sampled empty buckets    |
-| Object table (records) | 1.28 GiB  | 10 M × 128 B                                       |
-| Object table (radix)   | <16 MiB   | Three indirection levels                           |
-| Location table         | 480 MiB   | 10 M × 48 B                                        |
-| Forward index          | ~600 MiB  | B+ tree, ~60 B/object                              |
-| Tag inverted index     | 200–400 MiB | Roaring bitmaps, 5 000 tags                      |
-| KV index               | ~100 MiB  | Extendible hash + bitmaps                          |
-| Range index            | ~50 MiB   | B+ tree                                            |
+| Object table (records) | 1.28 GiB  | 10 M × 128 B in 256 KiB radix leaves               |
+| Object table (radix)   | < 1 MiB   | Single inner node (depth 2 total)                  |
+| Location table         | 480 MiB   | 10 M × 48 B in 256 KiB leaves (depth 2)            |
+| Forward index          | ~600 MiB  | §1.5 B+ tree, ~60 B/object, depth 2                |
+| Tag inverted index     | 200–400 MiB | Roaring bitmaps (4 KiB framed), 5 000 tags       |
+| KV index               | ~100 MiB  | Extendible hash + roaring bitmaps                  |
+| Range index            | ~50 MiB   | §1.5 B+ tree                                       |
 | Ontology               | <10 MiB   | Modules + DAG                                      |
 | Subscriptions          | ~1 MiB    | Per 1 000 subs                                     |
 | Path contexts          | 50 MiB    | One large project                                  |
