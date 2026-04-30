@@ -81,7 +81,8 @@ of type `BtreeKind` instead of `BlockHeader.kind`:
 ```rust
 enum BtreeKind {
     ObjectTable,        // §5 radix leaves & inners
-    LocationTable,      // §6 radix leaves & inners
+    LocationTable,      // §6.1 radix leaves & inners
+    Backpointer,        // §6.2 reverse-mapping B+ tree
     Forward,            // §7 forward index B+ tree
     TagDirectory,       // §8.1 tag directory B+ tree
     Range,              // §9.2 range index B+ tree
@@ -511,6 +512,12 @@ BucketWrite      : { disk_id: u16, bucket_no: u32, sectors_added: u16 }   // dir
 BucketGenBump    : { disk_id: u16, bucket_no: u32, new_generation: u32 }  // bucket reused
 BucketDiscard    : { disk_id: u16, bucket_no: u32 }                       // TRIM issued
 
+// Backpointers (§6.2)
+BackpointerInsert: { key: BackpointerKey, value: BackpointerValue }
+BackpointerRemove: { key: BackpointerKey }                                // explicit removal
+// Implicit removal: a BucketGenBump invalidates all of that bucket's backpointers lazily
+// (stale entries detected by gen mismatch on the next scan, no per-bp WAL op needed).
+
 // Bset format mutations (§1.5.6)
 FormatPromote    : { node_ref: BlockRef, bset_seq: u32, new_format: BsetKeyFormat }
 
@@ -757,7 +764,16 @@ for the rare wide objects (≥ 200 tags).
 
 ---
 
-## 6. Location Table
+## 6. Location and Backpointer Tables
+
+Two complementary structures translate between logical objects and physical extents:
+
+- **Location table** (§6.1) — forward mapping `oid → physical extent`. Used on every read.
+- **Backpointers** (§6.2) — reverse mapping `(disk_id, bucket_no, sector_offset) → owning key`.
+  Used by copygc, device evacuation, scrub, resilver, and cluster reconcile. Without
+  backpointers these operations cost O(pool size); with them, O(data-on-affected-bucket).
+
+### 6.1 Location Table (forward mapping)
 
 Same COW radix-tree machinery as the object table (§5), parameterised for 48-byte
 `ObjectLocation` records and using the same large-node format (§1.5):
@@ -804,6 +820,79 @@ struct ReplicaRef {                          // 8 bytes (DESIGN's 7-byte form pa
 
 For chunked objects (`flags & 1`), `extent_offset` instead points to a `ChunkList` block
 referencing N (chunk_hash, BlobRef) pairs — see §9.
+
+### 6.2 Backpointers (reverse mapping)
+
+A single global B+ tree of large nodes (§1.5), `BtreeKind::Backpointer`, keyed by physical
+location:
+
+```rust
+#[repr(C, packed)]
+struct BackpointerKey {                      // 12 bytes (packed via §1.5.6 to ~3-4 B per leaf)
+    disk_id: u16,
+    bucket_no: u32,
+    sector_offset: u32,                      // 4 KiB units within the bucket
+    _pad: u16,
+}
+
+#[repr(C, packed)]
+struct BackpointerValue {                    // 24 bytes
+    owner_kind: u8,                          // OwnerKind discriminator
+    _pad: u8,
+    length_sectors: u16,                     // extent length in 4 KiB sectors
+    bucket_gen: u32,                         // bucket generation at insertion time
+    owner_key: [u8; 16],                     // owning key (interpreted per OwnerKind)
+}
+
+#[repr(u8)]
+enum OwnerKind {
+    BlobExtent       = 1,                    // owner_key = ObjectId (u64) + extent_index (u64)
+    Chunk            = 2,                    // owner_key = first 16 B of chunk_hash (BLAKE3 prefix)
+    BtreeNode        = 3,                    // owner_key = (BtreeKind, level, min_key prefix)
+    TagBitmapExtent  = 4,                    // owner_key = TagId (u32) + container_idx (u32)
+    OverflowRecord   = 5,                    // owner_key = ObjectId (u64)
+}
+```
+
+The pair `(BackpointerKey, BackpointerValue)` is 36 bytes unpacked; with §1.5.6 key packing
+(`disk_id` constant per leaf, `bucket_no` packs to ~16–20 bits, `sector_offset` packs based on
+bucket size), per-key disk cost falls to **~26–28 B**. A 256 KiB leaf packs ~9 000 backpointers
+per bset.
+
+#### Properties
+
+- **Bucket-prefix scan.** "What lives in `(disk_id, bucket_no)`?" is a B+ tree range scan over
+  `(disk_id, bucket_no, *)`. With key packing the entire bucket's backpointers typically sit in
+  one or two contiguous leaf bsets — a single large-node load.
+- **Generation gating.** `BackpointerValue.bucket_gen` records the bucket's generation at
+  insertion. A backpointer whose `bucket_gen` does not match the current bucket generation is
+  **stale** (the bucket has been recycled) and is dropped lazily on the next scrub or copygc
+  pass. This means we don't have to atomically delete backpointers when freeing extents — a
+  generation bump invalidates all of a bucket's backpointers in O(1).
+
+#### Lifecycle
+
+- **Insert** on every blob/chunk/btree-node write. Journalled as `BackpointerInsert` (§3.3).
+- **Remove** on object deletion or extent rewrite. Journalled as `BackpointerRemove`. May be
+  elided when the bucket's generation will be bumped (lazy invalidation).
+- **Update** on copygc / reconcile move. The move path issues an atomic
+  `(BackpointerRemove old, BackpointerInsert new)` pair.
+
+#### Operations enabled
+
+| Operation              | Without backpointers     | With backpointers              |
+| ---------------------- | ------------------------ | ------------------------------ |
+| Copygc bucket reclaim  | Scan all forward indexes | Range scan one bucket prefix   |
+| Disk evacuation        | Scan location table      | Range scan all of disk's buckets |
+| Scrub bucket           | Scan all forward indexes | Range scan bucket prefix       |
+| Cluster resilver       | Replay full sync log     | Backpointer-driven replay of affected buckets only |
+| Stale-pointer cleanup  | Track-during-write       | Lazy via generation comparison |
+
+#### Footprint
+
+Per 10 M objects with average 1 extent each: 10 M backpointers × ~28 B packed ≈ **280 MiB**.
+Plus a few thousand btree-node backpointers (~100 KiB) and ~5 000 tag-bitmap backpointers
+(~140 KiB). Negligible compared to existing per-object metadata.
 
 ---
 
@@ -1190,6 +1279,11 @@ range, walk the COW trees of `A.root` and `B.root` in parallel:
 A snapshot retention policy (§11.3) that keeps recent snapshots inside the journal window makes
 near-real-time cluster sync free of tree-walk overhead; older diffs fall through to the COW path.
 
+**Resilver path.** When a peer comes back from a degraded state with one disk missing, the
+recovery is **backpointer-driven** (§6.2): the resilver enumerates all buckets that lived on the
+recovered disk, then for each bucket range-scans the backpointers btree to learn which objects'
+extents need to be re-fetched. Cost is proportional to data on the affected disk, not pool size.
+
 Either way, the result is a `SyncBundle`:
 
 ```
@@ -1360,17 +1454,23 @@ runs short. The authoritative classification is `BucketAllocKey.data_type` per b
 ### 12.6 Copy GC
 
 When the freespace LRU's empty-band count drops below the configured reserve
-(`Superblock.copygc_reserve_pct`, default 8%), copy GC:
+(`Superblock.copygc_reserve_pct`, default 8 %), copy GC:
 
 1. Selects the most-fragmented bucket(s) from the freespace LRU.
-2. Reads each live extent (validated by generation).
-3. Rewrites the live extents to a fresh bucket via the move path.
-4. Updates the index entries that pointed to the old bucket.
-5. Bumps the old bucket's generation, transitions it to `NeedDiscard` (or directly to `Free`).
+2. **Range-scans the backpointers btree (§6.2) at prefix `(disk_id, bucket_no, *)`** to
+   enumerate live extents in the bucket. Entries with stale `bucket_gen` are skipped.
+3. For each live extent, reads it from disk (CRC32C validated; BLAKE3 verified at the object
+   level if the owner is `BlobExtent`).
+4. Writes the extent into a fresh bucket via the move path.
+5. Atomically updates the owning index entry and the backpointer:
+   `BackpointerRemove(old_key) ∘ BackpointerInsert(new_key, new_value) ∘ owner-update`.
+6. Bumps the old bucket's generation, transitions it to `NeedDiscard` (or directly to `Free`).
+   The generation bump implicitly invalidates any backpointers we missed — they become
+   detectable-stale on the next scan.
 
-Copy GC cost is proportional to **fragmentation**, not pool size. The reserve guarantees forward
-progress: allocation can never block on GC because at least one fully-empty bucket is always
-available.
+Copy GC cost is proportional to **fragmentation**, not pool size. The bucket-prefix scan is
+~1 large-node load per fragmented bucket. The reserve guarantees forward progress: allocation
+can never block on GC because at least one fully-empty bucket is always available.
 
 ### 12.7 Discard / TRIM
 
@@ -1413,6 +1513,7 @@ queries:
 | `BucketCache` (`HashMap<(DiskId, u32), BucketAllocKey>`) | per-disk buckets B+ tree    | hot buckets pinned, cold paged in |
 | `WritePoints` (`HashMap<(DiskId, DataType, StreamTag), OpenBucket>`) | derived             | resident; ~hundreds of entries |
 | `BTreeNodeCache` (`HashMap<BlockRef, LoadedNode>` + LRU) | §1.5 large nodes (256 KiB each) | journal-pinned nodes never evicted; clean nodes LRU. Working-set ≈ 100–500 hot nodes ⇒ 25–125 MiB. |
+| `BackpointerCache` (LRU of bucket-prefix scan results) | §6.2 backpointer btree leaves | populated on demand by copygc / scrub / resilver |
 | `JournalReclaim` (`BinaryHeap` of (pin_pressure, BlockRef)) | derived from BTreeNodeCache | resident; rebuilt on demand |
 | `OpLog` (`VecDeque<OpLogEntry>`)             | recent WAL tail                           | trimmed at checkpoint  |
 
@@ -1501,6 +1602,7 @@ tail (≤ 64 MiB).
 | Object table (records) | 1.28 GiB  | Positional — no key packing applies                |
 | Object table (radix)   | < 1 MiB   | Single inner node (depth 2 total)                  |
 | Location table         | 480 MiB   | Positional — no key packing                        |
+| Backpointers           | ~280 MiB  | §6.2 — 10 M extents × ~28 B packed                 |
 | Forward index          | ~400 MiB  | §1.5 B+ tree with packed `oid`; was ~600 MiB       |
 | Tag inverted index     | 200–400 MiB | Roaring bitmaps (4 KiB framed), 5 000 tags       |
 | KV index               | ~100 MiB  | Extendible hash + roaring bitmaps                  |
@@ -1509,7 +1611,7 @@ tail (≤ 64 MiB).
 | Subscriptions          | ~700 KiB  | Per 1 000 subs with packed `sub_id`                |
 | Path contexts          | 50 MiB    | One large project; path hashes don't pack          |
 | Snapshot chain (7 days) | ~500 MiB | Diff-only                                          |
-| **Total metadata**     | **~2.7 GiB** | ~10 % smaller than pre-packing (3 GiB)         |
+| **Total metadata**     | **~3.0 GiB** | Includes backpointers (+280 MiB); still ~3 % smaller than pre-packing |
 
 This is the "few hundred megabytes" of the design intent at moderate scale, and at the upper end
 of practical scale still well under 1% of pool storage.
