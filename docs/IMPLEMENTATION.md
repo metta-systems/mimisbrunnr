@@ -365,7 +365,13 @@ struct Superblock {                          // 4096 bytes total
     blob_zone:     ZoneExtent,               // [352..376]
 
     encryption_keyid: [u8; 16],              // [376..392]   key identifier (not the key)
-    _reserved: [u8; 3700],                   // [392..4092]  zeroed, available for future fields
+    fs_format_version: u32,                  // [392..396]   §15 — current writing version
+    fs_min_on_disk: u32,                     // [396..400]   §15 — minimum version of any record on disk
+    compat_features: u64,                    // [400..408]   §15.2 — old readers tolerate
+    ro_compat_features: u64,                 // [408..416]   §15.2 — old readers mount RO
+    incompat_features: u64,                  // [416..424]   §15.2 — old readers refuse
+    downgrade_log_ref: BlockRef,             // [424..440]   §15.5 — chain of historical features
+    _reserved: [u8; 3652],                   // [440..4092]  zeroed, available for future fields
     // trailing CRC32C lives inside BlockHeader's frame
 }
 
@@ -1730,21 +1736,107 @@ unencrypted-layout level (block headers, but not payloads).
 
 ## 15. Format Versioning and Migration
 
-Every persistent structure carries `format_version` (in its `BlockHeader`) and, for
-super-structures, the superblock's `format_version` gates ensemble layout.
+The on-disk format evolves through a **two-version superblock**: the pool records both the
+version it currently *writes* with and the minimum version of any data still *on disk*. The
+two values move independently — new writes use the current version immediately, while older
+data retains its original format until rewritten by background migration (§15.4).
+`BlockHeader.format_version` (per-block, per-kind) remains the fine-grained per-structure
+version.
 
-Rules:
-1. **Additive changes** — new fields added in reserved/padding regions; bump structure
-   `format_version`. Old readers continue to function (they ignore unknown bytes); old writers
-   should not be used after format bump.
-2. **Layout changes** — new structure variant; old kind retained, new kind allocated, on-disk
-   migration tool walks structures and rewrites in place via COW (so a partial migration can be
-   rolled back via snapshot).
-3. **Semantic changes** — bump superblock `format_version` major; refuse mount with old code.
+### 15.1 Superblock version fields
 
-A `mimir fsck --upgrade` command walks the COW trees, re-emitting any structures whose version is
-older than the current build's preferred version, batching the rewrites into normal checkpoints so
-the migration is crash-safe and resumable.
+```rust
+fs_format_version:   u32,        // version the pool currently writes with
+fs_min_on_disk:      u32,        // smallest version any persistent record uses
+compat_features:     u64,        // additive features old readers ignore safely
+ro_compat_features:  u64,        // features old readers can read but not write
+incompat_features:   u64,        // features old readers cannot read at all
+downgrade_log_ref:   BlockRef,   // chain of historical features (§15.5)
+```
+
+`fs_min_on_disk ≤ fs_format_version` always holds. They are equal on a freshly formatted pool
+and after a complete migration; they differ during the gap between bumping the writing version
+and finishing the rewrite of older records.
+
+### 15.2 Feature flags
+
+| Class           | Old reader's behaviour                                            |
+| --------------- | ----------------------------------------------------------------- |
+| `compat`        | Reads and writes correctly; ignores the new field / record.       |
+| `ro_compat`     | Reads correctly; mounts read-only because writes might violate the feature. |
+| `incompat`      | Cannot interpret the data; refuses to mount.                      |
+
+A new feature is conservatively classified `incompat` until proven otherwise. Each feature has
+a stable bit position; `&~ supported` is the missing-feature set.
+
+### 15.3 Mount-time decisions
+
+On mount, the binary:
+
+1. Picks the active superblock copy by `(seq, lsn)` (§2.2).
+2. Refuses mount if `superblock.incompat_features &~ self.supported_incompat != 0`.
+3. Mounts read-only if `superblock.ro_compat_features &~ self.supported_ro_compat != 0`.
+4. Otherwise mounts read-write.
+5. Optionally consults `downgrade_log_ref` (§15.5) for historical incompat features that may
+   have left residue on disk.
+
+The `mimir mount --version-upgrade <mode>` flag controls upgrade behaviour:
+
+- `none` — never advance `fs_format_version`; new writes use the existing version.
+- `compatible` — advance to the latest version reachable without enabling any `incompat`
+  feature. Reversible by older binaries.
+- `incompatible` — advance to the binary's full supported version, enabling `incompat`
+  features. One-way: older binaries will refuse the pool from this point.
+
+### 15.4 Upgrade flow
+
+An upgrade has two distinct steps that proceed independently:
+
+**Step 1 — bump the writing version.** At the next checkpoint, `fs_format_version` advances to
+the new value and the appropriate feature bits are set. Subsequent writes use the new format.
+Existing data is untouched; `fs_min_on_disk` is unchanged.
+
+**Step 2 — migrate old data.** The reconcile engine (§17) launches a scan that walks all
+snapshot-aware btrees, rewriting any record whose `BlockHeader.format_version` is older than
+the current writing version. Each rewrite is COW; partial migrations are crash-safe.
+
+When the scan completes, `fs_min_on_disk` advances to match `fs_format_version` at the next
+checkpoint.
+
+`mimir fsck --upgrade` triggers step 2 explicitly and blocks until the scan finishes — useful
+when an operator wants the migration done before unmount, before snapshotting, or before
+relying on a feature that requires the rewrite.
+
+### 15.5 Downgrade
+
+A downgrade to version `V` is **safe** when `V ≥ fs_min_on_disk` and all
+`incompat_features` ever-enabled bits map to features that `V` understands. The invariant: an
+older binary can mount the pool as long as every record it might encounter is in a version it
+can read.
+
+`downgrade_log_ref` points to a small CBOR-encoded list of `(timestamp, feature_bits, fs_format_version)`
+tuples — the historical sequence of feature activations. An older binary consults this on mount
+to detect "this pool was once written with feature X" even if X has since been disabled — the
+data residue may still violate X's invariants. If any historical incompat feature is unknown
+to the binary, mount is refused.
+
+If `fs_min_on_disk > V` (i.e. some records have already been rewritten into formats `V` cannot
+read), the only path back is `brunnr export` followed by `brunnr import` into a freshly
+formatted pool at version `V`.
+
+### 15.6 Per-structure migration rules
+
+For each `BtreeKind` / `BlockKind`, schema evolution follows one of three patterns:
+
+1. **Additive** — new fields appended in reserved/padding regions; bump that kind's
+   `format_version`. Old readers ignore unknown bytes. Classified `compat`.
+2. **Layout** — new on-disk shape; allocate a new `BtreeKind` (or `BlockKind`) and keep the old
+   one defined. The reconcile-driven migration (§15.4) rewrites instances into the new kind.
+   Mid-migration the pool may contain both shapes; new writes always use the new one. Typically
+   `ro_compat` (old readers can still read the old shape) or `incompat` (depends on whether
+   the new kind appears in critical paths).
+3. **Semantic** — the meaning of an existing field changes. Always `incompat`; always requires
+   `fs_format_version` advance. Old readers must not interpret the field under the old meaning.
 
 ---
 
