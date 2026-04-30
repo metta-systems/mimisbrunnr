@@ -96,6 +96,12 @@ enum BtreeKind {
     Snapshots,          // §11.1 snapshot tree (SnapshotId → SnapshotNode)
     BucketAlloc,        // §12.2 per-disk bucket alloc B+ tree (physical)
     FreespaceLru,       // §12.4 per-disk freespace LRU B+ tree (physical)
+    ReconcileWork,      // §17.2 normal-priority reconcile queue (logical order)
+    ReconcileHipri,     // §17.2 high-priority reconcile queue
+    ReconcileWorkPhys,  // §17.2 physical-LBA-ordered work index (HDD pools)
+    ReconcileHipriPhys, // §17.2 physical-LBA-ordered hipri index (HDD pools)
+    ReconcilePending,   // §17.2 failed items awaiting device-config retry
+    ReconcileScan,      // §17.3 in-progress scan cursors
 }
 ```
 
@@ -527,6 +533,13 @@ SnapshotCreate   : { new_id: u32, parent_id: u32, current_replacement: u32, labe
 SnapshotDelete   : { id: u32 }                                            // marks for async cleanup
 SnapshotKeyMove  : { from_snap: u32, to_snap: u32, btree: BtreeKind, key: bytes }
                    // re-tags a key during deletion's runtime phase (§11.5)
+
+// Reconcile (§17)
+ReconcileEnqueue : { work: WorkItem, hipri: bool, phys_index: bool }
+ReconcileDequeue : { target_kind: u8, owner_key: bytes, work_kind: u8 }   // completion or cancel
+ReconcileMove    : { from_loc: BlockRef, to_loc: BlockRef, owner_key: bytes }
+                   // atomic location-update for move-path completion
+ReconcileScanStep: { scan_id: u64, btree: BtreeKind, cursor_key: bytes }  // resumable progress
 
 // Bset format mutations (§1.5.6)
 FormatPromote    : { node_ref: BlockRef, bset_seq: u32, new_format: BsetKeyFormat }
@@ -1430,9 +1443,10 @@ SyncBundle (CBOR):
 The bundle is signed and shipped to peers (per §9.4 key hierarchy in DESIGN.md).
 
 **Resilver path.** When a peer comes back from a degraded state with one disk missing, recovery
-is **backpointer-driven** (§6.2). Backpointers are snapshot-agnostic, so resilver enumerates
-all backpointers on the affected disk and re-fetches the corresponding extents irrespective of
-which snapshot owns them.
+is driven by the reconcile subsystem (§17). The disk-state change triggers a scan that
+backpointer-walks (§6.2) the affected disk and enqueues `ReplicaRepair` work items at high
+priority. Backpointers are snapshot-agnostic, so the resilver re-fetches extents irrespective
+of which snapshot owns them.
 
 ### 11.8 Retention policy
 
@@ -1593,20 +1607,23 @@ runs short. The authoritative classification is `BucketAllocKey.data_type` per b
 
 ### 12.6 Copy GC
 
-When the freespace LRU's empty-band count drops below the configured reserve
-(`Superblock.copygc_reserve_pct`, default 8 %), copy GC:
+Copy GC is one work kind in the reconcile subsystem (§17, `WorkKind::Copygc`). When the
+freespace LRU's empty-band count drops below the configured reserve
+(`Superblock.copygc_reserve_pct`, default 8 %), the reconcile engine enqueues `Copygc` items
+for the most-fragmented buckets.
 
-1. Selects the most-fragmented bucket(s) from the freespace LRU.
-2. **Range-scans the backpointers btree (§6.2) at prefix `(disk_id, bucket_no, *)`** to
+Each `Copygc` work item is processed via the standard move path (§17.5):
+
+1. **Range-scan the backpointers btree (§6.2) at prefix `(disk_id, bucket_no, *)`** to
    enumerate live extents in the bucket. Entries with stale `bucket_gen` are skipped.
-3. For each live extent, reads it from disk (CRC32C validated; BLAKE3 verified at the object
-   level if the owner is `BlobExtent`).
-4. Writes the extent into a fresh bucket via the move path.
-5. Atomically updates the owning index entry and the backpointer:
+2. Read each live extent from disk (CRC32C validated; BLAKE3 verified at the object level if
+   the owner is `BlobExtent`).
+3. Write to a fresh bucket via the move path.
+4. Atomically update the owning index entry and the backpointer:
    `BackpointerRemove(old_key) ∘ BackpointerInsert(new_key, new_value) ∘ owner-update`.
-6. Bumps the old bucket's generation, transitions it to `NeedDiscard` (or directly to `Free`).
-   The generation bump implicitly invalidates any backpointers we missed — they become
-   detectable-stale on the next scan.
+5. Bump the old bucket's generation, transition it to `NeedDiscard` (or directly to `Free`).
+   The generation bump implicitly invalidates any backpointers missed during the scan — they
+   become detectable-stale on the next pass.
 
 Copy GC cost is proportional to **fragmentation**, not pool size. The bucket-prefix scan is
 ~1 large-node load per fragmented bucket. The reserve guarantees forward progress: allocation
@@ -1655,6 +1672,8 @@ queries:
 | `BTreeNodeCache` (`HashMap<BlockRef, LoadedNode>` + LRU) | §1.5 large nodes (256 KiB each) | journal-pinned nodes never evicted; clean nodes LRU. Working-set ≈ 100–500 hot nodes ⇒ 25–125 MiB. |
 | `BackpointerCache` (LRU of bucket-prefix scan results) | §6.2 backpointer btree leaves | populated on demand by copygc / scrub / resilver |
 | `SnapshotTree` (`BTreeMap<SnapshotId, SnapshotNode>` + ancestor cache) | §11.1 snapshots btree | fully resident — typically thousands of entries; ancestor checks must be in-cache |
+| `ReconcileEngine` (priority queue heads, throttle counters, move-path semaphore) | §17 reconcile btrees | resident; queue heads cached, deeper queue paged from btree |
+| `ScanRegistry` (`HashMap<ScanId, ScanState>`) | §17.3 ReconcileScan | resident — small (< 100 active scans) |
 | `JournalReclaim` (`BinaryHeap` of (pin_pressure, BlockRef)) | derived from BTreeNodeCache | resident; rebuilt on demand |
 | `OpLog` (`VecDeque<OpLogEntry>`)             | recent WAL tail                           | trimmed at checkpoint  |
 
@@ -1760,7 +1779,183 @@ of practical scale still well under 1% of pool storage.
 
 ---
 
-## 17. References
+## 17. Reconcile
+
+The reconcile subsystem is the unified, **state-driven** engine for background data maintenance.
+A single mechanism handles operations that in other filesystems are separate threads with
+separate state machines: replica repair, tier migration, option propagation, copy GC, disk
+evacuation, auto-tiering, and erasure-coding promotion.
+
+The engine compares **actual state** (where each extent is, how many replicas, which tier,
+which compression / encryption) against **desired state** (placement rules, ontology-driven
+options, replica counts) and queues work to close the gap. Multiple desired-state changes
+compose naturally because each extent is evaluated independently.
+
+### 17.1 What reconcile does
+
+| Mismatch                                          | Action                                       |
+| ------------------------------------------------- | -------------------------------------------- |
+| Replica count below `Replicate { min_replicas }` rule | Re-replicate to additional disks         |
+| Object on wrong tier vs. `Pin` / `Prefer` rule    | Migrate via the move path                    |
+| Compression / encryption inconsistent with ontology | Rewrite with correct transform pipeline    |
+| `AutoTier` access-time threshold crossed          | Migrate Hot → Warm → Cold → Glacier          |
+| Bucket fragmentation > copygc threshold           | Run copy GC (§12.6)                          |
+| Disk in `Draining` state                          | Evacuate via backpointer scan (§6.2)         |
+| Disk failure detected, replicas missing           | Resilver (§11.7) — re-replicate from peers   |
+| Erasure-coding policy applies to cold data        | Encode into stripe (future)                  |
+
+Each is just a different `WorkKind` in the same queue. New mismatch types are additive.
+
+### 17.2 Work-item btrees
+
+Four §1.5 B+ trees, all `BtreeKind::Reconcile*`:
+
+```rust
+enum WorkKind {
+    ReplicaRepair    = 1,      // under-replicated; raise to target count
+    TierMigrate      = 2,      // wrong tier per placement rule
+    OptionUpdate     = 3,      // wrong compression/encryption
+    Evacuate         = 4,      // on a Draining disk
+    Copygc           = 5,      // fragmented bucket reclaim
+    AutoTier         = 6,      // age-based migration
+    EcEncode         = 7,      // promote to erasure-coding stripe
+}
+
+#[repr(C, packed)]
+struct WorkItem {                            // 48 B base + variable owner_key
+    target_kind: u8,                         // OwnerKind from §6.2
+    work_kind: u8,                           // WorkKind
+    attempt_count: u8,
+    last_error_code: u8,
+    flags: u32,                              // bit 0 = ratelimited, bit 1 = persistent
+    enqueued_lsn: u64,
+    desired_state_ref: BlockRef,             // 16 B → CBOR(DesiredState) for variable detail
+    owner_key: [u8; 16],                     // owning key in target btree (packed)
+}
+```
+
+| Btree                  | Ordering                              | Use                                          |
+| ---------------------- | ------------------------------------- | -------------------------------------------- |
+| `ReconcileWork`        | logical key (target_kind, owner_key)  | Default queue. Cheap on SSD where logical ≈ physical.|
+| `ReconcileHipri`       | same                                  | High-priority items processed first.         |
+| `ReconcileWorkPhys`    | physical LBA (disk_id, bucket, sector_offset) | HDD-backed pools — sequential processing avoids seeks. Maintained as a parallel index alongside `ReconcileWork`. |
+| `ReconcileHipriPhys`   | same                                  | High-priority physical-order index.          |
+| `ReconcilePending`     | logical key                           | Failed items. Retried only after device-config events; avoids spin loops on permanently-blocked work. |
+
+Whether to maintain `*_Phys` indexes is set per-disk via `DiskDescriptorOnDisk` (rotational
+hint). Pure NVMe pools skip them.
+
+### 17.3 Triggers
+
+Work enters the queue via two paths:
+
+**1. Per-key triggers.** Every snapshot-aware btree carries a trigger callback that fires on
+insert / update / delete. The trigger compares the new state against the relevant rules and
+emits a `WorkItem` to `ReconcileWork` (or `ReconcileHipri`) if a mismatch is observed.
+Triggers are journalled like any other btree mutation (§3.4) — recovery replays them
+deterministically.
+
+**2. Scans.** A scan walks one or more btrees end-to-end, evaluating every key against current
+desired state. Scans are launched by:
+
+- **Device state change** — disk added, removed, evacuating, or transitioned to faulted.
+- **Placement rule change** — admin updates `pool_state.placement_rules` (§10.4).
+- **Ontology change** — installation / upgrade alters compression, encryption, or tier
+  selection for a tag.
+- **Inode option change on a directory subtree** (e.g. a per-context override).
+
+Scan state lives in `ReconcileScan` records: `(scan_id, btree, cursor_key, originating_event)`.
+A scan that crashes mid-walk resumes from `cursor_key` on the next mount.
+
+### 17.4 Priority ordering
+
+Work is processed strictly in this order:
+
+1. `ReconcileHipri` — under-replicated metadata, evacuating metadata.
+2. `ReconcileHipri` — under-replicated data, evacuating data.
+3. `ReconcileWork` — normal metadata reconciliation.
+4. `ReconcileWork` — normal data (tiering, option updates, optimisations).
+5. `ReconcilePending` — retries (only when prerequisite device-config event has fired).
+
+Within each tier, ordering is logical (SSD) or physical (HDD).
+
+### 17.5 Move path
+
+Reconcile shares one **move path** with copygc: read extent → validate (CRC32C + BLAKE3) →
+write to fresh location → atomically update the owning key, the location table (§6.1), and the
+backpointer (§6.2) → remove old work item.
+
+Throttling: two pool-wide tunables in `pool_state`:
+
+- `move_bytes_in_flight` (default 64 MiB) — total outstanding move I/O
+- `move_ios_in_flight` (default 64) — concurrent move requests
+
+Per-work-kind disable flags (`copygc_enabled`, `tiering_enabled`, …) allow administrative
+control without unmounting.
+
+### 17.6 Composition properties
+
+Because reconcile is state-driven, multiple in-flight operations compose without coordination:
+
+- **Evacuating two disks simultaneously** — each extent's desired state is evaluated against
+  the current device topology; whichever evacuation reaches it first moves it correctly.
+- **Tier policy change during evacuation** — the next evaluation of each extent considers both
+  the new tier and the avoid-evacuating-disk constraint together.
+- **Replica repair during copygc** — under-replicated data discovered mid-copygc gets a
+  `ReplicaRepair` work item enqueued at hipri; copygc continues in parallel.
+
+This is what bcachefs gains by replacing event-driven rebalance/resilver/tiering threads with
+one state-driven engine.
+
+### 17.7 Self-healing
+
+If reconcile detects an inconsistency with **no obvious cause** (no recent option change, no
+device event), it records an error in `pool_state.errors`: something unexpected happened that
+needs operator attention. Degraded data is repaired regardless — the lack of a known cause
+doesn't block the repair, only flags it for investigation.
+
+Failed work items in `ReconcilePending` are retried only on device-configuration events (disk
+added, state changed, capacity expanded). Without such an event, the prerequisites haven't
+changed and a retry would just re-fail.
+
+### 17.8 In-memory state
+
+| Structure | Purpose |
+| --- | --- |
+| `ReconcileEngine` | Owns the four work btrees' write paths, the move-path semaphore, and the throttle counters. |
+| `ScanRegistry` (`HashMap<ScanId, ScanState>`) | In-progress scans; cursor + estimated remaining work for status reporting. |
+| `MoveInflight` (`Vec<InflightMove>`) | Bounded by the throttle; each entry carries the read buffer, target write point, and rollback handle. |
+
+The engine runs as a small pool of worker threads (default: one per HDD, two per SSD) draining
+the priority queue. Workers acquire the engine write lock only at trigger-firing and at
+move-completion atomic-update — not during the read/write of moved data.
+
+### 17.9 Operator interface (DESIGN-level)
+
+`mimir reconcile status` reports per-priority queue depth, in-flight bytes, current scan
+progress, and any pending-error items.
+
+`mimir reconcile wait --type evacuate --disk N` blocks until all work of the given type for
+the given target completes.
+
+Per-workload pause / resume via `pool_state` flags (e.g. `reconcile_on_ac_only` to pause on
+battery power for laptops).
+
+### 17.10 Footprint
+
+Work-item btrees are transient — fill during migration events, drain to near-empty in steady
+state. Typical bounds:
+
+- Idle pool: < 1 MiB across all reconcile btrees.
+- Disk evacuation in progress (~10 M items, all of an evacuated disk's blob extents): ~480 MiB
+  while in flight; drains to zero on completion.
+- Cluster resilver after a disk failure: similar.
+
+These are listed under "transient" in §16, not in the steady-state footprint.
+
+---
+
+## 18. References
 
 - Roaring portable serialisation: <https://github.com/RoaringBitmap/RoaringFormatSpec>
 - BLAKE3: <https://github.com/BLAKE3-team/BLAKE3-specs>
