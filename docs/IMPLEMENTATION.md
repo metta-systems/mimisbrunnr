@@ -185,15 +185,19 @@ RootPointer {                                // 64 bytes
 `BlockRef` is `{ disk_id: u16, _pad: u16, block_no: u32, generation: u64 }` — 16 bytes,
 self-validating against the destination block's header.
 
-**Commit protocol:**
+**Commit protocol** (invoked per the cadence in §3.5, *not* per mutation):
 
-1. Write all dirty COW pages into open buckets (bucket allocation tracked in WAL only — see §12).
-2. Append `Checkpoint` WAL entry referencing the new pages and computing the new `RootPointer`.
-3. `fsync` the WAL segment.
-4. Write the new `RootPointer` into the **inactive** slot of all superblock copies, flip
+1. Quiesce: stop new flushes from advancing past `commit_lsn`. Pending mutations keep going to
+   the WAL.
+2. Write all dirty btree pages produced by the journal-reclaim thread into open buckets (bucket
+   allocation tracked in WAL only — see §12).
+3. Append `Checkpoint` WAL entry referencing the new pages and computing the new `RootPointer`.
+4. `fsync` the WAL segment.
+5. Write the new `RootPointer` into the **inactive** slot of all superblock copies, flip
    `active_root`, recompute superblock CRC, write all 3 superblock copies, `fsync` the device.
-5. Old root and its no-longer-referenced pages are released to the allocator on the next
-   checkpoint.
+6. Advance `WalHeader.read_cursor` to the new `RootPointer.lsn`; old root pages are released to
+   the allocator (their buckets become candidates for generation bump once no live snapshot
+   pins them).
 
 A reader picks the superblock copy with the highest `(seq, lsn)` whose CRC validates and whose
 active root validates. If active root is corrupt, fall back to inactive root (the last good
@@ -213,9 +217,19 @@ indirected through `object_table_root` (§5).
 
 ## 3. Write-Ahead Log
 
-The WAL is a 64 MiB **circular** byte log (size configurable; must be a multiple of 4 KiB) on the
-fastest disk, mirrored to a second disk. Internal layout is segmented to allow parallel truncation
-and replay.
+The WAL is the **btree-update journal**: a 64 MiB circular log (configurable; must be a multiple
+of 4 KiB) on the fastest disk, mirrored to a second disk. Each entry records one key-level
+mutation (add tag, write extent, bucket transition, …). Btree nodes on disk are **not** rewritten
+per mutation — they are rewritten lazily when journal reclaim or memory pressure demands it
+(§3.4). The journal is therefore the **source of truth** for any btree state newer than each
+node's `BlockHeader.lsn`.
+
+This shifts the per-mutation cost from "rewrite a 4-deep COW path" (≈ 16 KiB of writes) to "append
+one ≈ 80-byte journal entry". Btree page rewrites are amortised across all the mutations that
+touched each node since its last flush. For our workload — where one tag mutation can touch four
+index trees — the savings are ≥ 100×.
+
+Internal layout is segmented to allow parallel truncation and replay.
 
 ### 3.1 WAL headers (two 4 KiB blocks at `wal_offset`)
 
@@ -290,6 +304,74 @@ Checkpoint       : { new_root: RootPointer, gc_reserve_buckets: u32 }
 
 Replay applies entries strictly in LSN order. Each in-memory mutation is idempotent under
 `(lsn ≤ structure.lsn)` shortcutting, so replay is safe across crashes mid-replay.
+
+### 3.4 Journal pins and deferred btree flushes
+
+Each in-memory dirty btree node carries a **journal pin** — the LSN of the oldest WAL entry
+whose update has not yet been merged into the on-disk node:
+
+```rust
+struct DirtyNode {                           // in-memory only
+    block_ref: BlockRef,                     // current on-disk location
+    last_persisted_lsn: u64,                 // BlockHeader.lsn of the on-disk version
+    pending_lsn_min: u64,                    // oldest WAL entry pinning this node
+    pending_lsn_max: u64,                    // newest WAL entry pinning this node
+    pending_count: u32,                      // entries waiting to be merged
+    in_memory: NodeContent,                  // merged live state (sorted)
+}
+```
+
+**Journal reclaim invariant.** `WalHeader.read_cursor` (the LSN below which entries may be
+overwritten) cannot advance past `min(all_dirty_nodes.pending_lsn_min)`. The reclaim thread
+monitors WAL fill level:
+
+| Fill level | Reclaim behaviour                                                           |
+| ---------- | --------------------------------------------------------------------------- |
+| < 25 %     | Idle. No flushes scheduled.                                                 |
+| 25 – 60 %  | Background flushes at low priority — flush nodes with highest pin pressure. |
+| 60 – 85 %  | Aggressive: rank dirty nodes by `(pending_lsn_max − pending_lsn_min)` × `pending_count` and flush the top fraction. |
+| > 85 %     | New mutations stall until reclaim catches up.                               |
+
+A flush rewrites the affected leaf via the COW path (§5), then each parent up to the root,
+updating `BlockHeader.lsn = pending_lsn_max` and clearing the journal pin. The next checkpoint
+(§2.2) commits the new root pointers atomically.
+
+**Memory reclaim.** A node may be evicted from the in-memory btree cache only after its pending
+journal entries have been merged and the resulting page persisted. Clean nodes (no pending
+updates) can be discarded immediately.
+
+**Read path.** Lookups consult the in-memory dirty-node mirror first. Cold reads load the node
+from disk, then the engine **replays** journal entries in `[node.last_persisted_lsn,
+journal_head]` whose key range intersects the node, producing the merged live view. This replay
+is bounded by journal size (~800 K entries worst-case), but the reclaim thresholds keep typical
+lag under ~10 K entries per node.
+
+**Write-once-under-read-lock.** Because rewrites are full-node COW (a fresh page at a fresh
+location), the flush thread holds only a *shared* lock on the source DirtyNode while it builds
+the new page contents. The exclusive lock is taken only at the moment the parent BlockRef is
+swapped — milliseconds, regardless of node size. Readers are never blocked on disk I/O.
+
+**Durability semantics.**
+
+- A user fsync triggers a journal flush (an fsync of the WAL ring) — the mutation is durable
+  even though its btree page may not yet be persisted.
+- Crash recovery reads the active root pointer, then replays all WAL entries with
+  `lsn > root.lsn` against the loaded btree.
+- `RootPointer.lsn` therefore lags `WalHeader.next_lsn`; the gap is the unmaterialised journal
+  tail, bounded by reclaim policy.
+
+### 3.5 Atomic root commit cadence
+
+The §2.2 commit protocol is invoked when:
+
+1. Btree topology actually changes (root split / merge / new tree depth).
+2. Sufficient flushes have accumulated that committing a fresh root meaningfully advances
+   `read_cursor` (default: every 30 s of mutation activity, or 256 MiB of accumulated flushed
+   pages, whichever first).
+3. A snapshot is created — snapshot creation forces a checkpoint so the snapshot's
+   `RootPointer` materialises a coherent btree state.
+
+Routine mutations do **not** flip the superblock root.
 
 ---
 
@@ -385,11 +467,16 @@ requires a wholesale rewrite.
 
 ### COW write path
 
-A page is rewritten copy-on-write: any update allocates a fresh page, writes it, then each parent
-inner page is replaced up to the root. A single record edit at depth *D* (= root level + 1) costs
-*D* × 4 KiB writes — for a 10 M-object pool, **4 page writes per record edit** (leaf + 3 inner).
-A run of edits within one transaction batches the rewrite at each level, so contiguous edits over
-a full leaf still cost only 4 pages.
+Pages are rewritten copy-on-write **only when the journal-reclaim thread flushes them** (§3.4) —
+never per mutation. A flush at depth *D* (= root level + 1) costs *D* × 4 KiB writes; for a
+10 M-object pool that's **4 page writes per flush** (leaf + 3 inner), amortised across however
+many mutations have accumulated against that leaf since its last flush (typically tens to
+thousands).
+
+Per-mutation cost is just the WAL append (~80 bytes). Reads consult the in-memory dirty-node
+mirror, which holds the merged on-disk state plus pending journal entries; cold reads materialise
+this view by replaying the journal range `[node.last_persisted_lsn, journal_head]` against the
+loaded page.
 
 ### 5.1 ObjectRecord (128 bytes, version 1)
 
@@ -772,15 +859,28 @@ per-snapshot bucket reference set (a 16 TiB / 1 MiB pool has 16 M buckets vs. 4 
 
 ### 11.2 Cluster diff between snapshots
 
-Two snapshots `A` and `B` (with `A.lsn < B.lsn`) on the same node produce a delta:
+Two snapshots `A` and `B` (with `A.lsn < B.lsn`) produce a delta. With the journal-of-btree-updates
+model (§3.4), there are two diff paths:
 
-1. Walk the COW trees of `A.root` and `B.root` in parallel. Identical `BlockRef.generation` →
-   skip subtree (entire branch unchanged).
+**Hot path — journal streaming.** If the journal still retains entries spanning
+`(A.lsn, B.lsn]` (i.e. neither snapshot has been reclaimed past the journal's `read_cursor`),
+the diff is the journal range itself: every entry is already a key-level mutation in canonical
+HLC order. This is the cheapest possible diff — no tree walking, no bitmap computation. Snapshots
+within the journal's retention window benefit from this path.
+
+**Cold path — COW tree walk.** When at least one snapshot's LSN precedes the current journal
+range, walk the COW trees of `A.root` and `B.root` in parallel:
+
+1. Identical `BlockRef.generation` → skip subtree (entire branch unchanged).
 2. Differing branches recurse to the leaf level:
    - `ObjectTablePage` diff → list of (oid, new ObjectRecord).
    - `TagBitmap` diff → roaring `xor` produces added/removed bitmaps directly (Δsize ≪ |bitmap|).
    - `ForwardIndex` leaf diff → per-oid assertion delta.
-3. Result is a `SyncBundle`:
+
+A snapshot retention policy (§11.3) that keeps recent snapshots inside the journal window makes
+near-real-time cluster sync free of tree-walk overhead; older diffs fall through to the COW path.
+
+Either way, the result is a `SyncBundle`:
 
 ```
 SyncBundle (CBOR):
@@ -999,6 +1099,8 @@ queries:
 | `PoolManager`                                | PoolStateRoot                             | fully resident         |
 | `BucketCache` (`HashMap<(DiskId, u32), BucketAllocKey>`) | per-disk buckets B+ tree    | hot buckets pinned, cold paged in |
 | `WritePoints` (`HashMap<(DiskId, DataType, StreamTag), OpenBucket>`) | derived             | resident; ~hundreds of entries |
+| `BTreeNodeCache` (`HashMap<BlockRef, DirtyNode>` + LRU) | every B+ tree (object/loc/forward/tag/kv/range) | journal-pinned nodes never evicted; clean nodes LRU |
+| `JournalReclaim` (`BinaryHeap` of (pin_pressure, BlockRef)) | derived from BTreeNodeCache | resident; rebuilt on demand |
 | `OpLog` (`VecDeque<OpLogEntry>`)             | recent WAL tail                           | trimmed at checkpoint  |
 
 `Engine` (DESIGN §15) owns these and is wrapped by `DiskEngine` which adds `FileBlockDevice`,
@@ -1008,7 +1110,8 @@ superblock, allocator, and snapshot manager. All mutations follow:
 1. Acquire engine write lock
 2. Append WAL entry (fsync if durability mode = sync)
 3. Apply to in-memory mirror (idempotent on lsn)
-4. Mark dirty pages for next checkpoint
+4. Update affected btree nodes' journal pins: set/extend `pending_lsn_max`, increment
+   `pending_count`. Page rewrites are deferred to the journal-reclaim thread (§3.4).
 5. Release write lock
 ```
 
@@ -1071,10 +1174,14 @@ the migration is crash-safe and resumable.
 
 ## 16. Summary of On-Disk Footprint (10 M objects, 5 000 tags)
 
+Steady-state footprint, with the journal-of-btree-updates model: btree pages settle into a
+compact rewritten state once the reclaim thread has caught up; at any moment the WAL ring holds
+the unmaterialised tail (≤ 64 MiB).
+
 | Structure              | Size      | Notes                                              |
 | ---------------------- | --------- | -------------------------------------------------- |
 | Superblock × 3         | 12 KiB    | Fixed                                              |
-| WAL                    | 64 MiB    | Configurable, mirrored                             |
+| WAL                    | 64 MiB    | Btree-update journal (§3); mirrored across devices |
 | Bucket alloc table     | 256 MiB   | Per 16 TiB at 1 MiB buckets (16 M × 16 B)          |
 | Freespace LRU          | ~16 MiB   | Sparse — only non-empty + sampled empty buckets    |
 | Object table (records) | 1.28 GiB  | 10 M × 128 B                                       |
