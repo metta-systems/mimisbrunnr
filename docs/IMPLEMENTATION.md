@@ -132,9 +132,10 @@ struct Superblock {                          // 4096 bytes total
     alloc_bitmap_size: u64,                  // [272..280]
     block_class_map_offset: u64,             // [280..288]
     block_class_map_size: u64,               // [288..296]
-    zone_map_offset: u64,                    // [296..304]   0 = single-extent legacy
+    zone_map_offset: u64,                    // [296..304]   0 until any zone is grown
 
-    // First-extent zone descriptors (mirrored in zone map if multi-extent).
+    // Initial-extent zone descriptors. Always authoritative for the first extent;
+    // additional extents (if any) are listed in the ZoneMap block.
     index_zone:    ZoneExtent,               // [304..328]   24 bytes
     metadata_zone: ZoneExtent,               // [328..352]
     blob_zone:     ZoneExtent,               // [352..376]
@@ -160,7 +161,8 @@ so flipping bytes from 0 → 1 in a future version is a strict additive change.
 The two-root scheme is the only way to update the filesystem state durably without TOCTTOU
 windows:
 
-```
+```rust
+#[repr(C, packed)]
 RootPointer {                                // 64 bytes
     seq: u64,                                // monotonic; larger seq wins
     lsn: u64,                                // WAL LSN this root corresponds to
@@ -215,9 +217,10 @@ The WAL is a 64 MiB **circular** byte log (size configurable; must be a multiple
 fastest disk, mirrored to a second disk. Internal layout is segmented to allow parallel truncation
 and replay.
 
-### 3.1 WAL header (one 4 KiB block at `wal_offset`)
+### 3.1 WAL headers (two 4 KiB blocks at `wal_offset`)
 
-```
+```rust
+#[repr(C, packed)]
 struct WalHeader {
     header: BlockHeader,                     // kind = WalSegment, format_version = 1
     next_lsn: u64,
@@ -240,7 +243,8 @@ header lives in two adjacent blocks and the active one is selected by `(seq, crc
 Entries are byte-packed, never crossing a 4 KiB boundary unless `payload_length` > 4060, in which
 case the entry is split into `Continuation` frames (flag bit 1 in `BlockHeader.flags`).
 
-```
+```rust
+#[repr(C, packed)]
 struct WalEntryHeader {                      // 32 bytes
     magic: u32,                              // "WALR"
     op_kind: u8,                             // WalOpKind
@@ -264,7 +268,7 @@ CBOR is acceptable here because:
 
 ### 3.3 WAL op payloads (CBOR schemas)
 
-```
+```rust
 CreateObject  : { oid: u64, generation: u32, created_ns: i64 }
 DeleteObject  : { oid: u64, lsn: u64 }
 AddTag        : { oid: u64, tag: u32, origin: u8 }
@@ -314,32 +318,71 @@ flooding.
 
 ## 5. Object Record Table
 
-Logically a flat array indexed by `ObjectId.local`. Physically, a **two-level radix table** of
-COW-able 4 KiB pages:
+Logically a flat array indexed by `ObjectId.local`. Physically, a **COW radix tree** of 4 KiB
+pages whose depth grows with the populated id space.
 
+### Page capacities
+
+A 4 KiB block carries a 32-byte `BlockHeader` plus a 4-byte trailing CRC, leaving **4060 bytes**
+of payload.
+
+- **Leaf page** (`ObjectTablePage`): 31 × `ObjectRecord` (128 B) = 3968 B, followed by a 92-byte
+  tail holding a 31-bit occupancy bitmap, a leaf generation counter, and reserved space.
+  → **31 records per leaf.**
+- **Inner page** (`ObjectTableInner`): up to 253 × `BlockRef` (16 B) = 4048 B, with the page's
+  tree level encoded in `BlockHeader.flags` (4 bits, supports depths 0–15) and 12 bytes of
+  trailing pad.
+  → **253 children per inner page.**
+
+### Tree depth and capacity
+
+| Depth (inner levels + leaf) | Max objects                      |
+| --------------------------- | -------------------------------- |
+| 0 inner (leaf only)         | 31                               |
+| 1 inner                     | 31 × 253 ≈ 7 843                 |
+| 2 inner                     | 31 × 253² ≈ 1.98 M               |
+| 3 inner                     | 31 × 253³ ≈ 502 M                |
+| 4 inner                     | 31 × 253⁴ ≈ 127 G                |
+
+A 10 M-object pool sits comfortably in a 3-inner-level tree (≤ 502 M). The 48-bit local id space
+is reachable at 5 inner levels (≈ 32 T objects) — well below the 16-level limit imposed by the
+4-bit level field.
+
+`RootPointer.object_table_root` is a `BlockRef` to the topmost page; its `BlockHeader.flags`
+identify whether it is a leaf (small pool) or an inner page at level *N*.
+
+### Address translation (oid → leaf slot)
+
+```rust
+let mut idx = oid_local;
+let leaf_slot = (idx % 31) as usize;  idx /= 31;
+let mut child_path = [0u16; MAX_LEVELS];
+for level in 0..root_level {
+    child_path[level] = (idx % 253) as u16;
+    idx /= 253;
+}
+debug_assert_eq!(idx, 0);  // any remaining bits would mean the tree is too shallow
 ```
-object_table_root: BlockRef
-   └── ObjectTableRoot (4 KiB)         // 512 BlockRef entries, indexes by oid >> 14
-        └── ObjectTablePage (4 KiB)    // 32 ObjectRecord (128B each), oid & 0x3FFF
-```
 
-- 14-bit page index → 16 384 records per page → at 32 records per page that's 512 pages per group.
-  Wait — 32 × 128 = 4096 bytes, so 32 records per page. To address 10 M objects we need 313 K
-  pages, which fits in a single root via three levels.
-- Adjust to a **3-level radix** for room: root (`L2`) → `L1` (512 BlockRefs) → `L0` (32 records).
-  - `oid_local & 0x1F` → record within page
-  - `(oid_local >> 5) & 0x1FF` → L1 entry
-  - `oid_local >> 14` → L2 entry
-  - 9-bit + 9-bit + 5-bit covers 23 bits of the 48-bit local id, sufficient for 8 M direct
-    addressing. For larger pools the L2 itself is widened (one indirection block above it),
-    handled by an L3 layer activated only when `tag_count_in_root > 1`. Activation is recorded in
-    `ObjectTableRoot.flags`.
+Object IDs are allocated sequentially per node, so populated leaves cluster densely and the tree
+stays compact. A missing child pointer in any inner page marks an unallocated id range (cleared
+slots are likewise sparse — the leaf occupancy bitmap distinguishes "never allocated" from
+"cleared", §5.1 / DESIGN §7.3).
 
-A page is **COW-on-write**: any update allocates a fresh page, writes it, then the parent L1 page
-is replaced (also COW), then L2, until the new `object_table_root` BlockRef is staged for the next
-`Checkpoint`. A run of updates within one transaction batches the rewrite at each level — a single
-record edit costs three 4 KiB writes (record page, its L1 parent, the root), which is the standard
-cost of a 3-level COW B-tree.
+### Tree growth
+
+When the root is full and a new id falls outside its range, a new inner page one level higher is
+allocated, populated with the previous root as its first child, and committed as the new
+`object_table_root` in the next `Checkpoint`. Tree growth is therefore log-amortised and never
+requires a wholesale rewrite.
+
+### COW write path
+
+A page is rewritten copy-on-write: any update allocates a fresh page, writes it, then each parent
+inner page is replaced up to the root. A single record edit at depth *D* (= root level + 1) costs
+*D* × 4 KiB writes — for a 10 M-object pool, **4 page writes per record edit** (leaf + 3 inner).
+A run of edits within one transaction batches the rewrite at each level, so contiguous edits over
+a full leaf still cost only 4 pages.
 
 ### 5.1 ObjectRecord (128 bytes, version 1)
 
@@ -404,24 +447,34 @@ for the rare wide objects (≥ 200 tags).
 
 ## 6. Location Table
 
-Same COW radix as the object table, with 32-byte aligned `ObjectLocation` records (40 bytes
-logical, padded to 48 to make 64 records per 4 KiB page after BlockHeader):
+Same COW radix-tree machinery as the object table (§5), parameterised for 48-byte
+`ObjectLocation` records:
 
-```
+- **Leaf page** (`LocationTablePage`): 84 × `ObjectLocation` (48 B) = 4032 B, followed by a
+  28-byte tail (84-bit occupancy bitmap = 11 B, leaf generation, reserved).
+  → **84 records per leaf.**
+- **Inner page**: 253 × `BlockRef`, identical to §5's `ObjectTableInner`.
+
+Capacity at depth *d* (= inner levels above the leaf, plus the leaf): 84 × 253^(d−1). A 10 M-pool
+fits in 4 levels (≈ 1.36 G capacity); the 48-bit local id space is reachable at 5 levels.
+
+The radix is keyed by the same `ObjectId.local`, so the location table tracks the object table
+slot-for-slot — a record edit costs the same 4 page writes at 10 M scale.
+
+```rust
 #[repr(C, align(8))]
-struct ObjectLocation {                      // 48 bytes (40 used + 8 pad)
-    disk_id: u16,
-    replica_count: u8,
-    flags: u8,                               // bit 0 = chunked, bit 1 = remote-only
-    _pad0: u32,
-    extent_offset: u64,
-    extent_length: u64,
-    replicas: [ReplicaRef; 3],               // 3 × 8 bytes
-    _pad1: [u8; 0],
+struct ObjectLocation {                      // 48 bytes
+    disk_id: u16,                            //  [0..2]
+    replica_count: u8,                       //  [2..3]
+    flags: u8,                               //  [3..4]    bit 0 = chunked, bit 1 = remote-only
+    _pad0: u32,                              //  [4..8]    explicit alignment to u64
+    extent_offset: u64,                      //  [8..16]
+    extent_length: u64,                      // [16..24]
+    replicas: [ReplicaRef; 3],               // [24..48]   3 × 8 bytes
 }
 
 #[repr(C)]
-struct ReplicaRef {                          // 8 bytes, was 7 in DESIGN — pad to 8 for alignment
+struct ReplicaRef {                          // 8 bytes (DESIGN's 7-byte form padded for alignment)
     disk_id: u16,
     _pad: u16,
     offset_blocks: u32,                      // 4 KiB units → up to 16 TiB per disk; widen later

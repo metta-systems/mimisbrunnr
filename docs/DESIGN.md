@@ -430,7 +430,7 @@ The filesystem operates directly on raw block devices:
  end-4K               Superblock backup copy
 ```
 
-**Growable zones:** Each zone starts as a single contiguous extent but can grow by appending additional extents. When zones have multiple extents, a **ZoneMap** (4 KiB block with its own CRC32C) is written to track all extent offsets/sizes (up to 80 extents per zone). The superblock's `zone_map_offset` field points to this block (0 = single-extent layout, legacy).
+**Growable zones:** Each zone starts as a single contiguous extent but can grow by appending additional extents. When zones have multiple extents, a **ZoneMap** (4 KiB block with its own CRC32C) is written to track all extent offsets/sizes (up to 80 extents per zone). The superblock's `zone_map_offset` field points to this block (0 until any zone is grown; the in-superblock extent descriptors remain authoritative for the initial extent).
 
 **Block classification:** A nibble-packed block class map (2 blocks per byte) tracks which zone owns each block: `Free(0)`, `Index(1)`, `Metadata(2)`, `Blob(3)`. This enables extent-based allocation within zones.
 
@@ -455,7 +455,7 @@ The filesystem operates directly on raw block devices:
 [88..96]    alloc_bitmap_size: u64
 [96..104]   creation_timestamp_ns: i64
 [104..112]  last_checkpoint_lsn: u64
-[112..120]  zone_map_offset: u64      (0 = single-extent, >0 = read ZoneMap)
+[112..120]  zone_map_offset: u64      (0 until any zone is grown; >0 = read ZoneMap)
 [120..124]  checksum: CRC32C of bytes [0..120]
 [124..128]  padding
 ```
