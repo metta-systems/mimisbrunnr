@@ -227,6 +227,80 @@ For a 10 M-object pool, the radix object table goes from 4 levels (4 KiB pages) 
 working set shrinks by 64× in page count, with the same total bytes. Sequential I/O on every
 node access — critical for HDD performance.
 
+#### 1.5.6 Bset format descriptors and packed keys
+
+Each B+ tree bset (§1.5.1) carries a per-bset **format descriptor** that exploits commonalities
+across the bset's key range to compress keys end-to-end. Constant fields (e.g. `attr_id` within
+a range-index leaf where every key shares the same attribute) consume **zero bits** and are
+recorded once in the descriptor rather than per key.
+
+```rust
+#[repr(C, packed)]
+struct BsetKeyFormat {                       // 8 + nr_fields × 12 bytes
+    nr_fields: u8,                           // 1..=8
+    key_header_bytes: u8,                    // 1..=4 (entry-type discriminator + flags)
+    common_value_prefix: u8,                 // bytes shared at the start of every value (0..=24)
+    _pad: u8,
+    sum_bit_width: u32,                      // total packed-key bits (incl. header), informational
+    fields: [FieldFormat; nr_fields],
+}
+
+#[repr(C, packed)]
+struct FieldFormat {                         // 12 bytes
+    bit_width: u8,                           // 0..=64;  0 ⇒ constant (use `base` directly)
+    flags: u8,                               // bit 0 = signed, bit 1 = MSB-first
+    _pad: u16,
+    base: u64,                               // value subtracted from each field at write time
+}
+```
+
+The descriptor is part of the `BsetHeader` payload (§1.5.1), prepended before the packed-key
+stream. With the typical 3-field shape it adds 8 + 36 = 44 bytes per bset — amortised over
+hundreds to thousands of keys.
+
+**Encoding.** A packed key is:
+
+```
+[ key_header_bytes of type / flags ]
+[ ∑ field[i].bit_width  bits of (field[i] − base[i]) for each field ]
+[ pad to byte boundary ]
+[ value bytes; first `common_value_prefix` bytes elided ]
+```
+
+Keys are laid out back-to-back with no inter-key padding. Binary search within a bset compares
+packed keys **directly** without decoding — base subtraction is strictly monotonic, so packed
+ordering matches unpacked ordering. Full decoding happens only at the lookup boundary.
+
+**Format selection.** Full compaction (§1.5.4) computes an optimal format for the merged bset
+by scanning the key distribution: `max − min` for each field gives the minimum bit width.
+Append-on-flush keeps the existing format. If a new key's field overflows the format's bit
+width, the flush either:
+
+- Promotes the bset's format (rewriting the bset under a wider format — rare), or
+- Triggers a full compaction of the node, producing a fresh format.
+
+Format upgrades are journalled as a `FormatPromote` WAL op so recovery can reconstruct the
+in-memory bset state.
+
+**Typical savings across our key shapes:**
+
+| Index             | Unpacked key | Typical packed | Saving | Driver                            |
+| ----------------- | ------------ | -------------- | ------ | --------------------------------- |
+| Forward leaf      | 8 B (oid)    | 2–3 B          | 60–75% | Sequential oid allocation         |
+| Forward inner     | 8 B          | 2–3 B          | 60–75% | Same                              |
+| Range leaf        | 28 B         | 8–14 B         | 50–70% | `attr_id` constant per leaf       |
+| Tag directory     | 4 B          | 2–3 B          | 25–50% | Sparse tag-id distribution        |
+| Alloc table       | 4 B (bkt_no) | 2 B            | 50%    | Sequential bucket numbers         |
+| Subscriptions     | 8 B (sub_id) | 2–4 B          | 50–75% | Sequential ids                    |
+| Path / chunk hash | 8 / 32 B     | unchanged      | 0%     | Random-looking hashes — packing skipped |
+
+Random-looking content hashes (chunk index, path-string hashes) bypass packing via
+`bit_width = 64` and `base = 0` — they keep the explicit form.
+
+**Footprint impact.** Combined across the metadata zone, packing reduces B+ tree footprint by
+~30% and improves cache utilisation proportionally — more keys per cache line means more keys
+inspected per memory fetch during binary search.
+
 ---
 
 ## 2. Superblock and Atomic Root
@@ -436,6 +510,9 @@ BucketAlloc      : { disk_id: u16, bucket_no: u32, data_type: u8, generation: u3
 BucketWrite      : { disk_id: u16, bucket_no: u32, sectors_added: u16 }   // dirty_sectors delta
 BucketGenBump    : { disk_id: u16, bucket_no: u32, new_generation: u32 }  // bucket reused
 BucketDiscard    : { disk_id: u16, bucket_no: u32 }                       // TRIM issued
+
+// Bset format mutations (§1.5.6)
+FormatPromote    : { node_ref: BlockRef, bset_seq: u32, new_format: BsetKeyFormat }
 
 Checkpoint       : { new_root: RootPointer, gc_reserve_buckets: u32 }
 ```
@@ -741,24 +818,29 @@ all bsets in the node.
 
 ### 7.1 Node layout
 
-- **Inner node** (`BtreeKind::Forward`, level ≥ 1): one or more bsets of `(key: u64, child:
-  BlockRef)` pairs (24 B per entry). One full bset packs ~10 900 children; with up to 4 active
-  bsets the effective fanout averages ~5 000 (post-merge ~10 900). Tree depth at 10 M objects:
-  **2 levels** (1 inner + leaves).
+Both inner and leaf bsets use the §1.5.6 packed-key encoding. Within a single leaf, all `oid`
+keys share the leaf's key range (typically a span of 10⁴ – 10⁵ contiguous ids), so the format
+descriptor's `bit_width` settles around 16–20 bits — encoding `oid` as 2–3 bytes versus the
+unpacked 8 bytes.
+
+- **Inner node** (`BtreeKind::Forward`, level ≥ 1): one or more bsets of `(packed_oid_key,
+  child: BlockRef)` pairs. With 2–3 byte packed keys + 16 B BlockRef = ~18–19 B per entry; one
+  full bset packs ~14 500 children. Tree depth at 10 M objects: **2 levels** (1 inner + leaves).
 - **Leaf node** (level 0): bsets of `LeafEntry` records:
 
 ```rust
-struct LeafEntry {                           // variable length
-    oid: u64,                                // 8 B  (sort key)
-    count: u16,                              // 2 B  number of inline assertions
-    spill: u16,                              //  bit 15 = is_spill; lower 15 bits unused
+// Logical (unpacked) shape; on-disk uses the §1.5.6 packed encoding.
+struct LeafEntry {                           // variable length on disk
+    oid: u64,                                // sort key — packed via BsetKeyFormat
+    count: u16,                              // number of inline assertions
+    spill: u16,                              // bit 15 = is_spill
     body: union {
         inline: [PackedAssertion; count],    // count × 16 B (when not spilled)
         spill_ref: BlockRef,                 // 16 B BlockRef into ForwardOverflow region
     },
 }
 
-struct PackedAssertion {                     // 16 bytes
+struct PackedAssertion {                     // 16 bytes (not key-packed; values stay byte-aligned)
     kind: u8,                                // 0=Tag, 1=Attr, 2=Relation
     origin: u8,                              // 0=Direct, 1=Materialized
     _pad: u16,
@@ -767,9 +849,12 @@ struct PackedAssertion {                     // 16 bytes
 }
 ```
 
-A leaf with 8 assertions per object (typical) packs ~1 800 entries per bset; with 4 active bsets
-the leaf carries up to ~7 000 entries before full compaction. Merged-leaf occupancy is similar
-to a single bset (duplicates collapse).
+The **key** (`oid`) is packed; the **value** (count, spill, body) stays byte-aligned. Per-leaf
+format descriptor records `oid_base = leaf.min_oid` and `oid_bits = ⌈log₂(leaf.max_oid −
+leaf.min_oid + 1)⌉`.
+
+A leaf with 8 assertions per object (typical) packs ~2 700 entries per bset (vs ~1 800 before
+key packing); with 4 active bsets the leaf carries up to ~10 000 entries before full compaction.
 
 ### 7.2 Spill
 
@@ -824,9 +909,10 @@ TagIndexLeafEntry {                          // 32 bytes
 }
 ```
 
-A 256 KiB leaf packs ~8 100 entries per bset. The full ontology of 5 000 tags fits in **a
-single leaf** (depth 0). For pools with hundreds of thousands of tags the tree extends to depth 1
-(~130 M-tag capacity).
+With key packing (§1.5.6) the `tag_id` typically packs to 2–3 bytes per leaf bset (sparse but
+clustered ids). A 256 KiB leaf holds ~9 000 entries per bset; the full ontology of 5 000 tags
+fits in **a single leaf** (depth 0). For pools with hundreds of thousands of tags the tree
+extends to depth 1 (~150 M-tag capacity).
 
 `(cardinality, last_modify_lsn, generation)` enables fast snapshot diffing without dereferencing
 the bitmap — the directory's bset stream alone tells a peer which tags changed and how.
@@ -910,7 +996,18 @@ faceted enumeration, range comparisons).
 ### 9.2 Range Index
 
 A **B+ tree of large nodes** (§1.5) keyed by `(attr_id: u32, value: NormalisedKey, oid: u64)` —
-28 B per key. Leaf bsets store key → `BlockRef` to a roaring bitmap; ~7 500 entries per bset.
+28 B unpacked. With per-bset key packing (§1.5.6) this is the structure that benefits most:
+
+- `attr_id` is almost always **constant** within a leaf (a leaf covers one or two adjacent
+  attributes) → 0 bits per key.
+- `value` (16 B `NormalisedKey`) gets a per-bset base + bit-width; for numeric attributes the
+  span within a leaf typically fits in 24–40 bits.
+- `oid` packs identically to forward-index keys: 16–20 bits.
+
+Net per-key size: typically **8–12 B** packed vs 28 B unpacked (60–70% saving). Each 256 KiB
+leaf packs ~25 000 entries per bset, vs ~7 500 unpacked.
+
+Leaf bsets store key → `BlockRef` to a roaring bitmap.
 
 `NormalisedKey` is a fixed-size order-preserving encoding:
 
@@ -1170,8 +1267,9 @@ freespace LRU.
 ### 12.2 Bucket alloc table
 
 One **§1.5 B+ tree** per disk, rooted at `DiskDescriptorOnDisk.buckets_root`, keyed by
-`bucket_no: u32`. A 256 KiB leaf packs ~13 100 BucketAllocKey entries per bset; a 16 M-bucket
-disk fits in **depth 1** (single inner node + ~1 250 leaves):
+`bucket_no: u32`. With key packing (§1.5.6) sequential bucket numbers compress to ~2 B per key,
+so a 256 KiB leaf packs ~14 600 BucketAllocKey entries per bset; a 16 M-bucket disk fits in
+**depth 1** (single inner node + ~1 100 leaves):
 
 ```rust
 #[repr(C, packed)]
@@ -1389,28 +1487,29 @@ the migration is crash-safe and resumable.
 
 ## 16. Summary of On-Disk Footprint (10 M objects, 5 000 tags)
 
-Steady-state footprint, with the journal-of-btree-updates model: btree pages settle into a
-compact rewritten state once the reclaim thread has caught up; at any moment the WAL ring holds
-the unmaterialised tail (≤ 64 MiB).
+Steady-state footprint with the journal-of-btree-updates model and packed-key bsets (§1.5.6):
+B+ tree footprints reflect the ~30 % compression from key packing; positional radix tables
+(object/location) and bitmap structures are unaffected. The WAL ring holds the unmaterialised
+tail (≤ 64 MiB).
 
 | Structure              | Size      | Notes                                              |
 | ---------------------- | --------- | -------------------------------------------------- |
 | Superblock × 3         | 12 KiB    | Fixed                                              |
 | WAL                    | 64 MiB    | Btree-update journal (§3); mirrored across devices |
-| Bucket alloc table     | 256 MiB   | Per 16 TiB at 1 MiB buckets (16 M × 16 B)          |
-| Freespace LRU          | ~16 MiB   | Sparse — only non-empty + sampled empty buckets    |
-| Object table (records) | 1.28 GiB  | 10 M × 128 B in 256 KiB radix leaves               |
+| Bucket alloc table     | ~180 MiB  | 256 MiB unpacked × ~70 % from `bucket_no` packing  |
+| Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
+| Object table (records) | 1.28 GiB  | Positional — no key packing applies                |
 | Object table (radix)   | < 1 MiB   | Single inner node (depth 2 total)                  |
-| Location table         | 480 MiB   | 10 M × 48 B in 256 KiB leaves (depth 2)            |
-| Forward index          | ~600 MiB  | §1.5 B+ tree, ~60 B/object, depth 2                |
+| Location table         | 480 MiB   | Positional — no key packing                        |
+| Forward index          | ~400 MiB  | §1.5 B+ tree with packed `oid`; was ~600 MiB       |
 | Tag inverted index     | 200–400 MiB | Roaring bitmaps (4 KiB framed), 5 000 tags       |
 | KV index               | ~100 MiB  | Extendible hash + roaring bitmaps                  |
-| Range index            | ~50 MiB   | §1.5 B+ tree                                       |
+| Range index            | ~20 MiB   | §1.5 B+ tree, packed (`attr_id` constant per leaf) |
 | Ontology               | <10 MiB   | Modules + DAG                                      |
-| Subscriptions          | ~1 MiB    | Per 1 000 subs                                     |
-| Path contexts          | 50 MiB    | One large project                                  |
+| Subscriptions          | ~700 KiB  | Per 1 000 subs with packed `sub_id`                |
+| Path contexts          | 50 MiB    | One large project; path hashes don't pack          |
 | Snapshot chain (7 days) | ~500 MiB | Diff-only                                          |
-| **Total metadata**     | **~3 GiB** | Replicated to every node                          |
+| **Total metadata**     | **~2.7 GiB** | ~10 % smaller than pre-packing (3 GiB)         |
 
 This is the "few hundred megabytes" of the design intent at moderate scale, and at the upper end
 of practical scale still well under 1% of pool storage.
