@@ -68,15 +68,13 @@ enum BlockKind {
     Superblock,
     ZoneMap,
     WalSegment,
-    AllocBitmap,
-    BlockClassMap,
     ObjectTablePage,
     LocationTablePage,
     ForwardIndexPage,
     TagBitmapPage,
-    BPlusInner,
-    BPlusLeaf,
-    KvHashBucket,
+    BPlusInner,                              // generic B+ tree inner page
+    BPlusLeaf,                               // generic B+ tree leaf page
+    KvHashBucket,                            // extendible-hash bucket (KV index)
     OntologyPage,
     PathContextPage,
     Checkpoint,
@@ -128,10 +126,12 @@ struct Superblock {                          // 4096 bytes total
     // Static layout pointers (set at format time, not written again).
     wal_offset: u64,                         // [248..256]
     wal_size: u64,                           // [256..264]
-    alloc_bitmap_offset: u64,                // [264..272]
-    alloc_bitmap_size: u64,                  // [272..280]
-    block_class_map_offset: u64,             // [280..288]
-    block_class_map_size: u64,               // [288..296]
+    bucket_size_log2: u8,                    // [264..265]   e.g. 20 = 1 MiB bucket
+    copygc_reserve_pct: u8,                  // [265..266]   default 8 (range 5..=21)
+    _pad3: [u8; 6],                          // [266..272]
+    bootstrap_buckets: u32,                  // [272..276]   reserved leading buckets (sb + WAL + …)
+    _pad4: [u8; 4],                          // [276..280]
+    _reserved_alloc: [u8; 16],               // [280..296]   space freed by removed bitmap fields
     zone_map_offset: u64,                    // [296..304]   0 until any zone is grown
 
     // Initial-extent zone descriptors. Always authoritative for the first extent;
@@ -187,7 +187,7 @@ self-validating against the destination block's header.
 
 **Commit protocol:**
 
-1. Write all dirty COW pages to free blocks (allocation bitmap mutated in WAL only).
+1. Write all dirty COW pages into open buckets (bucket allocation tracked in WAL only — see §12).
 2. Append `Checkpoint` WAL entry referencing the new pages and computing the new `RootPointer`.
 3. `fsync` the WAL segment.
 4. Write the new `RootPointer` into the **inactive** slot of all superblock copies, flip
@@ -269,16 +269,23 @@ CBOR is acceptable here because:
 ### 3.3 WAL op payloads (CBOR schemas)
 
 ```rust
-CreateObject  : { oid: u64, generation: u32, created_ns: i64 }
-DeleteObject  : { oid: u64, lsn: u64 }
-AddTag        : { oid: u64, tag: u32, origin: u8 }
-RemoveTag     : { oid: u64, tag: u32 }
-SetAttr       : { oid: u64, key: u32, value: Value }       // Value tagged-union (§4.2)
-RemoveAttr    : { oid: u64, key: u32, value_hash: u64 }
-AddRelation   : { oid: u64, predicate: u32, target: u64 }
-RemoveRelation: { oid: u64, predicate: u32, target: u64 }
-WriteBlob     : { oid: u64, content_hash: [u8;32], extent: ExtentRef, size: u64 }
-Checkpoint    : { new_root: RootPointer, freed_blocks_root: BlockRef, alloc_delta: BlockRef }
+CreateObject     : { oid: u64, generation: u32, created_ns: i64 }
+DeleteObject     : { oid: u64, lsn: u64 }
+AddTag           : { oid: u64, tag: u32, origin: u8 }
+RemoveTag        : { oid: u64, tag: u32 }
+SetAttr          : { oid: u64, key: u32, value: Value }       // Value tagged-union (§4.2)
+RemoveAttr       : { oid: u64, key: u32, value_hash: u64 }
+AddRelation      : { oid: u64, predicate: u32, target: u64 }
+RemoveRelation   : { oid: u64, predicate: u32, target: u64 }
+WriteBlob        : { oid: u64, content_hash: [u8;32], extent: ExtentRef, size: u64 }
+
+// Bucket lifecycle (§12)
+BucketAlloc      : { disk_id: u16, bucket_no: u32, data_type: u8, generation: u32 }
+BucketWrite      : { disk_id: u16, bucket_no: u32, sectors_added: u16 }   // dirty_sectors delta
+BucketGenBump    : { disk_id: u16, bucket_no: u32, new_generation: u32 }  // bucket reused
+BucketDiscard    : { disk_id: u16, bucket_no: u32 }                       // TRIM issued
+
+Checkpoint       : { new_root: RootPointer, gc_reserve_buckets: u32 }
 ```
 
 Replay applies entries strictly in LSN order. Each in-memory mutation is idempotent under
@@ -696,12 +703,34 @@ index as a special assertion kind, so listing all paths of an object is one forw
 PoolStateRoot (4 KiB):
   disk_count: u32
   cluster_node_count: u32
-  disks: [DiskDescriptorOnDisk; 64]    // fixed, 56 bytes each
+  disks: [DiskDescriptorOnDisk; 56]    // fixed, 64 bytes each
   placement_rules_root: BlockRef       → B+ tree of CBOR rules (heterogeneous)
   cluster_peers_root:   BlockRef       → B+ tree key = NodeId → PeerRecord
 ```
 
-`DiskDescriptorOnDisk` is fixed 56 bytes with `path_offset` into a string heap block.
+`DiskDescriptorOnDisk` is fixed **64 bytes**:
+
+```rust
+#[repr(C, packed)]
+struct DiskDescriptorOnDisk {                // 64 bytes
+    disk_id: u16,                            //  [0..2]
+    media_type: u8,                          //  [2..3]
+    tier: u8,                                //  [3..4]
+    state: u8,                               //  [4..5]    DiskState
+    _pad: u8,                                //  [5..6]
+    path_offset: u16,                        //  [6..8]    into string heap
+    capacity_bytes: u64,                     //  [8..16]
+    used_bytes: u64,                         // [16..24]
+    bucket_count: u32,                       // [24..28]   capacity_bytes >> bucket_size_log2
+    first_usable_bucket: u32,                // [28..32]   = bootstrap_buckets
+    buckets_root: BlockRef,                  // [32..48]   §12.2 bucket alloc table root
+    freespace_root: BlockRef,                // [48..64]   §12.4 freespace LRU root
+}
+```
+
+The per-disk `buckets_root` and `freespace_root` are COW under the standard checkpoint
+machinery — every RootPointer commit captures a self-consistent snapshot of every disk's
+allocation state.
 
 ---
 
@@ -725,7 +754,7 @@ SnapshotRecord (4 KiB):
    label: [u8; 64]                   // optional human label
    root: RootPointer                  // 64 bytes
    parent: BlockRef                   // previous SnapshotRecord, or zero
-   freed_blocks: BlockRef             // bitmap of blocks released *between* parent and this snapshot
+   pinned_buckets: BlockRef          // B+ tree of (disk_id, bucket_no, generation) pinned by this snapshot
    sync_metadata: BlockRef            // peer-watermarks, HLC, see below
 ```
 
@@ -734,9 +763,12 @@ A snapshot is created by:
 2. Linking the new `RootPointer` into the snapshot chain instead of (or in addition to)
    discarding the old root.
 
-Freed-block tracking ensures GC of blocks reachable from no live snapshot. The allocator only
-reclaims a block when `block_no` is in **none** of `[oldest_live_snapshot.freed_blocks, ...,
-newest.freed_blocks]`'s union complement — a standard reference-tracked COW scheme.
+**Bucket-level retention.** With bucket-based allocation (§12), each snapshot pins the buckets
+referenced by its `RootPointer`'s tree. A bucket is reclaimable only when *no* live snapshot's
+`pinned_buckets` set contains its `(disk_id, bucket_no, generation)`. On snapshot deletion, the
+allocator subtracts that snapshot's pinned set from the union and is free to bump the generation
+of any newly-released bucket. This replaces per-block freed-bitmap tracking with a much smaller
+per-snapshot bucket reference set (a 16 TiB / 1 MiB pool has 16 M buckets vs. 4 G blocks).
 
 ### 11.2 Cluster diff between snapshots
 
@@ -789,39 +821,162 @@ known-good snapshot, then re-apply HLC-ordered ops from peers.
 
 ## 12. Allocation Layer
 
-### 12.1 Allocation bitmap
+Allocation is **bucket-based** with **generation numbers**, modelled on bcachefs. Each disk is
+divided into fixed-size buckets (typically 1 MiB; configurable 256 KiB – 4 MiB at format time).
+Within a bucket, writes are **append-only**: once opened, sectors are written sequentially and
+never overwritten. A bucket is reused only after its generation counter has been incremented —
+which atomically invalidates every pointer that referenced its previous contents.
 
-One bit per 4 KiB block. Stored as a fixed array of `AllocBitmap` blocks (4096 bytes → 32 768 bits
-→ 128 MiB of addressable space per block). For a 16 TiB device that's 4096 bitmap blocks = 16 MiB,
-loaded into RAM at mount and dirtied via WAL.
+This buys four properties simultaneously:
+
+- **Constant-time bucket invalidation.** Bumping a bucket's generation invalidates every pointer
+  that referenced the old contents — no scan required.
+- **Crash-safe pointer staleness detection.** Every `BlockRef` carries the bucket's expected
+  generation; mismatches are silently dropped on read.
+- **Native fit for SMR / zoned drives.** Buckets map one-to-one to zones; write-once-then-erase
+  is exactly the semantics zoned media require. Glacier-tier media can be addressed without an
+  intervening FTL.
+- **Filesystem-scoped FTL.** On SSDs, the filesystem becomes the FTL with full visibility into
+  what is live — more predictable than the drive's own FTL under our access patterns.
+
+### 12.1 Buckets
+
+A bucket is identified by `(disk_id, bucket_no)`. Bucket size is encoded as
+`Superblock.bucket_size_log2`:
+
+| `bucket_size_log2` | Bucket size | Buckets per 16 TiB disk | Alloc table size |
+| ------------------ | ----------- | ----------------------- | ---------------- |
+| 18                 | 256 KiB     | 64 M                    | 1 GiB            |
+| 20 (default)       | 1 MiB       | 16 M                    | 256 MiB          |
+| 22                 | 4 MiB       | 4 M                     | 64 MiB           |
+
+`Superblock.bootstrap_buckets` (typically 32–64) pins the leading buckets used for the
+superblock, WAL header, and the root pages of the alloc table itself; these are excluded from the
+freespace LRU.
+
+### 12.2 Bucket alloc table
+
+One B+ tree per disk, rooted at `DiskDescriptorOnDisk.buckets_root`, keyed by `bucket_no: u32`:
+
+```rust
+#[repr(C, packed)]
+struct BucketAllocKey {                      // 16 bytes
+    generation: u32,                         // monotonic; matched by BlockRef.generation
+    data_type: u8,                           // BucketDataType (below)
+    flags: u8,                               // bit 0 = needs_discard, bit 1 = pinned-by-snapshot
+    dirty_sectors: u16,                      // live 4 KiB sectors written in this bucket
+    last_modify_lsn: u64,                    // for snapshot-diffing the alloc table itself
+}
+
+#[repr(u8)]
+enum BucketDataType {
+    Free        = 0,                         // not in use; freespace LRU candidate
+    Wal         = 1,                         // WAL ring buckets
+    Index       = 2,                         // index-zone btree pages, tag bitmaps
+    Metadata    = 3,                         // object table, location table, forward index
+    Blob        = 4,                         // user data blobs
+    BtreeNode   = 5,                         // dedicated btree-node buckets (post-change [3])
+    Stripe      = 6,                         // erasure-coding stripes (future)
+    NeedDiscard = 7,                         // freed, awaiting TRIM
+    Reserved    = 8,                         // copygc forward-progress reserve
+}
+```
+
+The B+ tree itself is housed in a self-bootstrapping subset of metadata buckets (tracked as
+`BucketDataType::Metadata` with the pinned flag). Updates go through the journal and are
+checkpointed in the same A/B atomic-root commit as everything else.
+
+### 12.3 Generation-checked pointers
+
+`BlockRef` (§2.2) already carries a 64-bit generation. With bucket-based allocation:
 
 ```
-AllocBitmap block:
-   header (kind = AllocBitmap)
-   bits: [u8; 4060]
-   trailing CRC
+bucket_no   = block_no >> (bucket_size_log2 - 12)        // e.g. block_no >> 8 for 1 MiB buckets
+in_bucket   = block_no &  ((1 << (bucket_size_log2 - 12)) - 1)
 ```
 
-Updates go through the WAL (`AllocDelta` op), then are flushed to bitmap blocks during checkpoint.
-Bitmap blocks are themselves COW'd via the `pool_state_root` so a torn write doesn't lose the
-allocation map.
+Dereference protocol:
 
-### 12.2 Block class map
+1. Compute `bucket_no` from `block_no`.
+2. Look up `BucketAllocKey` (hot buckets pinned in RAM).
+3. If `key.generation != ref.generation`, the pointer is **stale**: silently dropped on reads,
+   logged as a corruption signal during scrub.
 
-Nibble-packed `BlockClass` per block: `Free=0`, `Index=1`, `Metadata=2`, `Blob=3`,
-`Wal=4`, `Reserved=5`. Stored adjacent to the allocation bitmap, same COW machinery. Used by the
-zone-aware allocator and by fsck.
+Generation comparison replaces all the bookkeeping we previously needed for free-block tracking,
+torn-write detection on freed blocks, and stale-replica handling. The per-block CRC32C catches
+in-bucket corruption independently.
 
-### 12.3 Allocator behavior
+### 12.4 Freespace LRU
 
-Per-zone first-fit with extent-size hints. The allocator favours:
+A second B+ tree per disk (`DiskDescriptorOnDisk.freespace_root`), keyed by
+`(fragmentation_band, bucket_no)`:
 
-- **Index zone**: 4-block extents (sufficient for most B+ tree pages; large bitmaps span more).
-- **Metadata zone**: 1-block extents (single-page records).
-- **Blob zone**: 64+ block extents (256 KiB minimum) to keep fragmentation manageable.
+```
+fragmentation_band: u8     // 0 = empty (full free), 1..255 = band of (dirty_sectors / max_sectors)
+bucket_no: u32
+```
 
-Rebalance / disk evacuation walks extents in `block_class_map` order so a draining disk's blobs
-are migrated zone-by-zone.
+Used by:
+
+- **Foreground allocator**: scans `fragmentation_band == 0` for fast bump-allocation of new
+  write streams.
+- **Copy GC**: scans the most-fragmented non-empty buckets to reclaim space (§12.6).
+- **Cache eviction**: cached-replica buckets carry their own LRU, layered on top.
+
+Bands are recomputed lazily — a bucket's band is updated when `dirty_sectors` crosses an 8-sector
+boundary, keeping freespace-LRU churn proportional to allocation pressure rather than to
+write volume.
+
+### 12.5 Allocator behaviour
+
+Per-disk **write points** track a small set of currently-open buckets, segregated by:
+
+- **Data type** — index, metadata, blob, and WAL never share a bucket.
+- **Stream tag** — separate write points for placement-target groups, foreground vs. background
+  workloads, and per-tag pinning. This is the same trick bcachefs uses to keep unrelated I/O
+  patterns from co-mingling and producing correlated fragmentation.
+
+Allocation on the fast path is a bump: the open bucket's write cursor advances by the requested
+sectors. When a bucket fills, it is closed (its `dirty_sectors` stops changing until copygc) and
+a fresh bucket is opened from the freespace LRU.
+
+Per-zone hints (§2.1) are advisory rather than hard partitions: a zone defines the *preferred*
+disk region for a data type, but the allocator can spill across zone boundaries when the zone
+runs short. The authoritative classification is `BucketAllocKey.data_type` per bucket.
+
+### 12.6 Copy GC
+
+When the freespace LRU's empty-band count drops below the configured reserve
+(`Superblock.copygc_reserve_pct`, default 8%), copy GC:
+
+1. Selects the most-fragmented bucket(s) from the freespace LRU.
+2. Reads each live extent (validated by generation).
+3. Rewrites the live extents to a fresh bucket via the move path.
+4. Updates the index entries that pointed to the old bucket.
+5. Bumps the old bucket's generation, transitions it to `NeedDiscard` (or directly to `Free`).
+
+Copy GC cost is proportional to **fragmentation**, not pool size. The reserve guarantees forward
+progress: allocation can never block on GC because at least one fully-empty bucket is always
+available.
+
+### 12.7 Discard / TRIM
+
+Buckets transitioning to `Free` first sit in `NeedDiscard` until TRIM is issued (mount option
+`discard=true|async|off`). On rotational media TRIM is a no-op and the transition is immediate.
+
+### 12.8 Crash recovery
+
+The bucket alloc table is a B+ tree under the standard COW + journal commit machinery (§2.2).
+On unclean shutdown:
+
+1. Each disk's `buckets_root` is loaded from the last committed `RootPointer`.
+2. WAL replay applies pending bucket-lifecycle entries (`BucketAlloc`, `BucketWrite`,
+   `BucketGenBump`, `BucketDiscard`) in LSN order.
+3. Any block whose `BlockRef.generation` does not match the recovered `BucketAllocKey.generation`
+   is treated as stale and ignored — exactly as it would be at runtime.
+
+The combination of "WAL is authoritative for recent transitions" and "generation mismatches
+invalidate pointers atomically" makes recovery proportional to journal size, not pool size.
 
 ---
 
@@ -842,6 +997,8 @@ queries:
 | `SubscriptionEngine`                         | SubscriptionsRoot                         | fully resident         |
 | `PathContextManager`                         | PathContextRoot                           | fully resident         |
 | `PoolManager`                                | PoolStateRoot                             | fully resident         |
+| `BucketCache` (`HashMap<(DiskId, u32), BucketAllocKey>`) | per-disk buckets B+ tree    | hot buckets pinned, cold paged in |
+| `WritePoints` (`HashMap<(DiskId, DataType, StreamTag), OpenBucket>`) | derived             | resident; ~hundreds of entries |
 | `OpLog` (`VecDeque<OpLogEntry>`)             | recent WAL tail                           | trimmed at checkpoint  |
 
 `Engine` (DESIGN §15) owns these and is wrapped by `DiskEngine` which adds `FileBlockDevice`,
@@ -918,8 +1075,8 @@ the migration is crash-safe and resumable.
 | ---------------------- | --------- | -------------------------------------------------- |
 | Superblock × 3         | 12 KiB    | Fixed                                              |
 | WAL                    | 64 MiB    | Configurable, mirrored                             |
-| Allocation bitmap      | 16 MiB    | Per 16 TiB                                         |
-| Block class map        | 8 MiB     | Nibble-packed, per 16 TiB                          |
+| Bucket alloc table     | 256 MiB   | Per 16 TiB at 1 MiB buckets (16 M × 16 B)          |
+| Freespace LRU          | ~16 MiB   | Sparse — only non-empty + sampled empty buckets    |
 | Object table (records) | 1.28 GiB  | 10 M × 128 B                                       |
 | Object table (radix)   | <16 MiB   | Three indirection levels                           |
 | Location table         | 480 MiB   | 10 M × 48 B                                        |
