@@ -12,9 +12,9 @@ Goals:
    readers can skip unknown trailing fields and older readers can refuse cleanly.
 3. **Atomic root updates.** Mutations land in the WAL, then in shadowed (alternating) root blocks.
    A torn write never produces a corrupt root.
-4. **Snapshottable indices.** Index updates are copy-on-write at the page level. Every committed
-   superblock pins a self-consistent index root. Snapshots are taken by retaining the old root;
-   diffs between snapshots drive cluster sync.
+4. **Key-level snapshots.** Snapshots are 32-bit IDs embedded in the position of every key in
+   snapshot-aware btrees. Creation is O(1); diffs are set differences over the snapshot tree's
+   ancestor relation, driving cluster sync.
 5. **No JSON on disk.** Fixed binary layouts everywhere they fit. CBOR (RFC 8949) only where the
    shape is genuinely heterogeneous (ontology module manifests, attribute `Value`s).
 
@@ -226,10 +226,10 @@ on typical workloads.
 
 #### 1.5.5 Why this matters
 
-For a 10 M-object pool, the radix object table goes from 4 levels (4 KiB pages) to **2 levels**
-(256 KiB pages). Tag, range, and forward indexes drop from 4 levels to **2–3 levels**. Cache
-working set shrinks by 64× in page count, with the same total bytes. Sequential I/O on every
-node access — critical for HDD performance.
+For a 10 M-object pool, the radix object table is **2 levels** deep; tag, range, and forward
+indexes are **2–3 levels**. Each node access is a single sequential I/O of 256 KiB — critical
+for HDD performance and friendly to SSD command queues. The cache holds whole nodes, so
+intra-node lookups are memory-resident after the first hit.
 
 #### 1.5.6 Bset format descriptors and packed keys
 
@@ -349,7 +349,7 @@ struct Superblock {                          // 4096 bytes total
     _pad3: [u8; 5],                          // [267..272]
     bootstrap_buckets: u32,                  // [272..276]   reserved leading buckets (sb + WAL + …)
     _pad4: [u8; 4],                          // [276..280]
-    _reserved_alloc: [u8; 16],               // [280..296]   space freed by removed bitmap fields
+    _reserved: [u8; 16],                     // [280..296]   reserved for future use
     zone_map_offset: u64,                    // [296..304]   0 until any zone is grown
 
     // Initial-extent zone descriptors. Always authoritative for the first extent;
@@ -442,10 +442,9 @@ per mutation — they are rewritten lazily when journal reclaim or memory pressu
 (§3.4). The journal is therefore the **source of truth** for any btree state newer than each
 node's `BlockHeader.lsn`.
 
-This shifts the per-mutation cost from "rewrite a 4-deep COW path" (≈ 16 KiB of writes) to "append
-one ≈ 80-byte journal entry". Btree page rewrites are amortised across all the mutations that
-touched each node since its last flush. For our workload — where one tag mutation can touch four
-index trees — the savings are ≥ 100×.
+Per-mutation cost is one ≈ 80-byte journal append. Btree page rewrites are amortised across all
+mutations that touched each node since its last flush. A tag mutation that touches four index
+trees costs four journal entries; the corresponding page rewrites land later, batched.
 
 Internal layout is segmented to allow parallel truncation and replay.
 
@@ -953,8 +952,8 @@ The **key** (`oid`) is packed; the **value** (count, spill, body) stays byte-ali
 format descriptor records `oid_base = leaf.min_oid` and `oid_bits = ⌈log₂(leaf.max_oid −
 leaf.min_oid + 1)⌉`.
 
-A leaf with 8 assertions per object (typical) packs ~2 700 entries per bset (vs ~1 800 before
-key packing); with 4 active bsets the leaf carries up to ~10 000 entries before full compaction.
+A leaf with 8 assertions per object (typical) packs ~2 700 entries per bset; with 4 active bsets
+the leaf carries up to ~10 000 entries before full compaction.
 
 ### 7.2 Spill
 
@@ -1104,8 +1103,7 @@ A **B+ tree of large nodes** (§1.5) keyed by `(attr_id: u32, value: NormalisedK
   span within a leaf typically fits in 24–40 bits.
 - `oid` packs identically to forward-index keys: 16–20 bits.
 
-Net per-key size: typically **8–12 B** packed vs 28 B unpacked (60–70% saving). Each 256 KiB
-leaf packs ~25 000 entries per bset, vs ~7 500 unpacked.
+Net per-key size: typically **8–12 B** packed. Each 256 KiB leaf packs ~25 000 entries per bset.
 
 Leaf bsets store key → `BlockRef` to a roaring bitmap.
 
@@ -1233,14 +1231,14 @@ allocation state.
 
 ## 11. Snapshots and Cluster Sync
 
-Snapshots are **key-level**, modelled on bcachefs: a snapshot is a 32-bit ID embedded in the
-position of every key in a snapshot-aware btree. Multiple versions of the "same" logical key
-coexist in one btree, distinguished by their `snapshot` field. Visibility is determined by walking
-the snapshot tree (§11.1).
+Snapshots are **key-level**: a snapshot is a 32-bit ID embedded in the position of every key in a
+snapshot-aware btree. Multiple versions of the "same" logical key coexist in one btree,
+distinguished by their `snapshot` field. Visibility is determined by walking the snapshot tree
+(§11.1).
 
-This replaces the page-COW snapshot model. Creation is **O(1)** regardless of pool size — no
-keys are copied, no checkpoint forced. Many thousands or millions of snapshots can exist
-simultaneously, limited only by the disk space their per-key overhead consumes.
+Creation is **O(1)** regardless of pool size — no keys are copied, no checkpoint is forced. Many
+thousands or millions of snapshots can exist simultaneously; their cost is the disk space
+consumed by keys unique to each snapshot.
 
 ### 11.1 Snapshot tree
 
@@ -1270,8 +1268,7 @@ ancestors). For older queries, the 3-entry randomised skiplist provides O(log n)
 the root. During early recovery, before this data is validated, queries fall back to a simple
 parent-pointer walk.
 
-`RootPointer.snapshot_chain_root` is repurposed as the snapshots btree root — the chain is no
-longer a linked list of `SnapshotRecord` blocks but a btree of `SnapshotNode` keys.
+`RootPointer.snapshot_chain_root` is the snapshots btree root.
 
 ### 11.2 Snapshot-aware bkey position
 
@@ -1394,8 +1391,7 @@ prevent generation bumps once *all* snapshots have moved on), retention is enfor
 - When the deleting snapshot pass (§11.5) removes a key, the corresponding backpointer is
   removed too. Once a bucket has no live backpointers, its generation can be bumped.
 
-This eliminates the per-snapshot `pinned_buckets` set the page-COW model used. Snapshot
-retention now scales with **logical changes**, not bucket counts.
+Snapshot retention scales with **logical changes**, not bucket counts.
 
 ### 11.7 Cluster diff between snapshots
 
@@ -1416,13 +1412,10 @@ for tree in snapshot_aware_btrees {
 }
 ```
 
-This subsumes both former diff paths:
+The diff is a single btree range scan filtered by the small `new_only` set. The same operation
+serves recent and old snapshots — no special case for either.
 
-- The **hot path** (formerly journal streaming) is now "iterate keys with `snapshot ∈ new_only`"
-  — equivalent to a btree range scan filtered by the small `new_only` set.
-- The **cold path** (formerly COW tree walk) is the same operation; no special case needed.
-
-The result is the same `SyncBundle` shape:
+The result is a `SyncBundle`:
 
 ```
 SyncBundle (CBOR):
@@ -1436,14 +1429,14 @@ SyncBundle (CBOR):
 
 The bundle is signed and shipped to peers (per §9.4 key hierarchy in DESIGN.md).
 
-**Resilver path.** Unchanged from the prior section: when a peer comes back from a degraded
-state with one disk missing, recovery is **backpointer-driven** (§6.2). Backpointers are
-snapshot-agnostic, so resilver enumerates all backpointers on the affected disk and re-fetches
-the corresponding extents irrespective of which snapshot owns them.
+**Resilver path.** When a peer comes back from a degraded state with one disk missing, recovery
+is **backpointer-driven** (§6.2). Backpointers are snapshot-agnostic, so resilver enumerates
+all backpointers on the affected disk and re-fetches the corresponding extents irrespective of
+which snapshot owns them.
 
 ### 11.8 Retention policy
 
-Snapshot space cost is now per-key (not per-page). Per-snapshot overhead in steady state:
+Snapshot space cost is per-key. Per-snapshot overhead in steady state:
 
 - Keys unique to each snapshot: typically a few KB for an "idle" snapshot, scaling with logical
   changes since the parent.
@@ -1556,8 +1549,8 @@ Dereference protocol:
 3. If `key.generation != ref.generation`, the pointer is **stale**: silently dropped on reads,
    logged as a corruption signal during scrub.
 
-Generation comparison replaces all the bookkeeping we previously needed for free-block tracking,
-torn-write detection on freed blocks, and stale-replica handling. The per-block CRC32C catches
+Generation comparison alone resolves free-block tracking, torn-write detection on freed blocks,
+and stale-replica handling — no separate bookkeeping is required. The per-block CRC32C catches
 in-bucket corruption independently.
 
 ### 12.4 Freespace LRU
@@ -1738,23 +1731,20 @@ the migration is crash-safe and resumable.
 
 ## 16. Summary of On-Disk Footprint (10 M objects, 5 000 tags, ~100 live snapshots)
 
-Steady-state footprint with the journal-of-btree-updates model, packed-key bsets (§1.5.6), and
-key-level snapshots (§11): per-snapshot overhead is per-key, not per-page, so 100 sync
-snapshots add a few MB of unique keys rather than hundreds of MB of COW pages. B+ tree
-footprints reflect the ~30 % compression from key packing; positional radix tables and bitmap
-structures are unaffected. The WAL ring holds the unmaterialised tail (≤ 64 MiB).
+Steady-state footprint. The WAL ring holds the unmaterialised journal tail (≤ 64 MiB); per-key
+snapshot overhead scales with logical changes since each snapshot's parent.
 
 | Structure              | Size      | Notes                                              |
 | ---------------------- | --------- | -------------------------------------------------- |
 | Superblock × 3         | 12 KiB    | Fixed                                              |
 | WAL                    | 64 MiB    | Btree-update journal (§3); mirrored across devices |
-| Bucket alloc table     | ~180 MiB  | 256 MiB unpacked × ~70 % from `bucket_no` packing  |
+| Bucket alloc table     | ~180 MiB  | 16 M buckets with packed `bucket_no`               |
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
 | Object table (records) | 1.28 GiB  | Positional — no key packing applies                |
 | Object table (radix)   | < 1 MiB   | Single inner node (depth 2 total)                  |
 | Location table         | 480 MiB   | Positional — no key packing                        |
 | Backpointers           | ~280 MiB  | §6.2 — 10 M extents × ~28 B packed                 |
-| Forward index          | ~400 MiB  | §1.5 B+ tree with packed `oid`; was ~600 MiB       |
+| Forward index          | ~400 MiB  | §1.5 B+ tree with packed `oid`                     |
 | Tag inverted index     | 200–400 MiB | Roaring bitmaps (4 KiB framed), 5 000 tags       |
 | KV index               | ~100 MiB  | Extendible hash + roaring bitmaps                  |
 | Range index            | ~20 MiB   | §1.5 B+ tree, packed (`attr_id` constant per leaf) |
@@ -1762,8 +1752,8 @@ structures are unaffected. The WAL ring holds the unmaterialised tail (≤ 64 Mi
 | Subscriptions          | ~700 KiB  | Per 1 000 subs with packed `sub_id`                |
 | Path contexts          | 50 MiB    | One large project; path hashes don't pack          |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
-| Snapshot key overhead  | ~50 MiB   | Per-snapshot unique keys across all snapshot-aware btrees (vs. 500 MiB COW chain) |
-| **Total metadata**     | **~2.5 GiB** | Net win: snapshot overhead drops by ~450 MiB vs. page-COW model |
+| Snapshot key overhead  | ~50 MiB   | Per-snapshot unique keys across all snapshot-aware btrees |
+| **Total metadata**     | **~2.5 GiB** | Replicated to every node                       |
 
 This is the "few hundred megabytes" of the design intent at moderate scale, and at the upper end
 of practical scale still well under 1% of pool storage.
