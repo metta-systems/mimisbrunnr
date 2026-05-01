@@ -591,8 +591,11 @@ BackpointerRemove: { key: BackpointerKey }                                // exp
 // Snapshot lifecycle (§11)
 SnapshotCreate   : { new_id: u32, parent_id: u32, current_replacement: u32, label: Option<String> }
 SnapshotDelete   : { id: u32 }                                            // marks for async cleanup
-SnapshotKeyMove  : { from_snap: u32, to_snap: u32, btree: BtreeKind, key: bytes }
-                   // re-tags a key during deletion's runtime phase (§11.5)
+// Note: snapshot deletion does NOT emit per-key WAL ops. The actual
+// re-tag / drop happens via a reconcile-driven scan whose progress is
+// checkpointed via ReconcileScanStep (§11.5, §17.3). The scan is
+// idempotent: a re-tagged leaf no longer matches the deleted snapshot
+// id, so resuming from a stale cursor after crash is safe.
 
 // Reconcile (§17)
 ReconcileEnqueue : { work: WorkItem, hipri: bool, phys_index: bool }
@@ -1500,19 +1503,65 @@ and its existing backpointer is valid for both snapshots. Backpointers are physi
 
 ### 11.5 Snapshot deletion
 
-Deleting a snapshot marks it for asynchronous cleanup by a background pass (DESIGN §7.5
-analogue). The cost is proportional to the volume of data unique to the deleted snapshot:
+Deleting a snapshot is **two operations**: a small synchronous step that takes the snapshot
+out of visibility, and a long-running background scan that physically reclaims the keys.
+The synchronous step's WAL cost is one entry; the scan's WAL cost is a handful of cursor
+checkpoints, regardless of how many keys are involved.
 
-1. **Runtime phase**: walk every snapshot-aware btree. For keys with `snapshot == deleted_id`,
-   either drop them outright (if a child snapshot has a newer overriding key) or convert them to
-   whiteouts (if ancestor visibility must be preserved for siblings). For interior nodes that
-   lose all but one child, keys are moved to the surviving child (re-tagging from
-   `deleted_id` to the surviving descendant's id).
-2. **Next-mount phase**: interior `SnapshotNode` removal — updating `depth` and `skiplist` fields
-   atomically across the affected subtree — is deferred to recovery's single-threaded context.
+**Synchronous step (`SnapshotDelete` WAL op).**
+1. In the snapshots btree, set `SnapshotNode.flags` bit 1 (`deleted`). The node remains in
+   place — its `depth` and `skiplist` are still consulted during ancestry checks for siblings
+   and descendants — but no new reads are accepted *at* the deleted snapshot id.
+2. Enqueue a `WorkKind::SnapshotCleanup` work item per snapshot-aware btree (§17.2). Each
+   item carries `(deleted_id, surviving_descendant_id, btree_kind)`. The surviving descendant
+   is determined by the tree shape: a leaf snapshot has none (keys are dropped or whited
+   out); an interior snapshot collapses to whichever child remains live.
+3. Checkpoint. The deletion is durable after this; subsequent crashes resume the cleanup
+   from the work-item queue.
 
-A snapshot with two children cannot be deleted directly; one child must be deleted first.
-Multiple snapshot deletions are batched and processed in a single pass.
+**Background scan (reconcile-driven, no per-key WAL).** For each `SnapshotCleanup` item:
+
+```
+let mut cursor = scan_state.cursor;            // resumed from ReconcileScan record (§17.3)
+for leaf in btree.leaves_from(cursor) {
+    for entry in leaf.entries_with_snapshot(deleted_id) {
+        match classify(entry, child_set, sibling_set) {
+            Drop          => leaf.remove(entry),
+            Whiteout      => leaf.replace_value(entry, KEY_TYPE_whiteout),
+            Retag(target) => leaf.set_snapshot(entry, target),
+        }
+    }
+    if leaf.is_dirty() { dirty_node_set.add(leaf); }
+    cursor = leaf.next_key();
+    if elapsed_since_checkpoint() > scan_step_interval {
+        emit ReconcileScanStep { scan_id, btree, cursor_key: cursor };
+    }
+}
+```
+
+The mutations above are ordinary in-memory btree changes that hit the §3.4 dirty-node path —
+flushed lazily, not journalled per key. `ReconcileScanStep` entries fire at most every
+~30 s of scan progress (configurable), bounding WAL cost to O(scan duration), not O(keys).
+
+**Idempotency.** The scan classification is a function of the entry's snapshot id and the
+snapshot tree's current shape — both stable after `SnapshotDelete` is journalled. A leaf
+that has already been re-tagged no longer contains entries at `deleted_id`, so resuming the
+scan from a stale cursor after a crash is a no-op for already-processed leaves. This
+removes the need for any per-key undo or redo log.
+
+**Completion.** When the scan reaches the end of every snapshot-aware btree, a final
+`SnapshotNode` removal is performed: its parent's `children` slot is cleared and the
+`depth`/`skiplist` fields of descendants are recomputed in a single batched
+`SnapshotTreeReorg` pass (deferred to the next checkpoint quiesce — see §3.5 — to avoid
+racing with live ancestry queries).
+
+**Constraints.**
+- A snapshot with two non-deleted children cannot collapse during cleanup; one child must
+  itself be deleted (or itself be the `current_replacement` for a deeper snapshot) first.
+  This is checked at `SnapshotDelete` time and the request is rejected if not satisfied.
+- Multiple deletions can run concurrently — each `SnapshotCleanup` work item has its own
+  cursor and operates independently (the per-leaf rewrites compose because each touches
+  disjoint snapshot-id sets).
 
 ### 11.6 Bucket retention under key-level snapshots
 
@@ -2013,6 +2062,7 @@ compose naturally because each extent is evaluated independently.
 | Disk in `Draining` state                          | Evacuate via backpointer scan (§6.2)         |
 | Disk failure detected, replicas missing           | Resilver (§11.7) — re-replicate from peers   |
 | Erasure-coding policy applies to cold data        | Encode into stripe (future)                  |
+| Snapshot marked deleted (§11.5)                   | Scan + drop / whiteout / re-tag keys at the deleted snapshot id |
 
 Each is just a different `WorkKind` in the same queue. New mismatch types are additive.
 
@@ -2030,6 +2080,7 @@ enum WorkKind {
     Copygc           = 5,      // fragmented bucket reclaim
     AutoTier         = 6,      // age-based migration
     EcEncode         = 7,      // promote to erasure-coding stripe
+    SnapshotCleanup  = 8,      // §11.5 — drop / whiteout / re-tag keys of a deleted snapshot
 }
 
 #[repr(C, packed)]
@@ -2074,9 +2125,14 @@ desired state. Scans are launched by:
 - **Ontology change** — installation / upgrade alters compression, encryption, or tier
   selection for a tag.
 - **Inode option change on a directory subtree** (e.g. a per-context override).
+- **Snapshot marked deleted** — one `SnapshotCleanup` scan per snapshot-aware btree (§11.5);
+  the scan rewrites in-memory leaves only, never journalling per key.
 
 Scan state lives in `ReconcileScan` records: `(scan_id, btree, cursor_key, originating_event)`.
-A scan that crashes mid-walk resumes from `cursor_key` on the next mount.
+A scan that crashes mid-walk resumes from `cursor_key` on the next mount. Scans that perform
+in-place key mutations (e.g. `SnapshotCleanup`) are required to be idempotent under cursor
+re-entry: a leaf that has already been rewritten must satisfy the scan's filter as a no-op,
+so resuming from any earlier cursor produces the same final state.
 
 ### 17.4 Priority ordering
 
@@ -2085,10 +2141,13 @@ Work is processed strictly in this order:
 1. `ReconcileHipri` — under-replicated metadata, evacuating metadata.
 2. `ReconcileHipri` — under-replicated data, evacuating data.
 3. `ReconcileWork` — normal metadata reconciliation.
-4. `ReconcileWork` — normal data (tiering, option updates, optimisations).
+4. `ReconcileWork` — normal data (tiering, option updates, optimisations,
+   `SnapshotCleanup`).
 5. `ReconcilePending` — retries (only when prerequisite device-config event has fired).
 
-Within each tier, ordering is logical (SSD) or physical (HDD).
+Within each tier, ordering is logical (SSD) or physical (HDD). `SnapshotCleanup` runs at
+priority 4 — it reclaims space but never blocks correctness or safety; under sustained
+pressure it yields to copygc and tiering work and resumes from its cursor.
 
 ### 17.5 Move path
 
