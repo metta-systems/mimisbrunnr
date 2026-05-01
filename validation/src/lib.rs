@@ -18,13 +18,22 @@ pub struct BlockRef {
 const _: () = assert!(size_of::<BlockRef>() == 16);
 
 // =====================================================================
+// §1.3 BlockPreamble — 8 B (shared by BlockHeader and BtreeNodeHeader)
+// =====================================================================
+#[repr(C, packed)]
+pub struct BlockPreamble {
+    pub magic: [u8; 4],          // "MIMR" (4 KiB block) or "MIMB" (256 KiB region)
+    pub kind: u16,               // BlockKind or BtreeKind, scoped by magic
+    pub format_version: u16,
+}
+const _: () = assert!(size_of::<BlockPreamble>() == 8);
+
+// =====================================================================
 // §1.3 BlockHeader — 32 B
 // =====================================================================
 #[repr(C, packed)]
 pub struct BlockHeader {
-    pub magic: [u8; 4],
-    pub kind: u16,
-    pub format_version: u16,
+    pub pre: BlockPreamble,
     pub payload_length: u32,
     pub generation: u64,
     pub lsn: u64,
@@ -37,9 +46,7 @@ const _: () = assert!(size_of::<BlockHeader>() == 32);
 // =====================================================================
 #[repr(C, packed)]
 pub struct BtreeNodeHeader {
-    pub magic: [u8; 4],
-    pub kind: u16,
-    pub format_version: u16,
+    pub pre: BlockPreamble,
     pub seq: u64,
     pub last_persisted_lsn: u64,
     pub region_size_log2: u8,
@@ -51,6 +58,9 @@ pub struct BtreeNodeHeader {
     pub max_key: [u8; 16],
 }
 const _: () = assert!(size_of::<BtreeNodeHeader>() == 64);
+// First 8 bytes of each header structure are the shared BlockPreamble:
+const _: () = assert!(std::mem::offset_of!(BlockHeader, pre) == 0);
+const _: () = assert!(std::mem::offset_of!(BtreeNodeHeader, pre) == 0);
 
 // =====================================================================
 // §1.5.1 BsetHeader — 32 B

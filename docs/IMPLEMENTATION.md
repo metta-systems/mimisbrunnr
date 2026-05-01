@@ -40,22 +40,34 @@ Goals:
 
 ### 1.3 Per-block header (`BlockHeader`)
 
-Every block-sized persistent structure that is written or replaced as a unit begins with a 32-byte
-header:
+Every persistent header — both 4 KiB block headers (this section) and 256 KiB region headers
+(§1.5.1) — begins with the same 8-byte `BlockPreamble`. A generic reader can read those 8 bytes
+to identify the structure (atomic 4 KiB block vs. append-only 256 KiB region) and dispatch to
+the right parser:
+
+```rust
+#[repr(C, packed)]
+struct BlockPreamble {            // 8 bytes — first field of every persistent header
+    magic: [u8; 4],               // "MIMR" = 4 KiB block; "MIMB" = 256 KiB region (§1.5.1)
+    kind: u16,                    // BlockKind (when magic = "MIMR") or BtreeKind ("MIMB")
+    format_version: u16,          // per-kind structural version
+}
+```
+
+Every block-sized persistent structure that is written or replaced as a unit begins with a
+32-byte `BlockHeader`:
 
 ```rust
 #[repr(C, packed)]
 struct BlockHeader {              // 32 bytes
-    magic: [u8; 4],               // "MIMR"
-    kind: u16,                    // BlockKind discriminator
-    format_version: u16,          // structure-specific version
-    payload_length: u32,          // bytes following the header (excl. trailing CRC).
-                                  // u32 (not u16) leaves headroom for >64 KiB blocks
-                                  // in a future format revision; values for the current
-                                  // 4 KiB block are < 4096.
-    generation: u64,              // monotonic per-block generation, for COW
-    lsn: u64,                     // WAL LSN that produced this block
-    flags: u32,                   // bit 0 = encrypted, bit 1 = continuation
+    pre: BlockPreamble,           // [0..8]   magic = "MIMR", kind ∈ BlockKind
+    payload_length: u32,          // [8..12]  bytes following the header (excl. trailing CRC).
+                                  //          u32 (not u16) leaves headroom for >64 KiB blocks
+                                  //          in a future format revision; values for the current
+                                  //          4 KiB block are < 4096.
+    generation: u64,              // [12..20] monotonic per-block generation, for COW
+    lsn: u64,                     // [20..28] WAL LSN that produced this block
+    flags: u32,                   // [28..32] bit 0 = encrypted, bit 1 = continuation
 }
 ```
 
@@ -144,22 +156,38 @@ Every large node begins with a 64-byte `BtreeNodeHeader`:
 ```rust
 #[repr(C, packed)]
 struct BtreeNodeHeader {                     // 64 bytes
-    magic: [u8; 4],                          // "MIMB"
-    kind: u16,                               // BtreeKind: ObjectTable, Forward, Range, …
-    format_version: u16,                     // per-kind structural version
-    seq: u64,                                // monotonic per-region; bumped on each rewrite
-    last_persisted_lsn: u64,                 // BlockHeader.lsn analogue
-    region_size_log2: u8,                    // 18 = 256 KiB
-    level: u8,                               // 0 = leaf, ≥1 = inner
-    bset_count: u8,                          // number of bsets present
-    flags: u8,                               // bit 0 = compaction-in-progress (recovery hint)
-    payload_used: u32,                       // bytes consumed by all bsets so far (≤ region_size − 64)
-    min_key: [u8; 16],                       // covered key range (interpreted per-kind)
-    max_key: [u8; 16],                       // ditto
+    pre: BlockPreamble,                      // [0..8]   magic = "MIMB", kind ∈ BtreeKind (§1.3)
+    seq: u64,                                // [8..16]  monotonic per-region; bumped on each rewrite
+    last_persisted_lsn: u64,                 // [16..24] BlockHeader.lsn analogue
+    region_size_log2: u8,                    // [24..25] 18 = 256 KiB
+    level: u8,                               // [25..26] 0 = leaf, ≥1 = inner
+    bset_count: u8,                          // [26..27] number of bsets present
+    flags: u8,                               // [27..28] bit 0 = compaction-in-progress (recovery hint)
+    payload_used: u32,                       // [28..32] bytes consumed by all bsets so far (≤ region_size − 64)
+    min_key: [u8; 16],                       // [32..48] covered key range (interpreted per-kind)
+    max_key: [u8; 16],                       // [48..64] ditto
 }
 ```
 
-Subsequent bytes are a **stream of bsets**, each preceded by:
+`BlockPreamble` is the 8-byte common prefix shared with `BlockHeader` (§1.3), so a generic
+reader can identify any persistent header by its first 8 bytes. The two header shapes
+**diverge after the preamble** because their storage models are genuinely different:
+
+- `BlockHeader` describes a **write-once 4 KiB unit** with a single trailing CRC over the
+  whole block. `payload_length` is bounded by the block size; `flags` carries per-block
+  encryption / continuation bits.
+- `BtreeNodeHeader` describes an **append-only 256 KiB region** that is rewritten only at
+  its header sector (§1.5.2). There is no whole-region CRC — each bset carries its own CRC,
+  so a torn append invalidates only the trailing bset rather than the whole region.
+  `payload_used` is a high-water mark that grows monotonically across header rewrites within
+  one region's lifetime; `flags` carries region-rewrite hints.
+
+Forcing a single header shape onto both would require (a) inventing a "CRC that is not a
+CRC" slot for regions, and (b) overloading `payload_length`/`flags` across two unrelated
+semantic spaces. Keeping them distinct, with the shared preamble making the dispatch
+explicit, is cleaner.
+
+Subsequent bytes after the `BtreeNodeHeader` are a **stream of bsets**, each preceded by:
 
 ```rust
 #[repr(C, packed)]
