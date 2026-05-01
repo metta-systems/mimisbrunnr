@@ -1085,14 +1085,41 @@ unpacked 8 bytes.
 // Logical (unpacked) shape; on-disk uses the §1.5.6 packed encoding.
 struct LeafEntry {                           // variable length on disk
     oid: u64,                                // sort key — packed via BsetKeyFormat
-    count: u16,                              // number of inline assertions
-    spill: u16,                              // bit 15 = is_spill
-    body: union {
-        inline: [PackedAssertion; count],    // count × 16 B (when not spilled)
-        spill_ref: BlockRef,                 // 16 B BlockRef into ForwardOverflow region
+    header: u16,                             // bitfield: see below
+    body: union {                            // discriminated by header.is_spill
+        inline: [PackedAssertion; header & 0x7FFF],   // when is_spill = 0
+        spill_ref: BlockRef,                          // when is_spill = 1; chain via the
+                                                      //  spill region's trailing BlockRef
+                                                      //  slot per §7.2
     },
 }
+```
 
+The 16-bit `header` is a single bitfield carrying both the spill flag and the assertion
+count:
+
+```
+header: u16
+  bit 15       is_spill   1 = body is `spill_ref` (BlockRef into a ForwardOverflow chain)
+                          0 = body is the inline `[PackedAssertion; total]` array
+  bits 0..14   total      object's total assertion count, regardless of is_spill:
+                            is_spill = 0 → total inline assertions (typical 0..8,
+                                           hard cap ~16 before next-mutation spill)
+                            is_spill = 1 → total assertions across the entire spill
+                                           chain (up to 32 K)
+```
+
+**Total cardinality** is therefore just `header & 0x7FFF` — a single masked read, no
+branching on `is_spill`. The query optimiser uses this for intersection planning (§9), where
+the smaller-cardinality side is iterated first. The 15-bit ceiling (32 K) is comfortably
+above the >200-tag pathological case mentioned in §5.2; objects exceeding 32 K assertions
+take the per-object B+ tree escape hatch.
+
+The merge — a single `header` field rather than separate `count` and `spill` — saves 2 bytes
+per `LeafEntry` and removes the "either count or spill_count is zero" implicit invariant of
+the previous two-field form.
+
+```rust
 struct PackedAssertion {                     // 16 bytes (not key-packed; values stay byte-aligned)
     kind: u8,                                // 0=Tag, 1=Attr, 2=Relation
     origin: u8,                              // 0=Direct, 1=Materialized
@@ -1102,12 +1129,13 @@ struct PackedAssertion {                     // 16 bytes (not key-packed; values
 }
 ```
 
-The **key** (`oid`) is packed; the **value** (count, spill, body) stays byte-aligned. Per-leaf
+The **key** (`oid`) is packed; the **value** (`header`, body) stays byte-aligned. Per-leaf
 format descriptor records `oid_base = leaf.min_oid` and `oid_bits = ⌈log₂(leaf.max_oid −
 leaf.min_oid + 1)⌉`.
 
-A leaf with 8 assertions per object (typical) packs ~2 700 entries per bset; with 4 active bsets
-the leaf carries up to ~10 000 entries before full compaction.
+A leaf with 8 assertions per object (typical) packs ~2 740 entries per bset (per-entry
+≈ 2.5 B packed key + 2 B header + 128 B inline body = ~133 B); with 4 active bsets the leaf
+carries up to ~10 000 entries before full compaction.
 
 ### 7.2 Spill
 
