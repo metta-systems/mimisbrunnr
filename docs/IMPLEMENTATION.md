@@ -1215,9 +1215,13 @@ The **key** (`oid`) is packed; the **value** (`header`, body) stays byte-aligned
 format descriptor records `oid_base = leaf.min_oid` and `oid_bits = ⌈log₂(leaf.max_oid −
 leaf.min_oid + 1)⌉`.
 
-A leaf with 8 assertions per object (typical) packs ~2 740 entries per sorted run (per-entry
-≈ 2.5 B packed key + 2 B header + 128 B inline body = ~133 B); with 4 active sorted runs the leaf
-carries up to ~10 000 entries before full compaction.
+At "8 assertions per object" (the §7.2 inline-spill threshold; per-entry ≈ 2.5 B packed key + 2 B
+header + 128 B inline body = ~133 B), a leaf packs ~1 970 entries total. Sorted runs share the
+region's payload bytes (§1.5.2 appends them into the same 256 KiB region), so adding sorted runs
+does not multiply capacity — each new run consumes 76 B of overhead (`SortedRunHeader` +
+`SortedRunKeyFormat`) and slightly reduces the entry budget. With 4 active sorted runs the leaf
+still carries ~1 968 entries before §1.5.4 triggers full compaction. Smaller objects pack denser:
+4 assertions per entry → ~3 800 entries per leaf.
 
 ### 7.2 Spill
 

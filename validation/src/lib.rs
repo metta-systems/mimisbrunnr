@@ -645,3 +645,70 @@ const _: () = assert!(LOCATION_TABLE_PAD == 248);
 // =====================================================================
 const _: () = assert!(OBJECT_TABLE_LEAF_RECORDS * INNER_ENTRIES > 33_000_000); // ≥33 M at depth 2
 const _: () = assert!(LOCATION_TABLE_LEAF_RECORDS * INNER_ENTRIES > 89_000_000); // ≥89 M at depth 2
+
+// =====================================================================
+// §7.1 Forward-index leaf packing — validate the entries-per-run and
+// entries-per-leaf claims against region budget arithmetic.
+//
+// Per-region budget (§1.5.1, §1.5.6):
+//   region:                      256 KiB   = 262 144 B
+//   - BtreeNodeHeader:                 64 B
+//   - per-run SortedRunHeader:         32 B
+//   - per-run SortedRunKeyFormat (3 fields, §1.5.6: 8 + 3 × FieldFormat):
+//                                      8 + 3 × 12 = 44 B
+//
+// Per-LeafEntry cost (inline body, no spill; §7.1 prose):
+//   - packed oid key:    ~2.5 B average; 3 B integer ceiling for const math
+//   - LeafEntry.header:                 2 B
+//   - body: assertions × PackedAssertion (16 B each)
+// =====================================================================
+pub const FWD_RUN_KEY_FORMAT_3FIELD: usize = 8 + 3 * size_of::<FieldFormat>();
+const _: () = assert!(FWD_RUN_KEY_FORMAT_3FIELD == 44);
+
+pub const FWD_RUN_OVERHEAD: usize =
+    size_of::<SortedRunHeader>() + FWD_RUN_KEY_FORMAT_3FIELD;
+const _: () = assert!(FWD_RUN_OVERHEAD == 76);
+
+pub const FWD_ENTRY_KEY_BYTES_CEIL: usize = 3; // ⌈2.5⌉
+pub const FWD_ENTRY_HEADER_BYTES:  usize = 2;
+
+pub const fn fwd_entry_bytes(assertions: usize) -> usize {
+    FWD_ENTRY_KEY_BYTES_CEIL
+        + FWD_ENTRY_HEADER_BYTES
+        + assertions * size_of::<PackedAssertion>()
+}
+// At 8 assertions: 3 + 2 + 128 = 133 B (matches the §7.1 prose "~133 B").
+const _: () = assert!(fwd_entry_bytes(8) == 133);
+
+pub const fn fwd_payload_n_runs(runs: usize) -> usize {
+    REGION - size_of::<BtreeNodeHeader>() - runs * FWD_RUN_OVERHEAD
+}
+// One sorted run alone has 262 004 B of entry payload available.
+const _: () = assert!(fwd_payload_n_runs(1) == 262_004);
+// Four sorted runs share 261 776 B (the §1.5.4 trigger is sorted_run_count > 4).
+const _: () = assert!(fwd_payload_n_runs(4) == 261_776);
+
+// Sorted runs are appended into the *same* region (§1.5.2) — they share its
+// payload bytes. Adding a run does not multiply capacity; it slightly reduces
+// it (by one run's 76 B header + key-format descriptor). The total entry
+// count a leaf can hold is therefore bounded by (region − header − n×overhead)
+// divided by entry size, not by per-run × n.
+pub const fn fwd_total_entries(runs: usize, assertions: usize) -> usize {
+    fwd_payload_n_runs(runs) / fwd_entry_bytes(assertions)
+}
+
+// At "8 assertions per object (typical)" — matching §7.2's spill threshold —
+// a single-run leaf holds ~1 970 entries (NOT the 2 740 the prose previously
+// claimed). The original 2 740/run figure would require ~5.6 assertions/entry.
+const _: () = assert!(fwd_total_entries(1, 8) == 1_969);
+
+// At the §1.5.4 compaction trigger (sorted_run_count > 4) the leaf still
+// holds ~1 968 entries TOTAL — adding sorted runs eats overhead, not gains
+// capacity. The original prose's ~10 000-entry "before full compaction"
+// figure assumed runs accumulated capacity additively, which is incorrect.
+const _: () = assert!(fwd_total_entries(4, 8) == 1_968);
+
+// Lower-assertion regimes (smaller objects pack more densely; monotonic):
+const _: () = assert!(fwd_total_entries(1, 4) == 3_797);
+const _: () = assert!(fwd_total_entries(4, 4) == 3_793);
+const _: () = assert!(fwd_total_entries(1, 4) > fwd_total_entries(1, 8));
