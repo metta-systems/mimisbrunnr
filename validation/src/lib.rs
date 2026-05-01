@@ -281,12 +281,16 @@ const _: () = assert!(size_of::<ObjectRecord>() == 128);
 
 // =====================================================================
 // §6.1 ObjectLocation — 48 B, ReplicaRef — 8 B
+// ReplicaRef is bucket-relative, mirroring BackpointerKey's layout
+// (§6.2) so move/scrub/resilver paths share field-level conversions.
+// Per-disk reach: 2^32 buckets × bucket_size = 4 PiB (1 MiB buckets)
+// up to 16 PiB (4 MiB buckets).
 // =====================================================================
 #[repr(C)]
 pub struct ReplicaRef {
     pub disk_id: u16,
-    pub _pad: u16,
-    pub offset_blocks: u32,
+    pub sector_offset: u16,
+    pub bucket_no: u32,
 }
 const _: () = assert!(size_of::<ReplicaRef>() == 8);
 

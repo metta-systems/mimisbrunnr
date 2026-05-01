@@ -949,11 +949,26 @@ struct ObjectLocation {                      // 48 bytes
 }
 
 #[repr(C)]
-struct ReplicaRef {                          // 8 bytes (DESIGN's 7-byte form padded for alignment)
-    disk_id: u16,
-    _pad: u16,
-    offset_blocks: u32,                      // 4 KiB units → up to 16 TiB per disk; widen later
+struct ReplicaRef {                          // 8 bytes
+    disk_id: u16,                            // [0..2]
+    sector_offset: u16,                      // [2..4]   4 KiB sector within the bucket
+    bucket_no: u32,                          // [4..8]   bucket within the disk
 }
+```
+
+`ReplicaRef` is **bucket-relative**, mirroring the layout of `BackpointerKey` (§6.2) so that
+the move path (§17.5), scrub, resilver, and copygc can share field-level conversions instead
+of arithmetic on absolute block numbers. The reachable extent space per disk is
+`2^32 buckets × bucket_size`: 4 PiB at the default 1 MiB bucket, 16 PiB at the maximum 4 MiB
+bucket — well past current and foreseeable HDD capacity. `sector_offset: u16` admits up to
+64 K sectors per bucket, which covers any `bucket_size ≤ 256 MiB` (the format caps bucket
+size at 4 MiB / 1024 sectors).
+
+Conversion to/from absolute `block_no` (when interfacing with `BlockRef`):
+
+```
+bucket_no     = block_no >> (bucket_size_log2 - 12)
+sector_offset = block_no & ((1 << (bucket_size_log2 - 12)) - 1)
 ```
 
 For chunked objects (`flags & 1`), three of the inline fields are reinterpreted:
