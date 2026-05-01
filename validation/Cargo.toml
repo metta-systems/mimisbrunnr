@@ -1,0 +1,11 @@
+[package]
+name = "mimir_layout_check"
+version = "0.0.1"
+edition = "2024"
+
+[lib]
+path = "src/lib.rs"
+
+# Keep this crate out of the parent workspace; it is a standalone
+# const-assertion harness verifying docs/IMPLEMENTATION.md sizings.
+[workspace]

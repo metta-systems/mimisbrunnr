@@ -49,14 +49,15 @@ struct BlockHeader {              // 32 bytes
     magic: [u8; 4],               // "MIMR"
     kind: u16,                    // BlockKind discriminator
     format_version: u16,          // structure-specific version
-    payload_length: u32,          // bytes following the header (excl. trailing CRC)
+    payload_length: u32,          // bytes following the header (excl. trailing CRC).
+                                  // u32 (not u16) leaves headroom for >64 KiB blocks
+                                  // in a future format revision; values for the current
+                                  // 4 KiB block are < 4096.
     generation: u64,              // monotonic per-block generation, for COW
     lsn: u64,                     // WAL LSN that produced this block
     flags: u32,                   // bit 0 = encrypted, bit 1 = continuation
 }
 ```
-
-TODO: payload_length cannot be u32, since block is at most 4Kb?
 
 A block is `BlockHeader | payload | u32 CRC32C(BlockHeader || payload)` — total = 4096 bytes by
 construction. CRC is computed with the CRC slot itself zeroed.
@@ -89,6 +90,7 @@ enum BtreeKind {
     TagDirectory,       // §8.1 tag directory B+ tree (snapshot-aware)
     Range,              // §9.2 range index B+ tree (snapshot-aware)
     ChunkIndex,         // §9.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
+    KvDirectory,        // §9.1 extendible-hash directory spillover (positional)
     ValueSpill,         // value-hash → CBOR(Value); content-addressed
     Ontology,           // §10.1 ontology / dag B+ tree (snapshot-aware)
     PathContext,        // §10.3 path context B+ tree (snapshot-aware)
@@ -505,7 +507,7 @@ case the entry is split into `Continuation` frames (flag bit 1 in `BlockHeader.f
 
 ```rust
 #[repr(C, packed)]
-struct WalEntryHeader {                      // 32 bytes
+struct WalEntryHeader {                      // 40 bytes
     magic: u32,                              // "WALR"
     op_kind: u8,                             // WalOpKind
     format_version: u8,
@@ -680,16 +682,17 @@ nodes (§1.5) whose depth grows with the populated id space.
 
 ### Node capacities
 
-Each node is a 256 KiB region (§1.5) with a 64-byte `BtreeNodeHeader` and per-bset framing.
-For the radix variants, the header is followed by a single positional payload (no internal bsets
-— positional updates are journalled via §3.4 and merged on flush):
+Each node is a 256 KiB region (§1.5) with a 64-byte `BtreeNodeHeader`. For the radix variants
+there are no internal bsets — positional updates are journalled via §3.4 and merged on flush.
 
-- **Leaf node** (`BtreeKind::ObjectTable`, level 0): up to **2044** × `ObjectRecord` (128 B)
-  packed as a positional array. With a 64 B header + 32 B leaf metadata trailer (occupancy
-  bitmap, generation, reserved): 256 KiB − 96 B = 261 952 B / 128 B = 2046, rounded down to 2044
-  for alignment headroom.
-- **Inner node** (level ≥ 1): up to **16 380** × `BlockRef` (16 B) = 262 080 B; minus the 64 B
-  header that's 16 376 effective entries, rounded to 16 380 with a small trailing slot table.
+- **Leaf node** (`BtreeKind::ObjectTable`, level 0): **2044** × `ObjectRecord` (128 B). Layout:
+  64 B header + 256 B occupancy bitmap (one bit per slot, ≥ 2044 bits) + 32 B trailer
+  (generation, version, reserved) + 2044 × 128 B = **261 984 B used**, leaving 160 B trailing
+  pad inside the 256 KiB region. The bitmap distinguishes "never allocated" from "cleared"
+  slots (DESIGN §7.3).
+- **Inner node** (level ≥ 1): **16 380** × `BlockRef` (16 B) = 262 080 B = exactly 256 KiB −
+  64 B header. No bitmap and no trailer: empty child slots are denoted by the
+  `BlockRef.generation == 0` sentinel, which never matches a live bucket generation.
 
 ### Tree depth and capacity
 
@@ -697,7 +700,7 @@ For the radix variants, the header is followed by a single positional payload (n
 | --------------------------- | ---------------------------------------- |
 | 0 inner (leaf only)         | 2 044                                    |
 | 1 inner                     | 2 044 × 16 380 ≈ 33 M                    |
-| 2 inner                     | 2 044 × 16 380² ≈ 549 G                  |
+| 2 inner                     | 2 044 × 16 380² ≈ 548 G                  |
 
 A 10 M-object pool sits in a **single-inner-level tree** (root inner + leaves; depth 2). The
 full 48-bit local-id space is reachable at depth 3 (≈ 9 P objects). The 4-bit `level` field in
@@ -824,18 +827,19 @@ Two complementary structures translate between logical objects and physical exte
 Same COW radix-tree machinery as the object table (§5), parameterised for 48-byte
 `ObjectLocation` records and using the same large-node format (§1.5):
 
-- **Leaf node** (`BtreeKind::LocationTable`, level 0): 256 KiB region holds 5 458 ×
-  `ObjectLocation` (48 B) = 261 984 B, with a 64 B `BtreeNodeHeader` and a small trailer.
-  → **5 458 records per leaf.**
-- **Inner node**: identical to §5's inner — 16 380 × `BlockRef`.
+- **Leaf node** (`BtreeKind::LocationTable`, level 0): **5440** × `ObjectLocation` (48 B).
+  Layout: 64 B header + 680 B occupancy bitmap (5 440 bits exactly, no wastage) + 32 B trailer
+  + 5 440 × 48 B = **261 896 B used**, leaving 248 B trailing pad inside the 256 KiB region.
+- **Inner node**: identical to §5's inner — 16 380 × `BlockRef`, empty slots sentineled by
+  `BlockRef.generation == 0`.
 
 Capacity:
 
 | Depth | Max objects                              |
 | ----- | ---------------------------------------- |
-| 0     | 5 458                                    |
-| 1     | 5 458 × 16 380 ≈ 89 M                    |
-| 2     | 5 458 × 16 380² ≈ 1.46 T                 |
+| 0     | 5 440                                    |
+| 1     | 5 440 × 16 380 ≈ 89 M                    |
+| 2     | 5 440 × 16 380² ≈ 1.46 T                 |
 
 A 10 M-object pool fits in **depth 1** (single inner node + leaves). The 48-bit local id space
 is reachable at depth 2.
@@ -1030,24 +1034,35 @@ The tag index is the heart of query performance. Its on-disk form must:
 
 ### 8.1 TagIndexDirectory
 
-A **B+ tree of large nodes** (§1.5) keyed by `TagId: u32`. Leaf entries are 32 B:
+A **B+ tree of large nodes** (§1.5) keyed by `TagId: u32`. Leaf entries are 40 B, with fields
+reordered so every multi-byte field sits at its natural alignment (8-byte struct alignment;
+no `#[repr(packed)]` — the entry is read repeatedly during query bitmap algebra and unaligned
+loads on `last_modify_lsn` / `store_root` would be a measurable overhead):
 
 ```
-TagIndexLeafEntry {                          // 32 bytes
-    tag_id: u32,                             // sort key
-    store_kind: u8,                          // Simple / Ordered / Ranked
-    _pad: u8,
-    cardinality: u32,                        // for fast snapshot stats
-    last_modify_lsn: u64,
-    generation: u32,                         // bumped on bitmap rewrite
-    store_root: BlockRef,                    // 16 B → §8.2 / §8.3
+#[repr(C)]
+TagIndexLeafEntry {                          // 40 bytes
+    last_modify_lsn: u64,                    //  8  @  0   (8-aligned)
+    store_root:      BlockRef,               // 16  @  8   §8.2 / §8.3 — contains a u64 generation
+    tag_id:          u32,                    //  4  @ 24   sort key
+    cardinality:     u32,                    //  4  @ 28   for fast query-planner stats
+    generation:      u32,                    //  4  @ 32   bumped on bitmap rewrite
+    store_kind:      u8,                     //  1  @ 36   Simple / Ordered / Ranked
+    _pad:            [u8; 3],                //  3  @ 37
+                                             // 40 total
 }
 ```
 
-With key packing (§1.5.6) the `tag_id` typically packs to 2–3 bytes per leaf bset (sparse but
-clustered ids). A 256 KiB leaf holds ~9 000 entries per bset; the full ontology of 5 000 tags
-fits in **a single leaf** (depth 0). For pools with hundreds of thousands of tags the tree
-extends to depth 1 (~150 M-tag capacity).
+The hot pair `(tag_id, store_root)` lands on the same 32-byte half-cache-line: a query that
+loads a leaf entry to dispatch a bitmap fetch gets `tag_id`, `cardinality`, `generation`, and
+`store_root` all in a single 64-byte fetch.
+
+On-disk, leaf bsets use the §1.5.6 packed-key encoding: `tag_id` typically packs to 2–3 bytes
+per leaf (sparse but clustered ids); the value's 32 bytes after `tag_id` stay byte-aligned.
+Per-key on-disk cost is ~34 B. A 256 KiB leaf bset (262 144 B − 64 B node header − 32 B bset
+header − 44 B key-format descriptor = 262 004 B payload) holds **~7 700 entries**; the full
+ontology of 5 000 tags fits in **a single leaf** (depth 0). For pools with hundreds of
+thousands of tags the tree extends to depth 1 (~125 M-tag capacity).
 
 `(cardinality, last_modify_lsn, generation)` enables fast snapshot diffing without dereferencing
 the bitmap — the directory's bset stream alone tells a peer which tags changed and how.
@@ -1107,20 +1122,33 @@ the one structure that does **not** use the §1.5 large-node B+ tree format — 
 lookups benefit more from hash-bucket addressing.
 
 ```
-KvDirectory (4 KiB block, doubles when global depth grows):
-   header (BlockHeader, kind = KvHashBucket with directory flag in BlockHeader.flags)
-   global_depth: u8
-   _pad: u8
-   bucket_count: u16
-   entries: [BlockRef; 512]    // local-depth tagged buckets
+KvDirectory (single 4 KiB block, addressed by RootPointer.kv_index_root):
+   header (BlockHeader, kind = KvHashBucket with directory flag in BlockHeader.flags)  // 32 B
+   global_depth: u8                                                                    //  1 B
+   _pad0: [u8; 3]                                                                      //  3 B
+   bucket_count: u32                  // = 1 << global_depth                           //  4 B
+   entries: [BlockRef; 252]           // local-depth tagged buckets                    // 4032 B
+   spillover_root: BlockRef           // 0 unless global_depth ≥ 8 (see below)         //  16 B
+   _pad_tail: [u8; 4]                                                                  //  4 B
+   trailing CRC32C                                                                     //  4 B
+                                                                                        // = 4096 B
 
 KvBucket (4 KiB):
-   header (BlockHeader, kind = KvHashBucket)
-   local_depth: u8
-   entry_count: u16
-   _pad: u8
-   entries: [{ tag_id: u32, value_hash: u64, bitmap_ref: BlockRef }; ~120]
+   header (BlockHeader, kind = KvHashBucket)                                           // 32 B
+   local_depth: u8                                                                     //  1 B
+   entry_count: u16                                                                    //  2 B
+   _pad: u8                                                                            //  1 B
+   entries: [{ tag_id: u32, value_hash: u64, bitmap_ref: BlockRef }; 144]              // 4032 B
+   _pad_tail: [u8; 24]                                                                 // 24 B
+   trailing CRC32C                                                                     //  4 B
+                                                                                        // = 4096 B
 ```
+
+The inline directory holds 252 entries — sufficient for `global_depth ≤ 7` (i.e. up to 128
+hash buckets). At `global_depth ≥ 8`, `spillover_root` points at a §1.5 large-node positional
+region (`BtreeKind::KvDirectory`, level 0) holding the full `2^global_depth`-sized BlockRef
+array; the inline `entries` array is then ignored. Each 256 KiB spillover region holds 16 380
+entries, supporting `global_depth` up to 13 (8 192 buckets) before chaining to a deeper region.
 
 The bitmap referenced by each entry is a `TagBitmap` (§8.2), reused via the same machinery.
 
