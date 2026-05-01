@@ -315,6 +315,19 @@ Keys are laid out back-to-back with no inter-key padding. Binary search within a
 packed keys **directly** without decoding — base subtraction is strictly monotonic, so packed
 ordering matches unpacked ordering. Full decoding happens only at the lookup boundary.
 
+**`common_value_prefix` and variable-size values.** The elision applies only to bytes at the
+**leading offsets** of the value that are bit-for-bit identical across **every entry in the
+bset**. For fixed-shape values (e.g. `TagIndexLeafEntry`'s 32-byte value following `tag_id`)
+this is the natural common prefix — typically a few bytes of `store_kind` plus zeroed
+padding when most entries in a leaf share the same store kind. For **variable-shape values**
+(notably §7.1's `LeafEntry`, where the body is either an inline assertion array sized by
+`header & 0x7FFF` or a 16 B `BlockRef` for the spill case), the common prefix can only cover
+bytes that exist *and* are identical in every variant — in practice the 2-byte `header`'s
+discriminator bits (`is_spill`) are not shared, so `common_value_prefix = 0` is the typical
+setting for `LeafEntry`. Format selection (§1.5.4) computes the prefix during full
+compaction by scanning the merged bset's values and counting leading bytes shared by every
+entry; if the bset mixes shapes, the count is bounded by the shortest value.
+
 **Format selection.** Full compaction (§1.5.4) computes an optimal format for the merged bset
 by scanning the key distribution: `max − min` for each field gives the minimum bit width.
 Append-on-flush keeps the existing format. If a new key's field overflows the format's bit
@@ -1925,9 +1938,14 @@ A second **§1.5 B+ tree** per disk (`DiskDescriptorOnDisk.freespace_root`), key
 `(fragmentation_band, bucket_no)`:
 
 ```
-fragmentation_band: u8     // 0 = empty (full free), 1..255 = band of (dirty_sectors / max_sectors)
+fragmentation_band: u8     // 0 = empty (full free); 1..255 = ⌈255 × dirty_sectors / sectors_per_bucket⌉
 bucket_no: u32
 ```
+
+where `sectors_per_bucket = 1 << (Superblock.bucket_size_log2 - 12)` (the count of 4 KiB
+sectors in one bucket — 256 for the default 1 MiB bucket, 1024 for the 4 MiB maximum).
+The band is `0` exactly when `dirty_sectors == 0`; otherwise it scales linearly into 1..=255
+so that fully-occupied buckets land at band 255 and barely-occupied ones at band 1.
 
 Used by:
 
