@@ -198,6 +198,27 @@ pub struct Superblock {
 const _: () = assert!(size_of::<Superblock>() == 4096);
 
 // =====================================================================
+// §3.1 WalHeader — 4096 B (one block; A/B-alternated using
+// BlockHeader.generation, no separate seq field)
+// =====================================================================
+#[repr(C, packed)]
+pub struct WalHeader {
+    pub header: BlockHeader,            //   32
+    pub next_lsn: u64,                  //    8
+    pub write_cursor: u64,              //    8
+    pub read_cursor: u64,               //    8
+    pub used_bytes: u64,                //    8
+    pub last_checkpoint_lsn: u64,       //    8
+    pub last_checkpoint_offset: u64,    //    8
+    pub segment_size: u32,              //    4
+    pub _pad: u32,                      //    4
+    pub encryption_keyid: [u8; 16],     //   16
+    pub _reserved: [u8; 3988],          // 3988
+    pub trailing_crc: u32,              //    4
+}
+const _: () = assert!(size_of::<WalHeader>() == 4096);
+
+// =====================================================================
 // §3.2 WalEntryHeader — 40 B (was claimed 32 B)
 // =====================================================================
 #[repr(C, packed)]
@@ -381,6 +402,21 @@ pub struct ChunkIndexLeafEntry {
     pub blob: BlockRef,
 }
 const _: () = assert!(size_of::<ChunkIndexLeafEntry>() == 56);
+
+// =====================================================================
+// §10.3 PathContextHeader — 48 B
+// =====================================================================
+#[repr(C)]
+pub struct PathContextHeader {
+    pub name_offset: u32,
+    pub name_len: u16,
+    pub flags: u16,
+    pub manifest_root: BlockRef,
+    pub entry_count: u64,
+    pub last_refresh_ns: i64,
+    pub last_modify_lsn: u64,
+}
+const _: () = assert!(size_of::<PathContextHeader>() == 48);
 
 // =====================================================================
 // §10.4 DiskDescriptorOnDisk — 64 B

@@ -518,22 +518,26 @@ Internal layout is segmented to allow parallel truncation and replay.
 
 ```rust
 #[repr(C, packed)]
-struct WalHeader {
-    header: BlockHeader,                     // kind = WalSegment, format_version = 1
-    next_lsn: u64,
-    write_cursor: u64,                       // byte offset within WAL ring
-    read_cursor: u64,                        // oldest entry not yet checkpointed
-    used_bytes: u64,
-    last_checkpoint_lsn: u64,
-    last_checkpoint_offset: u64,             // block_no of newest Checkpoint block
-    segment_size: u32,                       // typically 1 MiB
-    encryption_keyid: [u8; 16],
-    _reserved: [u8; ...],
+struct WalHeader {                           // 4096 bytes (one block)
+    header: BlockHeader,                     // [0..32]   kind = WalSegment, format_version = 1
+    next_lsn: u64,                           // [32..40]
+    write_cursor: u64,                       // [40..48]  byte offset within WAL ring
+    read_cursor: u64,                        // [48..56]  oldest entry not yet checkpointed
+    used_bytes: u64,                         // [56..64]
+    last_checkpoint_lsn: u64,                // [64..72]
+    last_checkpoint_offset: u64,             // [72..80]  block_no of newest Checkpoint block
+    segment_size: u32,                       // [80..84]  typically 1 MiB
+    _pad: u32,                               // [84..88]  align to u64
+    encryption_keyid: [u8; 16],              // [88..104]
+    _reserved: [u8; 3988],                   // [104..4092]
+    // trailing CRC32C at [4092..4096] inside BlockHeader's frame
 }
 ```
 
-The header itself is updated using the same A/B alternation as the superblock root — the WAL
-header lives in two adjacent blocks and the active one is selected by `(seq, crc)`.
+The header is updated using the same A/B alternation as the superblock root — the WAL header
+lives in two adjacent blocks; the active one is the copy with the larger
+`BlockHeader.generation` whose CRC validates. (The `BlockHeader.generation` field is the same
+monotonic counter that drives every COW block update; no separate `seq` is needed.)
 
 ### 3.2 WAL entry
 
@@ -1315,10 +1319,27 @@ overhead is negligible.
 
 ```
 PathContextRoot:
-  §1.5 B+ tree, key = name_hash → PathContextHeader { name_offset, manifest_root, _stats }
+  §1.5 B+ tree, key = name_hash → PathContextHeader (48 bytes)
   Manifest is a §1.5 B+ tree keyed by path-string-hash → ProjectedEntry (96 bytes inline +
   spill for Symlink targets and long paths).
 ```
+
+```rust
+#[repr(C)]
+struct PathContextHeader {                   // 48 bytes
+    name_offset: u32,                        //  [0..4]   into the per-context string heap
+    name_len: u16,                           //  [4..6]
+    flags: u16,                              //  [6..8]   bit 0 = read-only, bit 1 = ephemeral
+    manifest_root: BlockRef,                 //  [8..24]  root of the §1.5 manifest tree
+    entry_count: u64,                        // [24..32] total ProjectedEntries (manifest size hint)
+    last_refresh_ns: i64,                    // [32..40] last full re-projection timestamp
+    last_modify_lsn: u64,                    // [40..48] for snapshot diffing
+}
+```
+
+`entry_count`, `last_refresh_ns`, and `last_modify_lsn` are the per-context "stats" — they
+let `mimir context list` answer size and freshness questions without dereferencing
+`manifest_root`.
 
 Per-object reverse mappings (which object → which paths in which contexts) live in the forward
 index as a special assertion kind, so listing all paths of an object is one forward-index hit.
@@ -2032,6 +2053,14 @@ snapshot overhead scales with logical changes since each snapshot's parent.
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
 | Snapshot key overhead  | ~50 MiB   | Per-snapshot unique keys across all snapshot-aware btrees |
 | **Total metadata**     | **~2.5 GiB** | Replicated to every node                       |
+
+**Transient overhead** (not in steady state — fills during specific events, drains afterwards):
+
+| Structure              | Size       | Trigger                                           |
+| ---------------------- | ---------- | ------------------------------------------------- |
+| Reconcile work btrees  | < 1 MiB idle, ~480 MiB during disk evacuation / cluster resilver | §17.10 |
+| `ReconcileScan` cursors| < 1 MiB    | Per active scan; ~hundreds of bytes each          |
+| `SnapshotCleanup` work | < 1 MiB    | Bounded by the count of snapshot-aware btrees, not key count (§11.5) |
 
 This is the "few hundred megabytes" of the design intent at moderate scale, and at the upper end
 of practical scale still well under 1% of pool storage.
