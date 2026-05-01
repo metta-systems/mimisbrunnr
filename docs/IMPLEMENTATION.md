@@ -939,13 +939,13 @@ amortised across pending mutations.
 ```rust
 #[repr(C, align(8))]
 struct ObjectLocation {                      // 48 bytes
-    disk_id: u16,                            //  [0..2]
-    replica_count: u8,                       //  [2..3]
-    flags: u8,                               //  [3..4]    bit 0 = chunked, bit 1 = remote-only
-    _pad0: u32,                              //  [4..8]    explicit alignment to u64
-    extent_offset: u64,                      //  [8..16]
-    extent_length: u64,                      // [16..24]
-    replicas: [ReplicaRef; 3],               // [24..48]   3 × 8 bytes
+    flags: u8,                               //  [0..1]    bit 0 = chunked, bit 1 = remote-only
+    replica_count: u8,                       //  [1..2]    1..=4; total physical copies
+    _pad: [u8; 6],                           //  [2..8]    align to u64
+    extent_length: u64,                      //  [8..16]   non-chunked: extent length in bytes
+                                             //           chunked:     plaintext logical length
+    replicas: [ReplicaRef; 4],               // [16..48]   4 × 8 B; slots [replica_count..4]
+                                             //           are zeroed and ignored
 }
 
 #[repr(C)]
@@ -956,13 +956,32 @@ struct ReplicaRef {                          // 8 bytes
 }
 ```
 
+**Symmetric replicas.** Every physical copy of an extent lives in `replicas[i]` for some
+`i ∈ [0, replica_count)`; there is no distinguished "primary" location. `replicas[0]` is the
+read-preferred copy by convention, but the others are equally authoritative. Empty inline
+slots (when `replica_count < 4`) are zeroed and ignored.
+
+**`replica_count` is the ground-truth cardinality.** It records the **total number of
+physical copies** of the extent, all of which are visible inline. This makes consistency
+checking exact: a scrub or verifier can enumerate every replica of an oid by reading
+`replicas[0..replica_count]`, look up each replica's backpointer at its `(disk_id,
+bucket_no, sector_offset)`, and assert that exactly `replica_count` backpointers match the
+oid as their `owner_key`. Any mismatch — extra backpointers (orphan replicas) or missing
+backpointers (lost replicas) — is a corruption signal.
+
+**Cap of 4 inline.** Since the consistency invariant requires every replica's address to be
+recoverable from `ObjectLocation` alone (the backpointer btree is keyed by physical
+location, not by oid — there is no efficient "find every backpointer for oid X" path), the
+maximum replication factor representable here is bounded by the inline array size: **4**.
+Workloads that need more durability than 4-way replication use erasure coding (§17,
+`WorkKind::EcEncode`), which is a separate code path and does not share this struct.
+
 `ReplicaRef` is **bucket-relative**, mirroring the layout of `BackpointerKey` (§6.2) so that
 the move path (§17.5), scrub, resilver, and copygc can share field-level conversions instead
 of arithmetic on absolute block numbers. The reachable extent space per disk is
 `2^32 buckets × bucket_size`: 4 PiB at the default 1 MiB bucket, 16 PiB at the maximum 4 MiB
-bucket — well past current and foreseeable HDD capacity. `sector_offset: u16` admits up to
-64 K sectors per bucket, which covers any `bucket_size ≤ 256 MiB` (the format caps bucket
-size at 4 MiB / 1024 sectors).
+bucket. `sector_offset: u16` admits up to 64 K sectors per bucket, which covers any
+`bucket_size ≤ 256 MiB` (the format caps bucket size at 4 MiB / 1024 sectors).
 
 Conversion to/from absolute `block_no` (when interfacing with `BlockRef`):
 
@@ -971,19 +990,19 @@ bucket_no     = block_no >> (bucket_size_log2 - 12)
 sector_offset = block_no & ((1 << (bucket_size_log2 - 12)) - 1)
 ```
 
-For chunked objects (`flags & 1`), three of the inline fields are reinterpreted:
+**Chunked objects** (`flags & 1`) reinterpret the meaning of what `replicas[]` points at,
+not the layout:
 
-- `extent_offset` is the `block_no` of the head `ChunkList` region (a §1.5 positional region;
-  see §9.3) instead of a physical extent offset.
+- `replicas[0..replica_count]` describe replicas of the head **`ChunkList` region** (a §1.5
+  positional region; see §9.3), not the user data. The chunks themselves are
+  content-addressed and replicated independently via the chunk index — their replication
+  factor is governed by chunk-level placement, not by `ObjectLocation.replica_count`.
 - `extent_length` is the **plaintext logical length** of the object (the sum of all chunk
-  plaintext lengths). Readers use it to size buffers and to bound chunk iteration; it is
-  authoritative for object size and matches `ObjectRecord.blob_length`.
-- `replicas[]` describes replicas of the **`ChunkList` region**, not of the data itself —
-  the chunks themselves are content-addressed and replicated independently via the chunk
-  index (§9.3). `disk_id` likewise identifies the `ChunkList`'s home disk.
+  plaintext lengths), used to size read buffers and bound chunk iteration; it matches
+  `ObjectRecord.blob_length`.
 
-This keeps `ObjectLocation` a single fixed-size record regardless of chunked/non-chunked,
-preserving the radix-leaf positional layout.
+This keeps `ObjectLocation` a single fixed-size 48 B record regardless of chunked /
+non-chunked, preserving the radix-leaf positional layout.
 
 ### 6.2 Backpointers (reverse mapping)
 

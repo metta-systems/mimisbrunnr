@@ -294,15 +294,17 @@ pub struct ReplicaRef {
 }
 const _: () = assert!(size_of::<ReplicaRef>() == 8);
 
+// Symmetric replicas: every physical copy lives in replicas[0..replica_count].
+// No distinguished "primary"; replicas[0] is read-preferred by convention.
+// replica_count is ground-truth cardinality (≤ 4); enumerating it from
+// backpointers must yield exactly replica_count matches.
 #[repr(C, align(8))]
 pub struct ObjectLocation {
-    pub disk_id: u16,
-    pub replica_count: u8,
     pub flags: u8,
-    pub _pad0: u32,
-    pub extent_offset: u64,
+    pub replica_count: u8,
+    pub _pad: [u8; 6],
     pub extent_length: u64,
-    pub replicas: [ReplicaRef; 3],
+    pub replicas: [ReplicaRef; 4],
 }
 const _: () = assert!(size_of::<ObjectLocation>() == 48);
 
