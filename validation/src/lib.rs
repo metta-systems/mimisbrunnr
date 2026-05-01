@@ -19,9 +19,9 @@ pub const BLOCK_FLAG_CONTINUATION: u32 = 1 << 1;
 // BtreeNodeHeader.flags
 pub const BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS: u8 = 1 << 0;
 
-// BsetHeader.flags
-pub const BSET_FLAG_PACKED_KEYS: u32 = 1 << 0;
-pub const BSET_FLAG_ENCRYPTED:   u32 = 1 << 1;
+// SortedRunHeader.flags
+pub const SORTED_RUN_FLAG_PACKED_KEYS: u32 = 1 << 0;
+pub const SORTED_RUN_FLAG_ENCRYPTED:   u32 = 1 << 1;
 
 // FieldFormat.flags
 pub const FIELD_FORMAT_FLAG_SIGNED:    u8 = 1 << 0;
@@ -107,7 +107,7 @@ pub struct BtreeNodeHeader {
     pub last_persisted_lsn: u64,
     pub region_size_log2: u8,
     pub level: u8,
-    pub bset_count: u8,
+    pub sorted_run_count: u8,
     pub flags: u8,
     pub payload_used: u32,
     pub min_key: [u8; 16],
@@ -119,10 +119,12 @@ const _: () = assert!(std::mem::offset_of!(BlockHeader, pre) == 0);
 const _: () = assert!(std::mem::offset_of!(BtreeNodeHeader, pre) == 0);
 
 // =====================================================================
-// §1.5.1 BsetHeader — 32 B
+// §1.5.1 SortedRunHeader — 32 B
+// (bcachefs source calls this `bset` — sorted run = bset = single sorted
+// append-only commit unit within a btree node. On-disk magic still "BSET".)
 // =====================================================================
 #[repr(C, packed)]
-pub struct BsetHeader {
+pub struct SortedRunHeader {
     pub magic: u32,
     pub seq: u32,
     pub journal_seq: u64,
@@ -131,10 +133,10 @@ pub struct BsetHeader {
     pub flags: u32,
     pub crc: u32,
 }
-const _: () = assert!(size_of::<BsetHeader>() == 32);
+const _: () = assert!(size_of::<SortedRunHeader>() == 32);
 
 // =====================================================================
-// §1.5.6 BsetKeyFormat / FieldFormat
+// §1.5.6 SortedRunKeyFormat / FieldFormat
 // =====================================================================
 #[repr(C, packed)]
 pub struct FieldFormat {
@@ -145,7 +147,7 @@ pub struct FieldFormat {
 }
 const _: () = assert!(size_of::<FieldFormat>() == 12);
 
-// (BsetKeyFormat is variable-length; spec says 8 + 12 × nr_fields.)
+// (SortedRunKeyFormat is variable-length; spec says 8 + 12 × nr_fields.)
 
 // =====================================================================
 // §2.1 ZoneExtent — 24 B

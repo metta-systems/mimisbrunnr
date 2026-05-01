@@ -103,7 +103,7 @@ enum BtreeKind {
     LocationHistory,    // §11.2 sidecar: (oid, snapshot) → ObjectLocation overrides
     Backpointer,        // §6.2 reverse-mapping B+ tree (snapshot-agnostic)
     Forward,            // §7 forward index B+ tree (snapshot-aware key)
-    ForwardOverflow,    // §7.2 per-object assertion spill (positional, no bsets)
+    ForwardOverflow,    // §7.2 per-object assertion spill (positional, no sorted runs)
     TagDirectory,       // §8.1 tag directory B+ tree (snapshot-aware)
     Range,              // §9.2 range index B+ tree (snapshot-aware)
     ChunkIndex,         // §9.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
@@ -150,11 +150,16 @@ compaction (§1.5.4) that writes the new node(s) into a fresh bucket region.
 Two large-node variants share the same outer envelope but differ in their internal layout:
 
 - **B+ tree node** (forward index, range index, alloc table, freespace LRU, ontology, path
-  contexts, subscriptions): a sequence of **bsets** — sorted runs of keyed records. New updates
-  append a new bset; periodic full compaction merges all bsets back into one.
+  contexts, subscriptions): a sequence of **sorted runs** of keyed records. New updates append
+  a new sorted run; periodic full compaction merges all of a node's sorted runs back into one.
 - **Radix leaf** (object table, location table): a positional array of fixed-size records. No
-  internal bsets — the WAL journal (§3.4) serves as the per-leaf update log; on flush the leaf
-  is rewritten from the merged in-memory state.
+  internal sorted runs — the WAL journal (§3.4) serves as the per-leaf update log; on flush the
+  leaf is rewritten from the merged in-memory state.
+
+> **Terminology.** A *sorted run* is the bcachefs concept of a `bset` ("btree set") — a single
+> append-only sorted-by-key commit unit within a btree node. The on-disk magic tag for one is
+> still `"BSET"` (§1.5.1); when cross-referencing bcachefs source, `bset` and `sorted run` name
+> the same thing.
 
 #### 1.5.1 Region envelope
 
@@ -168,9 +173,9 @@ struct BtreeNodeHeader {                     // 64 bytes
     last_persisted_lsn: u64,                 // [16..24] BlockHeader.lsn analogue
     region_size_log2: u8,                    // [24..25] 18 = 256 KiB
     level: u8,                               // [25..26] 0 = leaf, ≥1 = inner
-    bset_count: u8,                          // [26..27] number of bsets present
+    sorted_run_count: u8,                          // [26..27] number of sorted runs present
     flags: u8,                               // [27..28] BTREE_NODE_FLAG_*
-    payload_used: u32,                       // [28..32] bytes consumed by all bsets so far (≤ region_size − 64)
+    payload_used: u32,                       // [28..32] bytes consumed by all sorted runs so far (≤ region_size − 64)
     min_key: [u8; 16],                       // [32..48] covered key range (interpreted per-kind)
     max_key: [u8; 16],                       // [48..64] ditto
 }
@@ -187,8 +192,8 @@ reader can identify any persistent header by its first 8 bytes. The two header s
   whole block. `payload_length` is bounded by the block size; `flags` carries per-block
   encryption / continuation bits.
 - `BtreeNodeHeader` describes an **append-only 256 KiB region** that is rewritten only at
-  its header sector (§1.5.2). There is no whole-region CRC — each bset carries its own CRC,
-  so a torn append invalidates only the trailing bset rather than the whole region.
+  its header sector (§1.5.2). There is no whole-region CRC — each sorted run carries its own CRC,
+  so a torn append invalidates only the trailing sorted run rather than the whole region.
   `payload_used` is a high-water mark that grows monotonically across header rewrites within
   one region's lifetime; `flags` carries region-rewrite hints.
 
@@ -197,40 +202,42 @@ CRC" slot for regions, and (b) overloading `payload_length`/`flags` across two u
 semantic spaces. Keeping them distinct, with the shared preamble making the dispatch
 explicit, is cleaner.
 
-Subsequent bytes after the `BtreeNodeHeader` are a **stream of bsets**, each preceded by:
+Subsequent bytes after the `BtreeNodeHeader` are a **stream of sorted runs**, each preceded by:
 
 ```rust
 #[repr(C, packed)]
-struct BsetHeader {                          // 32 bytes
-    magic: u32,                              // "BSET"
+struct SortedRunHeader {                          // 32 bytes
+    magic: u32,                              // "BSET" (4-byte tag; historical
+                                             //   bcachefs nomenclature retained
+                                             //   as the on-disk magic value)
     seq: u32,                                // monotonic within the region
-    journal_seq: u64,                        // newest WAL LSN merged into this bset (recovery)
-    entry_count: u32,                        // entries in this bset
-    payload_length: u32,                     // bytes of bset payload
-    flags: u32,                              // BSET_FLAG_*
-    crc: u32,                                // CRC32C over (BsetHeader || payload), CRC slot zeroed
+    journal_seq: u64,                        // newest WAL LSN merged into this sorted run (recovery)
+    entry_count: u32,                        // entries in this sorted run
+    payload_length: u32,                     // bytes of sorted run payload
+    flags: u32,                              // SORTED_RUN_FLAG_*
+    crc: u32,                                // CRC32C over (SortedRunHeader || payload), CRC slot zeroed
 }
 
-// BsetHeader.flags bits
-const BSET_FLAG_PACKED_KEYS: u32 = 1 << 0;  // entries use BsetKeyFormat encoding (§1.5.6)
-const BSET_FLAG_ENCRYPTED:   u32 = 1 << 1;  // bset payload encrypted
+// SortedRunHeader.flags bits
+const SORTED_RUN_FLAG_PACKED_KEYS: u32 = 1 << 0;  // entries use SortedRunKeyFormat encoding (§1.5.6)
+const SORTED_RUN_FLAG_ENCRYPTED:   u32 = 1 << 1;  // sorted run payload encrypted
 ```
 
-The CRC scope is **per-bset**, not per-4 KiB-block. Each bset is therefore an independently
-verifiable, append-only commit unit. A torn write of a partial bset fails its CRC and is
-discarded — earlier bsets remain valid. There is no trailing CRC over the whole region.
+The CRC scope is **per-run**, not per-4 KiB-block. Each sorted run is therefore an independently
+verifiable, append-only commit unit. A torn write of a partial sorted run fails its CRC and is
+discarded — earlier sorted runs remain valid. There is no trailing CRC over the whole region.
 
 #### 1.5.2 Append-only growth
 
 When the journal-reclaim thread (§3.4) decides to flush a node:
 
-1. Materialise the pending journal entries that target this node into a new sorted bset.
-2. Append `BsetHeader` + bset payload at offset `payload_used` within the region.
-3. Update `BtreeNodeHeader.bset_count`, `payload_used`, `last_persisted_lsn`.
-4. Rewrite **only** the modified bytes (the new bset, plus a re-checksummed header) — typically
+1. Materialise the pending journal entries that target this node into a new sorted sorted run.
+2. Append `SortedRunHeader` + sorted run payload at offset `payload_used` within the region.
+3. Update `BtreeNodeHeader.sorted_run_count`, `payload_used`, `last_persisted_lsn`.
+4. Rewrite **only** the modified bytes (the new sorted run, plus a re-checksummed header) — typically
    a few hundred KB, not the whole 256 KiB.
 
-Because the bucket is write-once-then-recycle (§12), the new bset lands at the next free sectors
+Because the bucket is write-once-then-recycle (§12), the new sorted run lands at the next free sectors
 of the bucket. The header rewrite at offset 0 is a single 4 KiB-sector overwrite — a permitted
 operation because the region is reserved within the bucket and only the header sector is
 re-touched.
@@ -248,7 +255,7 @@ Loaded nodes are decoded into:
 ```rust
 struct LoadedNode {
     header: BtreeNodeHeader,
-    bsets: SmallVec<[Bset; 4]>,              // typically 1–3 active bsets
+    sorted runs: SmallVec<[SortedRun; 4]>,              // typically 1–3 active sorted runs
     merged_view: BTreeMap<Key, Value>,       // lazy: built on first lookup
     pending_journal: Vec<JournalEntry>,      // §3.4 entries past last_persisted_lsn
     dirty: bool,
@@ -256,17 +263,17 @@ struct LoadedNode {
 }
 ```
 
-Lookups merge-search across bsets; bsets are kept sorted at write time. With ≤ 3 active bsets
+Lookups merge-search across sorted runs; sorted runs are kept sorted at write time. With ≤ 3 active sorted runs
 each binary-searched, lookup cost is `O(3 × log(n))` per node — equivalent to a single sorted
 search at the constant-factor bcachefs measures at < 5% overhead.
 
 #### 1.5.4 Full compaction
 
-When a node's `payload_used` exceeds 75 % of region size, or `bset_count > 4`, full compaction
+When a node's `payload_used` exceeds 75 % of region size, or `sorted_run_count > 4`, full compaction
 runs:
 
 1. Allocate a fresh region in a new bucket (via the standard write-point mechanism, §12.5).
-2. Merge-sort all bsets into a single bset; write it as bset 0 in the new region.
+2. Merge-sort all sorted runs into a single sorted run; write it as sorted run 0 in the new region.
 3. Update the parent inner node's child pointer (which itself may need a flush — propagates
    up the tree).
 4. Old region is abandoned; its bucket's `dirty_sectors` decreases. The bucket becomes a copygc
@@ -282,16 +289,16 @@ indexes are **2–3 levels**. Each node access is a single sequential I/O of 256
 for HDD performance and friendly to SSD command queues. The cache holds whole nodes, so
 intra-node lookups are memory-resident after the first hit.
 
-#### 1.5.6 Bset format descriptors and packed keys
+#### 1.5.6 Sorted-run format descriptors and packed keys
 
-Each B+ tree bset (§1.5.1) carries a per-bset **format descriptor** that exploits commonalities
-across the bset's key range to compress keys end-to-end. Constant fields (e.g. `attr_id` within
+Each B+ tree sorted run (§1.5.1) carries a per-run **format descriptor** that exploits commonalities
+across the sorted run's key range to compress keys end-to-end. Constant fields (e.g. `attr_id` within
 a range-index leaf where every key shares the same attribute) consume **zero bits** and are
 recorded once in the descriptor rather than per key.
 
 ```rust
 #[repr(C, packed)]
-struct BsetKeyFormat {                       // 8 + nr_fields × 12 bytes
+struct SortedRunKeyFormat {                       // 8 + nr_fields × 12 bytes
     nr_fields: u8,                           // 1..=8
     key_header_bytes: u8,                    // 1..=4 (entry-type discriminator + flags)
     common_value_prefix: u8,                 // bytes shared at the start of every value (0..=24)
@@ -313,8 +320,8 @@ const FIELD_FORMAT_FLAG_SIGNED:    u8 = 1 << 0;
 const FIELD_FORMAT_FLAG_MSB_FIRST: u8 = 1 << 1;
 ```
 
-The descriptor is part of the `BsetHeader` payload (§1.5.1), prepended before the packed-key
-stream. With the typical 3-field shape it adds 8 + 36 = 44 bytes per bset — amortised over
+The descriptor is part of the `SortedRunHeader` payload (§1.5.1), prepended before the packed-key
+stream. With the typical 3-field shape it adds 8 + 36 = 44 bytes per sorted run — amortised over
 hundreds to thousands of keys.
 
 **Encoding.** A packed key is:
@@ -326,13 +333,13 @@ hundreds to thousands of keys.
 [ value bytes; first `common_value_prefix` bytes elided ]
 ```
 
-Keys are laid out back-to-back with no inter-key padding. Binary search within a bset compares
+Keys are laid out back-to-back with no inter-key padding. Binary search within a sorted run compares
 packed keys **directly** without decoding — base subtraction is strictly monotonic, so packed
 ordering matches unpacked ordering. Full decoding happens only at the lookup boundary.
 
 **`common_value_prefix` and variable-size values.** The elision applies only to bytes at the
 **leading offsets** of the value that are bit-for-bit identical across **every entry in the
-bset**. For fixed-shape values (e.g. `TagIndexLeafEntry`'s 32-byte value following `tag_id`)
+sorted run**. For fixed-shape values (e.g. `TagIndexLeafEntry`'s 32-byte value following `tag_id`)
 this is the natural common prefix — typically a few bytes of `store_kind` plus zeroed
 padding when most entries in a leaf share the same store kind. For **variable-shape values**
 (notably §7.1's `LeafEntry`, where the body is either an inline assertion array sized by
@@ -340,19 +347,19 @@ padding when most entries in a leaf share the same store kind. For **variable-sh
 bytes that exist *and* are identical in every variant — in practice the 2-byte `header`'s
 discriminator bits (`is_spill`) are not shared, so `common_value_prefix = 0` is the typical
 setting for `LeafEntry`. Format selection (§1.5.4) computes the prefix during full
-compaction by scanning the merged bset's values and counting leading bytes shared by every
-entry; if the bset mixes shapes, the count is bounded by the shortest value.
+compaction by scanning the merged sorted run's values and counting leading bytes shared by every
+entry; if the sorted run mixes shapes, the count is bounded by the shortest value.
 
-**Format selection.** Full compaction (§1.5.4) computes an optimal format for the merged bset
+**Format selection.** Full compaction (§1.5.4) computes an optimal format for the merged sorted run
 by scanning the key distribution: `max − min` for each field gives the minimum bit width.
 Append-on-flush keeps the existing format. If a new key's field overflows the format's bit
 width, the flush either:
 
-- Promotes the bset's format (rewriting the bset under a wider format — rare), or
+- Promotes the sorted run's format (rewriting the sorted run under a wider format — rare), or
 - Triggers a full compaction of the node, producing a fresh format.
 
 Format upgrades are journalled as a `FormatPromote` WAL op so recovery can reconstruct the
-in-memory bset state.
+in-memory sorted run state.
 
 **Typical savings across our key shapes** (snapshot-aware btrees include a trailing
 `snapshot: u32` field, typically 0–4 bits per leaf since one snapshot dominates):
@@ -677,8 +684,8 @@ ReconcileMove    : { from_loc: BlockRef, to_loc: BlockRef, owner_key: bytes }
                    // atomic location-update for move-path completion
 ReconcileScanStep: { scan_id: u64, btree: BtreeKind, cursor_key: bytes }  // resumable progress
 
-// Bset format mutations (§1.5.6)
-FormatPromote    : { node_ref: BlockRef, bset_seq: u32, new_format: BsetKeyFormat }
+// Sorted-run format mutations (§1.5.6)
+FormatPromote    : { node_ref: BlockRef, sorted_run_seq: u32, new_format: SortedRunKeyFormat }
 
 Checkpoint       : { new_root: RootPointer, gc_reserve_buckets: u32 }
 ```
@@ -794,7 +801,7 @@ nodes (§1.5) whose depth grows with the populated id space.
 ### Node capacities
 
 Each node is a 256 KiB region (§1.5) with a 64-byte `BtreeNodeHeader`. For the radix variants
-there are no internal bsets — positional updates are journalled via §3.4 and merged on flush.
+there are no internal sorted runs — positional updates are journalled via §3.4 and merged on flush.
 
 - **Leaf node** (`BtreeKind::ObjectTable`, level 0): **2044** × `ObjectRecord` (128 B). Layout:
   64 B header + 256 B occupancy bitmap (one bit per slot, ≥ 2044 bits) + 32 B trailer
@@ -865,11 +872,11 @@ Per-mutation cost is still the WAL append (~80 B). Reads consult the in-memory `
 (§1.5.3), which holds the on-disk state plus pending journal entries past
 `BtreeNodeHeader.last_persisted_lsn`; cold reads materialise the merged view at load time.
 
-Because positional radix leaves don't use internal bsets, every flush rewrites the whole leaf
+Because positional radix leaves don't use internal sorted runs, every flush rewrites the whole leaf
 into a fresh region. This is acceptable here: a leaf holding 2044 records absorbs hundreds to
 thousands of pending mutations before journal-reclaim chooses to flush it, so the per-mutation
 amortised write cost is well under 1 KiB. (The B+ tree variants in §7+ avoid even this by
-appending bsets — for keyed structures that's cheaper than rebuilding a sorted run.)
+appending sorted runs — for keyed structures that's cheaper than rebuilding a sorted run.)
 
 ### 5.1 ObjectRecord (128 bytes, version 1)
 
@@ -1089,13 +1096,13 @@ enum OwnerKind {
 The pair `(BackpointerKey, BackpointerValue)` is 36 bytes unpacked; with §1.5.6 key packing
 (`disk_id` constant per leaf, `bucket_no` packs to ~16–20 bits, `sector_offset` packs based on
 bucket size), per-key disk cost falls to **~26–28 B**. A 256 KiB leaf packs ~9 000 backpointers
-per bset.
+per sorted run.
 
 #### Properties
 
 - **Bucket-prefix scan.** "What lives in `(disk_id, bucket_no)`?" is a B+ tree range scan over
   `(disk_id, bucket_no, *)`. With key packing the entire bucket's backpointers typically sit in
-  one or two contiguous leaf bsets — a single large-node load.
+  one or two contiguous leaf sorted runs — a single large-node load.
 - **Generation gating.** `BackpointerValue.bucket_gen` records the bucket's generation at
   insertion. A backpointer whose `bucket_gen` does not match the current bucket generation is
   **stale** (the bucket has been recycled) and is dropped lazily on the next scrub or copygc
@@ -1134,25 +1141,25 @@ The forward index maps `oid → [ForwardEntry]` and must support fast per-object
 per-object diffing for sync.
 
 On disk it is a **B+ tree of large nodes** (§1.5), keyed by `oid`. Each node uses the standard
-multi-bset envelope: new mutations are appended as a fresh bset; lookups merge-search across
-all bsets in the node.
+multi-run envelope: new mutations are appended as a fresh sorted run; lookups merge-search across
+all sorted runs in the node.
 
 ### 7.1 Node layout
 
-Both inner and leaf bsets use the §1.5.6 packed-key encoding. Within a single leaf, all `oid`
+Both inner and leaf sorted runs use the §1.5.6 packed-key encoding. Within a single leaf, all `oid`
 keys share the leaf's key range (typically a span of 10⁴ – 10⁵ contiguous ids), so the format
 descriptor's `bit_width` settles around 16–20 bits — encoding `oid` as 2–3 bytes versus the
 unpacked 8 bytes.
 
-- **Inner node** (`BtreeKind::Forward`, level ≥ 1): one or more bsets of `(packed_oid_key,
+- **Inner node** (`BtreeKind::Forward`, level ≥ 1): one or more sorted runs of `(packed_oid_key,
   child: BlockRef)` pairs. With 2–3 byte packed keys + 16 B BlockRef = ~18–19 B per entry; one
-  full bset packs ~14 500 children. Tree depth at 10 M objects: **2 levels** (1 inner + leaves).
-- **Leaf node** (level 0): bsets of `LeafEntry` records:
+  full sorted run packs ~14 500 children. Tree depth at 10 M objects: **2 levels** (1 inner + leaves).
+- **Leaf node** (level 0): sorted runs of `LeafEntry` records:
 
 ```rust
 // Logical (unpacked) shape; on-disk uses the §1.5.6 packed encoding.
 struct LeafEntry {                           // variable length on disk
-    oid: u64,                                // sort key — packed via BsetKeyFormat
+    oid: u64,                                // sort key — packed via SortedRunKeyFormat
     header: u16,                             // bitfield: see below
     body: union {                            // discriminated by header & LEAF_ENTRY_SPILL_FLAG
         inline: [PackedAssertion; header & LEAF_ENTRY_TOTAL_MASK],   // !is_spill
@@ -1208,24 +1215,24 @@ The **key** (`oid`) is packed; the **value** (`header`, body) stays byte-aligned
 format descriptor records `oid_base = leaf.min_oid` and `oid_bits = ⌈log₂(leaf.max_oid −
 leaf.min_oid + 1)⌉`.
 
-A leaf with 8 assertions per object (typical) packs ~2 740 entries per bset (per-entry
-≈ 2.5 B packed key + 2 B header + 128 B inline body = ~133 B); with 4 active bsets the leaf
+A leaf with 8 assertions per object (typical) packs ~2 740 entries per sorted run (per-entry
+≈ 2.5 B packed key + 2 B header + 128 B inline body = ~133 B); with 4 active sorted runs the leaf
 carries up to ~10 000 entries before full compaction.
 
 ### 7.2 Spill
 
 Objects with more than 8 assertions store a `BlockRef` to a `ForwardOverflow` region (also a
-256 KiB large-node region; positional, no bsets — single rewrite on growth). Each overflow region
+256 KiB large-node region; positional, no sorted runs — single rewrite on growth). Each overflow region
 holds up to 16 380 × `PackedAssertion`. Further overflow chains via the trailing `BlockRef` slot.
 
-### 7.3 Bset behaviour
+### 7.3 Sorted-run behaviour
 
-- **Append on flush.** When journal-reclaim flushes a forward-index leaf, only the new bset is
+- **Append on flush.** When journal-reclaim flushes a forward-index leaf, only the new sorted run is
   written — typically a few KB to a few tens of KB, not the whole 256 KiB node.
 - **In-memory merge.** `LoadedNode.merged_view` builds a `BTreeMap<u64, SmallVec<[PackedAssertion;
   8]>>` lazily on first lookup; subsequent lookups are direct hits.
-- **Full compaction** triggers when `payload_used > 75%` or `bset_count > 4`, rewriting the node
-  into a fresh region with a single merged bset.
+- **Full compaction** triggers when `payload_used > 75%` or `sorted_run_count > 4`, rewriting the node
+  into a fresh region with a single merged sorted run.
 
 For attributes whose actual `Value` matters (not just its hash), the `value_hash` indirects into
 the **value spill table** (a separate B+ tree keyed by `value_hash → CBOR(Value)`), shared with
@@ -1234,7 +1241,7 @@ the KV index (§8). Tag and Relation entries are self-contained.
 ### 7.4 Properties
 
 - O(log N) lookup by oid (depth 2 at 10 M scale ⇒ ≤ 2 large-node loads).
-- O(1) per-assertion diffing via `BsetHeader.journal_seq` — sync streams bsets newer than
+- O(1) per-assertion diffing via `SortedRunHeader.journal_seq` — sync streams sorted runs newer than
   the peer's watermark, exactly the journal-streaming fast path of §11.2.
 - Compact in-memory mirror: a `HashMap<u64, SmallVec<[PackedAssertion; 8]>>` over the loaded
   node's `merged_view`.
@@ -1274,15 +1281,15 @@ The hot pair `(tag_id, store_root)` lands on the same 32-byte half-cache-line: a
 loads a leaf entry to dispatch a bitmap fetch gets `tag_id`, `cardinality`, `generation`, and
 `store_root` all in a single 64-byte fetch.
 
-On-disk, leaf bsets use the §1.5.6 packed-key encoding: `tag_id` typically packs to 2–3 bytes
+On-disk, leaf sorted runs use the §1.5.6 packed-key encoding: `tag_id` typically packs to 2–3 bytes
 per leaf (sparse but clustered ids); the value's 32 bytes after `tag_id` stay byte-aligned.
-Per-key on-disk cost is ~34 B. A 256 KiB leaf bset (262 144 B − 64 B node header − 32 B bset
+Per-key on-disk cost is ~34 B. A 256 KiB leaf sorted run (262 144 B − 64 B node header − 32 B sorted run
 header − 44 B key-format descriptor = 262 004 B payload) holds **~7 700 entries**; the full
 ontology of 5 000 tags fits in **a single leaf** (depth 0). For pools with hundreds of
 thousands of tags the tree extends to depth 1 (~125 M-tag capacity).
 
 `(cardinality, last_modify_lsn, generation)` enables fast snapshot diffing without dereferencing
-the bitmap — the directory's bset stream alone tells a peer which tags changed and how.
+the bitmap — the directory's sorted run stream alone tells a peer which tags changed and how.
 
 ### 8.2 Roaring bitmaps on disk
 
@@ -1376,17 +1383,17 @@ faceted enumeration, range comparisons).
 ### 9.2 Range Index
 
 A **B+ tree of large nodes** (§1.5) keyed by `(attr_id: u32, value: NormalisedKey, oid: u64)` —
-28 B unpacked. With per-bset key packing (§1.5.6) this is the structure that benefits most:
+28 B unpacked. With per-run key packing (§1.5.6) this is the structure that benefits most:
 
 - `attr_id` is almost always **constant** within a leaf (a leaf covers one or two adjacent
   attributes) → 0 bits per key.
-- `value` (16 B `NormalisedKey`) gets a per-bset base + bit-width; for numeric attributes the
+- `value` (16 B `NormalisedKey`) gets a per-run base + bit-width; for numeric attributes the
   span within a leaf typically fits in 24–40 bits.
 - `oid` packs identically to forward-index keys: 16–20 bits.
 
-Net per-key size: typically **8–12 B** packed. Each 256 KiB leaf packs ~25 000 entries per bset.
+Net per-key size: typically **8–12 B** packed. Each 256 KiB leaf packs ~25 000 entries per sorted run.
 
-Leaf bsets store key → `BlockRef` to a roaring bitmap.
+Leaf sorted runs store key → `BlockRef` to a roaring bitmap.
 
 `NormalisedKey` is a fixed-size order-preserving encoding:
 
@@ -1412,7 +1419,7 @@ ChunkIndexLeafEntry {                        // 56 bytes
 }
 ```
 
-A 256 KiB leaf packs ~4 600 chunk entries per bset.
+A 256 KiB leaf packs ~4 600 chunk entries per sorted run.
 
 `ChunkList` per object: array of `(chunk_hash, length)` referenced from `ObjectLocation` when
 chunked (a positional `ChunkList` region; see §1.5 for the radix layout).
@@ -1526,7 +1533,7 @@ tree as a single batched btree insert. The reverse transition (disk_count droppi
 below) is **lazy** — the overflow tree may be retained until the next checkpoint or until
 explicitly compacted; readers always check `disk_count` to know which side to consult.
 
-A 256 KiB overflow leaf packs ~1 000 entries per bset (256 B per descriptor), so even
+A 256 KiB overflow leaf packs ~1 000 entries per sorted run (256 B per descriptor), so even
 multi-thousand-disk clusters stay at depth 0–1.
 
 **Disk descriptor (256 bytes):**
@@ -1625,7 +1632,7 @@ parent-pointer walk.
 
 In snapshot-aware btrees, every bkey position carries an extra `snapshot: u32` field appended
 to the kind-specific key fields. With §1.5.6 packing, `snapshot` is typically a 0-bit field in a
-leaf bset (one snapshot dominates the bset's keys), or a few bits at most — its overhead is in
+leaf sorted run (one snapshot dominates the sorted run's keys), or a few bits at most — its overhead is in
 the noise.
 
 | Btree              | Snapshot-aware? | Notes                                         |
@@ -1922,7 +1929,7 @@ freespace LRU.
 
 One **§1.5 B+ tree** per disk, rooted at `DiskDescriptorOnDisk.buckets_root`, keyed by
 `bucket_no: u32`. With key packing (§1.5.6) sequential bucket numbers compress to ~2 B per key,
-so a 256 KiB leaf packs ~14 600 BucketAllocKey entries per bset; a 16 M-bucket disk fits in
+so a 256 KiB leaf packs ~14 600 BucketAllocKey entries per sorted run; a 16 M-bucket disk fits in
 **depth 1** (single inner node + ~1 100 leaves):
 
 ```rust
@@ -1953,7 +1960,7 @@ enum BucketDataType {
 }
 ```
 
-The B+ tree itself is housed in a self-bootstrapping subset of metadata buckets (tracked as
+The B+ tree itself is housed in a self-bootstrapping susorted run of metadata buckets (tracked as
 `BucketDataType::Metadata` with the pinned flag). Updates go through the journal and are
 checkpointed in the same A/B atomic-root commit as everything else.
 
