@@ -111,6 +111,9 @@ enum BtreeKind {
     Snapshots,          // §11.1 snapshot tree (SnapshotId → SnapshotNode)
     BucketAlloc,        // §12.2 per-disk bucket alloc B+ tree (physical)
     FreespaceLru,       // §12.4 per-disk freespace LRU B+ tree (physical)
+    DiskDescriptors,    // §10.4 disk descriptors overflow tree (>8 disks)
+    PlacementRules,     // §10.4 placement rules (heterogeneous, CBOR values)
+    ClusterPeers,       // §10.4 cluster peers (NodeId → PeerRecord)
     ReconcileWork,      // §17.2 normal-priority reconcile queue (logical order)
     ReconcileHipri,     // §17.2 high-priority reconcile queue
     ReconcileWorkPhys,  // §17.2 physical-LBA-ordered work index (HDD pools)
@@ -371,38 +374,38 @@ struct Superblock {                          // 4096 bytes total
     last_mount_timestamp_ns: i64,            //  [96..104]
     mount_count: u64,                        // [104..112]
 
-    // Two alternating root pointers — atomic commit. RootPointer = 376 bytes (§2.2).
-    root_a: RootPointer,                     // [112..488]
-    root_b: RootPointer,                     // [488..864]
-    active_root: u8,                         // [864..865]   0 = a, 1 = b
-    _pad2: [u8; 7],                          // [865..872]
+    // Two alternating root pointers — atomic commit. RootPointer = 424 bytes (§2.2).
+    root_a: RootPointer,                     // [112..536]
+    root_b: RootPointer,                     // [536..960]
+    active_root: u8,                         // [960..961]   0 = a, 1 = b
+    _pad2: [u8; 7],                          // [961..968]
 
     // Static layout pointers (set at format time, not written again).
-    wal_offset: u64,                         // [872..880]
-    wal_size: u64,                           // [880..888]
-    bucket_size_log2: u8,                    // [888..889]   e.g. 20 = 1 MiB bucket
-    copygc_reserve_pct: u8,                  // [889..890]   default 8 (range 5..=21)
-    btree_node_size_log2: u8,                // [890..891]   default 18 = 256 KiB (§1.5)
-    _pad3: [u8; 5],                          // [891..896]
-    bootstrap_buckets: u32,                  // [896..900]   reserved leading buckets (sb + WAL + …)
-    _pad4: [u8; 4],                          // [900..904]
-    zone_map_offset: u64,                    // [904..912]   0 until any zone is grown
+    wal_offset: u64,                         // [968..976]
+    wal_size: u64,                           // [976..984]
+    bucket_size_log2: u8,                    // [984..985]   e.g. 20 = 1 MiB bucket
+    copygc_reserve_pct: u8,                  // [985..986]   default 8 (range 5..=21)
+    btree_node_size_log2: u8,                // [986..987]   default 18 = 256 KiB (§1.5)
+    _pad3: [u8; 5],                          // [987..992]
+    bootstrap_buckets: u32,                  // [992..996]   reserved leading buckets (sb + WAL + …)
+    _pad4: [u8; 4],                          // [996..1000]
+    zone_map_offset: u64,                    // [1000..1008] 0 until any zone is grown
 
     // Initial-extent zone descriptors. Always authoritative for the first extent;
     // additional extents (if any) are listed in the ZoneMap block.
-    index_zone:    ZoneExtent,               // [912..936]   24 bytes
-    metadata_zone: ZoneExtent,               // [936..960]
-    blob_zone:     ZoneExtent,               // [960..984]
+    index_zone:    ZoneExtent,               // [1008..1032] 24 bytes
+    metadata_zone: ZoneExtent,               // [1032..1056]
+    blob_zone:     ZoneExtent,               // [1056..1080]
 
-    encryption_keyid: [u8; 16],              // [984..1000]  key identifier (not the key)
-    fs_format_version: u32,                  // [1000..1004] §15 — current writing version
-    fs_min_on_disk: u32,                     // [1004..1008] §15 — minimum version of any record on disk
-    compat_features: u64,                    // [1008..1016] §15.2 — old readers tolerate
-    ro_compat_features: u64,                 // [1016..1024] §15.2 — old readers mount RO
-    incompat_features: u64,                  // [1024..1032] §15.2 — old readers refuse
-    downgrade_log_ref: BlockRef,             // [1032..1048] §15.5 — chain of historical features
+    encryption_keyid: [u8; 16],              // [1080..1096] key identifier (not the key)
+    fs_format_version: u32,                  // [1096..1100] §15 — current writing version
+    fs_min_on_disk: u32,                     // [1100..1104] §15 — minimum version of any record on disk
+    compat_features: u64,                    // [1104..1112] §15.2 — old readers tolerate
+    ro_compat_features: u64,                 // [1112..1120] §15.2 — old readers mount RO
+    incompat_features: u64,                  // [1120..1128] §15.2 — old readers refuse
+    downgrade_log_ref: BlockRef,             // [1128..1144] §15.5 — chain of historical features
 
-    _reserved: [u8; 3044],                   // [1048..4092] zeroed, available for future fields
+    _reserved: [u8; 2948],                   // [1144..4092] zeroed, available for future fields
     // trailing CRC32C at [4092..4096] lives inside BlockHeader's frame
 }
 
@@ -458,7 +461,7 @@ windows:
 
 ```rust
 #[repr(C, packed)]
-struct RootPointer {                         // 376 bytes
+struct RootPointer {                         // 424 bytes
     seq: u64,                                //   [0..8]    monotonic; larger seq wins
     lsn: u64,                                //   [8..16]   WAL LSN this root corresponds to
 
@@ -477,7 +480,7 @@ struct RootPointer {                         // 376 bytes
     ontology_root:            BlockRef,      // [192..208]  §10.1
     path_context_root:        BlockRef,      // [208..224]  §10.3
     subscriptions_root:       BlockRef,      // [224..240]  §10.2
-    pool_state_root:          BlockRef,      // [240..256]  §10.4
+    pool_state_root:          BlockRef,      // [240..256]  §10.4  scalars + inline disks
     snapshot_chain_root:      BlockRef,      // [256..272]  §11.1  snapshots btree
 
     // Reconcile btrees (§17.2). Zeroed when unused; *_phys variants are
@@ -489,8 +492,14 @@ struct RootPointer {                         // 376 bytes
     reconcile_pending_root:   BlockRef,      // [336..352]
     reconcile_scan_root:      BlockRef,      // [352..368]  §17.3  in-progress scan cursors
 
-    flags: u32,                              // [368..372]
-    crc: u32,                                // [372..376]  CRC32C of bytes [0..372]
+    // Pool-state btrees (§10.4). Promoted from PoolStateRoot for uniform
+    // root-anchoring of every btree.
+    disks_overflow_root:      BlockRef,      // [368..384]  populated iff disk_count > 8
+    placement_rules_root:     BlockRef,      // [384..400]  placement rules
+    cluster_peers_root:       BlockRef,      // [400..416]  cluster peers
+
+    flags: u32,                              // [416..420]
+    crc: u32,                                // [420..424]  CRC32C of bytes [0..420]
 }
 ```
 
@@ -1436,38 +1445,75 @@ index as a special assertion kind, so listing all paths of an object is one forw
 
 ### 10.4 Pool state
 
-```
-PoolStateRoot (4 KiB):
-  disk_count: u32
-  cluster_node_count: u32
-  disks: [DiskDescriptorOnDisk; 56]    // fixed, 64 bytes each
-  placement_rules_root: BlockRef       → B+ tree of CBOR rules (heterogeneous)
-  cluster_peers_root:   BlockRef       → B+ tree key = NodeId → PeerRecord
-```
-
-`DiskDescriptorOnDisk` is fixed **64 bytes**:
+`PoolStateRoot` is a single 4 KiB block holding pool-wide scalars and an inline disk
+descriptor array sized for the typical small-pool case:
 
 ```rust
 #[repr(C, packed)]
-struct DiskDescriptorOnDisk {                // 64 bytes
+struct PoolStateRoot {                        // 4096 bytes
+    header: BlockHeader,                      //    [0..32]   kind = TBD (pool-state)
+    disk_count: u32,                          //   [32..36]
+    cluster_node_count: u32,                  //   [36..40]
+    inline_disks: [DiskDescriptorOnDisk; 12], //   [40..3112]  12 × 256 B
+    _reserved: [u8; 980],                     // [3112..4092] room for pool-wide tunables
+    // trailing CRC32C at [4092..4096] inside BlockHeader's frame
+}
+```
+
+**Hybrid disk storage.** Per the typical use case (1–5 disks per pool), the inline array
+covers normal operation without indirection; the cap of 12 leaves comfortable headroom for
+modest multi-disk hosts (4–10 disks) before any spillover. Larger pools spill to a B+ tree:
+
+- `disk_count ≤ 12`: all disks live in `inline_disks[0..disk_count]`. The
+  `RootPointer.disks_overflow_root` (§2.2) is zero; no overflow tree exists.
+- `disk_count > 12`: all disks live in the **disks-overflow B+ tree**
+  (`BtreeKind::DiskDescriptors`, keyed by `disk_id: u16`, rooted at
+  `RootPointer.disks_overflow_root`). The `inline_disks[]` array is unused (zeroed).
+
+Crossing the threshold (the 13th disk added) migrates the inline contents into the overflow
+tree as a single batched btree insert. The reverse transition (disk_count dropping to 12 or
+below) is **lazy** — the overflow tree may be retained until the next checkpoint or until
+explicitly compacted; readers always check `disk_count` to know which side to consult.
+
+A 256 KiB overflow leaf packs ~1 000 entries per bset (256 B per descriptor), so even
+multi-thousand-disk clusters stay at depth 0–1.
+
+**Disk descriptor (256 bytes):**
+
+```rust
+#[repr(C, packed)]
+struct DiskDescriptorOnDisk {                // 256 bytes
     disk_id: u16,                            //  [0..2]
     media_type: u8,                          //  [2..3]
     tier: u8,                                //  [3..4]
     state: u8,                               //  [4..5]    DiskState
-    _pad: u8,                                //  [5..6]
-    path_offset: u16,                        //  [6..8]    into string heap
+    _pad0: u8,                               //  [5..6]
+    path_len: u8,                            //  [6..7]    valid byte count of path[]
+    _pad1: u8,                               //  [7..8]
     capacity_bytes: u64,                     //  [8..16]
     used_bytes: u64,                         // [16..24]
     bucket_count: u32,                       // [24..28]   capacity_bytes >> bucket_size_log2
     first_usable_bucket: u32,                // [28..32]   = bootstrap_buckets
     buckets_root: BlockRef,                  // [32..48]   §12.2 bucket alloc table root
     freespace_root: BlockRef,                // [48..64]   §12.4 freespace LRU root
+    path: [u8; 192],                         // [64..256]  UTF-8, NUL-padded; path_len bytes valid
 }
 ```
+
+The 192-byte inline `path` covers the full range of plausible disk identifiers: Linux device
+names (`/dev/sda`, `/dev/nvme0n1p1`), full by-id / by-uuid symlinks
+(`/dev/disk/by-id/nvme-Samsung_SSD_990_PRO_2TB_S6Z2NJ0X123456A`), NVMe-oF and iSCSI
+discovery URLs, S3/HTTP endpoints with full bucket+key paths, etc. A `path_len` exceeding
+192 is a format error; this would represent a genuinely pathological identifier and is
+better surfaced explicitly than silently truncated.
 
 The per-disk `buckets_root` and `freespace_root` are COW under the standard checkpoint
 machinery — every RootPointer commit captures a self-consistent snapshot of every disk's
 allocation state.
+
+**Other pool-state btrees** (`placement_rules_root`, `cluster_peers_root`) live directly in
+`RootPointer` (§2.2). All btree roots are uniformly anchored at the top of the COW commit
+machinery, so a checkpoint flips a single `RootPointer` and every tree advances atomically.
 
 ---
 

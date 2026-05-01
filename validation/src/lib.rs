@@ -127,7 +127,9 @@ pub struct ZoneMap {
 const _: () = assert!(size_of::<ZoneMap>() == 4096);
 
 // =====================================================================
-// §2.2 RootPointer — 376 B (revised)
+// §2.2 RootPointer — 424 B (was 376)
+// Adds disks_overflow_root, placement_rules_root, cluster_peers_root —
+// the last three btree roots that previously lived in PoolStateRoot.
 // =====================================================================
 #[repr(C, packed)]
 pub struct RootPointer {
@@ -155,13 +157,18 @@ pub struct RootPointer {
     pub reconcile_hipri_phys_root: BlockRef,
     pub reconcile_pending_root: BlockRef,
     pub reconcile_scan_root: BlockRef,
+    pub disks_overflow_root: BlockRef,           // §10.4 — populated iff disk_count > 8
+    pub placement_rules_root: BlockRef,          // §10.4 — placement rules btree
+    pub cluster_peers_root: BlockRef,            // §10.4 — cluster peers btree
     pub flags: u32,
     pub crc: u32,
 }
-const _: () = assert!(size_of::<RootPointer>() == 376);
+const _: () = assert!(size_of::<RootPointer>() == 424);
 
 // =====================================================================
 // §2.1 Superblock — 4096 B
+// All offsets after root_a shift by +48 per RootPointer (was 376, now 424).
+// _reserved tail shrinks accordingly: 3044 → 2948 bytes.
 // =====================================================================
 #[repr(C, packed)]
 pub struct Superblock {
@@ -179,30 +186,30 @@ pub struct Superblock {
     pub creation_timestamp_ns: i64,             // [88..96]
     pub last_mount_timestamp_ns: i64,           // [96..104]
     pub mount_count: u64,                       // [104..112]
-    pub root_a: RootPointer,                    // [112..488]
-    pub root_b: RootPointer,                    // [488..864]
-    pub active_root: u8,                        // [864..865]
-    pub _pad2: [u8; 7],                         // [865..872]
-    pub wal_offset: u64,                        // [872..880]
-    pub wal_size: u64,                          // [880..888]
-    pub bucket_size_log2: u8,                   // [888..889]
-    pub copygc_reserve_pct: u8,                 // [889..890]
-    pub btree_node_size_log2: u8,               // [890..891]
-    pub _pad3: [u8; 5],                         // [891..896]
-    pub bootstrap_buckets: u32,                 // [896..900]
-    pub _pad4: [u8; 4],                         // [900..904]
-    pub zone_map_offset: u64,                   // [904..912]
-    pub index_zone: ZoneExtent,                 // [912..936]
-    pub metadata_zone: ZoneExtent,              // [936..960]
-    pub blob_zone: ZoneExtent,                  // [960..984]
-    pub encryption_keyid: [u8; 16],             // [984..1000]
-    pub fs_format_version: u32,                 // [1000..1004]
-    pub fs_min_on_disk: u32,                    // [1004..1008]
-    pub compat_features: u64,                   // [1008..1016]
-    pub ro_compat_features: u64,                // [1016..1024]
-    pub incompat_features: u64,                 // [1024..1032]
-    pub downgrade_log_ref: BlockRef,            // [1032..1048]
-    pub _reserved: [u8; 3044],                  // [1048..4092]
+    pub root_a: RootPointer,                    // [112..536]
+    pub root_b: RootPointer,                    // [536..960]
+    pub active_root: u8,                        // [960..961]
+    pub _pad2: [u8; 7],                         // [961..968]
+    pub wal_offset: u64,                        // [968..976]
+    pub wal_size: u64,                          // [976..984]
+    pub bucket_size_log2: u8,                   // [984..985]
+    pub copygc_reserve_pct: u8,                 // [985..986]
+    pub btree_node_size_log2: u8,               // [986..987]
+    pub _pad3: [u8; 5],                         // [987..992]
+    pub bootstrap_buckets: u32,                 // [992..996]
+    pub _pad4: [u8; 4],                         // [996..1000]
+    pub zone_map_offset: u64,                   // [1000..1008]
+    pub index_zone: ZoneExtent,                 // [1008..1032]
+    pub metadata_zone: ZoneExtent,              // [1032..1056]
+    pub blob_zone: ZoneExtent,                  // [1056..1080]
+    pub encryption_keyid: [u8; 16],             // [1080..1096]
+    pub fs_format_version: u32,                 // [1096..1100]
+    pub fs_min_on_disk: u32,                    // [1100..1104]
+    pub compat_features: u64,                   // [1104..1112]
+    pub ro_compat_features: u64,                // [1112..1120]
+    pub incompat_features: u64,                 // [1120..1128]
+    pub downgrade_log_ref: BlockRef,            // [1128..1144]
+    pub _reserved: [u8; 2948],                  // [1144..4092]
     pub trailing_crc: u32,                      // [4092..4096]
 }
 const _: () = assert!(size_of::<Superblock>() == 4096);
@@ -435,7 +442,10 @@ pub struct PathContextHeader {
 const _: () = assert!(size_of::<PathContextHeader>() == 48);
 
 // =====================================================================
-// §10.4 DiskDescriptorOnDisk — 64 B
+// §10.4 DiskDescriptorOnDisk — 256 B (path: [u8; 192])
+// path_len = number of valid UTF-8 bytes in path[]; remainder zero-padded.
+// 192 B path covers full /dev/disk/by-id/... names, NVMe-oF discovery URLs,
+// long S3/HTTP endpoints, etc.
 // =====================================================================
 #[repr(C, packed)]
 pub struct DiskDescriptorOnDisk {
@@ -443,16 +453,39 @@ pub struct DiskDescriptorOnDisk {
     pub media_type: u8,
     pub tier: u8,
     pub state: u8,
-    pub _pad: u8,
-    pub path_offset: u16,
+    pub _pad0: u8,
+    pub path_len: u8,
+    pub _pad1: u8,
     pub capacity_bytes: u64,
     pub used_bytes: u64,
     pub bucket_count: u32,
     pub first_usable_bucket: u32,
     pub buckets_root: BlockRef,
     pub freespace_root: BlockRef,
+    pub path: [u8; 192],
 }
-const _: () = assert!(size_of::<DiskDescriptorOnDisk>() == 64);
+const _: () = assert!(size_of::<DiskDescriptorOnDisk>() == 256);
+
+// =====================================================================
+// §10.4 PoolStateRoot — 4096 B
+// Hybrid disk storage:
+//   disk_count ≤ 12: all disks live in inline_disks[0..disk_count];
+//                    RootPointer.disks_overflow_root is zero.
+//   disk_count > 12: all disks live in the disks-overflow B+ tree
+//                    (BtreeKind::DiskDescriptors) keyed by disk_id;
+//                    inline_disks[] is unused. Crossing the threshold
+//                    migrates the inline contents into the tree.
+// =====================================================================
+#[repr(C, packed)]
+pub struct PoolStateRoot {
+    pub header: BlockHeader,                        //   32 B
+    pub disk_count: u32,                            //    4 B
+    pub cluster_node_count: u32,                    //    4 B
+    pub inline_disks: [DiskDescriptorOnDisk; 12],   // 3072 B  (12 × 256)
+    pub _reserved: [u8; 980],                       //  980 B  (room for pool-wide tunables)
+    pub trailing_crc: u32,                          //    4 B
+}
+const _: () = assert!(size_of::<PoolStateRoot>() == 4096);
 
 // =====================================================================
 // §11.1 SnapshotNode — 64 B
