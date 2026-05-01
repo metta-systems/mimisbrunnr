@@ -231,7 +231,7 @@ discarded — earlier sorted runs remain valid. There is no trailing CRC over th
 
 When the journal-reclaim thread (§3.4) decides to flush a node:
 
-1. Materialise the pending journal entries that target this node into a new sorted sorted run.
+1. Materialise the pending journal entries that target this node into a new sorted run.
 2. Append `SortedRunHeader` + sorted run payload at offset `payload_used` within the region.
 3. Update `BtreeNodeHeader.sorted_run_count`, `payload_used`, `last_persisted_lsn`.
 4. Rewrite **only** the modified bytes (the new sorted run, plus a re-checksummed header) — typically
@@ -263,7 +263,7 @@ struct LoadedNode {
 }
 ```
 
-Lookups merge-search across sorted runs; sorted runs are kept sorted at write time. With ≤ 3 active sorted runs
+Lookups merge-search across sorted runs; each run is internally sorted at write time. With ≤ 3 active sorted runs
 each binary-searched, lookup cost is `O(3 × log(n))` per node — equivalent to a single sorted
 search at the constant-factor bcachefs measures at < 5% overhead.
 
@@ -876,7 +876,7 @@ Because positional radix leaves don't use internal sorted runs, every flush rewr
 into a fresh region. This is acceptable here: a leaf holding 2044 records absorbs hundreds to
 thousands of pending mutations before journal-reclaim chooses to flush it, so the per-mutation
 amortised write cost is well under 1 KiB. (The B+ tree variants in §7+ avoid even this by
-appending sorted runs — for keyed structures that's cheaper than rebuilding a sorted run.)
+appending sorted runs — for keyed structures that's cheaper than rebuilding a leaf.)
 
 ### 5.1 ObjectRecord (128 bytes, version 1)
 
@@ -1960,7 +1960,7 @@ enum BucketDataType {
 }
 ```
 
-The B+ tree itself is housed in a self-bootstrapping susorted run of metadata buckets (tracked as
+The B+ tree itself is housed in a self-bootstrapping subset of metadata buckets (tracked as
 `BucketDataType::Metadata` with the pinned flag). Updates go through the journal and are
 checkpointed in the same A/B atomic-root commit as everything else.
 
