@@ -87,6 +87,7 @@ enum BtreeKind {
     LocationHistory,    // §11.2 sidecar: (oid, snapshot) → ObjectLocation overrides
     Backpointer,        // §6.2 reverse-mapping B+ tree (snapshot-agnostic)
     Forward,            // §7 forward index B+ tree (snapshot-aware key)
+    ForwardOverflow,    // §7.2 per-object assertion spill (positional, no bsets)
     TagDirectory,       // §8.1 tag directory B+ tree (snapshot-aware)
     Range,              // §9.2 range index B+ tree (snapshot-aware)
     ChunkIndex,         // §9.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
@@ -387,6 +388,40 @@ struct ZoneExtent {                          // 24 bytes
 
 `format_version` in the BlockHeader gates field interpretation. Reserved space is zero-initialised
 so flipping bytes from 0 → 1 in a future version is a strict additive change.
+
+The three `*_zone` fields in the superblock describe the **first** extent of each zone — the
+common case where a zone is one contiguous range. When a zone is grown by a non-contiguous
+addition (e.g. extending the metadata zone after the blob zone has already been allocated past
+its old tail), the additional extents are recorded in a `ZoneMap` block:
+
+```rust
+#[repr(C, packed)]
+struct ZoneMap {                             // 4096 bytes
+    header: BlockHeader,                     // [0..32]    kind = ZoneMap
+    extent_count: u16,                       // [32..34]   total ZoneExtent records below
+    _pad: [u8; 6],                           // [34..40]
+    extents: [ZoneMapEntry; 168],            // [40..4072] 168 × 24 B = 4032 B
+    _pad_tail: [u8; 20],                     // [4072..4092]
+    // trailing CRC32C at [4092..4096]
+}
+
+#[repr(C, packed)]
+struct ZoneMapEntry {                        // 24 bytes
+    zone_kind: u8,                           // 0 = index, 1 = metadata, 2 = blob
+    _pad: [u8; 7],
+    extent: ZoneExtent,                      // 16 B (offset + length only — flags/pad reused)
+}
+```
+
+`Superblock.zone_map_offset` is `0` until the first non-contiguous grow; from that point on
+it points to the active `ZoneMap` block. Updates use the same A/B alternation as the
+superblock root (two adjacent blocks; active selected by `BlockHeader.generation`). When a
+zone reaches 168 additional extents, a follow-on `ZoneMap` block is chained via
+`BlockHeader.flags` bit 1 (`continuation`).
+
+Mount-time zone resolution: walk superblock's first-extent fields, then if `zone_map_offset
+!= 0` append every entry whose `zone_kind` matches. The resulting per-zone vector is
+authoritative for that zone's address space.
 
 ### 2.2 Atomic root commit
 
@@ -712,6 +747,12 @@ full 48-bit local-id space is reachable at depth 3 (≈ 9 P objects). The 4-bit 
 ### Address translation (oid → leaf slot)
 
 ```rust
+// MAX_LEVELS bounds the inner-node depth above the leaf.
+// BtreeNodeHeader.level is u8 (§1.5.1), so the absolute upper bound is 15;
+// in practice depth 3 (MAX_LEVELS = 3) covers the entire 48-bit local-id
+// space at 2044 × 16380³ ≈ 9 P objects.
+const MAX_LEVELS: usize = 3;
+
 let mut idx = oid_local;
 let leaf_slot  = (idx % 2044) as u16; idx /= 2044;
 let mut child_path = [0u16; MAX_LEVELS];
@@ -719,7 +760,9 @@ for level in 0..root_level {
     child_path[level] = (idx % 16380) as u16;
     idx /= 16380;
 }
-debug_assert_eq!(idx, 0);  // remaining bits would mean the tree is too shallow
+// idx must be zero now; non-zero means oid_local exceeds the tree's
+// addressable range (caller should have grown the tree first — §"Tree growth").
+debug_assert_eq!(idx, 0);
 ```
 
 Object IDs are allocated sequentially per node (DESIGN §2.1), so populated leaves cluster densely
@@ -769,12 +812,12 @@ struct ObjectRecord {                        // 128 bytes
     blob_length: u64,                        //  [56..64]
     created_ns: i64,                         //  [64..72]
     modified_ns: i64,                        //  [72..80]
-    tag_count: u16,                          //  [80..82]
-    attr_count: u16,                         //  [82..84]
+    tag_count: u16,                          //  [80..82]    total tags on this object (object-wide)
+    attr_count: u16,                         //  [82..84]    total attrs on this object
     compression: u8,                         //  [84..85]
     encryption: u8,                          //  [85..86]
     _pad0: u16,                              //  [86..88]
-    inline_tags: [u32; 4],                   //  [88..104]   first 4 tags inline
+    inline_tags: [u32; 4],                   //  [88..104]   inline tag IDs; valid iff !has_overflow
     overflow_offset: u64,                    // [104..112]   block_no in metadata zone
     stored_size: u64,                        // [112..120]
     last_modify_lsn: u64,                    // [120..128]   for snapshot diffing
@@ -788,28 +831,38 @@ it.
 ### 5.2 Overflow records (when tags > 4 or attrs > 0)
 
 For objects with more than 4 tags or any attributes, a separate **OverflowRecord** lives in the
-metadata zone, addressed by `overflow_offset`. It is a self-contained 4 KiB block:
+metadata zone, addressed by `overflow_offset`. The `has_overflow` flag (`ObjectRecord.flags`
+bit 0) is set; while the flag is set, `inline_tags` is **ignored** and **all** tags + attrs +
+relations for the object live in the overflow chain (not split between inline and overflow).
+The object-wide totals stay in `ObjectRecord.{tag,attr}_count` (capped at u16 max ≈ 65 K).
 
 ```
 struct OverflowRecord {
     header: BlockHeader,                     // kind = OverflowRecord (§1.3)
     object_id: u64,
-    tag_count: u32,
-    attr_count: u32,
-    relation_count: u32,
-    _pad: u32,
+    tag_count: u16,                          // count IN THIS BLOCK only (≤ tag_count of owner)
+    attr_count: u16,                         // count IN THIS BLOCK only
+    relation_count: u16,                     // count IN THIS BLOCK only
+    _pad: u16,
+    next_overflow: u64,                      // block_no of the next overflow block, 0 if last
     // Followed by:
     //   tag_count × u32                                      (extra tag IDs)
     //   attr_count × { key: u32, value_hash: u64,
     //                  inline_value: [u8; 96] | spill: BlobRef }
     //   relation_count × { predicate: u32, target: u64 }
-    // ... up to 4032 bytes payload, then trailing CRC.
+    // ... up to ~4020 bytes payload, then trailing CRC.
 }
 ```
 
-If an object outgrows even a 4 KiB overflow record, a continuation chain is used (`flags` bit 1).
-At that point switching to a B+ tree per-object is more efficient and is the planned escape hatch
-for the rare wide objects (≥ 200 tags).
+If an object outgrows a single 4 KiB overflow record, the chain extends through `next_overflow`
+(equivalent to setting `BlockHeader.flags` bit 1 = `continuation` on the head). The widths for
+`tag_count` / `attr_count` / `relation_count` here are deliberately u16 — they record only the
+**per-block** count, never the object-wide total — and a single 4 KiB block cannot hold
+anywhere near 65 K of any of them. The owner's u16 totals therefore never need to be reconciled
+across blocks: each block's u16 is a lower bound that the reader sums during traversal.
+
+For pathological cases (≥ 200 tags), switching to a per-object B+ tree is more efficient and
+is the planned escape hatch.
 
 ---
 
@@ -868,8 +921,19 @@ struct ReplicaRef {                          // 8 bytes (DESIGN's 7-byte form pa
 }
 ```
 
-For chunked objects (`flags & 1`), `extent_offset` instead points to a `ChunkList` block
-referencing N (chunk_hash, BlobRef) pairs — see §9.
+For chunked objects (`flags & 1`), three of the inline fields are reinterpreted:
+
+- `extent_offset` is the `block_no` of the head `ChunkList` region (a §1.5 positional region;
+  see §9.3) instead of a physical extent offset.
+- `extent_length` is the **plaintext logical length** of the object (the sum of all chunk
+  plaintext lengths). Readers use it to size buffers and to bound chunk iteration; it is
+  authoritative for object size and matches `ObjectRecord.blob_length`.
+- `replicas[]` describes replicas of the **`ChunkList` region**, not of the data itself —
+  the chunks themselves are content-addressed and replicated independently via the chunk
+  index (§9.3). `disk_id` likewise identifies the `ChunkList`'s home disk.
+
+This keeps `ObjectLocation` a single fixed-size record regardless of chunked/non-chunked,
+preserving the radix-leaf positional layout.
 
 ### 6.2 Backpointers (reverse mapping)
 
@@ -1369,10 +1433,19 @@ allocate a fresh `TagBitmap` region and update the directory at the writing snap
 
 ### 11.3 Visibility rules (snapshot iteration)
 
+In every snapshot-aware btree, each leaf entry has a 1-byte **value-type discriminator** as its
+first byte (the `kind` field of `LeafEntry`/`PackedAssertion`/etc.; for the radix-table sidecar
+btrees `ObjectHistory`/`LocationHistory` the discriminator precedes the shadowed record).
+The reserved discriminator value `0xFF` is `KEY_TYPE_whiteout`: a tombstone marking that the
+key is **explicitly deleted** at that snapshot. Whiteouts carry no payload — the entry's
+length stops after the discriminator.
+
 When reading at snapshot `S`, the iterator walks the btree in order. For keys with the same
-non-snapshot prefix, it picks the one with the highest `snapshot ≤ S` that is an ancestor of `S`.
-A key with a `KEY_TYPE_whiteout` value in an ancestor snapshot blocks visibility of older
-versions for descendants of that snapshot.
+non-snapshot prefix, it picks the one with the highest `snapshot ≤ S` that is an ancestor of
+`S`. A whiteout encountered as the chosen ancestor returns "not visible" — it blocks fall-through
+to older versions for descendants of that snapshot. Whiteouts are physically reclaimed during
+the next full compaction (§1.5.4) of any leaf where every ancestor of the whiteout's snapshot
+is itself in the same leaf and either deleted or whited-out.
 
 Pseudocode:
 
@@ -1945,7 +2018,8 @@ Each is just a different `WorkKind` in the same queue. New mismatch types are ad
 
 ### 17.2 Work-item btrees
 
-Four §1.5 B+ trees, all `BtreeKind::Reconcile*`:
+Five §1.5 B+ trees, all `BtreeKind::Reconcile*` (a sixth, `ReconcileScan`, holds resumable
+scan cursors and is described in §17.3):
 
 ```rust
 enum WorkKind {

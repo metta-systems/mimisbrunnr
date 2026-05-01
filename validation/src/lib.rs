@@ -94,6 +94,29 @@ pub struct ZoneExtent {
 const _: () = assert!(size_of::<ZoneExtent>() == 24);
 
 // =====================================================================
+// §2.1 ZoneMap (4 KiB block) and ZoneMapEntry (24 B)
+// =====================================================================
+#[repr(C, packed)]
+pub struct ZoneMapEntry {
+    pub zone_kind: u8,
+    pub _pad: [u8; 7],
+    pub extent_offset: u64,
+    pub extent_length: u64,
+}
+const _: () = assert!(size_of::<ZoneMapEntry>() == 24);
+
+#[repr(C, packed)]
+pub struct ZoneMap {
+    pub header: BlockHeader,            //   32
+    pub extent_count: u16,              //    2
+    pub _pad: [u8; 6],                  //    6
+    pub extents: [ZoneMapEntry; 168],   // 4032
+    pub _pad_tail: [u8; 20],            //   20
+    pub trailing_crc: u32,              //    4
+}
+const _: () = assert!(size_of::<ZoneMap>() == 4096);
+
+// =====================================================================
 // §2.2 RootPointer — 376 B (revised)
 // =====================================================================
 #[repr(C, packed)]
