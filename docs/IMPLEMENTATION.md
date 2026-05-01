@@ -1067,11 +1067,11 @@ location:
 
 ```rust
 #[repr(C, packed)]
-struct BackpointerKey {                      // 12 bytes (packed via §1.5.6 to ~3-4 B per leaf)
+struct BackpointerKey {                      // 8 bytes (packed via §1.5.6 to ~3-4 B per leaf)
     disk_id: u16,
     bucket_no: u32,
-    sector_offset: u32,                      // 4 KiB units within the bucket
-    _pad: u16,
+    sector_offset: u16,                      // 4 KiB units within the bucket; u16 covers
+                                             // bucket_size ≤ 256 MiB (format caps at 4 MiB)
 }
 
 #[repr(C, packed)]
@@ -1093,7 +1093,7 @@ enum OwnerKind {
 }
 ```
 
-The pair `(BackpointerKey, BackpointerValue)` is 36 bytes unpacked; with §1.5.6 key packing
+The pair `(BackpointerKey, BackpointerValue)` is 32 bytes unpacked; with §1.5.6 key packing
 (`disk_id` constant per leaf, `bucket_no` packs to ~16–20 bits, `sector_offset` packs based on
 bucket size), per-key disk cost falls to **~26–28 B**. A 256 KiB leaf packs ~9 000 backpointers
 per sorted run.

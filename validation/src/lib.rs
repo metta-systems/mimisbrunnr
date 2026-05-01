@@ -374,16 +374,15 @@ pub struct ObjectLocation {
 const _: () = assert!(size_of::<ObjectLocation>() == 48);
 
 // =====================================================================
-// §6.2 BackpointerKey — 12 B, BackpointerValue — 24 B
+// §6.2 BackpointerKey — 8 B, BackpointerValue — 24 B
 // =====================================================================
 #[repr(C, packed)]
 pub struct BackpointerKey {
     pub disk_id: u16,
     pub bucket_no: u32,
-    pub sector_offset: u32,
-    pub _pad: u16,
+    pub sector_offset: u16,
 }
-const _: () = assert!(size_of::<BackpointerKey>() == 12);
+const _: () = assert!(size_of::<BackpointerKey>() == 8);
 
 #[repr(C, packed)]
 pub struct BackpointerValue {
