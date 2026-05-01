@@ -67,8 +67,12 @@ struct BlockHeader {              // 32 bytes
                                   //          4 KiB block are < 4096.
     generation: u64,              // [12..20] monotonic per-block generation, for COW
     lsn: u64,                     // [20..28] WAL LSN that produced this block
-    flags: u32,                   // [28..32] bit 0 = encrypted, bit 1 = continuation
+    flags: u32,                   // [28..32] BLOCK_FLAG_*
 }
+
+// BlockHeader.flags bits
+const BLOCK_FLAG_ENCRYPTED:    u32 = 1 << 0;  // payload encrypted (XTS-AES-256)
+const BLOCK_FLAG_CONTINUATION: u32 = 1 << 1;  // continuation of a chained record
 ```
 
 A block is `BlockHeader | payload | u32 CRC32C(BlockHeader || payload)` — total = 4096 bytes by
@@ -115,9 +119,9 @@ enum BtreeKind {
     PlacementRules,     // §10.4 placement rules (heterogeneous, CBOR values)
     ClusterPeers,       // §10.4 cluster peers (NodeId → PeerRecord)
     ReconcileWork,      // §17.2 normal-priority reconcile queue (logical order)
-    ReconcileHipri,     // §17.2 high-priority reconcile queue
+    ReconcileHighPrio,     // §17.2 high-priority reconcile queue
     ReconcileWorkPhys,  // §17.2 physical-LBA-ordered work index (HDD pools)
-    ReconcileHipriPhys, // §17.2 physical-LBA-ordered hipri index (HDD pools)
+    ReconcileHighPrioPhys, // §17.2 physical-LBA-ordered high-prio index (HDD pools)
     ReconcilePending,   // §17.2 failed items awaiting device-config retry
     ReconcileScan,      // §17.3 in-progress scan cursors
 }
@@ -165,11 +169,14 @@ struct BtreeNodeHeader {                     // 64 bytes
     region_size_log2: u8,                    // [24..25] 18 = 256 KiB
     level: u8,                               // [25..26] 0 = leaf, ≥1 = inner
     bset_count: u8,                          // [26..27] number of bsets present
-    flags: u8,                               // [27..28] bit 0 = compaction-in-progress (recovery hint)
+    flags: u8,                               // [27..28] BTREE_NODE_FLAG_*
     payload_used: u32,                       // [28..32] bytes consumed by all bsets so far (≤ region_size − 64)
     min_key: [u8; 16],                       // [32..48] covered key range (interpreted per-kind)
     max_key: [u8; 16],                       // [48..64] ditto
 }
+
+// BtreeNodeHeader.flags bits
+const BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS: u8 = 1 << 0;  // recovery hint
 ```
 
 `BlockPreamble` is the 8-byte common prefix shared with `BlockHeader` (§1.3), so a generic
@@ -200,9 +207,13 @@ struct BsetHeader {                          // 32 bytes
     journal_seq: u64,                        // newest WAL LSN merged into this bset (recovery)
     entry_count: u32,                        // entries in this bset
     payload_length: u32,                     // bytes of bset payload
-    flags: u32,                              // bit 0 = packed-keys, bit 1 = encrypted
+    flags: u32,                              // BSET_FLAG_*
     crc: u32,                                // CRC32C over (BsetHeader || payload), CRC slot zeroed
 }
+
+// BsetHeader.flags bits
+const BSET_FLAG_PACKED_KEYS: u32 = 1 << 0;  // entries use BsetKeyFormat encoding (§1.5.6)
+const BSET_FLAG_ENCRYPTED:   u32 = 1 << 1;  // bset payload encrypted
 ```
 
 The CRC scope is **per-bset**, not per-4 KiB-block. Each bset is therefore an independently
@@ -292,10 +303,14 @@ struct BsetKeyFormat {                       // 8 + nr_fields × 12 bytes
 #[repr(C, packed)]
 struct FieldFormat {                         // 12 bytes
     bit_width: u8,                           // 0..=64;  0 ⇒ constant (use `base` directly)
-    flags: u8,                               // bit 0 = signed, bit 1 = MSB-first
+    flags: u8,                               // FIELD_FORMAT_FLAG_*
     _pad: u16,
     base: u64,                               // value subtracted from each field at write time
 }
+
+// FieldFormat.flags bits
+const FIELD_FORMAT_FLAG_SIGNED:    u8 = 1 << 0;
+const FIELD_FORMAT_FLAG_MSB_FIRST: u8 = 1 << 1;
 ```
 
 The descriptor is part of the `BsetHeader` payload (§1.5.1), prepended before the packed-key
@@ -461,7 +476,7 @@ struct ZoneMapEntry {                        // 24 bytes
 it points to the active `ZoneMap` block. Updates use the same A/B alternation as the
 superblock root (two adjacent blocks; active selected by `BlockHeader.generation`). When a
 zone reaches 168 additional extents, a follow-on `ZoneMap` block is chained via
-`BlockHeader.flags` bit 1 (`continuation`).
+`BLOCK_FLAG_CONTINUATION` in `BlockHeader.flags`.
 
 Mount-time zone resolution: walk superblock's first-extent fields, then if `zone_map_offset
 != 0` append every entry whose `zone_kind` matches. The resulting per-zone vector is
@@ -499,9 +514,9 @@ struct RootPointer {                         // 424 bytes
     // Reconcile btrees (§17.2). Zeroed when unused; *_phys variants are
     // populated only when a rotational disk is present in the pool.
     reconcile_work_root:      BlockRef,      // [272..288]
-    reconcile_hipri_root:     BlockRef,      // [288..304]
+    reconcile_high_prio_root:     BlockRef,      // [288..304]
     reconcile_work_phys_root: BlockRef,      // [304..320]
-    reconcile_hipri_phys_root:BlockRef,      // [320..336]
+    reconcile_high_prio_phys_root: BlockRef, // [320..336]
     reconcile_pending_root:   BlockRef,      // [336..352]
     reconcile_scan_root:      BlockRef,      // [352..368]  §17.3  in-progress scan cursors
 
@@ -592,7 +607,7 @@ monotonic counter that drives every COW block update; no separate `seq` is neede
 ### 3.2 WAL entry
 
 Entries are byte-packed, never crossing a 4 KiB boundary unless `payload_length` > 4060, in which
-case the entry is split into `Continuation` frames (flag bit 1 in `BlockHeader.flags`).
+case the entry is split into `Continuation` frames (`BLOCK_FLAG_CONTINUATION`).
 
 ```rust
 #[repr(C, packed)]
@@ -600,12 +615,16 @@ struct WalEntryHeader {                      // 40 bytes
     magic: u32,                              // "WALR"
     op_kind: u8,                             // WalOpKind
     format_version: u8,
-    flags: u16,                              // bit 0 = encrypted, bit 1 = compressed payload
+    flags: u16,                              // WAL_ENTRY_FLAG_*
     lsn: u64,
     timestamp: HybridTimestamp,              // 16 bytes (see §10)
     payload_length: u32,
     payload_crc: u32,                        // CRC32C of payload (post-compression/encryption)
 }
+
+// WalEntryHeader.flags bits
+const WAL_ENTRY_FLAG_ENCRYPTED:  u16 = 1 << 0;  // payload encrypted (AES-256-GCM)
+const WAL_ENTRY_FLAG_COMPRESSED: u16 = 1 << 1;  // payload compressed (zstd) before encryption
 ```
 
 Followed by `payload_length` bytes of CBOR-encoded payload (per `WalOpKind`) and a 4-byte trailing
@@ -652,7 +671,7 @@ SnapshotDelete   : { id: u32 }                                            // mar
 // id, so resuming from a stale cursor after crash is safe.
 
 // Reconcile (§17)
-ReconcileEnqueue : { work: WorkItem, hipri: bool, phys_index: bool }
+ReconcileEnqueue : { work: WorkItem, high_prio: bool, phys_index: bool }
 ReconcileDequeue : { target_kind: u8, owner_key: bytes, work_kind: u8 }   // completion or cancel
 ReconcileMove    : { from_loc: BlockRef, to_loc: BlockRef, owner_key: bytes }
                    // atomic location-update for move-path completion
@@ -862,7 +881,7 @@ struct ObjectRecord {                        // 128 bytes
     id: u64,                                 //  [0..8]
     generation: u32,                         //  [8..12]
     state: u8,                               //  [12..13]    ObjectState
-    flags: u8,                               //  [13..14]    bit 0 = has_overflow, bit 1 = chunked
+    flags: u8,                               //  [13..14]    OBJECT_FLAG_*
     record_version: u16,                     //  [14..16]    structural version of THIS record
     content_hash: [u8; 32],                  //  [16..48]    BLAKE3 of plaintext
     blob_offset: u64,                        //  [48..56]
@@ -874,11 +893,15 @@ struct ObjectRecord {                        // 128 bytes
     compression: u8,                         //  [84..85]
     encryption: u8,                          //  [85..86]
     _pad0: u16,                              //  [86..88]
-    inline_tags: [u32; 4],                   //  [88..104]   inline tag IDs; valid iff !has_overflow
+    inline_tags: [u32; 4],                   //  [88..104]   inline tag IDs; valid iff !(flags & OBJECT_FLAG_HAS_OVERFLOW)
     overflow_offset: u64,                    // [104..112]   block_no in metadata zone
     stored_size: u64,                        // [112..120]
     last_modify_lsn: u64,                    // [120..128]   for snapshot diffing
 }
+
+// ObjectRecord.flags bits
+const OBJECT_FLAG_HAS_OVERFLOW: u8 = 1 << 0;  // tags/attrs/relations spilled to OverflowRecord
+const OBJECT_FLAG_CHUNKED:      u8 = 1 << 1;  // blob is FastCDC-chunked (see §9.3)
 ```
 
 `record_version` in addition to `BlockHeader.format_version` lets a single page mix old and new
@@ -888,8 +911,8 @@ it.
 ### 5.2 Overflow records (when tags > 4 or attrs > 0)
 
 For objects with more than 4 tags or any attributes, a separate **OverflowRecord** lives in the
-metadata zone, addressed by `overflow_offset`. The `has_overflow` flag (`ObjectRecord.flags`
-bit 0) is set; while the flag is set, `inline_tags` is **ignored** and **all** tags + attrs +
+metadata zone, addressed by `overflow_offset`. `OBJECT_FLAG_HAS_OVERFLOW` is set in
+`ObjectRecord.flags`; while it's set, `inline_tags` is **ignored** and **all** tags + attrs +
 relations for the object live in the overflow chain (not split between inline and overflow).
 The object-wide totals stay in `ObjectRecord.{tag,attr}_count` (capped at u16 max ≈ 65 K).
 
@@ -912,7 +935,7 @@ struct OverflowRecord {
 ```
 
 If an object outgrows a single 4 KiB overflow record, the chain extends through `next_overflow`
-(equivalent to setting `BlockHeader.flags` bit 1 = `continuation` on the head). The widths for
+(equivalent to setting `BLOCK_FLAG_CONTINUATION` in the head's `BlockHeader.flags`). The widths for
 `tag_count` / `attr_count` / `relation_count` here are deliberately u16 — they record only the
 **per-block** count, never the object-wide total — and a single 4 KiB block cannot hold
 anywhere near 65 K of any of them. The owner's u16 totals therefore never need to be reconciled
@@ -961,7 +984,7 @@ amortised across pending mutations.
 ```rust
 #[repr(C, align(8))]
 struct ObjectLocation {                      // 48 bytes
-    flags: u8,                               //  [0..1]    bit 0 = chunked, bit 1 = remote-only
+    flags: u8,                               //  [0..1]    LOCATION_FLAG_*
     replica_count: u8,                       //  [1..2]    1..=4; total physical copies
     _pad: [u8; 6],                           //  [2..8]    align to u64
     extent_length: u64,                      //  [8..16]   non-chunked: extent length in bytes
@@ -969,6 +992,10 @@ struct ObjectLocation {                      // 48 bytes
     replicas: [ReplicaRef; 4],               // [16..48]   4 × 8 B; slots [replica_count..4]
                                              //           are zeroed and ignored
 }
+
+// ObjectLocation.flags bits
+const LOCATION_FLAG_CHUNKED:     u8 = 1 << 0;  // replicas[] are ChunkList region copies (§9.3)
+const LOCATION_FLAG_REMOTE_ONLY: u8 = 1 << 1;  // no local replica; reads must go cross-node
 
 #[repr(C)]
 struct ReplicaRef {                          // 8 bytes
@@ -1012,8 +1039,8 @@ bucket_no     = block_no >> (bucket_size_log2 - 12)
 sector_offset = block_no & ((1 << (bucket_size_log2 - 12)) - 1)
 ```
 
-**Chunked objects** (`flags & 1`) reinterpret the meaning of what `replicas[]` points at,
-not the layout:
+**Chunked objects** (`flags & LOCATION_FLAG_CHUNKED`) reinterpret the meaning of what
+`replicas[]` points at, not the layout:
 
 - `replicas[0..replica_count]` describe replicas of the head **`ChunkList` region** (a §1.5
   positional region; see §9.3), not the user data. The chunks themselves are
@@ -1127,13 +1154,17 @@ unpacked 8 bytes.
 struct LeafEntry {                           // variable length on disk
     oid: u64,                                // sort key — packed via BsetKeyFormat
     header: u16,                             // bitfield: see below
-    body: union {                            // discriminated by header.is_spill
-        inline: [PackedAssertion; header & 0x7FFF],   // when is_spill = 0
-        spill_ref: BlockRef,                          // when is_spill = 1; chain via the
-                                                      //  spill region's trailing BlockRef
-                                                      //  slot per §7.2
+    body: union {                            // discriminated by header & LEAF_ENTRY_SPILL_FLAG
+        inline: [PackedAssertion; header & LEAF_ENTRY_TOTAL_MASK],   // !is_spill
+        spill_ref: BlockRef,                                         //  is_spill; chain via
+                                                                     //  spill region's trailing
+                                                                     //  BlockRef slot per §7.2
     },
 }
+
+// LeafEntry.header bitfield
+const LEAF_ENTRY_SPILL_FLAG: u16 = 1 << 15;  // body is spill_ref (BlockRef) when set
+const LEAF_ENTRY_TOTAL_MASK: u16 = 0x7FFF;   // bits 0..14: total assertion count
 ```
 
 The 16-bit `header` is a single bitfield carrying both the spill flag and the assertion
@@ -1141,17 +1172,20 @@ count:
 
 ```
 header: u16
-  bit 15       is_spill   1 = body is `spill_ref` (BlockRef into a ForwardOverflow chain)
-                          0 = body is the inline `[PackedAssertion; total]` array
-  bits 0..14   total      object's total assertion count, regardless of is_spill:
-                            is_spill = 0 → total inline assertions (typical 0..8,
-                                           hard cap ~16 before next-mutation spill)
-                            is_spill = 1 → total assertions across the entire spill
-                                           chain (up to 32 K)
+  LEAF_ENTRY_SPILL_FLAG (bit 15)   1 = body is `spill_ref` (BlockRef into a ForwardOverflow
+                                       chain)
+                                   0 = body is the inline `[PackedAssertion; total]` array
+  LEAF_ENTRY_TOTAL_MASK (bits 0..14)  total — object's total assertion count, regardless
+                                       of is_spill:
+                                         not spilled → total inline assertions (typical
+                                                       0..8, hard cap ~16 before next-
+                                                       mutation spill)
+                                         spilled     → total assertions across the entire
+                                                       spill chain (up to 32 K)
 ```
 
-**Total cardinality** is therefore just `header & 0x7FFF` — a single masked read, no
-branching on `is_spill`. The query optimiser uses this for intersection planning (§9), where
+**Total cardinality** is therefore `header & LEAF_ENTRY_TOTAL_MASK` — a single masked read,
+no branching on the spill bit. The query optimiser uses this for intersection planning (§9), where
 the smaller-cardinality side is iterated first. The 15-bit ceiling (32 K) is comfortably
 above the >200-tag pathological case mentioned in §5.2; objects exceeding 32 K assertions
 take the per-object B+ tree escape hatch.
@@ -1441,12 +1475,16 @@ PathContextRoot:
 struct PathContextHeader {                   // 48 bytes
     name_offset: u32,                        //  [0..4]   into the per-context string heap
     name_len: u16,                           //  [4..6]
-    flags: u16,                              //  [6..8]   bit 0 = read-only, bit 1 = ephemeral
+    flags: u16,                              //  [6..8]   PATH_CONTEXT_FLAG_*
     manifest_root: BlockRef,                 //  [8..24]  root of the §1.5 manifest tree
     entry_count: u64,                        // [24..32] total ProjectedEntries (manifest size hint)
     last_refresh_ns: i64,                    // [32..40] last full re-projection timestamp
     last_modify_lsn: u64,                    // [40..48] for snapshot diffing
 }
+
+// PathContextHeader.flags bits
+const PATH_CONTEXT_FLAG_READ_ONLY: u16 = 1 << 0;  // immutable view; mutations rejected
+const PATH_CONTEXT_FLAG_EPHEMERAL: u16 = 1 << 1;  // not persisted across mounts
 ```
 
 `entry_count`, `last_refresh_ns`, and `last_modify_lsn` are the per-context "stats" — they
@@ -1554,8 +1592,7 @@ struct SnapshotNode {                        // 64 bytes
     first_child: u32,                        // first child id (0 = leaf)
     next_sibling: u32,                       // next sibling under same parent (0 = last)
     depth: u16,                              // distance from root
-    flags: u8,                               // bit 0 = leaf (subvolume-bearing),
-                                             // bit 1 = deleted (§11.5)
+    flags: u8,                               // SNAPSHOT_FLAG_*
     _pad: u8,
     ancestor_bitmap: u128,                   // bits[i] = "id − i is an ancestor", i ∈ 0..128
     skiplist: [u32; 3],                      // randomised ancestor IDs for O(log n) deep checks
@@ -1563,6 +1600,10 @@ struct SnapshotNode {                        // 64 bytes
     label_offset: u32,                       // into a string heap; 0 = unlabelled
     _reserved: u32,
 }
+
+// SnapshotNode.flags bits
+const SNAPSHOT_FLAG_LEAF:    u8 = 1 << 0;  // subvolume-bearing (a writable head)
+const SNAPSHOT_FLAG_DELETED: u8 = 1 << 1;  // marked for SnapshotCleanup (§11.5)
 ```
 
 **Children topology.** The pair `(first_child, next_sibling)` encodes a **first-child /
@@ -1693,7 +1734,7 @@ The synchronous step's WAL cost is one entry; the scan's WAL cost is a handful o
 checkpoints, regardless of how many keys are involved.
 
 **Synchronous step (`SnapshotDelete` WAL op).**
-1. In the snapshots btree, set `SnapshotNode.flags` bit 1 (`deleted`). The node remains in
+1. In the snapshots btree, set `SNAPSHOT_FLAG_DELETED` in `SnapshotNode.flags`. The node remains in
    place — its `depth` and `skiplist` are still consulted during ancestry checks for siblings
    and descendants — but no new reads are accepted *at* the deleted snapshot id.
 2. Enqueue a `WorkKind::SnapshotCleanup` work item per snapshot-aware btree (§17.2). Each
@@ -1889,10 +1930,14 @@ so a 256 KiB leaf packs ~14 600 BucketAllocKey entries per bset; a 16 M-bucket d
 struct BucketAllocKey {                      // 16 bytes
     generation: u32,                         // monotonic; matched by BlockRef.generation
     data_type: u8,                           // BucketDataType (below)
-    flags: u8,                               // bit 0 = needs_discard, bit 1 = pinned-by-snapshot
+    flags: u8,                               // BUCKET_FLAG_*
     dirty_sectors: u16,                      // live 4 KiB sectors written in this bucket
     last_modify_lsn: u64,                    // for snapshot-diffing the alloc table itself
 }
+
+// BucketAllocKey.flags bits
+const BUCKET_FLAG_NEEDS_DISCARD:      u8 = 1 << 0;  // queued for TRIM (§12.7)
+const BUCKET_FLAG_PINNED_BY_SNAPSHOT: u8 = 1 << 1;  // contents reachable from a live snapshot
 
 #[repr(u8)]
 enum BucketDataType {
@@ -2088,7 +2133,7 @@ The on-disk layout is encryption-aware but encryption-agnostic:
   Length-preserving.
 - **WAL**: each entry is **AES-256-GCM** authenticated. Nonce = LSN (96 bits = 64-bit LSN || 32-bit
   zero, nonce-misuse-resistant by construction since LSNs never repeat). The `payload_crc` slot in
-  the entry header is replaced by the GCM tag in encrypted mode (flag bit 0 set). The trailing
+  the entry header is replaced by the GCM tag in encrypted mode (`WAL_ENTRY_FLAG_ENCRYPTED`). The trailing
   framing CRC remains plaintext for I/O-error detection.
 - **Sync bundles**: **ChaCha20-Poly1305** with random nonces.
 
@@ -2294,19 +2339,23 @@ struct WorkItem {                            // 48 B base + variable owner_key
     work_kind: u8,                           // WorkKind
     attempt_count: u8,
     last_error_code: u8,
-    flags: u32,                              // bit 0 = ratelimited, bit 1 = persistent
+    flags: u32,                              // WORK_FLAG_*
     enqueued_lsn: u64,
     desired_state_ref: BlockRef,             // 16 B → CBOR(DesiredState) for variable detail
     owner_key: [u8; 16],                     // owning key in target btree (packed)
 }
+
+// WorkItem.flags bits
+const WORK_FLAG_RATELIMITED: u32 = 1 << 0;  // throttle this item below pool default
+const WORK_FLAG_PERSISTENT:  u32 = 1 << 1;  // do not drop on completion (audit trail)
 ```
 
 | Btree                  | Ordering                              | Use                                          |
 | ---------------------- | ------------------------------------- | -------------------------------------------- |
 | `ReconcileWork`        | logical key (target_kind, owner_key)  | Default queue. Cheap on SSD where logical ≈ physical.|
-| `ReconcileHipri`       | same                                  | High-priority items processed first.         |
+| `ReconcileHighPrio`       | same                                  | High-priority items processed first.         |
 | `ReconcileWorkPhys`    | physical LBA (disk_id, bucket, sector_offset) | HDD-backed pools — sequential processing avoids seeks. Maintained as a parallel index alongside `ReconcileWork`. |
-| `ReconcileHipriPhys`   | same                                  | High-priority physical-order index.          |
+| `ReconcileHighPrioPhys`   | same                                  | High-priority physical-order index.          |
 | `ReconcilePending`     | logical key                           | Failed items. Retried only after device-config events; avoids spin loops on permanently-blocked work. |
 
 Whether to maintain `*_Phys` indexes is set per-disk via `DiskDescriptorOnDisk` (rotational
@@ -2318,7 +2367,7 @@ Work enters the queue via two paths:
 
 **1. Per-key triggers.** Every snapshot-aware btree carries a trigger callback that fires on
 insert / update / delete. The trigger compares the new state against the relevant rules and
-emits a `WorkItem` to `ReconcileWork` (or `ReconcileHipri`) if a mismatch is observed.
+emits a `WorkItem` to `ReconcileWork` (or `ReconcileHighPrio`) if a mismatch is observed.
 Triggers are journalled like any other btree mutation (§3.4) — recovery replays them
 deterministically.
 
@@ -2343,8 +2392,8 @@ so resuming from any earlier cursor produces the same final state.
 
 Work is processed strictly in this order:
 
-1. `ReconcileHipri` — under-replicated metadata, evacuating metadata.
-2. `ReconcileHipri` — under-replicated data, evacuating data.
+1. `ReconcileHighPrio` — under-replicated metadata, evacuating metadata.
+2. `ReconcileHighPrio` — under-replicated data, evacuating data.
 3. `ReconcileWork` — normal metadata reconciliation.
 4. `ReconcileWork` — normal data (tiering, option updates, optimisations,
    `SnapshotCleanup`).
@@ -2377,7 +2426,7 @@ Because reconcile is state-driven, multiple in-flight operations compose without
 - **Tier policy change during evacuation** — the next evaluation of each extent considers both
   the new tier and the avoid-evacuating-disk constraint together.
 - **Replica repair during copygc** — under-replicated data discovered mid-copygc gets a
-  `ReplicaRepair` work item enqueued at hipri; copygc continues in parallel.
+  `ReplicaRepair` work item enqueued at high priority; copygc continues in parallel.
 
 This is what bcachefs gains by replacing event-driven rebalance/resilver/tiering threads with
 one state-driven engine.

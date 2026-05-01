@@ -6,6 +6,62 @@
 use std::mem::size_of;
 
 // =====================================================================
+// Symbolic flag constants — mirrors §1.3, §1.5.1, §1.5.6, §3.1, §3.2,
+// §5.1, §6.1, §7.1, §10.3, §11.1, §12.2, §17.2.
+// Asserted-by-existence: any code referring to these names compiles iff
+// the constants stay defined here.
+// =====================================================================
+
+// BlockHeader.flags
+pub const BLOCK_FLAG_ENCRYPTED:    u32 = 1 << 0;
+pub const BLOCK_FLAG_CONTINUATION: u32 = 1 << 1;
+
+// BtreeNodeHeader.flags
+pub const BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS: u8 = 1 << 0;
+
+// BsetHeader.flags
+pub const BSET_FLAG_PACKED_KEYS: u32 = 1 << 0;
+pub const BSET_FLAG_ENCRYPTED:   u32 = 1 << 1;
+
+// FieldFormat.flags
+pub const FIELD_FORMAT_FLAG_SIGNED:    u8 = 1 << 0;
+pub const FIELD_FORMAT_FLAG_MSB_FIRST: u8 = 1 << 1;
+
+// WalEntryHeader.flags
+pub const WAL_ENTRY_FLAG_ENCRYPTED:  u16 = 1 << 0;
+pub const WAL_ENTRY_FLAG_COMPRESSED: u16 = 1 << 1;
+
+// ObjectRecord.flags
+pub const OBJECT_FLAG_HAS_OVERFLOW: u8 = 1 << 0;
+pub const OBJECT_FLAG_CHUNKED:      u8 = 1 << 1;
+
+// ObjectLocation.flags
+pub const LOCATION_FLAG_CHUNKED:     u8 = 1 << 0;
+pub const LOCATION_FLAG_REMOTE_ONLY: u8 = 1 << 1;
+
+// LeafEntry.header (§7.1)
+pub const LEAF_ENTRY_SPILL_FLAG: u16 = 1 << 15;
+pub const LEAF_ENTRY_TOTAL_MASK: u16 = 0x7FFF;
+const _: () = assert!(LEAF_ENTRY_SPILL_FLAG | LEAF_ENTRY_TOTAL_MASK == 0xFFFF);
+const _: () = assert!(LEAF_ENTRY_SPILL_FLAG & LEAF_ENTRY_TOTAL_MASK == 0);
+
+// PathContextHeader.flags
+pub const PATH_CONTEXT_FLAG_READ_ONLY: u16 = 1 << 0;
+pub const PATH_CONTEXT_FLAG_EPHEMERAL: u16 = 1 << 1;
+
+// SnapshotNode.flags
+pub const SNAPSHOT_FLAG_LEAF:    u8 = 1 << 0;
+pub const SNAPSHOT_FLAG_DELETED: u8 = 1 << 1;
+
+// BucketAllocKey.flags
+pub const BUCKET_FLAG_NEEDS_DISCARD:      u8 = 1 << 0;
+pub const BUCKET_FLAG_PINNED_BY_SNAPSHOT: u8 = 1 << 1;
+
+// WorkItem.flags
+pub const WORK_FLAG_RATELIMITED: u32 = 1 << 0;
+pub const WORK_FLAG_PERSISTENT:  u32 = 1 << 1;
+
+// =====================================================================
 // §2.3 BlockRef — 16 B
 // =====================================================================
 #[repr(C, packed)]
@@ -152,9 +208,9 @@ pub struct RootPointer {
     pub pool_state_root: BlockRef,
     pub snapshot_chain_root: BlockRef,
     pub reconcile_work_root: BlockRef,
-    pub reconcile_hipri_root: BlockRef,
+    pub reconcile_high_prio_root: BlockRef,
     pub reconcile_work_phys_root: BlockRef,
-    pub reconcile_hipri_phys_root: BlockRef,
+    pub reconcile_high_prio_phys_root: BlockRef,
     pub reconcile_pending_root: BlockRef,
     pub reconcile_scan_root: BlockRef,
     pub disks_overflow_root: BlockRef,           // §10.4 — populated iff disk_count > 8
