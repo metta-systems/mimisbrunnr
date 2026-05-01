@@ -340,39 +340,39 @@ struct Superblock {                          // 4096 bytes total
     last_mount_timestamp_ns: i64,            //  [96..104]
     mount_count: u64,                        // [104..112]
 
-    // Two alternating root pointers — atomic commit.
-    root_a: RootPointer,                     // [112..176]  64 bytes
-    root_b: RootPointer,                     // [176..240]
-    active_root: u8,                         // [240..241]  0 = a, 1 = b
-    _pad2: [u8; 7],                          // [241..248]
+    // Two alternating root pointers — atomic commit. RootPointer = 376 bytes (§2.2).
+    root_a: RootPointer,                     // [112..488]
+    root_b: RootPointer,                     // [488..864]
+    active_root: u8,                         // [864..865]   0 = a, 1 = b
+    _pad2: [u8; 7],                          // [865..872]
 
     // Static layout pointers (set at format time, not written again).
-    wal_offset: u64,                         // [248..256]
-    wal_size: u64,                           // [256..264]
-    bucket_size_log2: u8,                    // [264..265]   e.g. 20 = 1 MiB bucket
-    copygc_reserve_pct: u8,                  // [265..266]   default 8 (range 5..=21)
-    btree_node_size_log2: u8,                // [266..267]   default 18 = 256 KiB (§1.5)
-    _pad3: [u8; 5],                          // [267..272]
-    bootstrap_buckets: u32,                  // [272..276]   reserved leading buckets (sb + WAL + …)
-    _pad4: [u8; 4],                          // [276..280]
-    _reserved: [u8; 16],                     // [280..296]   reserved for future use
-    zone_map_offset: u64,                    // [296..304]   0 until any zone is grown
+    wal_offset: u64,                         // [872..880]
+    wal_size: u64,                           // [880..888]
+    bucket_size_log2: u8,                    // [888..889]   e.g. 20 = 1 MiB bucket
+    copygc_reserve_pct: u8,                  // [889..890]   default 8 (range 5..=21)
+    btree_node_size_log2: u8,                // [890..891]   default 18 = 256 KiB (§1.5)
+    _pad3: [u8; 5],                          // [891..896]
+    bootstrap_buckets: u32,                  // [896..900]   reserved leading buckets (sb + WAL + …)
+    _pad4: [u8; 4],                          // [900..904]
+    zone_map_offset: u64,                    // [904..912]   0 until any zone is grown
 
     // Initial-extent zone descriptors. Always authoritative for the first extent;
     // additional extents (if any) are listed in the ZoneMap block.
-    index_zone:    ZoneExtent,               // [304..328]   24 bytes
-    metadata_zone: ZoneExtent,               // [328..352]
-    blob_zone:     ZoneExtent,               // [352..376]
+    index_zone:    ZoneExtent,               // [912..936]   24 bytes
+    metadata_zone: ZoneExtent,               // [936..960]
+    blob_zone:     ZoneExtent,               // [960..984]
 
-    encryption_keyid: [u8; 16],              // [376..392]   key identifier (not the key)
-    fs_format_version: u32,                  // [392..396]   §15 — current writing version
-    fs_min_on_disk: u32,                     // [396..400]   §15 — minimum version of any record on disk
-    compat_features: u64,                    // [400..408]   §15.2 — old readers tolerate
-    ro_compat_features: u64,                 // [408..416]   §15.2 — old readers mount RO
-    incompat_features: u64,                  // [416..424]   §15.2 — old readers refuse
-    downgrade_log_ref: BlockRef,             // [424..440]   §15.5 — chain of historical features
-    _reserved: [u8; 3652],                   // [440..4092]  zeroed, available for future fields
-    // trailing CRC32C lives inside BlockHeader's frame
+    encryption_keyid: [u8; 16],              // [984..1000]  key identifier (not the key)
+    fs_format_version: u32,                  // [1000..1004] §15 — current writing version
+    fs_min_on_disk: u32,                     // [1004..1008] §15 — minimum version of any record on disk
+    compat_features: u64,                    // [1008..1016] §15.2 — old readers tolerate
+    ro_compat_features: u64,                 // [1016..1024] §15.2 — old readers mount RO
+    incompat_features: u64,                  // [1024..1032] §15.2 — old readers refuse
+    downgrade_log_ref: BlockRef,             // [1032..1048] §15.5 — chain of historical features
+
+    _reserved: [u8; 3044],                   // [1048..4092] zeroed, available for future fields
+    // trailing CRC32C at [4092..4096] lives inside BlockHeader's frame
 }
 
 struct ZoneExtent {                          // 24 bytes
@@ -393,22 +393,39 @@ windows:
 
 ```rust
 #[repr(C, packed)]
-RootPointer {                                // 64 bytes
-    seq: u64,                                // monotonic; larger seq wins
-    lsn: u64,                                // WAL LSN this root corresponds to
-    object_table_root:    BlockRef,          // 16 bytes — see §2.3
-    location_table_root:  BlockRef,
-    forward_index_root:   BlockRef,
-    tag_index_root:       BlockRef,          // root of TagIndexDirectory
-    kv_index_root:        BlockRef,
-    range_index_root:     BlockRef,
-    ontology_root:        BlockRef,
-    path_context_root:    BlockRef,
-    subscriptions_root:   BlockRef,
-    pool_state_root:      BlockRef,
-    snapshot_chain_root:  BlockRef,          // root of the snapshots btree — §11.1
-    flags: u32,
-    crc: u32,                                // CRC32C of bytes [0..60]
+struct RootPointer {                         // 376 bytes
+    seq: u64,                                //   [0..8]    monotonic; larger seq wins
+    lsn: u64,                                //   [8..16]   WAL LSN this root corresponds to
+
+    // Logical / data btrees (snapshot-aware unless noted; see §11.2 table).
+    object_table_root:        BlockRef,      //  [16..32]   §5     radix table — current view
+    object_history_root:      BlockRef,      //  [32..48]   §11.2  sidecar: (oid, snapshot) overrides
+    location_table_root:      BlockRef,      //  [48..64]   §6.1   radix table — current view
+    location_history_root:    BlockRef,      //  [64..80]   §11.2  sidecar
+    forward_index_root:       BlockRef,      //  [80..96]   §7
+    tag_index_root:           BlockRef,      //  [96..112]  §8.1   TagIndexDirectory
+    kv_index_root:            BlockRef,      // [112..128]  §9.1   KvDirectory (4 KiB block)
+    range_index_root:         BlockRef,      // [128..144]  §9.2
+    chunk_index_root:         BlockRef,      // [144..160]  §9.3   content-addressed (snapshot-agnostic)
+    value_spill_root:         BlockRef,      // [160..176]  §7.3   content-addressed by value_hash
+    backpointer_root:         BlockRef,      // [176..192]  §6.2   physical (snapshot-agnostic)
+    ontology_root:            BlockRef,      // [192..208]  §10.1
+    path_context_root:        BlockRef,      // [208..224]  §10.3
+    subscriptions_root:       BlockRef,      // [224..240]  §10.2
+    pool_state_root:          BlockRef,      // [240..256]  §10.4
+    snapshot_chain_root:      BlockRef,      // [256..272]  §11.1  snapshots btree
+
+    // Reconcile btrees (§17.2). Zeroed when unused; *_phys variants are
+    // populated only when a rotational disk is present in the pool.
+    reconcile_work_root:      BlockRef,      // [272..288]
+    reconcile_hipri_root:     BlockRef,      // [288..304]
+    reconcile_work_phys_root: BlockRef,      // [304..320]
+    reconcile_hipri_phys_root:BlockRef,      // [320..336]
+    reconcile_pending_root:   BlockRef,      // [336..352]
+    reconcile_scan_root:      BlockRef,      // [352..368]  §17.3  in-progress scan cursors
+
+    flags: u32,                              // [368..372]
+    crc: u32,                                // [372..376]  CRC32C of bytes [0..372]
 }
 ```
 
