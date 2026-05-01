@@ -1430,9 +1430,11 @@ stored in the **snapshots btree** (`BtreeKind::Snapshots`, a §1.5 B+ tree keyed
 struct SnapshotNode {                        // 64 bytes
     id: u32,                                 // self-id (also the btree key)
     parent: u32,                             // 0 = root snapshot
-    children: [u32; 2],                      // bcachefs-style binary structure
+    first_child: u32,                        // first child id (0 = leaf)
+    next_sibling: u32,                       // next sibling under same parent (0 = last)
     depth: u16,                              // distance from root
-    flags: u8,                               // bit 0 = leaf (subvolume-bearing)
+    flags: u8,                               // bit 0 = leaf (subvolume-bearing),
+                                             // bit 1 = deleted (§11.5)
     _pad: u8,
     ancestor_bitmap: u128,                   // bits[i] = "id − i is an ancestor", i ∈ 0..128
     skiplist: [u32; 3],                      // randomised ancestor IDs for O(log n) deep checks
@@ -1441,6 +1443,13 @@ struct SnapshotNode {                        // 64 bytes
     _reserved: u32,
 }
 ```
+
+**Children topology.** The pair `(first_child, next_sibling)` encodes a **first-child /
+next-sibling** linked list, supporting an arbitrary number of children per node at fixed
+per-node cost. Walking a node's children is `cur = node.first_child; while cur != 0 { yield
+cur; cur = tree[cur].next_sibling; }`. This admits the rollback case (§11.9: a snapshot may
+spawn N≥3 sibling branches over its lifetime) without changing node size — same 8 bytes as
+the previous `[u32; 2]` form.
 
 **Ancestry check.** The 128-bit `ancestor_bitmap` answers `is X an ancestor of Y?` in O(1) when
 `Y.id − X.id ≤ 128` — which covers the vast majority of cases (most snapshots reference recent
@@ -1531,20 +1540,25 @@ choosing the closest ancestor as it goes.
 
 Snapshot creation is O(1): allocate two new `SnapshotId`s as children of the current snapshot's
 node — one becomes the new snapshot's ID; the other replaces the current view's ID. No keys are
-copied. Both children inherit visibility of all ancestor keys through the tree.
+copied. Both children inherit visibility of all ancestor keys through the tree. The new pair
+is **prepended** to N's child sibling list (each new child becomes the head; previous head
+becomes its `next_sibling`).
 
 ```
 Before snapshot:                After snapshot:
 
        N (current)                       N
                                          │
-                                       split
-                                       /   \
-                                     N₁     N₂  (N₁ = new "current", N₂ = the snapshot)
+                                  first_child = N₁
+                                         │ next_sibling
+                                         ▼
+                                         N₂   (N₁ = new "current", N₂ = the snapshot)
 ```
 
 Subsequent writes to the current view are tagged with `N₁`; reads against the snapshot use `N₂`.
-Divergence happens only where modifications occur.
+Divergence happens only where modifications occur. If N already has children from prior
+snapshots / rollbacks, those nodes follow N₂ in the sibling chain (`N₂.next_sibling`) — the
+total ordering reflects creation recency, head-first.
 
 A new `BackpointerInsert` is **not** issued for shared extents — the underlying blob is unchanged
 and its existing backpointer is valid for both snapshots. Backpointers are physical, not logical
@@ -1599,15 +1613,18 @@ scan from a stale cursor after a crash is a no-op for already-processed leaves. 
 removes the need for any per-key undo or redo log.
 
 **Completion.** When the scan reaches the end of every snapshot-aware btree, a final
-`SnapshotNode` removal is performed: its parent's `children` slot is cleared and the
-`depth`/`skiplist` fields of descendants are recomputed in a single batched
-`SnapshotTreeReorg` pass (deferred to the next checkpoint quiesce — see §3.5 — to avoid
-racing with live ancestry queries).
+`SnapshotNode` removal is performed: the deleted node is unlinked from its parent's sibling
+list (parent's `first_child` is advanced past it, or its predecessor's `next_sibling` is
+spliced over it), and the `depth`/`skiplist` fields of descendants are recomputed in a single
+batched `SnapshotTreeReorg` pass (deferred to the next checkpoint quiesce — see §3.5 — to
+avoid racing with live ancestry queries).
 
 **Constraints.**
-- A snapshot with two non-deleted children cannot collapse during cleanup; one child must
-  itself be deleted (or itself be the `current_replacement` for a deeper snapshot) first.
-  This is checked at `SnapshotDelete` time and the request is rejected if not satisfied.
+- A snapshot with more than one non-deleted child cannot collapse during cleanup; all but one
+  child must itself be deleted (or itself be the `current_replacement` for a deeper snapshot)
+  first. This is checked at `SnapshotDelete` time and the request is rejected if not
+  satisfied. (Walking a node's children to count them is O(children_count), which is bounded
+  by the per-node fan-out in practice — typically 2, occasionally 3-5 after rollbacks.)
 - Multiple deletions can run concurrently — each `SnapshotCleanup` work item has its own
   cursor and operates independently (the per-leaf rewrites compose because each touches
   disjoint snapshot-id sets).
@@ -1691,11 +1708,16 @@ brunnr rollback --to <snapshot_label>
 ```
 
 1. Resolve the label to a `SnapshotId` `S`.
-2. Atomically retag the "current" pointer to `S`'s child slot (or create a new child of `S`).
-3. The current view now reflects `S`'s state; subsequent writes diverge at the new child.
+2. Allocate a fresh `SnapshotId` `S'` and link it as a new child of `S`: prepend it to S's
+   sibling list (`S'.next_sibling = S.first_child; S.first_child = S'`). The first-child /
+   next-sibling topology (§11.1) admits any number of children, so this works regardless of
+   how many sibling branches `S` has accumulated from prior snapshots and rollbacks.
+3. Atomically retag the pool's "current" pointer to `S'`. The view now reflects `S`'s state;
+   subsequent writes are tagged with `S'` and diverge from `S` at this point. The previously
+   current branch remains intact as another sibling of `S'` until explicitly deleted.
 
 No data is copied. The rollback is O(1); subsequent reads pay the snapshot-iteration cost
-(§11.3) until garbage collection (§11.5) tidies away the abandoned-side keys.
+(§11.3) until the abandoned branch is deleted via §11.5.
 
 ---
 

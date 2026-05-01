@@ -450,12 +450,15 @@ const _: () = assert!(size_of::<DiskDescriptorOnDisk>() == 64);
 
 // =====================================================================
 // §11.1 SnapshotNode — 64 B
+// First-child / next-sibling topology supports arbitrary fan-out at no
+// extra per-node cost vs. the previous fixed [u32; 2] children array.
 // =====================================================================
 #[repr(C, packed)]
 pub struct SnapshotNode {
     pub id: u32,
     pub parent: u32,
-    pub children: [u32; 2],
+    pub first_child: u32,
+    pub next_sibling: u32,
     pub depth: u16,
     pub flags: u8,
     pub _pad: u8,
