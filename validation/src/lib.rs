@@ -741,3 +741,33 @@ const _: () = assert!(fwd_total_entries(4, 8) == 1_968);
 const _: () = assert!(fwd_total_entries(1, 4) == 3_797);
 const _: () = assert!(fwd_total_entries(4, 4) == 3_793);
 const _: () = assert!(fwd_total_entries(1, 4) > fwd_total_entries(1, 8));
+
+// Forward-index footprint at 10 M objects, basis = 8 assertions/entry
+// (the §7.2 inline-spill threshold, used as the §7.1 calculation basis).
+//
+// Tree shape at this scale: depth 2 (root inner + leaves).
+//   leaves = ⌈10_000_000 / fwd_total_entries(4, 8)⌉
+//   inner  = ⌈leaves / INNER_ENTRIES⌉   (= 1, since leaves « 16 380)
+//   total_bytes = (leaves + inner) × REGION
+pub const FWD_OBJECTS_10M: usize = 10_000_000;
+pub const FWD_LEAVES_10M_K8: usize =
+    FWD_OBJECTS_10M.div_ceil(fwd_total_entries(4, 8));
+pub const FWD_INNER_10M_K8: usize = FWD_LEAVES_10M_K8.div_ceil(INNER_ENTRIES);
+const _: () = assert!(FWD_LEAVES_10M_K8 == 5_082);
+const _: () = assert!(FWD_INNER_10M_K8 == 1);
+
+pub const FWD_BYTES_10M_K8: usize = (FWD_LEAVES_10M_K8 + FWD_INNER_10M_K8) * REGION;
+// 5 083 × 256 KiB = 1 332 617 152 B ≈ 1.241 GiB.
+const _: () = assert!(FWD_BYTES_10M_K8 == 5_083 * 262_144);
+// Within [1.24 GiB, 1.25 GiB].
+const _: () = assert!(FWD_BYTES_10M_K8 > 1_330_000_000);
+const _: () = assert!(FWD_BYTES_10M_K8 < 1_335_000_000);
+
+// For comparison, the small-object regime (4 assertions/entry):
+pub const FWD_LEAVES_10M_K4: usize =
+    FWD_OBJECTS_10M.div_ceil(fwd_total_entries(4, 4));
+pub const FWD_BYTES_10M_K4: usize = (FWD_LEAVES_10M_K4 + 1) * REGION;
+const _: () = assert!(FWD_LEAVES_10M_K4 == 2_637);
+// 2 638 × 256 KiB ≈ 659 MiB.
+const _: () = assert!(FWD_BYTES_10M_K4 > 690_000_000);
+const _: () = assert!(FWD_BYTES_10M_K4 < 695_000_000);

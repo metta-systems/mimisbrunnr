@@ -2320,7 +2320,10 @@ For each `BtreeKind` / `BlockKind`, schema evolution follows one of three patter
 ## 16. Summary of On-Disk Footprint (10 M objects, 5 000 tags, ~100 live snapshots)
 
 Steady-state footprint. The WAL ring holds the unmaterialised journal tail (≤ 64 MiB); per-key
-snapshot overhead scales with logical changes since each snapshot's parent.
+snapshot overhead scales with logical changes since each snapshot's parent. The forward-index
+sizing assumes 8 assertions per object (the §7.2 inline-spill threshold and the §7.1 calculation
+basis), which is a worst-case upper bound — small-object workloads (~4 assertions) cut the
+forward index roughly in half (~660 MiB at this scale).
 
 | Structure              | Size      | Notes                                              |
 | ---------------------- | --------- | -------------------------------------------------- |
@@ -2332,7 +2335,7 @@ snapshot overhead scales with logical changes since each snapshot's parent.
 | Object table (radix)   | < 1 MiB   | Single inner node (depth 2 total)                  |
 | Location table         | 480 MiB   | Positional — no key packing                        |
 | Backpointers           | ~280 MiB  | §6.2 — 10 M extents × ~28 B packed                 |
-| Forward index          | ~400 MiB  | §1.5 B+ tree with packed `oid`                     |
+| Forward index          | ~1.24 GiB | §7 / §1.5 B+ tree, ~1 968 entries/leaf at 8 assertions/object → 5 082 leaves + 1 inner |
 | Tag inverted index     | 200–400 MiB | Roaring bitmaps (4 KiB framed), 5 000 tags       |
 | KV index               | ~100 MiB  | Extendible hash + roaring bitmaps                  |
 | Range index            | ~20 MiB   | §1.5 B+ tree, packed (`attr_id` constant per leaf) |
@@ -2341,7 +2344,7 @@ snapshot overhead scales with logical changes since each snapshot's parent.
 | Path contexts          | 50 MiB    | One large project; path hashes don't pack          |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
 | Snapshot key overhead  | ~50 MiB   | Per-snapshot unique keys across all snapshot-aware btrees |
-| **Total metadata**     | **~2.5 GiB** | Replicated to every node                       |
+| **Total metadata**     | **~4.0 GiB** | Replicated to every node; dominated by object records (1.28 GiB) and forward index (1.24 GiB) |
 
 **Transient overhead** (not in steady state — fills during specific events, drains afterwards):
 
@@ -2351,8 +2354,10 @@ snapshot overhead scales with logical changes since each snapshot's parent.
 | `ReconcileScan` cursors| < 1 MiB    | Per active scan; ~hundreds of bytes each          |
 | `SnapshotCleanup` work | < 1 MiB    | Bounded by the count of snapshot-aware btrees, not key count (§11.5) |
 
-This is the "few hundred megabytes" of the design intent at moderate scale, and at the upper end
-of practical scale still well under 1% of pool storage.
+At moderate scale (10 M objects, the worked example here) metadata sits in the low single-digit
+GiB; for typical workloads where average object size is ≥ 1 MiB, that's well under 1% of pool
+storage. Small-object pools (logs, telemetry, tags-only) trade more of their footprint to
+metadata but still amortise per record, since the per-object cost is fixed.
 
 ---
 
