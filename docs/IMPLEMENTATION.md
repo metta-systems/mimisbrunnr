@@ -2142,10 +2142,16 @@ The on-disk layout is encryption-aware but encryption-agnostic:
   decrypt then check magic.
 - **Blob zone**: encrypted with **HCTR2-AES-128**, tweak = `(object_id || block_no_within_extent)`.
   Length-preserving.
-- **WAL**: each entry is **AES-256-GCM** authenticated. Nonce = LSN (96 bits = 64-bit LSN || 32-bit
-  zero, nonce-misuse-resistant by construction since LSNs never repeat). The `payload_crc` slot in
-  the entry header is replaced by the GCM tag in encrypted mode (`WAL_ENTRY_FLAG_ENCRYPTED`). The trailing
-  framing CRC remains plaintext for I/O-error detection.
+- **WAL**: each entry is **AES-256-GCM** authenticated. Nonce = LSN (96 bits = 64-bit LSN ||
+  32-bit zero); nonces are guaranteed unique because LSNs are monotonically allocated and never
+  repeat under a given key. AES-GCM is *not* a nonce-misuse-resistant scheme — uniqueness must
+  be enforced by construction, and reuse would be catastrophic. The 64-bit LSN space (~1.8 × 10¹⁹
+  values) cannot wrap within any realistic deployment lifetime: at 10⁶ entries/s sustained,
+  wrap takes ~580 000 years. Pool format must nevertheless reject `next_lsn` rollover and
+  require key rotation (re-encrypting the live tail under a fresh `DiskKey`) before approaching
+  the boundary; an LSN wrap under the same key would reuse a nonce. The `payload_crc` slot in
+  the entry header is replaced by the GCM tag in encrypted mode (`WAL_ENTRY_FLAG_ENCRYPTED`).
+  The trailing framing CRC remains plaintext for I/O-error detection.
 - **Sync bundles**: **ChaCha20-Poly1305** with random nonces.
 
 Keys never leave the in-memory key hierarchy (`MasterKEK → DiskKey`). The superblock stores only
