@@ -969,29 +969,49 @@ relations for the object live in the overflow chain (not split between inline an
 The object-wide totals stay in `ObjectRecord.{tag,attr}_count` (capped at u16 max ≈ 65 K).
 
 ```
-struct OverflowRecord {
-    header: BlockHeader,                     // kind = OverflowRecord (§1.3)
-    object_id: u64,
-    tag_count: u16,                          // count IN THIS BLOCK only (≤ tag_count of owner)
-    attr_count: u16,                         // count IN THIS BLOCK only
-    relation_count: u16,                     // count IN THIS BLOCK only
-    _pad: u16,
-    next_overflow: u64,                      // block_no of the next overflow block, 0 if last
-    // Followed by:
-    //   tag_count × u32                                      (extra tag IDs)
-    //   attr_count × { key: u32, value_hash: u64,
-    //                  inline_value: [u8; 96] | spill: BlobRef }
-    //   relation_count × { predicate: u32, target: u64 }
-    // ... up to ~4020 bytes payload, then trailing CRC.
+struct OverflowRecord {                      // 4096 bytes
+    header: BlockHeader,                     // [0..32]   kind = OverflowRecord (§1.3)
+    object_id: u64,                          // [32..40]
+    tag_count: u16,                          // [40..42]  count IN THIS BLOCK only
+    attr_count: u16,                         // [42..44]  count IN THIS BLOCK only
+    relation_count: u16,                     // [44..46]  count IN THIS BLOCK only
+    _pad: u16,                               // [46..48]
+    next_overflow: u64,                      // [48..56]  block_no of the next overflow block,
+                                             //           0 if last
+    // [56..4092] = 4036 B variable payload, written in order:
+    //   tag_count × u32                                  (extra tag IDs)
+    //   attr_count × OverflowAttr                        (variable: 32 B spilled, 112 B inline)
+    //   relation_count × { predicate: u32, target: u64 } (12 B each)
+    // [4092..4096] trailing CRC32C inside BlockHeader's frame
 }
+
+#[repr(C)]
+struct OverflowAttr {                        // 32 bytes (spill) or 112 bytes (inline)
+    flags: u8,                               // [0..1]   OVERFLOW_ATTR_FLAG_*
+    _pad0: [u8; 3],                          // [1..4]   align `key` to u32
+    key: u32,                                // [4..8]   attribute id
+    value_hash: u64,                         // [8..16]  SipHash, §4.2
+    // [16..) — body, discriminated by `flags & OVERFLOW_ATTR_FLAG_SPILL`:
+    //   spilled (flag set):    spill: BlobRef               (16 B; total record = 32 B)
+    //   inline (flag clear):   inline_value: [u8; 96]       (96 B; total record = 112 B)
+}
+
+// OverflowAttr.flags bits
+const OVERFLOW_ATTR_FLAG_SPILL: u8 = 1 << 0;  // body is 16 B BlobRef, not 96 B inline value
 ```
 
+`OverflowAttr.flags` is the discriminator that tells a reader how many bytes to consume for the
+body — without it the variant is unrecoverable. The pattern mirrors §7.1's `LeafEntry.header`
+spill bit. Other `flags` bits are reserved for future per-attr metadata (e.g. compression
+hints) and zeroed in `format_version = 1`.
+
 If an object outgrows a single 4 KiB overflow record, the chain extends through `next_overflow`
-(equivalent to setting `BLOCK_FLAG_CONTINUATION` in the head's `BlockHeader.flags`). The widths for
-`tag_count` / `attr_count` / `relation_count` here are deliberately u16 — they record only the
-**per-block** count, never the object-wide total — and a single 4 KiB block cannot hold
-anywhere near 65 K of any of them. The owner's u16 totals therefore never need to be reconciled
-across blocks: each block's u16 is a lower bound that the reader sums during traversal.
+(equivalent to setting `BLOCK_FLAG_CONTINUATION` in the head's `BlockHeader.flags`). The widths
+for `tag_count` / `attr_count` / `relation_count` here are deliberately u16 — they record only
+the **per-block** count, never the object-wide total — and a single 4 KiB block cannot hold
+anywhere near 65 K of any of them. The owner's u16 totals therefore never need to be
+reconciled across blocks: each block's u16 is a lower bound that the reader sums during
+traversal.
 
 For pathological cases (≥ 200 tags), switching to a per-object B+ tree is more efficient and
 is the planned escape hatch.

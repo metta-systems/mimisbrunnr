@@ -374,6 +374,60 @@ pub struct ObjectRecord {
 const _: () = assert!(size_of::<ObjectRecord>() == 128);
 
 // =====================================================================
+// §5.2 OverflowRecord per-attribute layout — 32 B (spill) or 112 B (inline)
+// `OverflowAttr.flags` is the discriminator that tells a reader how many
+// bytes to consume for the body (the spill arm is 16 B, the inline arm
+// is 96 B; without the flag the variant is unrecoverable).
+// =====================================================================
+pub const OVERFLOW_ATTR_FLAG_SPILL: u8 = 1 << 0;
+
+// Placeholder layout for BlobRef (§4.1 / §9.3 — 16 bytes; the doc fixes
+// only its size and three logical fields, not the on-disk pad arrangement).
+#[repr(C)]
+pub struct BlobRef {
+    pub disk_id: u16,
+    pub _pad: u16,
+    pub block_no: u32,
+    pub length: u64,
+}
+const _: () = assert!(size_of::<BlobRef>() == 16);
+
+#[repr(C)]
+pub struct OverflowAttrHead {                // 16 B common prefix
+    pub flags: u8,                           // OVERFLOW_ATTR_FLAG_*
+    pub _pad0: [u8; 3],                      // align `key` to u32
+    pub key: u32,
+    pub value_hash: u64,
+}
+const _: () = assert!(size_of::<OverflowAttrHead>() == 16);
+const _: () = assert!(std::mem::offset_of!(OverflowAttrHead, key) == 4);
+const _: () = assert!(std::mem::offset_of!(OverflowAttrHead, value_hash) == 8);
+
+// Inline-body variant: head + 96 B value.
+#[repr(C)]
+pub struct OverflowAttrInline {
+    pub head: OverflowAttrHead,
+    pub inline_value: [u8; 96],
+}
+const _: () = assert!(size_of::<OverflowAttrInline>() == 112);
+
+// Spill-body variant: head + BlobRef (no length needed inline, the
+// referenced extent carries it).
+#[repr(C)]
+pub struct OverflowAttrSpill {
+    pub head: OverflowAttrHead,
+    pub spill: BlobRef,
+}
+const _: () = assert!(size_of::<OverflowAttrSpill>() == 32);
+
+// The inline arm is exactly 80 B larger than the spill arm — the delta
+// between a 96 B inline value and a 16 B BlobRef.
+const _: () = assert!(
+    size_of::<OverflowAttrInline>() - size_of::<OverflowAttrSpill>()
+        == 96 - size_of::<BlobRef>()
+);
+
+// =====================================================================
 // §6.1 ObjectLocation — 48 B, ReplicaRef — 8 B
 // ReplicaRef is bucket-relative, mirroring BackpointerKey's layout
 // (§6.2) so move/scrub/resilver paths share field-level conversions.
