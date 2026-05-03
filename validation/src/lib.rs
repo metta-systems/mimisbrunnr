@@ -437,24 +437,50 @@ pub struct PackedAssertion {
 const _: () = assert!(size_of::<PackedAssertion>() == 16);
 
 // =====================================================================
-// §8.1 TagIndexLeafEntry — 40 B
-// Fields reordered so every multi-byte field lands at its natural alignment.
-// (tag_id, store_root) sit on the same 32-byte half-cache-line, so a single
-// 64-byte fetch on tag-id lookup also brings cardinality and generation in.
+// §8.1 TagIndexLeafEntry — 48 B
+// Snapshot-aware (§11.2): key is (tag_id, snapshot). Fields ordered so every
+// multi-byte field lands at its natural alignment. The hot key+pointer set
+// (store_root through store_kind) all fits within [0..48], a single 64-byte
+// cache line.
 // =====================================================================
 #[repr(C)]
 pub struct TagIndexLeafEntry {
     pub last_modify_lsn: u64,    //  8 @  0   (8-aligned)
     pub store_root: BlockRef,    // 16 @  8   (8-aligned; BlockRef contains a u64)
-    pub tag_id: u32,             //  4 @ 24
-    pub cardinality: u32,        //  4 @ 28
-    pub generation: u32,         //  4 @ 32
-    pub store_kind: u8,          //  1 @ 36
-    pub _pad: [u8; 3],           //  3 @ 37
-                                 // 40 total, struct alignment = 8
+    pub tag_id: u32,             //  4 @ 24   sort key
+    pub snapshot: u32,           //  4 @ 28   sort key (suffix); §11.2
+    pub cardinality: u32,        //  4 @ 32
+    pub generation: u32,         //  4 @ 36
+    pub store_kind: u8,          //  1 @ 40
+    pub _pad: [u8; 7],           //  7 @ 41
+                                 // 48 total, struct alignment = 8
 }
-const _: () = assert!(size_of::<TagIndexLeafEntry>() == 40);
+const _: () = assert!(size_of::<TagIndexLeafEntry>() == 48);
 const _: () = assert!(std::mem::align_of::<TagIndexLeafEntry>() == 8);
+
+// §8.1 leaf packing — verify the entries-per-run claim against the 2-key-field
+// SortedRunKeyFormat overhead (8 + 2×12 = 32 B/run, vs 44 for 3-field).
+// Per-key on-disk cost: ~3 B packed key (tag_id ~2.5 B + snapshot ~0 bits)
+// + ~34 B value (40 B − ~6 B common-prefix elision) = ~37 B.
+pub const TAG_DIR_RUN_KEY_FORMAT_2FIELD: usize = 8 + 2 * size_of::<FieldFormat>();
+const _: () = assert!(TAG_DIR_RUN_KEY_FORMAT_2FIELD == 32);
+pub const TAG_DIR_RUN_OVERHEAD: usize =
+    size_of::<SortedRunHeader>() + TAG_DIR_RUN_KEY_FORMAT_2FIELD;
+const _: () = assert!(TAG_DIR_RUN_OVERHEAD == 64);
+pub const TAG_DIR_PAYLOAD_PER_RUN: usize =
+    REGION - size_of::<BtreeNodeHeader>() - TAG_DIR_RUN_OVERHEAD;
+const _: () = assert!(TAG_DIR_PAYLOAD_PER_RUN == 262_016);
+pub const TAG_DIR_ENTRY_BYTES_PACKED: usize = 37;
+pub const TAG_DIR_ENTRIES_PER_RUN: usize =
+    TAG_DIR_PAYLOAD_PER_RUN / TAG_DIR_ENTRY_BYTES_PACKED;
+const _: () = assert!(TAG_DIR_ENTRIES_PER_RUN == 7_081);
+
+// §11.2 — TagIndexLeafEntry gained 4 bytes of `snapshot` field; with
+// 8-byte struct alignment the on-disk size grew from 40 → 48 (4 B field
+// + 4 B trailing alignment pad). The snapshot field is at offset 28
+// (immediately after the tag_id sort key).
+const _: () = assert!(std::mem::offset_of!(TagIndexLeafEntry, snapshot) == 28);
+const _: () = assert!(std::mem::offset_of!(TagIndexLeafEntry, tag_id) == 24);
 
 // =====================================================================
 // §9.1 KvDirectory — 4096 B (was [BlockRef; 512] which overflowed)
@@ -683,20 +709,22 @@ const _: () = assert!(LOCATION_TABLE_LEAF_RECORDS * INNER_ENTRIES > 89_000_000);
 //   region:                      256 KiB   = 262 144 B
 //   - BtreeNodeHeader:                 64 B
 //   - per-run SortedRunHeader:         32 B
-//   - per-run SortedRunKeyFormat (3 fields, §1.5.6: 8 + 3 × FieldFormat):
-//                                      8 + 3 × 12 = 44 B
+//   - per-run SortedRunKeyFormat (2 fields after §11.2: `(oid, snapshot)`,
+//                                 §1.5.6: 8 + 2 × FieldFormat):
+//                                      8 + 2 × 12 = 32 B
 //
 // Per-LeafEntry cost (inline body, no spill; §7.1 prose):
-//   - packed oid key:    ~2.5 B average; 3 B integer ceiling for const math
+//   - packed (oid, snapshot) key: ~2.5 B average (snapshot ~0 bits when one
+//     snapshot dominates a sorted run); 3 B integer ceiling for const math
 //   - LeafEntry.header:                 2 B
 //   - body: assertions × PackedAssertion (16 B each)
 // =====================================================================
-pub const FWD_RUN_KEY_FORMAT_3FIELD: usize = 8 + 3 * size_of::<FieldFormat>();
-const _: () = assert!(FWD_RUN_KEY_FORMAT_3FIELD == 44);
+pub const FWD_RUN_KEY_FORMAT_2FIELD: usize = 8 + 2 * size_of::<FieldFormat>();
+const _: () = assert!(FWD_RUN_KEY_FORMAT_2FIELD == 32);
 
 pub const FWD_RUN_OVERHEAD: usize =
-    size_of::<SortedRunHeader>() + FWD_RUN_KEY_FORMAT_3FIELD;
-const _: () = assert!(FWD_RUN_OVERHEAD == 76);
+    size_of::<SortedRunHeader>() + FWD_RUN_KEY_FORMAT_2FIELD;
+const _: () = assert!(FWD_RUN_OVERHEAD == 64);
 
 pub const FWD_ENTRY_KEY_BYTES_CEIL: usize = 3; // ⌈2.5⌉
 pub const FWD_ENTRY_HEADER_BYTES:  usize = 2;
@@ -712,14 +740,14 @@ const _: () = assert!(fwd_entry_bytes(8) == 133);
 pub const fn fwd_payload_n_runs(runs: usize) -> usize {
     REGION - size_of::<BtreeNodeHeader>() - runs * FWD_RUN_OVERHEAD
 }
-// One sorted run alone has 262 004 B of entry payload available.
-const _: () = assert!(fwd_payload_n_runs(1) == 262_004);
-// Four sorted runs share 261 776 B (the §1.5.4 trigger is sorted_run_count > 4).
-const _: () = assert!(fwd_payload_n_runs(4) == 261_776);
+// One sorted run alone has 262 016 B of entry payload available.
+const _: () = assert!(fwd_payload_n_runs(1) == 262_016);
+// Four sorted runs share 261 824 B (the §1.5.4 trigger is sorted_run_count > 4).
+const _: () = assert!(fwd_payload_n_runs(4) == 261_824);
 
 // Sorted runs are appended into the *same* region (§1.5.2) — they share its
 // payload bytes. Adding a run does not multiply capacity; it slightly reduces
-// it (by one run's 76 B header + key-format descriptor). The total entry
+// it (by one run's 64 B header + key-format descriptor). The total entry
 // count a leaf can hold is therefore bounded by (region − header − n×overhead)
 // divided by entry size, not by per-run × n.
 pub const fn fwd_total_entries(runs: usize, assertions: usize) -> usize {
@@ -729,7 +757,7 @@ pub const fn fwd_total_entries(runs: usize, assertions: usize) -> usize {
 // At "8 assertions per object (typical)" — matching §7.2's spill threshold —
 // a single-run leaf holds ~1 970 entries (NOT the 2 740 the prose previously
 // claimed). The original 2 740/run figure would require ~5.6 assertions/entry.
-const _: () = assert!(fwd_total_entries(1, 8) == 1_969);
+const _: () = assert!(fwd_total_entries(1, 8) == 1_970);
 
 // At the §1.5.4 compaction trigger (sorted_run_count > 4) the leaf still
 // holds ~1 968 entries TOTAL — adding sorted runs eats overhead, not gains
@@ -739,7 +767,7 @@ const _: () = assert!(fwd_total_entries(4, 8) == 1_968);
 
 // Lower-assertion regimes (smaller objects pack more densely; monotonic):
 const _: () = assert!(fwd_total_entries(1, 4) == 3_797);
-const _: () = assert!(fwd_total_entries(4, 4) == 3_793);
+const _: () = assert!(fwd_total_entries(4, 4) == 3_794);
 const _: () = assert!(fwd_total_entries(1, 4) > fwd_total_entries(1, 8));
 
 // Forward-index footprint at 10 M objects, basis = 8 assertions/entry
@@ -767,7 +795,7 @@ const _: () = assert!(FWD_BYTES_10M_K8 < 1_335_000_000);
 pub const FWD_LEAVES_10M_K4: usize =
     FWD_OBJECTS_10M.div_ceil(fwd_total_entries(4, 4));
 pub const FWD_BYTES_10M_K4: usize = (FWD_LEAVES_10M_K4 + 1) * REGION;
-const _: () = assert!(FWD_LEAVES_10M_K4 == 2_637);
-// 2 638 × 256 KiB ≈ 659 MiB.
+const _: () = assert!(FWD_LEAVES_10M_K4 == 2_636);
+// 2 637 × 256 KiB ≈ 659 MiB.
 const _: () = assert!(FWD_BYTES_10M_K4 > 690_000_000);
 const _: () = assert!(FWD_BYTES_10M_K4 < 695_000_000);

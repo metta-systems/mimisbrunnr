@@ -1205,6 +1205,8 @@ unpacked 8 bytes.
 // Logical (unpacked) shape; on-disk uses the §1.5.6 packed encoding.
 struct LeafEntry {                           // variable length on disk
     oid: u64,                                // sort key — packed via SortedRunKeyFormat
+    snapshot: u32,                           // sort key (§11.2) — packs to ~0 bits when one
+                                             //   snapshot dominates a sorted run
     header: u16,                             // bitfield: see below
     body: union {                            // discriminated by header & LEAF_ENTRY_SPILL_FLAG
         inline: [PackedAssertion; header & LEAF_ENTRY_TOTAL_MASK],   // !is_spill
@@ -1260,13 +1262,14 @@ The **key** (`oid`) is packed; the **value** (`header`, body) stays byte-aligned
 format descriptor records `oid_base = leaf.min_oid` and `oid_bits = ⌈log₂(leaf.max_oid −
 leaf.min_oid + 1)⌉`.
 
-At "8 assertions per object" (the §7.2 inline-spill threshold; per-entry ≈ 2.5 B packed key + 2 B
-header + 128 B inline body = ~133 B), a leaf packs ~1 970 entries total. Sorted runs share the
-region's payload bytes (§1.5.2 appends them into the same 256 KiB region), so adding sorted runs
-does not multiply capacity — each new run consumes 76 B of overhead (`SortedRunHeader` +
-`SortedRunKeyFormat`) and slightly reduces the entry budget. With 4 active sorted runs the leaf
-still carries ~1 968 entries before §1.5.4 triggers full compaction. Smaller objects pack denser:
-4 assertions per entry → ~3 800 entries per leaf.
+At "8 assertions per object" (the §7.2 inline-spill threshold; per-entry ≈ 2.5 B packed
+`(oid, snapshot)` key + 2 B header + 128 B inline body = ~133 B), a leaf packs ~1 970 entries
+total. Sorted runs share the region's payload bytes (§1.5.2 appends them into the same 256 KiB
+region), so adding sorted runs does not multiply capacity — each new run consumes 64 B of
+overhead (32 B `SortedRunHeader` + 32 B `SortedRunKeyFormat` for the 2-field key) and slightly
+reduces the entry budget. With 4 active sorted runs the leaf still carries ~1 968 entries
+before §1.5.4 triggers full compaction. Smaller objects pack denser: 4 assertions per entry
+→ ~3 800 entries per leaf.
 
 ### 7.2 Spill
 
@@ -1307,35 +1310,42 @@ The tag index is the heart of query performance. Its on-disk form must:
 
 ### 8.1 TagIndexDirectory
 
-A **B+ tree of large nodes** (§1.5) keyed by `TagId: u32`. Leaf entries are 40 B, with fields
-reordered so every multi-byte field sits at its natural alignment (8-byte struct alignment;
-no `#[repr(packed)]` — the entry is read repeatedly during query bitmap algebra and unaligned
-loads on `last_modify_lsn` / `store_root` would be a measurable overhead):
+A **B+ tree of large nodes** (§1.5) keyed by `(TagId: u32, snapshot: u32)` — snapshot-aware per
+§11.2. Leaf entries are 48 B, with fields reordered so every multi-byte field sits at its
+natural alignment (8-byte struct alignment; no `#[repr(packed)]` — the entry is read repeatedly
+during query bitmap algebra and unaligned loads on `last_modify_lsn` / `store_root` would be a
+measurable overhead):
 
 ```
 #[repr(C)]
-TagIndexLeafEntry {                          // 40 bytes
+TagIndexLeafEntry {                          // 48 bytes
     last_modify_lsn: u64,                    //  8  @  0   (8-aligned)
     store_root:      BlockRef,               // 16  @  8   §8.2 / §8.3 — contains a u64 generation
-    tag_id:          u32,                    //  4  @ 24   sort key
-    cardinality:     u32,                    //  4  @ 28   for fast query-planner stats
-    generation:      u32,                    //  4  @ 32   bumped on bitmap rewrite
-    store_kind:      u8,                     //  1  @ 36   Simple / Ordered / Ranked
-    _pad:            [u8; 3],                //  3  @ 37
-                                             // 40 total
+    tag_id:          u32,                    //  4  @ 24   sort key (with `snapshot`, §11.2)
+    snapshot:        u32,                    //  4  @ 28   sort key (suffix); ~0 bits packed
+                                             //                       when one snapshot dominates
+    cardinality:     u32,                    //  4  @ 32   for fast query-planner stats
+    generation:      u32,                    //  4  @ 36   bumped on bitmap rewrite
+    store_kind:      u8,                     //  1  @ 40   Simple / Ordered / Ranked
+    _pad:            [u8; 7],                //  7  @ 41   (8-byte alignment tail)
+                                             // 48 total
 }
 ```
 
-The hot pair `(tag_id, store_root)` lands on the same 32-byte half-cache-line: a query that
-loads a leaf entry to dispatch a bitmap fetch gets `tag_id`, `cardinality`, `generation`, and
-`store_root` all in a single 64-byte fetch.
+The hot key+pointer pair still lands within a single 64-byte cache line: a query that loads a
+leaf entry to dispatch a bitmap fetch gets `store_root`, `tag_id`, `snapshot`, `cardinality`,
+`generation`, and `store_kind` all in `[0..48]` — one 64 B fetch.
 
-On-disk, leaf sorted runs use the §1.5.6 packed-key encoding: `tag_id` typically packs to 2–3 bytes
-per leaf (sparse but clustered ids); the value's 32 bytes after `tag_id` stay byte-aligned.
-Per-key on-disk cost is ~34 B. A 256 KiB leaf sorted run (262 144 B − 64 B node header − 32 B sorted run
-header − 44 B key-format descriptor = 262 004 B payload) holds **~7 700 entries**; the full
-ontology of 5 000 tags fits in **a single leaf** (depth 0). For pools with hundreds of
-thousands of tags the tree extends to depth 1 (~125 M-tag capacity).
+On-disk, leaf sorted runs use the §1.5.6 packed-key encoding with **two key fields**
+(`tag_id`, `snapshot`); the format descriptor occupies 8 + 2 × 12 = **32 B per sorted run**
+(down from 44 B for a 3-field shape). `tag_id` typically packs to 2–3 bytes per leaf (sparse
+but clustered ids); `snapshot` packs to ~0 bits when one snapshot dominates, a few bits
+otherwise. The 40 bytes of value following the key stay byte-aligned. Per-key on-disk cost is
+~37 B. A 256 KiB leaf sorted run (262 144 − 64 − 32 − 32 = 262 016 B payload) holds
+**~7 080 entries**. For 5 000 tags × ~100 snapshots without divergence (one entry per tag,
+shared across snapshots) the full directory fits in **a single leaf** (depth 0); pools where
+many tags diverge across snapshots, or pools with hundreds of thousands of tags, extend the
+tree to depth 1 (~115 M-entry capacity).
 
 `(cardinality, last_modify_lsn, generation)` enables fast snapshot diffing without dereferencing
 the bitmap — the directory's sorted run stream alone tells a peer which tags changed and how.
@@ -1431,14 +1441,16 @@ faceted enumeration, range comparisons).
 
 ### 9.2 Range Index
 
-A **B+ tree of large nodes** (§1.5) keyed by `(attr_id: u32, value: NormalisedKey, oid: u64)` —
-28 B unpacked. With per-run key packing (§1.5.6) this is the structure that benefits most:
+A **B+ tree of large nodes** (§1.5) keyed by `(attr_id: u32, value: NormalisedKey, oid: u64,
+snapshot: u32)` — 32 B unpacked (snapshot-aware per §11.2). With per-run key packing (§1.5.6)
+this is the structure that benefits most:
 
 - `attr_id` is almost always **constant** within a leaf (a leaf covers one or two adjacent
   attributes) → 0 bits per key.
 - `value` (16 B `NormalisedKey`) gets a per-run base + bit-width; for numeric attributes the
   span within a leaf typically fits in 24–40 bits.
 - `oid` packs identically to forward-index keys: 16–20 bits.
+- `snapshot` packs to ~0 bits when one snapshot dominates a sorted run (§11.2).
 
 Net per-key size: typically **8–12 B** packed. Each 256 KiB leaf packs ~25 000 entries per sorted run.
 
@@ -1492,11 +1504,18 @@ OntologyRoot (4 KiB):
   module_count: u32
   tag_count: u32
   implication_count: u32
-  modules_root: BlockRef     → §1.5 B+ tree, key = module_id_hash → CBOR(ModuleManifest)
-  tags_root:    BlockRef     → §1.5 B+ tree, key = TagId          → TagDefRecord (fixed, 64 bytes)
-  tag_names:    BlockRef     → §1.5 B+ tree, key = name_hash      → (TagId, BlockRef → CBOR(TagDef))
+  modules_root: BlockRef     → §1.5 B+ tree, key = (module_id_hash, snapshot: u32)
+                                                  → CBOR(ModuleManifest)
+  tags_root:    BlockRef     → §1.5 B+ tree, key = (TagId, snapshot: u32)
+                                                  → TagDefRecord (fixed, 64 bytes)
+  tag_names:    BlockRef     → §1.5 B+ tree, key = (name_hash, snapshot: u32)
+                                                  → (TagId, BlockRef → CBOR(TagDef))
   dag_root:     BlockRef     → ImplicationDagPages (sparse adjacency lists, §1.5 large nodes)
 ```
+
+All four sub-trees are snapshot-aware (§11.2) — installing a new ontology version under a new
+snapshot id leaves older snapshots seeing the previous shape. The trailing `snapshot` packs to
+~0 bits when one ontology version dominates.
 
 `TagDefRecord` is 64 bytes with `name_offset` pointing into `tag_names`. The variable-shape parts
 (`TagSemantics::OrderedCollection { element_constraint }`, future fields) live in CBOR via
@@ -1509,8 +1528,10 @@ CBOR at install time. TOML is never seen by the read path.
 
 ```
 SubscriptionsRoot:
-  §1.5 B+ tree, key = SubscriptionId u64 → SubscriptionRecord (variable, CBOR)
+  §1.5 B+ tree, key = (SubscriptionId u64, snapshot: u32) → SubscriptionRecord (variable, CBOR)
 ```
+
+Snapshot-aware (§11.2): the trailing `snapshot` packs to ~0 bits when one snapshot dominates.
 
 A subscription's `cached_result` is a roaring bitmap stored in a `TagBitmap` (§8.2) referenced
 from the record. Cursor (LSN), state, retention, debounce config, and the `Query` AST are all
@@ -1522,8 +1543,13 @@ overhead is negligible.
 ```
 PathContextRoot:
   §1.5 B+ tree, key = name_hash → PathContextHeader (48 bytes)
-  Manifest is a §1.5 B+ tree keyed by path-string-hash → ProjectedEntry (96 bytes inline +
-  spill for Symlink targets and long paths).
+              (snapshot-agnostic — the directory of contexts itself doesn't diverge
+               per snapshot; per §11.2, divergence lives in each context's manifest)
+
+  Manifest is a §1.5 B+ tree keyed by (path-string-hash, snapshot: u32) → ProjectedEntry
+              (96 bytes inline + spill for Symlink targets and long paths).
+              Snapshot-aware (§11.2): the trailing `snapshot` packs to ~0 bits when one
+              snapshot dominates a sorted run.
 ```
 
 ```rust
@@ -1680,21 +1706,35 @@ parent-pointer walk.
 ### 11.2 Snapshot-aware bkey position
 
 In snapshot-aware btrees, every bkey position carries an extra `snapshot: u32` field appended
-to the kind-specific key fields. With §1.5.6 packing, `snapshot` is typically a 0-bit field in a
-leaf sorted run (one snapshot dominates the sorted run's keys), or a few bits at most — its overhead is in
-the noise.
+to the kind-specific key fields. With §1.5.6 packing, `snapshot` is typically a 0-bit field in
+a leaf sorted run (one snapshot dominates the sorted run's keys), or a few bits at most — its
+on-disk overhead is in the noise. The unpacked in-memory struct still pays the 4 bytes; this
+section's struct definitions show the field explicitly.
+
+**Where the field appears.** Every leaf-entry struct in this document marked snapshot-aware
+below carries a `snapshot: u32` field immediately after the kind-specific sort-key fields
+(e.g. `oid` for Forward, `tag_id` for TagDirectory, `(attr_id, value, oid)` for Range). The
+field is part of the **key**, not the value — it participates in ordering and is what the
+§1.5.6 format descriptor packs to ~0 bits when one snapshot dominates.
+
+**Inheritance for nested structures.** Snapshot-aware *directory* entries inherit the field
+on the directory key. The objects they point at — bitmap pages, value-spill blobs, manifest
+inner trees — are content-addressed and shared across snapshots; only the directory entry
+that selects them carries the snapshot id. For `PathContext` specifically, the
+`PathContextHeader` (the per-context directory entry) is snapshot-agnostic; the
+`ProjectedEntry` records inside each context's manifest btree carry the snapshot.
 
 | Btree              | Snapshot-aware? | Notes                                         |
 | ------------------ | --------------- | --------------------------------------------- |
 | `Forward`          | yes             | per-object assertions diverge across snapshots |
 | `Range`            | yes             | per-object attributes diverge                  |
-| `KvIndex`          | yes             | same                                           |
-| `TagDirectory`     | yes             | tags exist or don't per snapshot               |
+| `KvIndex`          | no              | content-addressed by `(tag_id, value_hash)`; per-snapshot views come from intersecting with the per-snapshot tag bitmap |
+| `TagDirectory`     | yes             | directory entries are `(tag_id, snapshot)`; pointed-at bitmap blocks are not snapshot-aware |
 | `ChunkIndex`       | no              | content-addressed; refcount handles divergence |
 | `Backpointer`      | no              | physical state, not logical                    |
 | `BucketAlloc`, `FreespaceLru` | no | physical state                              |
 | `Ontology`         | yes             | snapshot freezes the ontology version          |
-| `PathContext`      | yes             | path projections diverge                       |
+| `PathContext`      | manifest only   | header is snapshot-agnostic; `ProjectedEntry` keys carry snapshot |
 | `Subscriptions`    | yes             | per-snapshot watch state                       |
 | `ValueSpill`       | no              | content-addressed by `value_hash`              |
 
