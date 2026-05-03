@@ -317,6 +317,35 @@ pub struct WalEntryHeader {
 }
 const _: () = assert!(size_of::<WalEntryHeader>() == 40);
 
+// §3.2 / §14 — encrypted WAL entry framing.
+// Plaintext entry overhead = WalEntryHeader (40) + framing CRC32C (4) = 44 B.
+// Encrypted entry overhead = header (40) + GCM tag (16) + framing CRC32C (4) = 60 B.
+// The GCM tag does NOT replace `payload_crc` (4 B is too narrow for a 16 B tag);
+// it sits between the ciphertext and the trailing framing CRC.
+pub const WAL_FRAMING_CRC_BYTES: usize = 4;
+pub const WAL_GCM_TAG_BYTES:     usize = 16;          // AES-256-GCM standard tag
+pub const WAL_GCM_NONCE_BYTES:   usize = 12;          // 96-bit nonce (LSN || 0)
+pub const WAL_GCM_AAD_BYTES:     usize =
+    size_of::<WalEntryHeader>() - size_of::<u32>();   // header[0..36] excludes payload_crc
+const _: () = assert!(WAL_GCM_AAD_BYTES == 36);
+
+pub const WAL_ENTRY_PLAINTEXT_OVERHEAD: usize =
+    size_of::<WalEntryHeader>() + WAL_FRAMING_CRC_BYTES;
+pub const WAL_ENTRY_ENCRYPTED_OVERHEAD: usize =
+    size_of::<WalEntryHeader>() + WAL_GCM_TAG_BYTES + WAL_FRAMING_CRC_BYTES;
+const _: () = assert!(WAL_ENTRY_PLAINTEXT_OVERHEAD == 44);
+const _: () = assert!(WAL_ENTRY_ENCRYPTED_OVERHEAD == 60);
+
+// AES-GCM is length-preserving: payload_length counts ciphertext bytes,
+// equal to plaintext bytes. The encrypted layout adds exactly tag-bytes
+// of overhead beyond plaintext.
+const _: () = assert!(
+    WAL_ENTRY_ENCRYPTED_OVERHEAD - WAL_ENTRY_PLAINTEXT_OVERHEAD == WAL_GCM_TAG_BYTES
+);
+
+// Nonce derivation: 64-bit LSN || 32-bit zero = 96 bits = 12 B.
+const _: () = assert!(size_of::<u64>() + size_of::<u32>() == WAL_GCM_NONCE_BYTES);
+
 // =====================================================================
 // §5.1 ObjectRecord — 128 B
 // =====================================================================

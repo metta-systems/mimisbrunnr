@@ -634,14 +634,59 @@ const WAL_ENTRY_FLAG_ENCRYPTED:  u16 = 1 << 0;  // payload encrypted (AES-256-GC
 const WAL_ENTRY_FLAG_COMPRESSED: u16 = 1 << 1;  // payload compressed (zstd) before encryption
 ```
 
-Followed by `payload_length` bytes of CBOR-encoded payload (per `WalOpKind`) and a 4-byte trailing
-CRC over `WalEntryHeader || payload` for end-to-end framing detection.
+**Plaintext framing** (`WAL_ENTRY_FLAG_ENCRYPTED == 0`):
+
+```
+WalEntryHeader (40 B) | payload (payload_length B) | framing CRC32C (4 B)
+```
+
+`payload_crc` covers the payload bytes; the trailing 4-byte CRC32C covers `WalEntryHeader ||
+payload` for end-to-end framing detection.
+
+**Encrypted framing** (`WAL_ENTRY_FLAG_ENCRYPTED == 1`):
+
+```
+WalEntryHeader (40 B) | ciphertext (payload_length B) | GCM tag (16 B) | framing CRC32C (4 B)
+```
+
+The 16-byte AES-256-GCM tag sits between the ciphertext and the trailing framing CRC — it does
+**not** replace `payload_crc`, which is too narrow (4 B) to hold it. `payload_length` is
+unchanged because GCM is length-preserving; it counts ciphertext bytes, which equal plaintext
+bytes (after optional zstd compression). Encrypted-entry overhead is 60 B (header + tag +
+framing CRC) versus 44 B plaintext.
+
+Encryption inputs (cipher details: §14):
+
+- **Key**: `DiskKey`.
+- **Nonce**: 96 bits = 64-bit `lsn` || 32-bit zero. Unique by LSN monotonicity (§14).
+- **AAD**: the first 36 bytes of `WalEntryHeader` — every field except `payload_crc`. This
+  authenticates magic, op_kind, format_version, flags, lsn, timestamp, and payload_length,
+  preventing header-swap attacks. `payload_crc` is excluded because it is computed *after* the
+  GCM call (over the ciphertext that GCM produces) and so cannot be an input to it.
+- **Plaintext**: CBOR-encoded payload, optionally zstd-compressed first when
+  `WAL_ENTRY_FLAG_COMPRESSED` is also set. Order is *compress, then encrypt* — never the
+  reverse, since GCM ciphertext is incompressible.
+
+In encrypted mode `payload_crc` is CRC32C over the ciphertext (computed post-GCM). Readers
+without the key can still validate I/O integrity via the two CRCs; readers with the key
+additionally authenticate via the GCM tag.
+
+**Write order.** (1) serialise CBOR → (2) optional zstd compress → (3) AES-256-GCM encrypt with
+the AAD-and-nonce above → (4) compute `payload_crc` over ciphertext, fill in `WalEntryHeader` →
+(5) compute trailing framing CRC over the assembled bytes → (6) issue a single sequential write
+to the WAL ring.
+
+**Read / replay order.** (1) verify trailing framing CRC (cheap, no key needed); reject the
+entry on mismatch — torn write or media corruption. (2) verify `payload_crc` over ciphertext
+(also key-free). (3) if `WAL_ENTRY_FLAG_ENCRYPTED`: AES-256-GCM-decrypt with header[0..36] as
+AAD and the LSN-derived nonce; reject on tag mismatch (tampering or wrong key). (4) if
+`WAL_ENTRY_FLAG_COMPRESSED`: zstd-decompress. (5) parse CBOR.
 
 CBOR is acceptable here because:
 - WAL entries are written once and read once during replay (not random access).
 - Op payloads are heterogeneous (`AddTag` vs `WriteBlob` differ wildly in size and shape).
-- CBOR's deterministic encoding mode gives stable byte-for-byte serialisation, important for HMAC
-  authentication (entries are AES-GCM authenticated; LSN is the nonce).
+- CBOR's deterministic encoding mode gives stable byte-for-byte serialisation, important for
+  AEAD authentication (re-encoding must produce identical bytes for the tag to verify).
 
 ### 3.3 WAL op payloads (CBOR schemas)
 
@@ -2142,16 +2187,22 @@ The on-disk layout is encryption-aware but encryption-agnostic:
   decrypt then check magic.
 - **Blob zone**: encrypted with **HCTR2-AES-128**, tweak = `(object_id || block_no_within_extent)`.
   Length-preserving.
-- **WAL**: each entry is **AES-256-GCM** authenticated. Nonce = LSN (96 bits = 64-bit LSN ||
-  32-bit zero); nonces are guaranteed unique because LSNs are monotonically allocated and never
-  repeat under a given key. AES-GCM is *not* a nonce-misuse-resistant scheme — uniqueness must
-  be enforced by construction, and reuse would be catastrophic. The 64-bit LSN space (~1.8 × 10¹⁹
-  values) cannot wrap within any realistic deployment lifetime: at 10⁶ entries/s sustained,
-  wrap takes ~580 000 years. Pool format must nevertheless reject `next_lsn` rollover and
-  require key rotation (re-encrypting the live tail under a fresh `DiskKey`) before approaching
-  the boundary; an LSN wrap under the same key would reuse a nonce. The `payload_crc` slot in
-  the entry header is replaced by the GCM tag in encrypted mode (`WAL_ENTRY_FLAG_ENCRYPTED`).
-  The trailing framing CRC remains plaintext for I/O-error detection.
+- **WAL**: each entry is **AES-256-GCM** authenticated when `WAL_ENTRY_FLAG_ENCRYPTED` is set.
+  - **Nonce**: 96 bits = 64-bit LSN || 32-bit zero. Nonces are unique by construction — LSNs
+    are monotonically allocated and never repeat under one key. AES-GCM is *not* a
+    nonce-misuse-resistant scheme; uniqueness must be enforced and reuse is catastrophic.
+  - **LSN wrap**: the 64-bit LSN space (~1.8 × 10¹⁹ values) cannot wrap within any realistic
+    deployment lifetime — at 10⁶ entries/s sustained, wrap takes ~580 000 years. The format
+    nevertheless rejects `next_lsn` rollover and requires key rotation (a fresh `DiskKey`)
+    before the boundary; a wrap under the same key would reuse a nonce.
+  - **AAD**: the first 36 bytes of `WalEntryHeader` — every field except `payload_crc` —
+    authenticating magic, op_kind, format_version, flags, lsn, timestamp, and payload_length.
+    Header-swap attacks (re-binding a valid ciphertext to a different LSN or op_kind) are
+    therefore detected as tag mismatches.
+  - **Layout**: the 16-byte GCM tag is appended to the ciphertext, before the trailing 4-byte
+    framing CRC; see §3.2 for the full byte layout and read/write ordering. `payload_crc`
+    remains a 4-byte CRC32C — over ciphertext in encrypted mode, over plaintext otherwise —
+    so readers without the key still validate framing/I/O integrity.
 - **Sync bundles**: **ChaCha20-Poly1305** with random nonces.
 
 Keys never leave the in-memory key hierarchy (`MasterKEK → DiskKey`). The superblock stores only
