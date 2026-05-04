@@ -941,10 +941,10 @@ struct ObjectRecord {                        // 128 bytes
     created_ns: i64,                         //  [64..72]
     modified_ns: i64,                        //  [72..80]
     tag_count: u16,                          //  [80..82]    total tags on this object (object-wide)
-    attr_count: u16,                         //  [82..84]    total attrs on this object
+    attr_count: u16,                         //  [82..84]    total attrs on this object (object-wide)
     compression: u8,                         //  [84..85]
     encryption: u8,                          //  [85..86]
-    _pad0: u16,                              //  [86..88]
+    relation_count: u16,                     //  [86..88]    total relations on this object (object-wide)
     inline_tags: [u32; 4],                   //  [88..104]   inline tag IDs; valid iff !(flags & OBJECT_FLAG_HAS_OVERFLOW)
     overflow_offset: u64,                    // [104..112]   block_no in metadata zone
     stored_size: u64,                        // [112..120]
@@ -962,11 +962,14 @@ it.
 
 ### 5.2 Overflow records (when tags > 4 or attrs > 0)
 
-For objects with more than 4 tags or any attributes, a separate **OverflowRecord** lives in the
-metadata zone, addressed by `overflow_offset`. `OBJECT_FLAG_HAS_OVERFLOW` is set in
-`ObjectRecord.flags`; while it's set, `inline_tags` is **ignored** and **all** tags + attrs +
-relations for the object live in the overflow chain (not split between inline and overflow).
-The object-wide totals stay in `ObjectRecord.{tag,attr}_count` (capped at u16 max ≈ 65 K).
+For objects with more than 4 tags, any attributes, or any relations, a separate
+**OverflowRecord** lives in the metadata zone, addressed by `overflow_offset`.
+`OBJECT_FLAG_HAS_OVERFLOW` is set in `ObjectRecord.flags`; while it's set, `inline_tags` is
+**ignored** and **all** tags + attrs + relations for the object live in the overflow chain
+(not split between inline and overflow). When the flag is clear, `relation_count` is
+guaranteed `0` (no inline relation storage exists). The object-wide totals stay in
+`ObjectRecord.{tag,attr,relation}_count` (each capped at u16 max ≈ 65 K — beyond that, switch
+to the per-object B+ tree escape hatch).
 
 ```
 struct OverflowRecord {                      // 4096 bytes

@@ -365,13 +365,18 @@ pub struct ObjectRecord {
     pub attr_count: u16,
     pub compression: u8,
     pub encryption: u8,
-    pub _pad0: u16,
+    pub relation_count: u16,            // was _pad0; absorbs into the slot at offset 86
     pub inline_tags: [u32; 4],
     pub overflow_offset: u64,
     pub stored_size: u64,
     pub last_modify_lsn: u64,
 }
 const _: () = assert!(size_of::<ObjectRecord>() == 128);
+// Per-object cardinality fields land at fixed offsets — important because
+// they're hot-path on every mutation (tag/attr/relation add/remove).
+const _: () = assert!(std::mem::offset_of!(ObjectRecord, tag_count) == 80);
+const _: () = assert!(std::mem::offset_of!(ObjectRecord, attr_count) == 82);
+const _: () = assert!(std::mem::offset_of!(ObjectRecord, relation_count) == 86);
 
 // =====================================================================
 // §5.2 OverflowRecord per-attribute layout — 32 B (spill) or 112 B (inline)
