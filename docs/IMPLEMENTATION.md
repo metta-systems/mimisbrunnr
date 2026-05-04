@@ -317,8 +317,15 @@ struct FieldFormat {                         // 12 bytes
 
 // FieldFormat.flags bits
 const FIELD_FORMAT_FLAG_SIGNED:    u8 = 1 << 0;
-const FIELD_FORMAT_FLAG_MSB_FIRST: u8 = 1 << 1;
+const FIELD_FORMAT_FLAG_MSB_FIRST: u8 = 1 << 1;  // see byte-order note below
 ```
+
+**Byte order.** The unflagged default is **little-endian** (matching §1.1's invariant for all
+multi-byte integers). `FIELD_FORMAT_FLAG_MSB_FIRST` selects big-endian / MSB-first packing for
+fields whose ordering must match a byte-wise lexicographic compare on a multi-byte natural
+encoding (e.g. UTF-8 string prefixes inside `NormalisedKey`). For ordinary integer fields the
+flag is left clear; bit-packed values still compare correctly because the packed form is the
+field's two's-complement value with `base` subtracted, monotonic by construction.
 
 The descriptor is part of the `SortedRunHeader` payload (§1.5.1), prepended before the packed-key
 stream. With the typical 3-field shape it adds 8 + 36 = 44 bytes per sorted run — amortised over
@@ -799,8 +806,11 @@ The §2.2 commit protocol is invoked when:
 
 1. Btree topology actually changes (root split / merge / new tree depth).
 2. Sufficient flushes have accumulated that committing a fresh root meaningfully advances
-   `read_cursor` (default: every 30 s of mutation activity, or 256 MiB of accumulated flushed
-   pages, whichever first).
+   `read_cursor`. Default: whichever of the two thresholds is hit first —
+   - **30 s** of mutation activity, or
+   - **256 MiB** of **flushed btree-page bytes**: cumulative bytes the journal-reclaim
+     thread has rewritten to fresh buckets since the last checkpoint. Not WAL bytes — the
+     WAL ring itself is only 64 MiB.
 3. A snapshot is created — snapshot creation forces a checkpoint so the snapshot's
    `RootPointer` materialises a coherent btree state.
 
@@ -1160,6 +1170,16 @@ enum OwnerKind {
     OverflowRecord   = 5,                    // owner_key = ObjectId (u64)
 }
 ```
+
+**`owner_key` padding.** Variants whose logical key is shorter than 16 bytes
+(`TagBitmapExtent` and `OverflowRecord` use 8; `BtreeNode` may use less, depending on
+the `min_key prefix` length) must **zero the trailing bytes** of `owner_key`. Equality
+of two `BackpointerValue` records is byte-wise over the full 16 B, and the move-path
+update protocol (§17.5) issues `BackpointerRemove(old_key) ∘ BackpointerInsert(new_key)`
+on exact-match keys — non-zero padding would silently break that match. Writers fill
+the logical bytes per the `OwnerKind` table above and zero the rest; readers ignore
+bytes past the kind-specific length but must treat the full 16 B as canonical for
+equality and §1.5.6 packing.
 
 The pair `(BackpointerKey, BackpointerValue)` is 32 bytes unpacked; with §1.5.6 key packing
 (`disk_id` constant per leaf, `bucket_no` packs to ~16–20 bits, `sector_offset` packs based on
@@ -2552,16 +2572,24 @@ so resuming from any earlier cursor produces the same final state.
 
 Work is processed strictly in this order:
 
-1. `ReconcileHighPrio` — under-replicated metadata, evacuating metadata.
-2. `ReconcileHighPrio` — under-replicated data, evacuating data.
+1. `ReconcileHighPrio`, **metadata items** — under-replicated or evacuating btree-node /
+   overflow / tag-bitmap extents.
+2. `ReconcileHighPrio`, **data items** — under-replicated or evacuating blob / chunk extents.
 3. `ReconcileWork` — normal metadata reconciliation.
 4. `ReconcileWork` — normal data (tiering, option updates, optimisations,
    `SnapshotCleanup`).
 5. `ReconcilePending` — retries (only when prerequisite device-config event has fired).
 
-Within each tier, ordering is logical (SSD) or physical (HDD). `SnapshotCleanup` runs at
-priority 4 — it reclaims space but never blocks correctness or safety; under sustained
-pressure it yields to copygc and tiering work and resumes from its cursor.
+Tiers 1 and 2 share the `ReconcileHighPrio` btree; the worker discriminates by inspecting
+`WorkItem.target_kind` (an `OwnerKind` from §6.2). `OwnerKind ∈ { BtreeNode, OverflowRecord,
+TagBitmapExtent }` is metadata (tier 1); `OwnerKind ∈ { BlobExtent, Chunk }` is data
+(tier 2). Workers consume the btree in `target_kind`-priority order rather than via two
+separate scans, so the on-disk shape stays a single tree.
+
+Within each tier, secondary ordering is logical (SSD) or physical (HDD), via the
+`*_Phys` parallel index when present (§17.2). `SnapshotCleanup` runs at priority 4 — it
+reclaims space but never blocks correctness or safety; under sustained pressure it yields to
+copygc and tiering work and resumes from its cursor.
 
 ### 17.5 Move path
 
