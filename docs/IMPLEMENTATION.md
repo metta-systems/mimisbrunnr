@@ -2191,7 +2191,8 @@ queries:
 
 | In-memory type                               | Mirrors on-disk                           | Lifetime                  |
 | -------------------------------------------- | ----------------------------------------- | ------------------------- |
-| `ObjectTable` (`Vec<ObjectRecord>` + free-list) | radix table of object pages                | mmap-pinned, written via WAL |
+| `ObjectTable` (positional accessor over `BTreeNodeCache`) | §5 radix tree of `BtreeKind::ObjectTable` leaves; per-record access = (radix descent → leaf `BlockRef`) → cache lookup → 128 B slot at `oid_local % 2044` | leaves cached per `BTreeNodeCache` policy below; no separate resident array (1.28 GiB at 10 M objects, ≥ TiBs at the 48-bit cap) |
+| `LocationTable` (positional accessor over `BTreeNodeCache`) | §6.1 radix tree of `BtreeKind::LocationTable` leaves; per-record access = same descent → 48 B slot at `oid_local % 5440` | shares `BTreeNodeCache`; same eviction policy as `ObjectTable` |
 | `TagIndex { HashMap<TagId, TagStore> }`      | TagIndexDirectory + TagBitmap pages       | mmap-pinned roaring containers |
 | `KvIndex { HashMap<(TagId,u64), RoaringBitmap> }` | KvDirectory + buckets                  | resident, lazy-load buckets |
 | `RangeIndex` (`BTreeMap<(TagId, NormKey), Roaring>`) | B+ tree pages                       | resident, paged in     |
