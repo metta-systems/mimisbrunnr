@@ -2088,7 +2088,7 @@ enum BucketDataType {
     Index       = 2,                         // index-zone btree pages, tag bitmaps
     Metadata    = 3,                         // object table, location table, forward index
     Blob        = 4,                         // user data blobs
-    BtreeNode   = 5,                         // dedicated btree-node buckets (post-change [3])
+    BtreeNode   = 5,                         // dedicated btree-node buckets
     Stripe      = 6,                         // erasure-coding stripes (future)
     NeedDiscard = 7,                         // freed, awaiting TRIM
     Reserved    = 8,                         // copygc forward-progress reserve

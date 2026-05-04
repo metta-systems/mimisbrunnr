@@ -185,9 +185,9 @@ pub struct ZoneMap {
 const _: () = assert!(size_of::<ZoneMap>() == 4096);
 
 // =====================================================================
-// §2.2 RootPointer — 424 B (was 376)
-// Adds disks_overflow_root, placement_rules_root, cluster_peers_root —
-// the last three btree roots that previously lived in PoolStateRoot.
+// §2.2 RootPointer — 424 B
+// Anchors every persistent btree root atomically (one COW commit flips
+// the active superblock root; every tree advances together).
 // =====================================================================
 #[repr(C, packed)]
 pub struct RootPointer {
@@ -225,8 +225,9 @@ const _: () = assert!(size_of::<RootPointer>() == 424);
 
 // =====================================================================
 // §2.1 Superblock — 4096 B
-// All offsets after root_a shift by +48 per RootPointer (was 376, now 424).
-// _reserved tail shrinks accordingly: 3044 → 2948 bytes.
+// Two alternating RootPointer slots (root_a, root_b) for atomic commit;
+// the trailing _reserved region absorbs whatever space remains after
+// the static layout fields.
 // =====================================================================
 #[repr(C, packed)]
 pub struct Superblock {
@@ -294,7 +295,7 @@ pub struct WalHeader {
 const _: () = assert!(size_of::<WalHeader>() == 4096);
 
 // =====================================================================
-// §3.2 WalEntryHeader — 40 B (was claimed 32 B)
+// §3.2 WalEntryHeader — 40 B
 // =====================================================================
 #[repr(C, packed)]
 pub struct HybridTimestamp {
@@ -850,15 +851,13 @@ pub const fn fwd_total_entries(runs: usize, assertions: usize) -> usize {
     fwd_payload_n_runs(runs) / fwd_entry_bytes(assertions)
 }
 
-// At "8 assertions per object (typical)" — matching §7.2's spill threshold —
-// a single-run leaf holds ~1 970 entries (NOT the 2 740 the prose previously
-// claimed). The original 2 740/run figure would require ~5.6 assertions/entry.
+// At "8 assertions per object" (the §7.2 inline-spill threshold and the
+// §7.1 calculation basis), a single-run leaf holds ~1 970 entries.
 const _: () = assert!(fwd_total_entries(1, 8) == 1_970);
 
 // At the §1.5.4 compaction trigger (sorted_run_count > 4) the leaf still
-// holds ~1 968 entries TOTAL — adding sorted runs eats overhead, not gains
-// capacity. The original prose's ~10 000-entry "before full compaction"
-// figure assumed runs accumulated capacity additively, which is incorrect.
+// holds ~1 968 entries TOTAL — sorted runs share the region's payload
+// bytes (§1.5.2), so adding runs costs overhead without adding capacity.
 const _: () = assert!(fwd_total_entries(4, 8) == 1_968);
 
 // Lower-assertion regimes (smaller objects pack more densely; monotonic):
