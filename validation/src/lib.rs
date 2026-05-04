@@ -586,6 +586,43 @@ pub struct KvBucket {
 const _: () = assert!(size_of::<KvBucket>() == 4096);
 
 // =====================================================================
+// §8.3 SequencePage / RankedPage — 4096 B each
+// Each page is a 4 KiB block under the standard §1.3 BlockHeader framing,
+// so its capacity is reduced from the naive (4096 / entry_size) — the
+// previous "512 ObjectIds" / "256 ranked entries" claims left no room
+// for header + trailing CRC.
+// =====================================================================
+#[repr(C, packed)]
+pub struct SequencePage {
+    pub header: BlockHeader,                 //   32
+    pub entry_count: u16,                    //    2
+    pub _pad: [u8; 6],                       //    6
+    pub entries: [u64; 506],                 // 4048 (506 × 8)
+    pub _pad_tail: [u8; 4],                  //    4
+    pub trailing_crc: u32,                   //    4
+}
+const _: () = assert!(size_of::<SequencePage>() == 4096);
+
+#[repr(C, packed)]
+pub struct RankedEntry {                     // 16 B
+    pub oid: u64,
+    pub score: f32,
+    pub _pad: u32,
+}
+const _: () = assert!(size_of::<RankedEntry>() == 16);
+
+#[repr(C, packed)]
+pub struct RankedPage {
+    pub header: BlockHeader,                 //   32
+    pub entry_count: u16,                    //    2
+    pub _pad: [u8; 6],                       //    6
+    pub entries: [RankedEntry; 253],         // 4048 (253 × 16)
+    pub _pad_tail: [u8; 4],                  //    4
+    pub trailing_crc: u32,                   //    4
+}
+const _: () = assert!(size_of::<RankedPage>() == 4096);
+
+// =====================================================================
 // §9.3 ChunkIndexLeafEntry — 56 B
 // =====================================================================
 #[repr(C, packed)]

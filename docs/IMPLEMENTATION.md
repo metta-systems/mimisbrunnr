@@ -1404,13 +1404,36 @@ fit in one block, the directory and containers are co-located.
 ```
 OrderedStore root block:
   members: BlockRef → TagBitmap
-  sequence: BlockRef → SequencePages (4 KiB each, 512 ObjectIds per page)
+  sequence: BlockRef → SequencePages
   sequence_count: u64
 
 RankedStore root block:
   members: BlockRef → TagBitmap
-  ranked: BlockRef → RankedPages   { (oid: u64, score: f32, _pad: u32) per entry, 256 per page }
+  ranked: BlockRef → RankedPages
   ranked_count: u64
+```
+
+Each `SequencePage` and `RankedPage` is a 4 KiB block under the standard §1.3 framing
+(`BlockHeader` + payload + trailing CRC32C):
+
+```
+SequencePage (4 KiB):
+  BlockHeader  { kind = TagBitmapPage, format_version = 1 }       // 32 B
+  entry_count: u16                                                //  2 B
+  _pad: [u8; 6]                                                   //  6 B
+  entries: [u64; 506]              // ObjectIds                    // 4048 B
+  _pad_tail: [u8; 4]                                              //  4 B
+  trailing CRC32C                                                 //  4 B
+                                                                  // = 4096 B
+
+RankedPage (4 KiB):
+  BlockHeader  { kind = TagBitmapPage, format_version = 1 }       // 32 B
+  entry_count: u16                                                //  2 B
+  _pad: [u8; 6]                                                   //  6 B
+  entries: [{ oid: u64, score: f32, _pad: u32 }; 253]   // 16 B   // 4048 B
+  _pad_tail: [u8; 4]                                              //  4 B
+  trailing CRC32C                                                 //  4 B
+                                                                  // = 4096 B
 ```
 
 The sequence pages form a logical array; updates use a packed log + periodic compaction (small
