@@ -695,7 +695,7 @@ CreateObject     : { oid: u64, generation: u32, created_ns: i64 }
 DeleteObject     : { oid: u64, lsn: u64 }
 AddTag           : { oid: u64, tag: u32, origin: u8 }
 RemoveTag        : { oid: u64, tag: u32 }
-SetAttr          : { oid: u64, key: u32, value: Value }       // Value tagged-union (§4.2)
+SetAttr          : { oid: u64, key: u32, value: Value }       // Value tagged-union (§4)
 RemoveAttr       : { oid: u64, key: u32, value_hash: u64 }
 AddRelation      : { oid: u64, predicate: u32, target: u64 }
 RemoveRelation   : { oid: u64, predicate: u32, target: u64 }
