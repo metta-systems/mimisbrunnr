@@ -148,6 +148,7 @@ struct TagDefinition {
     name: String,
     semantics: TagSemantics,
     implies: Vec<TagId>,
+    storage: Option<StoragePolicy>,   // §3.5 — chunking, compression, encryption
 }
 
 enum ValueType { Text, Int, Float, Timestamp, Blob }
@@ -164,6 +165,8 @@ enum TagSemantics {
 ```
 
 `OrderedCollection` is a property of the tag, not of the objects. The storage layer sees it and maintains both a bitmap (for fast membership queries) and a sequence vector (for ordering). Adding a new collection type — recipe books, photo albums, project folders — is purely an ontology change, no code needed.
+
+`storage` is the per-tag storage policy: chunking parameters, compression algorithm, encryption mode. A tag that does not declare a `storage` policy contributes nothing to the per-axis resolution (§3.5) for objects bearing it. Most user-facing tags don't need a policy — only tags meant to drive storage behaviour (`vm-disk`, `archive`, `sensitive`) declare one.
 
 ### 3.2 Tag Relations
 
@@ -199,6 +202,80 @@ Ontology says "vm-image" is-a mutable-large-file
   → Enable CDC chunking
   → Enable per-block compression
 ```
+
+### 3.5 Storage Policy Resolution
+
+Each tag's optional `storage: StoragePolicy` declares values for one or more **axes** —
+chunking, compression, encryption — that the storage layer applies to objects bearing the
+tag. An object usually has many tags; resolving its effective policy means choosing one
+value per axis from the candidates contributed by its tag set.
+
+```rust
+struct StoragePolicy {
+    chunking:    Option<ChunkParams>,        // §8.4 (chunking is a placement decision)
+    compression: Option<CompressionAlgo>,    // §9.2
+    encryption:  Option<EncryptionMode>,     // §9.3
+}
+```
+
+**Static invariant (enforced at ontology install time).** For every storage axis A and
+every pair of tags `(T₁, T₂)` that both *directly* declare a value for A in their own
+`storage` field, either `T₁` implies `T₂` or `T₂` implies `T₁` (transitively). Otherwise
+ontology install fails with the conflict pinpointed.
+
+The invariant guarantees that the set of tags directly declaring any axis forms a chain
+in the implication DAG. Runtime resolution can therefore always pick the unique
+most-derived tag without ambiguity.
+
+#### Worked examples
+
+The five archetypal cases:
+
+**1. Linear chain.** `file → binary → vm-disk`, all declaring `chunking`. `vm-disk` is the
+deepest tag → wins. No ambiguity, no install error.
+
+**2. Sibling tags.** `archive` declares `chunking: avg=1 MiB`, `log` declares
+`chunking: avg=64 KiB`, neither implies the other. **Install fails.** The fix is one of:
+declare an implication between them; move the policy to a common ancestor and remove from
+the conflicting tag; mark them `MutuallyExclusive` (§3.2) so they cannot coexist on an
+object.
+
+**3. Diamond.** `large-file` (1 MiB chunks) and `mutable-file` (16 KiB chunks) are siblings.
+`vm-disk implies BOTH` but does not declare chunking itself. **Install of `vm-disk`
+fails** with: "vm-disk inherits chunking via two unrelated paths; declare an explicit
+chunking policy on vm-disk." The descendant breaks the diamond.
+
+**4. Cross-cutting tags on different axes.** `encrypted` declares only encryption;
+`vm-disk` declares only chunking + compression. They're unrelated by implication and the
+object carries both. **Allowed** — they declare different axes. Per-axis resolution
+proceeds independently: `encrypted` wins on encryption, `vm-disk` wins on the others.
+
+**5. Multiple unrelated tags declaring the same axis with the same value.** `encrypted`
+and `sensitive` both declare `encryption: AES-GCM`, neither implies the other.
+**Install fails** — the rule is structural, not value-based. Even though today's values
+agree, a future change to either tag silently creates a conflict the next time an object
+bearing both is written. Catching it at install time is the right ergonomic.
+
+#### Per-tag effective policy (cached at install time)
+
+For tag T and axis A, the *effective value* is the value declared by the unique
+most-derived tag in `{T} ∪ ancestors(T)` that directly declares A. The static invariant
+guarantees uniqueness. If no ancestor declares A, the effective value is `None` and the
+axis falls through to placement rules and superblock defaults.
+
+#### Per-object resolution at write time
+
+For each axis:
+
+1. Collect each tag's *effective* value from the object's tag set.
+2. The static invariant guarantees the non-`None` values form a chain → pick the
+   most-derived; that is the ontology's resolved value.
+3. If the set is empty (no tag specifies the axis), check matching `PlacementRule`s in
+   the placement engine (§8.3); the most recently installed rule wins on ties.
+4. If still unresolved, fall through to the superblock default
+   (`Superblock.default_storage_policy`).
+
+Cost: O(tags-on-object × axes), with no runtime ambiguity.
 
 ---
 
@@ -659,17 +736,46 @@ struct DiskDescriptor {
 
 ### 8.3 Semantic Placement Rules
 
-Placement rules bind semantic properties to physical topology:
+Placement rules bind semantic properties to physical topology — and to the *granularity*
+at which objects are stored. Chunking is a placement decision: it determines how an
+object's bytes are subdivided across the bucket layer (single contiguous extent vs.
+content-defined chunks):
 
 ```rust
 enum PlacementRule {
-    Pin { query: Query, tier: StorageTier },
-    Prefer { query: Query, tier: StorageTier, priority: u8 },
+    Pin       { query: Query, tier: StorageTier },
+    Prefer    { query: Query, tier: StorageTier, priority: u8 },
     Replicate { query: Query, min_replicas: u8, across_disks: bool },
-    Colocate { query: Query },
-    AutoTier { hot_threshold_days: u32, warm_threshold_days: u32, cold_after: u32 },
+    Colocate  { query: Query },
+    AutoTier  { hot_threshold_days: u32, warm_threshold_days: u32, cold_after: u32 },
+    Chunk     { query: Query, params: ChunkParams },
+}
+
+struct ChunkParams {
+    algo: ChunkingAlgo,
+    min_size: u32,                       // plaintext bytes; ignored when algo == None
+    avg_size: u32,
+    max_size: u32,
+}
+
+enum ChunkingAlgo {
+    None      = 0,                       // do not chunk; store as a single extent
+    FixedSize = 1,                       // resumability without CDC overhead
+    FastCDC   = 2,                       // content-defined; default for the chunked path
+    // 3+ reserved for future algorithms
 }
 ```
+
+`PlacementRule::Chunk` is the **admin-time override** for chunking — used when the
+operator wants to force a chunking decision that's not captured in the installed
+ontology (e.g. "all objects matching `tag=database AND size>1GiB` use FastCDC at 64 KiB
+average regardless of what the ontology says"). For ontology-driven defaults, declare the
+policy on the relevant `TagDefinition.storage` instead (§3.5).
+
+`ChunkingAlgo::None` is the explicit "do not chunk" form — used both as the
+format-time default (`Superblock.default_storage_policy`) and as an admin override
+("force this matching set of objects to be unchunked"). The full resolution order is:
+ontology effective policy → matching `PlacementRule::Chunk` → superblock default.
 
 ### 8.4 Disk Operations
 
@@ -815,6 +921,20 @@ Content-defined chunking (FastCDC) is only applied where the ontology indicates 
 |Large immutable transfers|Maybe|Fixed-chunk for resumability|
 
 Only ~1% of objects are typically chunked, keeping the chunk index small (~5 MB vs 4 GB if everything were chunked). When active: chunk plaintext, hash each chunk, compress per-chunk, encrypt.
+
+**Where chunk parameters come from.** Per-object chunking parameters
+(`algo`, `min_size`, `avg_size`, `max_size`) are resolved at write time per §3.5:
+
+1. Ontology-effective policy on the object's tag set (the deepest tag whose
+   `TagDefinition.storage.chunking` is set wins; static install-time invariant
+   guarantees no ambiguity).
+2. Matching `PlacementRule::Chunk` rules (§8.3) — admin-time overrides.
+3. `Superblock.default_storage_policy.chunking` — pool-wide default
+   (`ChunkingAlgo::None` at format time).
+
+The resolved `ChunkParams` are then **persisted in the ChunkList head region** so
+readers know exactly what was used and reconcile (§17) can detect mismatches and
+re-chunk when the policy changes. See IMPLEMENTATION.md §9.3 for the on-disk layout.
 
 **Two complementary structures, not one.** A chunked object is stored across two structures
 with deliberately opposing key shapes (full layout in IMPLEMENTATION §9.3):

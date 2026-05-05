@@ -107,6 +107,7 @@ const _: () = {
 
 // BtreeNodeHeader.flags
 pub const BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS: u8 = 1 << 0;
+pub const BTREE_NODE_FLAG_HEAD_OF_CHAIN:          u8 = 1 << 1;  // §9.3 ChunkList head
 
 // SortedRunHeader.flags
 pub const SORTED_RUN_FLAG_PACKED_KEYS: u32 = 1 << 0;
@@ -354,7 +355,10 @@ pub struct Superblock {
     pub ro_compat_features: u64,                // [1080..1088]
     pub incompat_features: u64,                 // [1088..1096]
     pub downgrade_log_ref: BlockRef,            // [1096..1112]
-    pub _reserved: [u8; 2980],                  // [1112..4092]
+    // §3.5 / §8.3 default storage policy
+    pub default_chunking_threshold: u64,        // [1112..1120]
+    pub default_chunking: ChunkParamsRecord,    // [1120..1136]
+    pub _reserved: [u8; 2956],                  // [1136..4092]
     pub trailing_crc: u32,                      // [4092..4096]
 }
 const _: () = assert!(size_of::<Superblock>() == 4096);
@@ -743,6 +747,44 @@ pub struct ChunkListEntry {
 }
 const _: () = assert!(size_of::<ChunkListEntry>() == 40);
 
+// =====================================================================
+// §9.3 ChunkParamsRecord — 16 B, lives in the ChunkList head region only
+// (§1.5.1 BTREE_NODE_FLAG_HEAD_OF_CHAIN). Records the chunking parameters
+// resolved at write time (DESIGN §3.5). Reconcile compares this against
+// the currently-resolved policy and re-chunks on mismatch (§17.1).
+// =====================================================================
+#[repr(C, packed)]
+pub struct ChunkParamsRecord {
+    pub algo: u8,                            // [0..1]   ChunkingAlgo discriminant
+    pub flags: u8,                           // [1..2]   reserved
+    pub _pad: [u8; 2],                       // [2..4]
+    pub min_size: u32,                       // [4..8]   plaintext bytes; ignored when algo == None
+    pub avg_size: u32,                       // [8..12]
+    pub max_size: u32,                       // [12..16]
+}
+const _: () = assert!(size_of::<ChunkParamsRecord>() == 16);
+
+// ChunkingAlgo discriminants — pinned numerically. 3+ reserved for future.
+pub const CHUNKING_ALGO_NONE:       u8 = 0;
+pub const CHUNKING_ALGO_FIXED_SIZE: u8 = 1;
+pub const CHUNKING_ALGO_FAST_CDC:   u8 = 2;
+pub const CHUNKING_ALGO_COUNT:      u8 = 3;
+const _: () = assert!(CHUNKING_ALGO_FAST_CDC + 1 == CHUNKING_ALGO_COUNT);
+
+// §9.3 head-region capacity. The 16 B ChunkParamsRecord lives in space that
+// was previously trailing pad, so capacity stays at 6 551 entries — same as
+// chained (non-head) regions. Pin both shapes.
+pub const CHUNK_LIST_HEAD_PAYLOAD: usize =
+    REGION
+        - size_of::<BtreeNodeHeader>()
+        - size_of::<ChunkParamsRecord>()
+        - size_of::<BlockRef>();             // trailing chain ref
+pub const CHUNK_LIST_HEAD_ENTRIES: usize =
+    CHUNK_LIST_HEAD_PAYLOAD / size_of::<ChunkListEntry>();
+const _: () = assert!(CHUNK_LIST_HEAD_PAYLOAD == 262_048);
+const _: () = assert!(CHUNK_LIST_HEAD_ENTRIES == 6_551);
+const _: () = assert!(CHUNK_LIST_HEAD_ENTRIES == CHUNK_LIST_ENTRIES);  // same as chained
+
 // §10.3 — Path projections are encoded as ordinary tag/attribute assertions
 // (Value::Scoped { context, inner }; §4.3). Nothing here to validate at the
 // layout level; ontology validation handles the type rules.
@@ -1072,6 +1114,135 @@ pub const WAL_CURSOR_KEY_MAX_BYTES: usize = 256;
 pub const WAL_OWNER_KEY_BYTES:      usize = 16;     // §6.2 BackpointerValue.owner_key
 const _: () = assert!(WAL_LABEL_MAX_BYTES      < WAL_OP_MAX_PAYLOAD);
 const _: () = assert!(WAL_CURSOR_KEY_MAX_BYTES < WAL_OP_MAX_PAYLOAD);
+
+// =====================================================================
+// §3.3.1 Chunked-object WAL ops (§9.3).
+// Per-entry sizes (raw, unpacked):
+//   ChunkInsertBatch entry: chunk_hash (32) + extent: BlockRef (16) + length (4) = 52 B
+//   ChunkListReplace hash:  32 B
+// CBOR adds ~4 B framing per array + ~3 B per record. We allow generous slack so the
+// producer can pick any N that fits, capped by these constants — debug_assert! in the
+// appender catches CBOR overflow.
+// =====================================================================
+pub const CHUNK_INSERT_ENTRY_BYTES:  usize = 32 + 16 + 4;     // 52 B
+pub const CHUNK_INSERT_FRAMING_SLACK: usize = 64;             // op-kind + array prefix + per-entry CBOR overhead
+pub const CHUNK_INSERT_BATCH_MAX:    usize =
+    (WAL_OP_MAX_PAYLOAD - CHUNK_INSERT_FRAMING_SLACK) / CHUNK_INSERT_ENTRY_BYTES;
+// (4036 − 64) / 52 = 76 entries — producer picks any N in 1..=76.
+const _: () = assert!(CHUNK_INSERT_BATCH_MAX == 76);
+const _: () = assert!(
+    CHUNK_INSERT_FRAMING_SLACK
+        + CHUNK_INSERT_BATCH_MAX * CHUNK_INSERT_ENTRY_BYTES
+        <= WAL_OP_MAX_PAYLOAD
+);
+
+pub const CHUNK_LIST_REPLACE_HASH_BYTES: usize = 32;
+pub const CHUNK_LIST_REPLACE_FRAMING_SLACK: usize = 32;        // oid + position + array prefix + CBOR
+pub const CHUNK_LIST_REPLACE_MAX_HASHES: usize =
+    (WAL_OP_MAX_PAYLOAD - CHUNK_LIST_REPLACE_FRAMING_SLACK) / CHUNK_LIST_REPLACE_HASH_BYTES;
+// (4036 − 32) / 32 = 125 hashes per op.
+const _: () = assert!(CHUNK_LIST_REPLACE_MAX_HASHES == 125);
+
+// §3.3.1 throughput-model constants. Five regimes (4 KiB → 8 MiB) span FastCDC's
+// real-world parameter range and pin every figure in the doc's spectrum table.
+// All compute over a 32 GiB bulk write with no dedup.
+pub const CHUNK_LIST_ENTRIES_PER_REGION: usize = CHUNK_LIST_ENTRIES;        // 6_551
+pub const CHUNK_INDEX_LEAF_ENTRIES:      usize = 4_600;                      // §9.3 prose figure
+const _: () = assert!(CHUNK_LIST_ENTRIES_PER_REGION == 6_551);
+
+pub const CHUNK_BULK_WRITE_BYTES:        usize = 32 * 1024 * 1024 * 1024;   // 32 GiB
+pub const WAL_RING_BYTES_DEFAULT:        usize = 64 * 1024 * 1024;          // §3 default
+
+const fn chunks_for(avg: usize) -> usize { CHUNK_BULK_WRITE_BYTES / avg }
+const fn insert_ops_for(avg: usize) -> usize {
+    chunks_for(avg).div_ceil(CHUNK_INSERT_BATCH_MAX)
+}
+const fn list_ops_for(avg: usize) -> usize {
+    chunks_for(avg).div_ceil(CHUNK_LIST_ENTRIES_PER_REGION)
+}
+// Worst-case WAL bytes: one full 4 KiB sector per op (real ChunkListAppend is ~50 B,
+// real ChunkInsertBatch fills the sector — pinning the upper bound is the honest
+// way to assert "WAL traffic is bounded, ring is circular, reclaim drains it").
+const fn wal_bytes_for(avg: usize) -> usize {
+    (insert_ops_for(avg) + list_ops_for(avg)) * BLOCK_SIZE
+}
+
+// --- 4 KiB extreme (small-chunk / fine-grained-edit regime) -------------
+pub const CHUNK_AVG_4KIB:               usize = 4 * 1024;
+pub const CHUNK_4KIB_CHUNKS:            usize = chunks_for(CHUNK_AVG_4KIB);
+pub const CHUNK_4KIB_INSERT_OPS:        usize = insert_ops_for(CHUNK_AVG_4KIB);
+pub const CHUNK_4KIB_LIST_OPS:          usize = list_ops_for(CHUNK_AVG_4KIB);
+pub const CHUNK_4KIB_WAL_BYTES_MAX:     usize = wal_bytes_for(CHUNK_AVG_4KIB);
+const _: () = assert!(CHUNK_4KIB_CHUNKS    == 8_388_608);                    // 8 M
+const _: () = assert!(CHUNK_4KIB_INSERT_OPS == 110_377);                     // ~110 K
+const _: () = assert!(CHUNK_4KIB_LIST_OPS   == 1_281);                       // ~1.28 K
+// ~447 MiB worst-case — exceeds 64 MiB ring by ~7×; ring cycles continuously.
+const _: () = assert!(CHUNK_4KIB_WAL_BYTES_MAX > 7 * WAL_RING_BYTES_DEFAULT);
+const _: () = assert!(CHUNK_4KIB_WAL_BYTES_MAX < 8 * WAL_RING_BYTES_DEFAULT);
+
+// --- 16 KiB (VM / database canonical workload) -------------------------
+pub const CHUNK_AVG_16KIB:              usize = 16 * 1024;
+pub const CHUNK_16KIB_CHUNKS:           usize = chunks_for(CHUNK_AVG_16KIB);
+pub const CHUNK_16KIB_INSERT_OPS:       usize = insert_ops_for(CHUNK_AVG_16KIB);
+pub const CHUNK_16KIB_LIST_OPS:         usize = list_ops_for(CHUNK_AVG_16KIB);
+pub const CHUNK_16KIB_WAL_BYTES_MAX:    usize = wal_bytes_for(CHUNK_AVG_16KIB);
+const _: () = assert!(CHUNK_16KIB_CHUNKS    == 2_097_152);                   // ~2 M
+const _: () = assert!(CHUNK_16KIB_INSERT_OPS == 27_595);                     // ~28 K
+const _: () = assert!(CHUNK_16KIB_LIST_OPS   == 320);
+// ~115 MiB worst-case — exceeds ring by ~1.8×; ring cycles ~2× over the write.
+const _: () = assert!(CHUNK_16KIB_WAL_BYTES_MAX > WAL_RING_BYTES_DEFAULT);
+const _: () = assert!(CHUNK_16KIB_WAL_BYTES_MAX < 2 * WAL_RING_BYTES_DEFAULT);
+
+// --- 256 KiB (generic FastCDC default) ---------------------------------
+pub const CHUNK_AVG_256KIB:             usize = 256 * 1024;
+pub const CHUNK_256KIB_CHUNKS:          usize = chunks_for(CHUNK_AVG_256KIB);
+pub const CHUNK_256KIB_INSERT_OPS:      usize = insert_ops_for(CHUNK_AVG_256KIB);
+pub const CHUNK_256KIB_LIST_OPS:        usize = list_ops_for(CHUNK_AVG_256KIB);
+pub const CHUNK_256KIB_WAL_BYTES_MAX:   usize = wal_bytes_for(CHUNK_AVG_256KIB);
+const _: () = assert!(CHUNK_256KIB_CHUNKS    == 131_072);                    // ~131 K
+const _: () = assert!(CHUNK_256KIB_INSERT_OPS == 1_725);
+const _: () = assert!(CHUNK_256KIB_LIST_OPS   == 20);
+// ~7 MiB — fits inside the ring with room to spare.
+const _: () = assert!(CHUNK_256KIB_WAL_BYTES_MAX < WAL_RING_BYTES_DEFAULT / 8);
+
+// --- 1 MiB (backup-tool default, restic-class) -------------------------
+pub const CHUNK_AVG_1MIB:               usize = 1024 * 1024;
+pub const CHUNK_1MIB_CHUNKS:            usize = chunks_for(CHUNK_AVG_1MIB);
+pub const CHUNK_1MIB_INSERT_OPS:        usize = insert_ops_for(CHUNK_AVG_1MIB);
+pub const CHUNK_1MIB_LIST_OPS:          usize = list_ops_for(CHUNK_AVG_1MIB);
+pub const CHUNK_1MIB_WAL_BYTES_MAX:     usize = wal_bytes_for(CHUNK_AVG_1MIB);
+const _: () = assert!(CHUNK_1MIB_CHUNKS    == 32_768);
+const _: () = assert!(CHUNK_1MIB_INSERT_OPS == 432);
+const _: () = assert!(CHUNK_1MIB_LIST_OPS   == 5);
+// ~1.8 MiB total.
+
+// --- 8 MiB extreme (large-chunk / resumability regime) -----------------
+pub const CHUNK_AVG_8MIB:               usize = 8 * 1024 * 1024;
+pub const CHUNK_8MIB_CHUNKS:            usize = chunks_for(CHUNK_AVG_8MIB);
+pub const CHUNK_8MIB_INSERT_OPS:        usize = insert_ops_for(CHUNK_AVG_8MIB);
+pub const CHUNK_8MIB_LIST_OPS:          usize = list_ops_for(CHUNK_AVG_8MIB);
+pub const CHUNK_8MIB_WAL_BYTES_MAX:     usize = wal_bytes_for(CHUNK_AVG_8MIB);
+const _: () = assert!(CHUNK_8MIB_CHUNKS    == 4_096);
+const _: () = assert!(CHUNK_8MIB_INSERT_OPS == 54);
+const _: () = assert!(CHUNK_8MIB_LIST_OPS   == 1);                           // single region
+// ~220 KiB total — bookkeeping overhead negligible vs 32 GiB plaintext.
+const _: () = assert!(CHUNK_8MIB_WAL_BYTES_MAX < 256 * 1024);
+
+// Spread across regimes: ~2 000× on every axis. Pin the magnitude.
+const _: () = assert!(CHUNK_4KIB_CHUNKS / CHUNK_8MIB_CHUNKS == 2_048);
+const _: () =
+    assert!(CHUNK_4KIB_WAL_BYTES_MAX / CHUNK_8MIB_WAL_BYTES_MAX > 1_500);
+const _: () =
+    assert!(CHUNK_4KIB_WAL_BYTES_MAX / CHUNK_8MIB_WAL_BYTES_MAX < 2_500);
+
+// Per-object ChunkList footprint (in 256 KiB regions) at the extremes.
+// 4 KiB: 1 281 regions × 256 KiB ≈ 320 MiB ChunkList per object (~1 % of plaintext).
+// 8 MiB: 1 region × 256 KiB = 256 KiB ChunkList per object.
+pub const CHUNK_4KIB_LIST_FOOTPRINT_BYTES: usize = CHUNK_4KIB_LIST_OPS * REGION;
+pub const CHUNK_8MIB_LIST_FOOTPRINT_BYTES: usize = CHUNK_8MIB_LIST_OPS * REGION;
+const _: () = assert!(CHUNK_4KIB_LIST_FOOTPRINT_BYTES > 300 * 1024 * 1024);
+const _: () = assert!(CHUNK_4KIB_LIST_FOOTPRINT_BYTES < 340 * 1024 * 1024);
+const _: () = assert!(CHUNK_8MIB_LIST_FOOTPRINT_BYTES == REGION);            // 256 KiB
 
 // =====================================================================
 // §7.2 ForwardOverflow region: positional PackedAssertion array minus

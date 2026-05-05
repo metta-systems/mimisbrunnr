@@ -226,6 +226,10 @@ struct BtreeNodeHeader {                     // 64 bytes
 
 // BtreeNodeHeader.flags bits
 const BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS: u8 = 1 << 0;  // recovery hint
+const BTREE_NODE_FLAG_HEAD_OF_CHAIN:          u8 = 1 << 1;  // §9.3 — first ChunkList region
+                                                            // of an object's chain (carries
+                                                            // ChunkParamsRecord; chained regions
+                                                            // do not)
 ```
 
 `BlockPreamble` is the 8-byte common prefix shared with `BlockHeader` (§1.3), so a generic
@@ -504,7 +508,13 @@ struct Superblock {                          // 4096 bytes total
     incompat_features: u64,                  // [1088..1096] §15.2 — old readers refuse
     downgrade_log_ref: BlockRef,             // [1096..1112] §15.5 — chain of historical features
 
-    _reserved: [u8; 2980],                   // [1112..4092] zeroed, available for future fields
+    // Default storage policy (DESIGN §3.5 / §8.3) — applied when neither ontology nor
+    // PlacementRule resolves an axis. Format-time default: chunking algo = None.
+    default_chunking_threshold: u64,         // [1112..1120] objects ≤ this size are never
+                                             //              chunked regardless of policy
+    default_chunking: ChunkParamsRecord,     // [1120..1136] 16 B (§9.3)
+
+    _reserved: [u8; 2956],                   // [1136..4092] zeroed, available for future fields
     // trailing CRC32C at [4092..4096] lives inside BlockHeader's frame
 }
 
@@ -811,6 +821,37 @@ RemoveAttr       : { oid: u64, key: u32, value_hash: u64 }
 AddRelation      : { oid: u64, predicate: u32, target: u64 }
 RemoveRelation   : { oid: u64, predicate: u32, target: u64 }
 WriteBlob        : { oid: u64, content_hash: [u8;32], extent: ExtentRef, size: u64 }
+                   // Non-chunked objects only. Chunked objects (§9.3) use the
+                   // ChunkInsertBatch / ChunkListAppend / ChunkObjectFinalize flow
+                   // described in §3.3.1.
+
+// FastCDC chunked objects (§9.3, §3.3.1)
+ChunkInsertBatch    : { chunks: [(chunk_hash: [u8;32], extent: BlockRef, length: u32); N] }
+                   // N chosen by producer s.t. encoded op fits the §3.2 sector cap;
+                   //   replay inserts each (hash → extent) into ChunkIndex (or bumps
+                   //   ref_count if the hash already exists). Idempotent under LSN.
+ChunkListAppend     : { oid: u64, position_start: u64, region: BlockRef, count: u32 }
+                   // The region — a freshly written §9.3 ChunkList region — already
+                   //   holds `count` chunk hashes; the op records its placement in
+                   //   oid's ChunkList chain at logical positions
+                   //   [position_start, position_start + count). Hashes are not
+                   //   inlined; replay reads them from the region.
+ChunkListReplace    : { oid: u64, position: u64, new_hashes: [[u8;32]; N] }
+                   // In-place patch: replace N entries starting at `position`.
+                   //   N capped by the sector budget (~125 hashes at 32 B each).
+                   //   Replay rewrites the affected ChunkList region(s) and adjusts
+                   //   ChunkIndex.ref_count (decrement old, increment new).
+ChunkListShrink     : { oid: u64, new_length: u64 }
+                   // Truncate oid's ChunkList to new_length entries. Replay walks the
+                   //   tail and decrements ref_count for each dropped chunk; fully-
+                   //   emptied regions are freed via bucket-gen bump.
+ChunkObjectFinalize : { oid: u64, content_hash: [u8;32], total_length: u64,
+                        list_head: BlockRef }
+                   // Publishes a chunked object: sets ObjectLocation.flags |=
+                   //   LOCATION_FLAG_CHUNKED, replicas[0] = list_head;
+                   //   ObjectRecord.content_hash = whole-plaintext hash;
+                   //   ObjectRecord.blob_length = total_length. Readers see a fully
+                   //   assembled chunked object only after this op replays.
 
 // Bucket lifecycle (§12)
 BucketAlloc      : { disk_id: u16, bucket_no: u32, data_type: u8, generation: u32 }
@@ -852,6 +893,111 @@ Checkpoint       : { new_root: RootPointer, gc_reserve_buckets: u32 }
 
 Replay applies entries strictly in LSN order. Each in-memory mutation is idempotent under
 `(lsn ≤ structure.lsn)` shortcutting, so replay is safe across crashes mid-replay.
+
+### 3.3.1 Chunked-object write sequence
+
+Chunked objects (DESIGN §9.6, IMPLEMENTATION §9.3) are the only logical mutation that splits
+into a multi-op flow. The `WriteBlob` op covers atomic non-chunked writes; chunked workloads
+need finer granularity because a single object can be gigabytes and per-fsync durability
+during long transfers matters.
+
+**Bulk write (e.g. a 32 GiB VM image, no dedup).** Before chunking begins, the producer
+resolves the per-object chunking parameters per DESIGN §3.5 (ontology effective policy →
+matching `PlacementRule::Chunk` → superblock default). Then:
+
+1. Allocates a fresh `ChunkList` head region; sets `BTREE_NODE_FLAG_HEAD_OF_CHAIN` and
+   writes the resolved `ChunkParamsRecord` immediately after the header (§9.3). The
+   region holds 6 551 entries.
+2. Splits plaintext using the resolved algorithm/params (e.g. FastCDC at the resolved
+   `avg_size`). For each chunk: writes the chunk extent to a fresh blob bucket; appends
+   the `(hash, extent, length)` triple to a pending `ChunkInsertBatch` and the hash to
+   the region's entry array.
+3. When the in-flight `ChunkInsertBatch` reaches the producer's chosen size cap (bounded
+   by `WAL_OP_MAX_PAYLOAD`), emits the batch as a WAL op.
+4. When the head region fills (or fsync arrives), commits it and allocates a chained
+   non-head region (no `ChunkParamsRecord`). Each region commit emits
+   `ChunkListAppend { oid, position_start, region, count }`.
+5. At end-of-write, emits `ChunkObjectFinalize { oid, content_hash, total_length, list_head }`.
+   `list_head` points at the head region whose `ChunkParamsRecord` is now the durable
+   record of the parameters this object was written with.
+
+**Small in-place edit** (e.g. 4 KiB write at offset 1 GiB into a VM disk → FastCDC re-chunks
+the affected window, replacing 1–3 chunks):
+
+1. New chunks → `ChunkInsertBatch { chunks: [1..3] }`.
+2. `ChunkListReplace { oid, position, new_hashes: [hash; 1..3] }`.
+
+No `ChunkObjectFinalize` is needed for in-place edits — the object is already published; the
+replace op modifies its existing ChunkList. The total `content_hash` and `total_length` only
+change if the edit shifts logical length, in which case a follow-up `ChunkObjectFinalize` (or
+`ChunkListShrink` for truncation) updates them.
+
+**Sync receive / resumable transfer.** Identical to bulk-write but driven by stream arrival
+order. After crash, the receiver queries the persisted ChunkList chain length and resumes
+from there — the `ChunkListAppend` chain *is* the durable progress record.
+
+**Truncate / delete.** `ChunkListShrink { oid, new_length: 0 }` drops the chain;
+`DeleteObject` then removes the object record. ChunkIndex `ref_count` decrements happen during
+shrink-replay; chunks reaching `ref_count = 0` are freed.
+
+**Crash semantics.** Each step is independently durable: chunks written to fresh buckets but
+not yet referenced from any `ChunkInsertBatch` get reclaimed by bucket-gen GC. ChunkList
+regions written but not yet referenced from a `ChunkListAppend` get reclaimed similarly. A
+chunked object that crashed before `ChunkObjectFinalize` is invisible to readers — its oid's
+`ObjectLocation.replicas[0]` was never set — so no partial state is observable.
+
+**Throughput model — 32 GiB bulk write, no dedup, across the FastCDC parameter space.**
+
+FastCDC's avg-chunk-size knob spans ~3 orders of magnitude in real deployments (DESIGN §9.6):
+4 KiB for fine-grained edits at the small end, up to 8 MiB for resumability-only large
+transfers at the other. The five-regime table below shows how the design scales:
+
+| Avg chunk | Typical workload                   | Chunks      | `ChunkInsertBatch` ops (≤ 76/op) | `ChunkListAppend` ops (one per 6 551-entry region) | Cumulative WAL bytes (worst case: 1 sector/op) | WAL append rate at 530 MiB/s plaintext |
+| --------- | ---------------------------------- | ----------- | -------------------------------- | -------------------------------------------------- | ---------------------------------------------- | -------------------------------------- |
+| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 110 377                          | 1 281                                              | ~436 MiB (1.3 % of plaintext)                  | ~7.3 MiB/s                             |
+| 16 KiB    | VM disks, databases                | 2 097 152   | 27 595                           | 320                                                | ~109 MiB (0.33 %)                              | ~1.8 MiB/s                             |
+| 256 KiB   | generic FastCDC default            | 131 072     | 1 725                            | 20                                                 | ~6.8 MiB (0.020 %)                             | ~114 KiB/s                             |
+| 1 MiB     | backup-tool default (restic-class) | 32 768      | 432                              | 5                                                  | ~1.7 MiB (0.0052 %)                            | ~29 KiB/s                              |
+| **8 MiB** | large extreme — pure resumability  | 4 096       | 54                               | 1                                                  | ~220 KiB (0.00067 %)                           | ~3.6 KiB/s                             |
+
+The spread is roughly **2 000×** across regimes on every axis — the same op set covers all
+of it, only the constants change.
+
+**Cumulative ≠ simultaneous.** The 64 MiB ring is circular. Steady-state ring fill is bounded
+by *reclaim latency*, not by total traffic over the operation. Reclaim's job is flushing
+ChunkIndex leaves (256 KiB regions packing ~4 600 chunks each); the leaf-flush rate it must
+sustain to keep the ring drained is `chunks_per_second / 4 600` leaves/s — equivalently,
+`(producer_plaintext_rate / avg_chunk_size) / 4 600` leaves/s. At 530 MiB/s plaintext:
+
+- **4 KiB regime:** ~135 K chunks/s ÷ 4 600 = ~29 leaves/s = ~7.5 MiB/s of leaf rewrites.
+  Comfortably within NVMe write bandwidth (~1–3 GiB/s typical) but no longer trivial; this
+  is where reclaim genuinely has to keep up. Cumulative WAL exceeds the 64 MiB ring by ~7×,
+  so the ring cycles continuously.
+- **16 KiB regime (canonical VM / DB workload):** ~7 leaves/s ≈ 1.8 MiB/s leaf rewrites.
+  Ring cycles ~1.7× over the 60-second write. §3.4's *idle* / *background-flush* bands
+  cover the producer comfortably.
+- **256 KiB and above:** WAL traffic is in the noise; reclaim is essentially never the
+  bottleneck. The ring barely fills.
+
+The design therefore scales from "fine-grained dedup workload that genuinely stresses
+reclaim" to "barely-noticed bookkeeping" without changing op shapes. The producer's choice
+of FastCDC parameters trades dedup granularity (small chunks → more shared chunks across
+edits) against per-chunk overhead (small chunks → more WAL ops, more ChunkIndex leaves,
+larger per-object ChunkList chain).
+
+**HDD-only pools.** A pool whose only writable disk is rotational clamps the producer to
+whatever reclaim sustains there. At the 4 KiB extreme this would be a real bottleneck (HDD
+write throughput is far below the 7.5 MiB/s leaf-flush demand); at 1 MiB or above it is
+unnoticeable. Chunked workloads typically imply hot-tier (NVMe/SSD) presence anyway, so
+this is a corner case.
+
+**Per-object footprint** (orthogonal to WAL but worth noting at the small extreme): a 32 GiB
+object's `ChunkList` chain is `chunks ÷ 6 551` regions × 256 KiB. At 4 KiB chunks that's
+~320 MiB of ChunkList per object (1 % of plaintext); at 8 MiB chunks it's a single 256 KiB
+region. ChunkIndex footprint scales similarly. The very-small-chunk regime is therefore
+viable but pays for itself in dedup hit-rate, not in raw efficiency — fine for VM-disk
+workloads with high common-chunk ratios across snapshots, less so for one-shot writes of
+unique data.
 
 ### 3.4 Journal pins and deferred btree flushes
 
@@ -1773,11 +1919,32 @@ chunk once, refcounted, so two objects sharing common chunks share their storage
 
 #### `ChunkList` — per-object FastCDC recipe
 
-A chunked object's `ObjectLocation` (§6.1, with `LOCATION_FLAG_CHUNKED`) points at the head of
-a `BtreeKind::ChunkList` chain. The region is a §1.5 large-node region in the positional
-flavour (no sorted runs — single rewrite on growth, like `ForwardOverflow`):
+A chunked object's `ObjectLocation` (§6.1, with `LOCATION_FLAG_CHUNKED`) points at the **head**
+of a `BtreeKind::ChunkList` chain. The head region carries `BTREE_NODE_FLAG_HEAD_OF_CHAIN`
+in `BtreeNodeHeader.flags` (§1.5.1) and a fixed 16 B `ChunkParamsRecord` immediately after
+the header — recording the chunking parameters used to produce the chain. Chained
+(non-head) regions carry only the `BtreeNodeHeader`; their chunking parameters are inherited
+from the head.
 
 ```rust
+#[repr(C, packed)]
+struct ChunkParamsRecord {                   // 16 bytes — head region only
+    algo: u8,                                //  [0..1]   ChunkingAlgo discriminant
+    flags: u8,                               //  [1..2]   reserved
+    _pad: [u8; 2],                           //  [2..4]
+    min_size: u32,                           //  [4..8]   plaintext bytes; ignored when algo == None
+    avg_size: u32,                           //  [8..12]
+    max_size: u32,                           // [12..16]
+}
+
+#[repr(u8)]
+enum ChunkingAlgo {
+    None      = 0,                           // not chunked — record exists for re-chunk overrides
+    FixedSize = 1,                           // for resumability without CDC overhead
+    FastCDC   = 2,                           // content-defined; default for the chunked path
+    // 3+ reserved for future algorithms
+}
+
 struct ChunkListEntry {                      // 40 bytes (8-aligned)
     chunk_hash: [u8; 32],                    //  [0..32]   BLAKE3 of plaintext, indexes ChunkIndex
     length: u32,                             // [32..36]   plaintext length of this chunk
@@ -1785,18 +1952,38 @@ struct ChunkListEntry {                      // 40 bytes (8-aligned)
 }
 ```
 
-Region capacity at 256 KiB:
+Region capacity:
 
 ```
-262 144 (region) − 64 (BtreeNodeHeader) − 16 (trailing chain BlockRef) = 262 064 B
-                                                       ÷ 40 B/entry  = 6 551 entries
+Head region:
+  262 144 − 64 (BtreeNodeHeader) − 16 (ChunkParamsRecord) − 16 (trailing chain BlockRef)
+    = 262 048 B  ÷ 40 B/entry  = 6 551 entries
+
+Chained regions:
+  262 144 − 64 (BtreeNodeHeader) − 16 (trailing chain BlockRef)
+    = 262 064 B  ÷ 40 B/entry  = 6 551 entries
 ```
+
+Both shapes pack the same 6 551 entries — the head's `ChunkParamsRecord` lives in space
+that was previously trailing pad, so adding it costs no slots. The head region's first
+entry sits at offset 80 (`64 + 16`); chained regions' first entry sits at offset 64.
+Readers determine which shape they're looking at by inspecting
+`BTREE_NODE_FLAG_HEAD_OF_CHAIN`.
 
 Each entry covers a single FastCDC chunk (typical 4 – 64 KiB plaintext); a single region
 therefore covers ≈ 26 MiB – 410 MiB of plaintext at the average chunk size. Larger objects
 chain through the trailing `BlockRef` slot (same convention as `ForwardOverflow`, §7.2).
 Reads stream chunks in order: walk the list, look up each chunk in `ChunkIndex` to find its
 physical extent, fetch.
+
+**Re-chunking after policy change.** When the resolved storage policy (DESIGN §3.5) for an
+object changes — typically because the operator updated a `PlacementRule::Chunk` or because
+an ontology install bumped a tag's `storage.chunking` — reconcile (§17.1) detects the
+mismatch by comparing the head region's `ChunkParamsRecord` to the resolved policy and
+enqueues a `WorkKind::OptionUpdate` item. The re-chunk pass produces a fresh ChunkList
+chain (with new params in its head) and atomically swaps `ObjectLocation.replicas[0]` to
+the new head via `ReconcileMove`; the old chain becomes unreferenced and is reclaimed via
+bucket-gen GC.
 
 The list is **snapshot-agnostic** because chunks are content-addressed: two snapshots of the
 same chunked object that happen to share a prefix simply share the prefix portion of their
@@ -2774,6 +2961,7 @@ compose naturally because each extent is evaluated independently.
 | Replica count below `Replicate { min_replicas }` rule | Re-replicate to additional disks         |
 | Object on wrong tier vs. `Pin` / `Prefer` rule    | Migrate via the move path                    |
 | Compression / encryption inconsistent with ontology | Rewrite with correct transform pipeline    |
+| ChunkList head's `ChunkParamsRecord` ≠ resolved policy (§9.3, DESIGN §3.5) | Re-chunk with new params via `WorkKind::OptionUpdate` |
 | `AutoTier` access-time threshold crossed          | Migrate Hot → Warm → Cold → Glacier          |
 | Bucket fragmentation > copygc threshold           | Run copy GC (§12.6)                          |
 | Disk in `Draining` state                          | Evacuate via backpointer scan (§6.2)         |
