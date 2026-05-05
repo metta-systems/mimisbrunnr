@@ -142,12 +142,13 @@ const _: () = assert!(size_of::<SortedRunHeader>() == 32);
 pub struct FieldFormat {
     pub bit_width: u8,
     pub flags: u8,
-    pub _pad: u16,
+    pub _pad0: u16,
     pub base: u64,
+    pub _pad1: u32,                          // tail pad to keep struct multiple-of-8 (§1.1)
 }
-const _: () = assert!(size_of::<FieldFormat>() == 12);
+const _: () = assert!(size_of::<FieldFormat>() == 16);
 
-// (SortedRunKeyFormat is variable-length; spec says 8 + 12 × nr_fields.)
+// (SortedRunKeyFormat is variable-length; spec says 8 + 16 × nr_fields.)
 
 // =====================================================================
 // §2.1 ZoneExtent — 24 B
@@ -162,23 +163,24 @@ pub struct ZoneExtent {
 const _: () = assert!(size_of::<ZoneExtent>() == 24);
 
 // =====================================================================
-// §2.1 ZoneMap (4 KiB block) and ZoneMapEntry (24 B)
+// §2.1 ZoneMap (4 KiB block) and ZoneMapEntry (32 B)
+// ZoneMapEntry embeds the full 24 B ZoneExtent so each entry carries
+// `flags` for future per-extent hints.
 // =====================================================================
 #[repr(C, packed)]
 pub struct ZoneMapEntry {
-    pub zone_kind: u8,
-    pub _pad: [u8; 7],
-    pub extent_offset: u64,
-    pub extent_length: u64,
+    pub zone_kind: u8,                  //  [0..1]
+    pub _pad: [u8; 7],                  //  [1..8]   align embedded extent to u64
+    pub extent: ZoneExtent,             //  [8..32]  full 24 B form (offset, length, flags, _pad)
 }
-const _: () = assert!(size_of::<ZoneMapEntry>() == 24);
+const _: () = assert!(size_of::<ZoneMapEntry>() == 32);
 
 #[repr(C, packed)]
 pub struct ZoneMap {
     pub header: BlockHeader,            //   32
     pub extent_count: u16,              //    2
     pub _pad: [u8; 6],                  //    6
-    pub extents: [ZoneMapEntry; 168],   // 4032
+    pub extents: [ZoneMapEntry; 126],   // 4032 (126 × 32)
     pub _pad_tail: [u8; 20],            //   20
     pub trailing_crc: u32,              //    4
 }
@@ -215,7 +217,7 @@ pub struct RootPointer {
     pub reconcile_high_prio_phys_root: BlockRef,
     pub reconcile_pending_root: BlockRef,
     pub reconcile_scan_root: BlockRef,
-    pub disks_overflow_root: BlockRef,           // §10.4 — populated iff disk_count > 8
+    pub disks_overflow_root: BlockRef,           // §10.4 — populated iff disk_count > 12
     pub placement_rules_root: BlockRef,          // §10.4 — placement rules btree
     pub cluster_peers_root: BlockRef,            // §10.4 — cluster peers btree
     pub flags: u32,
@@ -519,17 +521,17 @@ const _: () = assert!(size_of::<TagIndexLeafEntry>() == 48);
 const _: () = assert!(std::mem::align_of::<TagIndexLeafEntry>() == 8);
 
 // §8.1 leaf packing — verify the entries-per-run claim against the 2-key-field
-// SortedRunKeyFormat overhead (8 + 2×12 = 32 B/run, vs 44 for 3-field).
+// SortedRunKeyFormat overhead (8 + 2×16 = 40 B/run, vs 56 for 3-field).
 // Per-key on-disk cost: ~3 B packed key (tag_id ~2.5 B + snapshot ~0 bits)
 // + ~34 B value (40 B − ~6 B common-prefix elision) = ~37 B.
 pub const TAG_DIR_RUN_KEY_FORMAT_2FIELD: usize = 8 + 2 * size_of::<FieldFormat>();
-const _: () = assert!(TAG_DIR_RUN_KEY_FORMAT_2FIELD == 32);
+const _: () = assert!(TAG_DIR_RUN_KEY_FORMAT_2FIELD == 40);
 pub const TAG_DIR_RUN_OVERHEAD: usize =
     size_of::<SortedRunHeader>() + TAG_DIR_RUN_KEY_FORMAT_2FIELD;
-const _: () = assert!(TAG_DIR_RUN_OVERHEAD == 64);
+const _: () = assert!(TAG_DIR_RUN_OVERHEAD == 72);
 pub const TAG_DIR_PAYLOAD_PER_RUN: usize =
     REGION - size_of::<BtreeNodeHeader>() - TAG_DIR_RUN_OVERHEAD;
-const _: () = assert!(TAG_DIR_PAYLOAD_PER_RUN == 262_016);
+const _: () = assert!(TAG_DIR_PAYLOAD_PER_RUN == 262_008);
 pub const TAG_DIR_ENTRY_BYTES_PACKED: usize = 37;
 pub const TAG_DIR_ENTRIES_PER_RUN: usize =
     TAG_DIR_PAYLOAD_PER_RUN / TAG_DIR_ENTRY_BYTES_PACKED;
@@ -589,16 +591,16 @@ const _: () = assert!(size_of::<KvBucket>() == 4096);
 // =====================================================================
 // §8.3 SequencePage / RankedPage — 4096 B each
 // Each page is a 4 KiB block under the standard §1.3 BlockHeader framing,
-// so its capacity is reduced from the naive (4096 / entry_size) — the
-// previous "512 ObjectIds" / "256 ranked entries" claims left no room
-// for header + trailing CRC.
+// with a trailing `next: BlockRef` slot (zero on the tail page) forming
+// a singly-linked chain.
 // =====================================================================
 #[repr(C, packed)]
 pub struct SequencePage {
     pub header: BlockHeader,                 //   32
     pub entry_count: u16,                    //    2
     pub _pad: [u8; 6],                       //    6
-    pub entries: [u64; 506],                 // 4048 (506 × 8)
+    pub next: BlockRef,                      //   16  (0 = tail of chain)
+    pub entries: [u64; 504],                 // 4032 (504 × 8)
     pub _pad_tail: [u8; 4],                  //    4
     pub trailing_crc: u32,                   //    4
 }
@@ -617,7 +619,8 @@ pub struct RankedPage {
     pub header: BlockHeader,                 //   32
     pub entry_count: u16,                    //    2
     pub _pad: [u8; 6],                       //    6
-    pub entries: [RankedEntry; 253],         // 4048 (253 × 16)
+    pub next: BlockRef,                      //   16  (0 = tail of chain)
+    pub entries: [RankedEntry; 252],         // 4032 (252 × 16)
     pub _pad_tail: [u8; 4],                  //    4
     pub trailing_crc: u32,                   //    4
 }
@@ -634,6 +637,19 @@ pub struct ChunkIndexLeafEntry {
     pub blob: BlockRef,
 }
 const _: () = assert!(size_of::<ChunkIndexLeafEntry>() == 56);
+
+// =====================================================================
+// §9.3 ChunkListEntry — 40 B (positional within ChunkList region)
+// Region capacity: (262 144 − 64 − 16) / 40 = 6 551 entries before chaining
+// through the trailing BlockRef slot.
+// =====================================================================
+#[repr(C, packed)]
+pub struct ChunkListEntry {
+    pub chunk_hash: [u8; 32],   // [0..32]   BLAKE3 of plaintext, indexes ChunkIndex
+    pub length: u32,            // [32..36]  plaintext length of this chunk
+    pub flags: u32,             // [36..40]  reserved
+}
+const _: () = assert!(size_of::<ChunkListEntry>() == 40);
 
 // =====================================================================
 // §10.3 PathContextHeader — 48 B
@@ -700,23 +716,26 @@ const _: () = assert!(size_of::<PoolStateRoot>() == 4096);
 // §11.1 SnapshotNode — 64 B
 // First-child / next-sibling topology supports arbitrary fan-out at no
 // extra per-node cost vs. the previous fixed [u32; 2] children array.
+// `ancestor_bitmap: u128` is placed at offset 16 so the u128 hits its
+// natural alignment on the hot ancestry-check path.
 // =====================================================================
 #[repr(C, packed)]
 pub struct SnapshotNode {
-    pub id: u32,
-    pub parent: u32,
-    pub first_child: u32,
-    pub next_sibling: u32,
-    pub depth: u16,
-    pub flags: u8,
-    pub _pad: u8,
-    pub ancestor_bitmap: u128,
-    pub skiplist: [u32; 3],
-    pub created_ns: i64,
-    pub label_offset: u32,
-    pub _reserved: u32,
+    pub id: u32,                // [0..4]
+    pub parent: u32,            // [4..8]
+    pub first_child: u32,       // [8..12]
+    pub next_sibling: u32,      // [12..16]
+    pub ancestor_bitmap: u128,  // [16..32]   16-byte aligned
+    pub skiplist: [u32; 3],     // [32..44]
+    pub depth: u16,             // [44..46]
+    pub flags: u8,              // [46..47]
+    pub _pad: u8,               // [47..48]
+    pub created_ns: i64,        // [48..56]
+    pub label_offset: u32,      // [56..60]
+    pub _reserved: u32,         // [60..64]
 }
 const _: () = assert!(size_of::<SnapshotNode>() == 64);
+const _: () = assert!(std::mem::offset_of!(SnapshotNode, ancestor_bitmap) == 16);
 
 // =====================================================================
 // §12.2 BucketAllocKey — 16 B
@@ -817,11 +836,11 @@ const _: () = assert!(LOCATION_TABLE_LEAF_RECORDS * INNER_ENTRIES > 89_000_000);
 //   - body: assertions × PackedAssertion (16 B each)
 // =====================================================================
 pub const FWD_RUN_KEY_FORMAT_2FIELD: usize = 8 + 2 * size_of::<FieldFormat>();
-const _: () = assert!(FWD_RUN_KEY_FORMAT_2FIELD == 32);
+const _: () = assert!(FWD_RUN_KEY_FORMAT_2FIELD == 40);
 
 pub const FWD_RUN_OVERHEAD: usize =
     size_of::<SortedRunHeader>() + FWD_RUN_KEY_FORMAT_2FIELD;
-const _: () = assert!(FWD_RUN_OVERHEAD == 64);
+const _: () = assert!(FWD_RUN_OVERHEAD == 72);
 
 pub const FWD_ENTRY_KEY_BYTES_CEIL: usize = 3; // ⌈2.5⌉
 pub const FWD_ENTRY_HEADER_BYTES:  usize = 2;
@@ -837,23 +856,24 @@ const _: () = assert!(fwd_entry_bytes(8) == 133);
 pub const fn fwd_payload_n_runs(runs: usize) -> usize {
     REGION - size_of::<BtreeNodeHeader>() - runs * FWD_RUN_OVERHEAD
 }
-// One sorted run alone has 262 016 B of entry payload available.
-const _: () = assert!(fwd_payload_n_runs(1) == 262_016);
-// Four sorted runs share 261 824 B (the §1.5.4 trigger is sorted_run_count > 4).
-const _: () = assert!(fwd_payload_n_runs(4) == 261_824);
+// One sorted run alone has 262 008 B of entry payload available.
+const _: () = assert!(fwd_payload_n_runs(1) == 262_008);
+// Four sorted runs share 261 792 B (the §1.5.4 trigger is sorted_run_count > 4).
+const _: () = assert!(fwd_payload_n_runs(4) == 261_792);
 
 // Sorted runs are appended into the *same* region (§1.5.2) — they share its
 // payload bytes. Adding a run does not multiply capacity; it slightly reduces
-// it (by one run's 64 B header + key-format descriptor). The total entry
-// count a leaf can hold is therefore bounded by (region − header − n×overhead)
-// divided by entry size, not by per-run × n.
+// it (by one run's 32 B header + 40 B key-format descriptor = 72 B). The
+// total entry count a leaf can hold is therefore bounded by (region − header
+// − n×overhead) divided by entry size, not by per-run × n.
 pub const fn fwd_total_entries(runs: usize, assertions: usize) -> usize {
     fwd_payload_n_runs(runs) / fwd_entry_bytes(assertions)
 }
 
 // At "8 assertions per object" (the §7.2 inline-spill threshold and the
-// §7.1 calculation basis), a single-run leaf holds ~1 970 entries.
-const _: () = assert!(fwd_total_entries(1, 8) == 1_970);
+// §7.1 calculation basis), a single-run leaf holds ~1 969 entries
+// (the doc prose rounds to "~1 970").
+const _: () = assert!(fwd_total_entries(1, 8) == 1_969);
 
 // At the §1.5.4 compaction trigger (sorted_run_count > 4) the leaf still
 // holds ~1 968 entries TOTAL — sorted runs share the region's payload
