@@ -921,3 +921,123 @@ const _: () = assert!(FWD_LEAVES_10M_K4 == 2_636);
 // 2 637 × 256 KiB ≈ 659 MiB.
 const _: () = assert!(FWD_BYTES_10M_K4 > 690_000_000);
 const _: () = assert!(FWD_BYTES_10M_K4 < 695_000_000);
+
+// =====================================================================
+// §5 / §6.1 Radix-tree depth covers 48-bit local-id space.
+// MAX_LEVELS = 3 (inner levels above the leaf); the table in each
+// section claims depth 3 reaches ≥ 2^48 ≈ 281 T objects. Asserting
+// the inequality nails the §6.1 prose ("48-bit space reachable at
+// depth 3").
+// =====================================================================
+pub const LOCAL_ID_SPACE: u64 = 1u64 << 48;       // 2^48 ≈ 281.5 T
+pub const OBJECT_TABLE_DEPTH3_CAP: u64 =
+    OBJECT_TABLE_LEAF_RECORDS as u64
+        * INNER_ENTRIES as u64
+        * INNER_ENTRIES as u64
+        * INNER_ENTRIES as u64;
+pub const LOCATION_TABLE_DEPTH3_CAP: u64 =
+    LOCATION_TABLE_LEAF_RECORDS as u64
+        * INNER_ENTRIES as u64
+        * INNER_ENTRIES as u64
+        * INNER_ENTRIES as u64;
+const _: () = assert!(OBJECT_TABLE_DEPTH3_CAP >= LOCAL_ID_SPACE);
+const _: () = assert!(LOCATION_TABLE_DEPTH3_CAP >= LOCAL_ID_SPACE);
+// Depth 2 alone is NOT enough for the location table (would have caught
+// the §6.1 "depth 2" prose bug):
+pub const LOCATION_TABLE_DEPTH2_CAP: u64 =
+    LOCATION_TABLE_LEAF_RECORDS as u64 * INNER_ENTRIES as u64 * INNER_ENTRIES as u64;
+const _: () = assert!(LOCATION_TABLE_DEPTH2_CAP < LOCAL_ID_SPACE);
+
+// =====================================================================
+// §16 footprint: 10 M-object leaf counts (positional radix tables).
+// Pinning these against the doc's §16 figures ensures off-by-one in the
+// leaf count is caught at build time.
+// =====================================================================
+pub const OBJECT_TABLE_LEAVES_10M: usize =
+    FWD_OBJECTS_10M.div_ceil(OBJECT_TABLE_LEAF_RECORDS);
+pub const LOCATION_TABLE_LEAVES_10M: usize =
+    FWD_OBJECTS_10M.div_ceil(LOCATION_TABLE_LEAF_RECORDS);
+const _: () = assert!(OBJECT_TABLE_LEAVES_10M == 4_893);    // §16: 4 893 leaves
+const _: () = assert!(LOCATION_TABLE_LEAVES_10M == 1_839);  // §16: 1 839 leaves
+
+// =====================================================================
+// §3.2 / §3 max in-frame WAL payload_length before Continuation framing.
+// 4096 − WalEntryHeader (40) − framing CRC (4) = 4052 plaintext;
+// encrypted is 16 B narrower (GCM tag).
+// =====================================================================
+pub const BLOCK_SIZE: usize = 4096;
+pub const WAL_MAX_PAYLOAD_PLAINTEXT: usize = BLOCK_SIZE - WAL_ENTRY_PLAINTEXT_OVERHEAD;
+pub const WAL_MAX_PAYLOAD_ENCRYPTED: usize = BLOCK_SIZE - WAL_ENTRY_ENCRYPTED_OVERHEAD;
+const _: () = assert!(WAL_MAX_PAYLOAD_PLAINTEXT == 4_052);
+const _: () = assert!(WAL_MAX_PAYLOAD_ENCRYPTED == 4_036);
+
+// =====================================================================
+// §7.2 ForwardOverflow region: positional PackedAssertion array minus
+// trailing-chain BlockRef. Region capacity claim: 16 379 entries.
+// =====================================================================
+pub const FORWARD_OVERFLOW_PAYLOAD: usize =
+    REGION - size_of::<BtreeNodeHeader>() - size_of::<BlockRef>();
+pub const FORWARD_OVERFLOW_ENTRIES: usize =
+    FORWARD_OVERFLOW_PAYLOAD / size_of::<PackedAssertion>();
+const _: () = assert!(FORWARD_OVERFLOW_PAYLOAD == 262_064);
+const _: () = assert!(FORWARD_OVERFLOW_ENTRIES == 16_379);
+
+// =====================================================================
+// §9.3 ChunkList region: positional ChunkListEntry array minus
+// trailing-chain BlockRef. Region capacity claim: 6 551 entries.
+// =====================================================================
+pub const CHUNK_LIST_PAYLOAD: usize =
+    REGION - size_of::<BtreeNodeHeader>() - size_of::<BlockRef>();
+pub const CHUNK_LIST_ENTRIES: usize =
+    CHUNK_LIST_PAYLOAD / size_of::<ChunkListEntry>();
+const _: () = assert!(CHUNK_LIST_PAYLOAD == 262_064);
+const _: () = assert!(CHUNK_LIST_ENTRIES == 6_551);
+
+// =====================================================================
+// §9.1 KvDirectory inline capacity: 252 entries supports global_depth ≤ 7.
+// At global_depth ≥ 8 the directory spills into a §1.5 region holding
+// up to INNER_ENTRIES (16 380) BlockRef entries, supporting global_depth ≤ 13.
+// =====================================================================
+pub const KV_INLINE_ENTRIES: usize = 252;
+pub const KV_INLINE_GLOBAL_DEPTH_MAX: u32 = 7;
+const _: () = assert!((1u32 << KV_INLINE_GLOBAL_DEPTH_MAX) <= KV_INLINE_ENTRIES as u32);
+// One step further would overflow:
+const _: () = assert!((1u32 << (KV_INLINE_GLOBAL_DEPTH_MAX + 1)) > KV_INLINE_ENTRIES as u32);
+pub const KV_SPILLOVER_GLOBAL_DEPTH_MAX: u32 = 13;
+const _: () = assert!((1usize << KV_SPILLOVER_GLOBAL_DEPTH_MAX) <= INNER_ENTRIES);
+const _: () = assert!((1usize << (KV_SPILLOVER_GLOBAL_DEPTH_MAX + 1)) > INNER_ENTRIES);
+
+// =====================================================================
+// §7.1 Forward-index inner-node packing (sanity check the prose's
+// "~13 000 children per run" claim).
+//
+// Inner entry: packed (oid, snapshot) key (~3 B) + BlockRef (16 B) ≈ 19 B.
+// Per-run payload uses the same 2-field SortedRunKeyFormat as the leaf.
+// =====================================================================
+pub const FWD_INNER_ENTRY_BYTES: usize = FWD_ENTRY_KEY_BYTES_CEIL + size_of::<BlockRef>();
+const _: () = assert!(FWD_INNER_ENTRY_BYTES == 19);
+pub const FWD_INNER_CHILDREN_PER_RUN: usize =
+    fwd_payload_n_runs(1) / FWD_INNER_ENTRY_BYTES;
+// 262 008 / 19 ≈ 13 790 — comfortably above the prose's "~13 000".
+const _: () = assert!(FWD_INNER_CHILDREN_PER_RUN >= 13_000);
+const _: () = assert!(FWD_INNER_CHILDREN_PER_RUN <= 14_000);
+
+// =====================================================================
+// §9.2 Range-index leaf packing (4-field key: attr_id, value, oid, snapshot).
+// Per-run overhead = SortedRunHeader (32) + SortedRunKeyFormat (8 + 4×16 = 72) = 104 B.
+// Per-entry on-disk cost = 8–12 B packed key + 16 B BlockRef value = 24–28 B.
+// =====================================================================
+pub const RANGE_RUN_KEY_FORMAT_4FIELD: usize = 8 + 4 * size_of::<FieldFormat>();
+const _: () = assert!(RANGE_RUN_KEY_FORMAT_4FIELD == 72);
+pub const RANGE_RUN_OVERHEAD: usize =
+    size_of::<SortedRunHeader>() + RANGE_RUN_KEY_FORMAT_4FIELD;
+const _: () = assert!(RANGE_RUN_OVERHEAD == 104);
+pub const RANGE_PAYLOAD_PER_RUN: usize =
+    REGION - size_of::<BtreeNodeHeader>() - RANGE_RUN_OVERHEAD;
+const _: () = assert!(RANGE_PAYLOAD_PER_RUN == 261_976);
+// Best/worst entries-per-run bounds (24–28 B/entry):
+pub const RANGE_ENTRIES_PER_RUN_BEST: usize = RANGE_PAYLOAD_PER_RUN / 24;
+pub const RANGE_ENTRIES_PER_RUN_WORST: usize = RANGE_PAYLOAD_PER_RUN / 28;
+// Pin the prose's "~9 350–10 900 entries" range.
+const _: () = assert!(RANGE_ENTRIES_PER_RUN_BEST  >= 10_900 && RANGE_ENTRIES_PER_RUN_BEST  < 11_000);
+const _: () = assert!(RANGE_ENTRIES_PER_RUN_WORST >=  9_350 && RANGE_ENTRIES_PER_RUN_WORST <  9_500);

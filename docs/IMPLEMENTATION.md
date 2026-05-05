@@ -130,7 +130,7 @@ enum BtreeKind {
     Snapshots,          // §11.1 snapshot tree (SnapshotId → SnapshotNode)
     BucketAlloc,        // §12.2 per-disk bucket alloc B+ tree (physical)
     FreespaceLru,       // §12.4 per-disk freespace LRU B+ tree (physical)
-    DiskDescriptors,    // §10.4 disk descriptors overflow tree (>8 disks)
+    DiskDescriptors,    // §10.4 disk descriptors overflow tree (>12 disks)
     PlacementRules,     // §10.4 placement rules (heterogeneous, CBOR values)
     ClusterPeers,       // §10.4 cluster peers (NodeId → PeerRecord)
     ReconcileWork,      // §17.2 normal-priority reconcile queue (logical order)
@@ -664,8 +664,10 @@ monotonic counter that drives every COW block update; no separate `seq` is neede
 
 ### 3.2 WAL entry
 
-Entries are byte-packed, never crossing a 4 KiB boundary unless `payload_length` > 4060, in which
-case the entry is split into `Continuation` frames (`BLOCK_FLAG_CONTINUATION`).
+Entries are byte-packed, never crossing a 4 KiB boundary unless `payload_length` > 4052, in which
+case the entry is split into `Continuation` frames (`BLOCK_FLAG_CONTINUATION`). The bound is
+`4096 − WalEntryHeader (40) − framing CRC32C (4) = 4052` for plaintext entries; encrypted
+entries pay an additional 16 B GCM tag and so split at 4036.
 
 ```rust
 #[repr(C, packed)]
@@ -1138,9 +1140,11 @@ Capacity:
 | 0     | 5 440                                    |
 | 1     | 5 440 × 16 380 ≈ 89 M                    |
 | 2     | 5 440 × 16 380² ≈ 1.46 T                 |
+| 3     | 5 440 × 16 380³ ≈ 23.9 P                 |
 
 A 10 M-object pool fits in **depth 1** (single inner node + leaves). The 48-bit local id space
-is reachable at depth 2.
+(≈ 281 T) is reachable at depth 3 (capacity ≈ 23.9 P, comfortably above 2⁴⁸). `MAX_LEVELS = 3`
+in §5 bounds both the object and location radix trees.
 
 The radix is keyed by the same `ObjectId.local`, so the location table tracks the object table
 slot-for-slot. A flush at depth 1 costs **2 node rewrites** at 10 M scale (leaf + root inner),
@@ -1613,9 +1617,11 @@ this is the structure that benefits most:
 - `oid` packs identically to forward-index keys: 16–20 bits.
 - `snapshot` packs to ~0 bits when one snapshot dominates a sorted run (§11.2).
 
-Net per-key size: typically **8–12 B** packed. Each 256 KiB leaf packs ~25 000 entries per sorted run.
-
-Leaf sorted runs store key → `BlockRef` to a roaring bitmap.
+Net per-key size: typically **8–12 B** packed. Leaf sorted runs store key → `BlockRef` to a
+roaring bitmap (16 B value), so per-entry on-disk cost is 24–28 B. Per-run payload budget is
+`262 144 − 64 (BtreeNodeHeader) − 32 (SortedRunHeader) − 72 (4-field SortedRunKeyFormat:
+attr_id, value, oid, snapshot) = 261 976 B`, holding **~9 350–10 900 entries per sorted run**
+depending on key-packing efficiency.
 
 `NormalisedKey` is a fixed-size order-preserving encoding:
 
@@ -2611,7 +2617,7 @@ forward index roughly in half (~660 MiB at this scale).
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
 | Object table (records) | ~1.19 GiB | Positional — no key packing applies; 4 893 leaves × 256 KiB |
 | Object table (radix)   | < 1 MiB   | Single inner node (depth 1 total)                  |
-| Location table         | ~459 MiB  | Positional — no key packing; 1 838 leaves × 256 KiB |
+| Location table         | ~460 MiB  | Positional — no key packing; 1 839 leaves × 256 KiB |
 | Backpointers           | ~267 MiB  | §6.2 — 10 M extents × ~28 B packed                 |
 | Forward index          | ~1.24 GiB | §7 / §1.5 B+ tree, 1 968 entries/leaf at 8 assertions/object → 5 082 leaves + 1 inner |
 | Tag inverted index     | 200–400 MiB | Roaring bitmaps (4 KiB framed), 5 000 tags       |
