@@ -93,20 +93,27 @@ construction. CRC is computed with the CRC slot itself zeroed.
 ```rust
 // Discriminants are pinned: any insertion goes at the end with the next free
 // value; existing variants never renumber. On-disk records carry these
-// numbers literally, so reordering is a format break.
+// numbers literally, so reordering is a format break. Variants are grouped
+// here by functional role for readability — the numeric values, not the
+// declaration order, are what's stable.
 #[repr(u16)]
 enum BlockKind {
-    Superblock        = 0,
-    ZoneMap           = 1,
-    WalSegment        = 2,   // WAL header / segment marker
-    TagBitmapPage     = 3,   // roaring bitmap framing (4 KiB; §8.2)
-    KvHashDirectory   = 4,   // extendible-hash directory (4 KiB; §9.1)
-    KvHashBucket      = 5,   // extendible-hash bucket (4 KiB; §9.1)
-    OverflowRecord    = 6,   // per-object tag/attr overflow (4 KiB; §5.2)
-    Checkpoint        = 7,   // checkpoint block within the WAL
-    PoolStateRoot     = 8,   // pool-state root block (4 KiB; §10.4)
-    SequencePage      = 9,   // §8.3 OrderedStore page (singly-linked chain)
-    RankedPage        = 10,  // §8.3 RankedStore page (singly-linked chain)
+    // Filesystem identity, on-disk geometry, and pool composition
+    Superblock        = 0,   // per-disk identity + format pointers (§2.1)
+    ZoneMap           = 1,   // per-disk extra-extent zone descriptors (§2.1)
+    PoolStateRoot     = 2,   // pool-wide disk geometry + tunables (§10.4)
+    // WAL framing
+    WalSegment        = 3,   // WAL header / segment marker
+    Checkpoint        = 4,   // checkpoint block within the WAL
+    // Tag-store pages
+    TagBitmapPage     = 5,   // roaring bitmap framing (4 KiB; §8.2)
+    SequencePage      = 6,   // §8.3 OrderedStore page (singly-linked chain)
+    RankedPage        = 7,   // §8.3 RankedStore page (singly-linked chain)
+    // KV equality pages
+    KvHashDirectory   = 8,   // extendible-hash directory (4 KiB; §9.1)
+    KvHashBucket      = 9,   // extendible-hash bucket (4 KiB; §9.1)
+    // Per-object metadata overflow
+    OverflowRecord    = 10,  // per-object tag/attr overflow (4 KiB; §5.2)
 }
 ```
 
@@ -115,31 +122,42 @@ of type `BtreeKind` instead of `BlockHeader.kind`:
 
 ```rust
 // Discriminants are pinned per BlockKind's rule: insertions append, existing
-// variants never renumber.
+// variants never renumber. Grouped by functional role for readability.
 #[repr(u16)]
 enum BtreeKind {
+    // Logical radix (current view + per-snapshot history sidecars)
     ObjectTable           = 0,   // §5 radix leaves & inners (current view)
     ObjectHistory         = 1,   // §11.2 sidecar: (oid, snapshot) → ObjectRecord overrides
     LocationTable         = 2,   // §6.1 radix leaves & inners (current view)
     LocationHistory       = 3,   // §11.2 sidecar: (oid, snapshot) → ObjectLocation overrides
-    Backpointer           = 4,   // §6.2 reverse-mapping B+ tree (snapshot-agnostic)
-    Forward               = 5,   // §7 forward index B+ tree (snapshot-aware key)
-    ForwardOverflow       = 6,   // §7.2 per-object assertion spill (positional, no sorted runs)
-    TagDirectory          = 7,   // §8.1 tag directory B+ tree (snapshot-aware)
-    Range                 = 8,   // §9.2 range index B+ tree (snapshot-aware)
-    ChunkIndex            = 9,   // §9.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
-    ChunkList             = 10,  // §9.3 per-object FastCDC chunk-list region (positional, no sorted runs)
-    KvDirectory           = 11,  // §9.1 extendible-hash directory spillover (positional, no sorted runs)
-    ValueSpill            = 12,  // value-hash → CBOR(Value); content-addressed
+    // Forward index family (oid → assertions)
+    Forward               = 4,   // §7 forward index B+ tree (snapshot-aware key)
+    ForwardOverflow       = 5,   // §7.2 per-object assertion spill (positional, no sorted runs)
+    // Inverted / range indexes
+    TagDirectory          = 6,   // §8.1 tag directory B+ tree (snapshot-aware)
+    Range                 = 7,   // §9.2 range index B+ tree (snapshot-aware)
+    // KV equality + value storage
+    KvDirectory           = 8,   // §9.1 extendible-hash directory spillover (positional, no sorted runs)
+    ValueSpill            = 9,   // value-hash → CBOR(Value); content-addressed
+    // Chunk content-addressing
+    ChunkIndex            = 10,  // §9.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
+    ChunkList             = 11,  // §9.3 per-object FastCDC chunk-list region (positional, no sorted runs)
+    // Physical reverse mapping
+    Backpointer           = 12,  // §6.2 reverse-mapping B+ tree (snapshot-agnostic)
+    // Catalogs (snapshot-aware)
     Ontology              = 13,  // §10.1 ontology / dag B+ tree (snapshot-aware)
     PathContext           = 14,  // §10.3 path context B+ tree (snapshot-aware)
     Subscriptions         = 15,  // §10.2 subscription B+ tree (snapshot-aware)
+    // Snapshot tree itself
     Snapshots             = 16,  // §11.1 snapshot tree (SnapshotId → SnapshotNode)
+    // Per-disk physical allocation
     BucketAlloc           = 17,  // §12.2 per-disk bucket alloc B+ tree (physical)
     FreespaceLru          = 18,  // §12.4 per-disk freespace LRU B+ tree (physical)
+    // Pool / cluster state
     DiskDescriptors       = 19,  // §10.4 disk descriptors overflow tree (>12 disks)
     PlacementRules        = 20,  // §10.4 placement rules (heterogeneous, CBOR values)
     ClusterPeers          = 21,  // §10.4 cluster peers (NodeId → PeerRecord)
+    // Reconcile queues (transient)
     ReconcileWork         = 22,  // §17.2 normal-priority reconcile queue (logical order)
     ReconcileHighPrio     = 23,  // §17.2 high-priority reconcile queue
     ReconcileWorkPhys     = 24,  // §17.2 physical-LBA-ordered work index (HDD pools)

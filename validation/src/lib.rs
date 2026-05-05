@@ -20,48 +20,65 @@ pub const BLOCK_FLAG_CONTINUATION: u32 = 1 << 1;
 // §1.3 BlockKind / BtreeKind discriminants — pinned numerically.
 // Reordering or renumbering is a format break. Mirrors the doc tables
 // verbatim; any divergence between this list and the engine's enum
-// definitions is caught at integration time.
+// definitions is caught at integration time. Variants are grouped here
+// by functional role for readability — the numeric values are stable.
 // =====================================================================
 
 // BlockKind (BlockHeader.kind, magic = "MIMR")
+// Filesystem identity, on-disk geometry, and pool composition
 pub const BLOCK_KIND_SUPERBLOCK:        u16 = 0;
 pub const BLOCK_KIND_ZONE_MAP:          u16 = 1;
-pub const BLOCK_KIND_WAL_SEGMENT:       u16 = 2;
-pub const BLOCK_KIND_TAG_BITMAP_PAGE:   u16 = 3;
-pub const BLOCK_KIND_KV_HASH_DIRECTORY: u16 = 4;
-pub const BLOCK_KIND_KV_HASH_BUCKET:    u16 = 5;
-pub const BLOCK_KIND_OVERFLOW_RECORD:   u16 = 6;
-pub const BLOCK_KIND_CHECKPOINT:        u16 = 7;
-pub const BLOCK_KIND_POOL_STATE_ROOT:   u16 = 8;
-pub const BLOCK_KIND_SEQUENCE_PAGE:     u16 = 9;   // §8.3 OrderedStore page
-pub const BLOCK_KIND_RANKED_PAGE:       u16 = 10;  // §8.3 RankedStore page
+pub const BLOCK_KIND_POOL_STATE_ROOT:   u16 = 2;
+// WAL framing
+pub const BLOCK_KIND_WAL_SEGMENT:       u16 = 3;
+pub const BLOCK_KIND_CHECKPOINT:        u16 = 4;
+// Tag-store pages
+pub const BLOCK_KIND_TAG_BITMAP_PAGE:   u16 = 5;
+pub const BLOCK_KIND_SEQUENCE_PAGE:     u16 = 6;   // §8.3 OrderedStore page
+pub const BLOCK_KIND_RANKED_PAGE:       u16 = 7;   // §8.3 RankedStore page
+// KV equality pages
+pub const BLOCK_KIND_KV_HASH_DIRECTORY: u16 = 8;
+pub const BLOCK_KIND_KV_HASH_BUCKET:    u16 = 9;
+// Per-object metadata overflow
+pub const BLOCK_KIND_OVERFLOW_RECORD:   u16 = 10;
 pub const BLOCK_KIND_COUNT:             u16 = 11;
 // Sanity: every BlockKind must be unique and densely numbered from 0.
-const _: () = assert!(BLOCK_KIND_RANKED_PAGE + 1 == BLOCK_KIND_COUNT);
+const _: () = assert!(BLOCK_KIND_OVERFLOW_RECORD + 1 == BLOCK_KIND_COUNT);
 
 // BtreeKind (BtreeNodeHeader.kind, magic = "MIMB")
+// Logical radix (current view + per-snapshot history sidecars)
 pub const BTREE_KIND_OBJECT_TABLE:            u16 = 0;
 pub const BTREE_KIND_OBJECT_HISTORY:          u16 = 1;
 pub const BTREE_KIND_LOCATION_TABLE:          u16 = 2;
 pub const BTREE_KIND_LOCATION_HISTORY:        u16 = 3;
-pub const BTREE_KIND_BACKPOINTER:             u16 = 4;
-pub const BTREE_KIND_FORWARD:                 u16 = 5;
-pub const BTREE_KIND_FORWARD_OVERFLOW:        u16 = 6;
-pub const BTREE_KIND_TAG_DIRECTORY:           u16 = 7;
-pub const BTREE_KIND_RANGE:                   u16 = 8;
-pub const BTREE_KIND_CHUNK_INDEX:             u16 = 9;
-pub const BTREE_KIND_CHUNK_LIST:              u16 = 10;
-pub const BTREE_KIND_KV_DIRECTORY:            u16 = 11;
-pub const BTREE_KIND_VALUE_SPILL:             u16 = 12;
+// Forward index family
+pub const BTREE_KIND_FORWARD:                 u16 = 4;
+pub const BTREE_KIND_FORWARD_OVERFLOW:        u16 = 5;
+// Inverted / range indexes
+pub const BTREE_KIND_TAG_DIRECTORY:           u16 = 6;
+pub const BTREE_KIND_RANGE:                   u16 = 7;
+// KV equality + value storage
+pub const BTREE_KIND_KV_DIRECTORY:            u16 = 8;
+pub const BTREE_KIND_VALUE_SPILL:             u16 = 9;
+// Chunk content-addressing
+pub const BTREE_KIND_CHUNK_INDEX:             u16 = 10;
+pub const BTREE_KIND_CHUNK_LIST:              u16 = 11;
+// Physical reverse mapping
+pub const BTREE_KIND_BACKPOINTER:             u16 = 12;
+// Catalogs (snapshot-aware)
 pub const BTREE_KIND_ONTOLOGY:                u16 = 13;
 pub const BTREE_KIND_PATH_CONTEXT:            u16 = 14;
 pub const BTREE_KIND_SUBSCRIPTIONS:           u16 = 15;
+// Snapshot tree itself
 pub const BTREE_KIND_SNAPSHOTS:               u16 = 16;
+// Per-disk physical allocation
 pub const BTREE_KIND_BUCKET_ALLOC:            u16 = 17;
 pub const BTREE_KIND_FREESPACE_LRU:           u16 = 18;
+// Pool / cluster state
 pub const BTREE_KIND_DISK_DESCRIPTORS:        u16 = 19;
 pub const BTREE_KIND_PLACEMENT_RULES:         u16 = 20;
 pub const BTREE_KIND_CLUSTER_PEERS:           u16 = 21;
+// Reconcile queues (transient)
 pub const BTREE_KIND_RECONCILE_WORK:          u16 = 22;
 pub const BTREE_KIND_RECONCILE_HIGH_PRIO:     u16 = 23;
 pub const BTREE_KIND_RECONCILE_WORK_PHYS:     u16 = 24;
