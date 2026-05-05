@@ -820,7 +820,7 @@ SetAttr          : { oid: u64, key: u32, value: Value }       // Value tagged-un
 RemoveAttr       : { oid: u64, key: u32, value_hash: u64 }
 AddRelation      : { oid: u64, predicate: u32, target: u64 }
 RemoveRelation   : { oid: u64, predicate: u32, target: u64 }
-WriteBlob        : { oid: u64, content_hash: [u8;32], extent: ExtentRef, size: u64 }
+WriteBlob        : { oid: u64, content_hash: [u8;32], extent: BlockRef, size: u64 }
                    // Non-chunked objects only. Chunked objects (§9.3) use the
                    // ChunkInsertBatch / ChunkListAppend / ChunkObjectFinalize flow
                    // described in §3.3.1.
@@ -986,7 +986,7 @@ transfers at the other. The five-regime table below shows how the design scales:
 
 | Avg chunk | Typical workload                   | Chunks      | `ChunkInsertBatch` ops (≤ 76/op) | `ChunkListAppend` ops (one per 6 551-entry region) | Cumulative WAL bytes (worst case: 1 sector/op) | WAL append rate at 530 MiB/s plaintext |
 | --------- | ---------------------------------- | ----------- | -------------------------------- | -------------------------------------------------- | ---------------------------------------------- | -------------------------------------- |
-| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 110 377                          | 1 281                                              | ~436 MiB (1.3 % of plaintext)                  | ~7.3 MiB/s                             |
+| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 110 377                          | 1 281                                              | ~436 MiB (1.3 % of plaintext)                  | ~7.1 MiB/s                             |
 | 16 KiB    | VM disks, databases                | 2 097 152   | 27 595                           | 321                                                | ~109 MiB (0.33 %)                              | ~1.8 MiB/s                             |
 | 256 KiB   | generic FastCDC default            | 131 072     | 1 725                            | 21                                                 | ~6.8 MiB (0.020 %)                             | ~114 KiB/s                             |
 | 1 MiB     | backup-tool default (restic-class) | 32 768      | 432                              | 6                                                  | ~1.7 MiB (0.0052 %)                            | ~29 KiB/s                              |
@@ -2275,14 +2275,17 @@ carries the snapshot id.
 | `BucketAlloc`, `FreespaceLru` | no | physical state                              |
 | `Ontology`         | yes             | snapshot freezes the ontology version          |
 | `Subscriptions`    | yes             | per-snapshot watch state                       |
+| `ObjectHistory`    | yes             | sidecar for `ObjectTable` (§5) — current view in the radix, per-snapshot overrides here |
+| `LocationHistory`  | yes             | sidecar for `LocationTable` (§6.1) — same pattern |
 | `ValueSpill`       | no              | content-addressed by `value_hash`              |
 
 For the **positional radix tables** (`ObjectTable` §5, `LocationTable` §6.1), snapshot-versioning
-uses a sidecar btree `(BtreeKind::ObjectHistory)`: keyed by `(oid, snapshot)` with values that
-shadow the radix entry. The radix always holds the **current** view; reads in a non-current
-snapshot consult the sidecar first, falling through to the radix only if no shadowing record
-applies. This keeps the hot path (current-snapshot reads) at single-radix-lookup cost while
-preserving the snapshot model for older views.
+uses a sidecar btree per radix (`BtreeKind::ObjectHistory` for §5; `BtreeKind::LocationHistory`
+for §6.1): each is keyed by `(oid, snapshot)` with values that shadow the radix entry. The radix
+always holds the **current** view; reads in a non-current snapshot consult the sidecar first,
+falling through to the radix only if no shadowing record applies. This keeps the hot path
+(current-snapshot reads) at single-radix-lookup cost while preserving the snapshot model for
+older views.
 
 For **roaring tag bitmaps** (§8.2), each tag's `store_root` resolves through the snapshot tree:
 the `TagDirectory` is snapshot-aware (the directory itself has snapshot-tagged keys), so each
@@ -2291,12 +2294,20 @@ allocate a fresh `TagBitmap` region and update the directory at the writing snap
 
 ### 11.3 Visibility rules (snapshot iteration)
 
-In every snapshot-aware btree, each leaf entry has a 1-byte **value-type discriminator** as its
-first byte (the `kind` field of `LeafEntry`/`PackedAssertion`/etc.; for the radix-table sidecar
-btrees `ObjectHistory`/`LocationHistory` the discriminator precedes the shadowed record).
-The reserved discriminator value `0xFF` is `KEY_TYPE_whiteout`: a tombstone marking that the
-key is **explicitly deleted** at that snapshot. Whiteouts carry no payload — the entry's
-length stops after the discriminator.
+A **whiteout** is a tombstone marking that a key is **explicitly deleted** at a snapshot.
+The snapshot-aware leaves do not share a common discriminator slot — their value shapes
+were chosen for their query-hot fields (e.g. `TagIndexLeafEntry` puts `last_modify_lsn`
+at offset 0 for cache-line packing) — so the whiteout encoding is **per leaf shape**:
+
+| Btree | Whiteout sentinel |
+| ----- | ----------------- |
+| `Forward` (§7.1) | `LeafEntry.header == LEAF_ENTRY_SPILL_FLAG` (spill bit set, total = 0); body absent. The shape is otherwise meaningless — a spill implies > 8 assertions. |
+| `Range` (§9.2) | leaf BlockRef value zeroed (`disk_id = block_no = generation = 0`) — never a valid bitmap pointer. |
+| `TagDirectory` (§8.1) | `store_kind = 0xFF` (`STORE_KIND_WHITEOUT`, reserved) with `store_root` zeroed. |
+| `Ontology`, `Subscriptions` (§10.1, §10.2) | a CBOR null (`0xF6`) at the value position, in place of the usual record. |
+| `ObjectHistory`, `LocationHistory` (§11.2) | a 1-byte discriminator precedes the shadowed record; `0xFF` (`KEY_TYPE_whiteout`) means whiteout, otherwise the record follows. |
+
+Whiteouts carry no payload beyond the sentinel — the entry's length stops there.
 
 When reading at snapshot `S`, the iterator walks the btree in order. For keys with the same
 non-snapshot prefix, it picks the one with the highest `snapshot ≤ S` that is an ancestor of
@@ -2520,7 +2531,7 @@ brunnr rollback --to <snapshot_label>
 
 1. Resolve the label to a `SnapshotId` `S`.
 2. Allocate a fresh `SnapshotId` `S'` and link it as a new child of `S`: prepend it to S's
-   sibling list (`S'.next_sibling = S.first_child; S.first_child = S'`). The first-child /
+   child sibling list (`S'.next_sibling = S.first_child; S.first_child = S'`). The first-child /
    next-sibling topology (§11.1) admits any number of children, so this works regardless of
    how many sibling branches `S` has accumulated from prior snapshots and rollbacks.
 3. Atomically retag the pool's "current" pointer to `S'`. The view now reflects `S`'s state;

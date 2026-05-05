@@ -772,13 +772,17 @@ const _: () = assert!(ALLOC_FOOTPRINT_BYTES == 288 * 1024 * 1024);            //
 
 // =====================================================================
 // §9.3 ChunkIndexLeafEntry — 56 B
+// `blob` is a BlobRef (§2.2): chunk-extent freshness comes from the
+// owning bucket's generation at deref time, not from a per-pointer gen
+// counter. The leaf entry duplicates the chunk's plaintext length in
+// `length: u32` for fast iteration without dereferencing the BlobRef.
 // =====================================================================
 #[repr(C, packed)]
 pub struct ChunkIndexLeafEntry {
     pub chunk_hash: [u8; 32],
     pub ref_count: u32,
     pub length: u32,
-    pub blob: BlockRef,
+    pub blob: BlobRef,
 }
 const _: () = assert!(size_of::<ChunkIndexLeafEntry>() == 56);
 
