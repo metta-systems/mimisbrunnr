@@ -1229,12 +1229,12 @@ enum OwnerKind {
 **`owner_key` padding.** Variants whose logical key is shorter than 16 bytes
 (`TagBitmapExtent` and `OverflowRecord` use 8; `BtreeNode` may use less, depending on
 the `min_key prefix` length) must **zero the trailing bytes** of `owner_key`. Equality
-of two `BackpointerValue` records is byte-wise over the full 16 B, and the move-path
-update protocol (§17.5) issues `BackpointerRemove(old_key) ∘ BackpointerInsert(new_key)`
-on exact-match keys — non-zero padding would silently break that match. Writers fill
-the logical bytes per the `OwnerKind` table above and zero the rest; readers ignore
-bytes past the kind-specific length but must treat the full 16 B as canonical for
-equality and §1.5.6 packing.
+of two `BackpointerValue` records is byte-wise over the full 16 B, and replay of a
+`ReconcileMove` (§3.3, §17.5) decomposes into `BackpointerRemove(old_key) ∘
+BackpointerInsert(new_key) ∘ owner-update` on exact-match keys — non-zero padding would
+silently break that match. Writers fill the logical bytes per the `OwnerKind` table
+above and zero the rest; readers ignore bytes past the kind-specific length but must
+treat the full 16 B as canonical for equality and §1.5.6 packing.
 
 The pair `(BackpointerKey, BackpointerValue)` is 32 bytes unpacked; with §1.5.6 key packing
 (`disk_id` constant per leaf, `bucket_no` packs to ~16–20 bits, `sector_offset` packs based on
@@ -1257,8 +1257,11 @@ per sorted run.
 - **Insert** on every blob/chunk/btree-node write. Journalled as `BackpointerInsert` (§3.3).
 - **Remove** on object deletion or extent rewrite. Journalled as `BackpointerRemove`. May be
   elided when the bucket's generation will be bumped (lazy invalidation).
-- **Update** on copygc / reconcile move. The move path issues an atomic
-  `(BackpointerRemove old, BackpointerInsert new)` pair.
+- **Update** on copygc / reconcile move. The move path emits a single `ReconcileMove` WAL op
+  (§3.3, §17.5); replay projects it into the equivalent `BackpointerRemove(old) ∘
+  BackpointerInsert(new) ∘ owner-update` sequence and applies all three under one LSN. This
+  keeps moves single-LSN atomic without duplicating the primitive ops, which remain available
+  for non-move callers (object deletion, fresh writes, lazy btree-node free).
 
 #### Operations enabled
 
@@ -2329,8 +2332,9 @@ Each `Copygc` work item is processed via the standard move path (§17.5):
 2. Read each live extent from disk (CRC32C validated; BLAKE3 verified at the object level if
    the owner is `BlobExtent`).
 3. Write to a fresh bucket via the move path.
-4. Atomically update the owning index entry and the backpointer:
-   `BackpointerRemove(old_key) ∘ BackpointerInsert(new_key, new_value) ∘ owner-update`.
+4. Emit a single `ReconcileMove { from_loc, to_loc, owner_key }` WAL op (§3.3, §17.5). Replay
+   projects this into `BackpointerRemove(old_key) ∘ BackpointerInsert(new_key, new_value) ∘
+   owner-update` applied as a single LSN's worth of btree mutations.
 5. Bump the old bucket's generation, transition it to `NeedDiscard` (or directly to `Free`).
    The generation bump implicitly invalidates any backpointers missed during the scan — they
    become detectable-stale on the next pass.
@@ -2729,9 +2733,34 @@ copygc and tiering work and resumes from its cursor.
 
 ### 17.5 Move path
 
-Reconcile shares one **move path** with copygc: read extent → validate (CRC32C + BLAKE3) →
-write to fresh location → atomically update the owning key, the location table (§6.1), and the
-backpointer (§6.2) → remove old work item.
+Reconcile shares one **move path** with copygc:
+
+1. Read the extent from `from_loc` and validate (CRC32C + BLAKE3 at the object level for
+   `OwnerKind::BlobExtent`).
+2. Write the bytes to a fresh `to_loc`.
+3. Emit one `ReconcileMove { from_loc, to_loc, owner_key }` WAL op (§3.3) — this is the
+   atomicity boundary: a single LSN, one `payload_crc`, one fsync.
+4. Remove the old work item from `ReconcileWork` / `ReconcileHighPrio`.
+
+**Schema vs. replay.** `ReconcileMove` is what writers emit; the journal replay engine
+projects it into the equivalent primitive btree mutations:
+
+```
+ReconcileMove { from_loc, to_loc, owner_key }
+  ⇒ BackpointerRemove(from_loc → key)
+   ∘ BackpointerInsert(to_loc → key, value)
+   ∘ owner-update on owner_key:
+        OwnerKind::BlobExtent      → ObjectLocation.replicas[i] (§6.1)
+        OwnerKind::Chunk           → ChunkIndex entry's BlobRef (§9.3)
+        OwnerKind::BtreeNode       → parent inner node's BlockRef (§1.5)
+        OwnerKind::TagBitmapExtent → TagDirectory entry's store_root (§8.1)
+        OwnerKind::OverflowRecord  → ObjectRecord.overflow_offset (§5.2)
+```
+
+All three projected mutations apply under the move's LSN, so a crash either replays all of
+them or none. `BackpointerInsert` / `BackpointerRemove` remain first-class WAL ops in §3.3
+because they are also emitted directly by non-move callers (object deletion, fresh writes,
+lazy btree-node free) — moves are the only flow that needs the bundled `ReconcileMove`.
 
 Throttling: two pool-wide tunables in `pool_state`:
 
