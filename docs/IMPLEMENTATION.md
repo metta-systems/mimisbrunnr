@@ -81,14 +81,17 @@ construction. CRC is computed with the CRC slot itself zeroed.
 `BlockKind` enumerates:
 
 ```rust
+#[repr(u16)]
 enum BlockKind {
     Superblock,
     ZoneMap,
     WalSegment,                              // WAL header / segment marker
     TagBitmapPage,                           // roaring bitmap framing (4 KiB; §8.2)
+    KvHashDirectory,                         // extendible-hash directory (4 KiB; §9.1)
     KvHashBucket,                            // extendible-hash bucket (4 KiB; §9.1)
     OverflowRecord,                          // per-object tag/attr overflow (4 KiB; §5.2)
     Checkpoint,                              // checkpoint block within the WAL
+    PoolStateRoot,                           // pool-state root block (4 KiB; §10.4)
 }
 ```
 
@@ -96,6 +99,7 @@ Large-node regions (256 KiB B+ tree nodes and radix leaves; §1.5) carry **`Btre
 of type `BtreeKind` instead of `BlockHeader.kind`:
 
 ```rust
+#[repr(u16)]
 enum BtreeKind {
     ObjectTable,        // §5 radix leaves & inners (current view)
     ObjectHistory,      // §11.2 sidecar: (oid, snapshot) → ObjectRecord overrides
@@ -255,7 +259,7 @@ Loaded nodes are decoded into:
 ```rust
 struct LoadedNode {
     header: BtreeNodeHeader,
-    sorted runs: SmallVec<[SortedRun; 4]>,              // typically 1–3 active sorted runs
+    sorted_runs: SmallVec<[SortedRun; 4]>,   // typically 1–3 active sorted runs
     merged_view: BTreeMap<Key, Value>,       // lazy: built on first lookup
     pending_journal: Vec<JournalEntry>,      // §3.4 entries past last_persisted_lsn
     dirty: bool,
@@ -298,7 +302,7 @@ recorded once in the descriptor rather than per key.
 
 ```rust
 #[repr(C, packed)]
-struct SortedRunKeyFormat {                       // 8 + nr_fields × 12 bytes
+struct SortedRunKeyFormat {                       // 8 + nr_fields × 16 bytes
     nr_fields: u8,                           // 1..=8
     key_header_bytes: u8,                    // 1..=4 (entry-type discriminator + flags)
     common_value_prefix: u8,                 // bytes shared at the start of every value (0..=24)
@@ -308,11 +312,12 @@ struct SortedRunKeyFormat {                       // 8 + nr_fields × 12 bytes
 }
 
 #[repr(C, packed)]
-struct FieldFormat {                         // 12 bytes
+struct FieldFormat {                         // 16 bytes
     bit_width: u8,                           // 0..=64;  0 ⇒ constant (use `base` directly)
     flags: u8,                               // FIELD_FORMAT_FLAG_*
-    _pad: u16,
+    _pad0: u16,
     base: u64,                               // value subtracted from each field at write time
+    _pad1: u32,                              // tail pad to keep struct multiple-of-8 (§1.1)
 }
 
 // FieldFormat.flags bits
@@ -328,7 +333,7 @@ flag is left clear; bit-packed values still compare correctly because the packed
 field's two's-complement value with `base` subtracted, monotonic by construction.
 
 The descriptor is part of the `SortedRunHeader` payload (§1.5.1), prepended before the packed-key
-stream. With the typical 3-field shape it adds 8 + 36 = 44 bytes per sorted run — amortised over
+stream. With the typical 3-field shape it adds 8 + 48 = 56 bytes per sorted run — amortised over
 hundreds to thousands of keys.
 
 **Encoding.** A packed key is:
@@ -513,7 +518,7 @@ struct RootPointer {                         // 424 bytes
     location_table_root:      BlockRef,      //  [48..64]   §6.1   radix table — current view
     location_history_root:    BlockRef,      //  [64..80]   §11.2  sidecar
     forward_index_root:       BlockRef,      //  [80..96]   §7
-    tag_index_root:           BlockRef,      //  [96..112]  §8.1   TagIndexDirectory
+    tag_index_root:           BlockRef,      //  [96..112]  §8.1   TagDirectory
     kv_index_root:            BlockRef,      // [112..128]  §9.1   KvDirectory (4 KiB block)
     range_index_root:         BlockRef,      // [128..144]  §9.2
     chunk_index_root:         BlockRef,      // [144..160]  §9.3   content-addressed (snapshot-agnostic)
@@ -631,9 +636,19 @@ struct WalEntryHeader {                      // 40 bytes
     format_version: u8,
     flags: u16,                              // WAL_ENTRY_FLAG_*
     lsn: u64,
-    timestamp: HybridTimestamp,              // 16 bytes (see §10)
+    timestamp: HybridTimestamp,              // 16 bytes — defined below
     payload_length: u32,
     payload_crc: u32,                        // CRC32C of payload (post-compression/encryption)
+}
+
+// HybridTimestamp is the cluster-wide hybrid logical clock for total ordering
+// without coordination (DESIGN §10.4). Sort order: wall_ms → logical → node_id.
+#[repr(C, packed)]
+struct HybridTimestamp {                     // 16 bytes
+    wall_ms: u64,                            // [0..8]   wall-clock milliseconds
+    logical: u16,                            // [8..10]  logical counter for same-ms ordering
+    node_id: u16,                            // [10..12] originating node (NodeId)
+    _pad: u32,                               // [12..16] tail pad to multiple-of-8 (§1.1)
 }
 
 // WalEntryHeader.flags bits
@@ -1308,8 +1323,8 @@ leaf.min_oid + 1)⌉`.
 At "8 assertions per object" (the §7.2 inline-spill threshold; per-entry ≈ 2.5 B packed
 `(oid, snapshot)` key + 2 B header + 128 B inline body = ~133 B), a leaf packs ~1 970 entries
 total. Sorted runs share the region's payload bytes (§1.5.2 appends them into the same 256 KiB
-region), so adding sorted runs does not multiply capacity — each new run consumes 64 B of
-overhead (32 B `SortedRunHeader` + 32 B `SortedRunKeyFormat` for the 2-field key) and slightly
+region), so adding sorted runs does not multiply capacity — each new run consumes 72 B of
+overhead (32 B `SortedRunHeader` + 40 B `SortedRunKeyFormat` for the 2-field key) and slightly
 reduces the entry budget. With 4 active sorted runs the leaf still carries ~1 968 entries
 before §1.5.4 triggers full compaction. Smaller objects pack denser: 4 assertions per entry
 → ~3 800 entries per leaf.
@@ -1317,8 +1332,9 @@ before §1.5.4 triggers full compaction. Smaller objects pack denser: 4 assertio
 ### 7.2 Spill
 
 Objects with more than 8 assertions store a `BlockRef` to a `ForwardOverflow` region (also a
-256 KiB large-node region; positional, no sorted runs — single rewrite on growth). Each overflow region
-holds up to 16 380 × `PackedAssertion`. Further overflow chains via the trailing `BlockRef` slot.
+256 KiB large-node region; positional, no sorted runs — single rewrite on growth). Each overflow
+region holds up to 16 379 × `PackedAssertion` (262 144 B − 64 B header − 16 B trailing chain
+`BlockRef` = 262 064 B / 16 B). Further overflow chains via the trailing `BlockRef` slot.
 
 ### 7.3 Sorted-run behaviour
 
@@ -1351,7 +1367,7 @@ The tag index is the heart of query performance. Its on-disk form must:
 - Allow per-tag COW updates without rewriting unrelated tags.
 - Support delta-sync: cheap diff between two snapshots of the same bitmap.
 
-### 8.1 TagIndexDirectory
+### 8.1 TagDirectory
 
 A **B+ tree of large nodes** (§1.5) keyed by `(TagId: u32, snapshot: u32)` — snapshot-aware per
 §11.2. Leaf entries are 48 B, with fields reordered so every multi-byte field sits at its
@@ -1380,11 +1396,11 @@ leaf entry to dispatch a bitmap fetch gets `store_root`, `tag_id`, `snapshot`, `
 `generation`, and `store_kind` all in `[0..48]` — one 64 B fetch.
 
 On-disk, leaf sorted runs use the §1.5.6 packed-key encoding with **two key fields**
-(`tag_id`, `snapshot`); the format descriptor occupies 8 + 2 × 12 = **32 B per sorted run**
-(down from 44 B for a 3-field shape). `tag_id` typically packs to 2–3 bytes per leaf (sparse
+(`tag_id`, `snapshot`); the format descriptor occupies 8 + 2 × 16 = **40 B per sorted run**
+(down from 56 B for a 3-field shape). `tag_id` typically packs to 2–3 bytes per leaf (sparse
 but clustered ids); `snapshot` packs to ~0 bits when one snapshot dominates, a few bits
 otherwise. The 40 bytes of value following the key stay byte-aligned. Per-key on-disk cost is
-~37 B. A 256 KiB leaf sorted run (262 144 − 64 − 32 − 32 = 262 016 B payload) holds
+~37 B. A 256 KiB leaf sorted run (262 144 − 64 − 32 − 40 = 262 008 B payload) holds
 **~7 080 entries**. For 5 000 tags × ~100 snapshots without divergence (one entry per tag,
 shared across snapshots) the full directory fits in **a single leaf** (depth 0); pools where
 many tags diverge across snapshots, or pools with hundreds of thousands of tags, extend the
@@ -1472,7 +1488,7 @@ lookups benefit more from hash-bucket addressing.
 
 ```
 KvDirectory (single 4 KiB block, addressed by RootPointer.kv_index_root):
-   header (BlockHeader, kind = KvHashBucket with directory flag in BlockHeader.flags)  // 32 B
+   header (BlockHeader, kind = KvHashDirectory)                                        // 32 B
    global_depth: u8                                                                    //  1 B
    _pad0: [u8; 3]                                                                      //  3 B
    bucket_count: u32                  // = 1 << global_depth                           //  4 B
@@ -1650,7 +1666,7 @@ descriptor array sized for the typical small-pool case:
 ```rust
 #[repr(C, packed)]
 struct PoolStateRoot {                        // 4096 bytes
-    header: BlockHeader,                      //    [0..32]   kind = TBD (pool-state)
+    header: BlockHeader,                      //    [0..32]   kind = PoolStateRoot
     disk_count: u32,                          //   [32..36]
     cluster_node_count: u32,                  //   [36..40]
     inline_disks: [DiskDescriptorOnDisk; 12], //   [40..3112]  12 × 256 B
@@ -1892,8 +1908,9 @@ and its existing backpointer is valid for both snapshots. Backpointers are physi
 
 Deleting a snapshot is **two operations**: a small synchronous step that takes the snapshot
 out of visibility, and a long-running background scan that physically reclaims the keys.
-The synchronous step's WAL cost is one entry; the scan's WAL cost is a handful of cursor
-checkpoints, regardless of how many keys are involved.
+The synchronous step's WAL cost is `1 + N` entries (one `SnapshotDelete` plus one
+`ReconcileEnqueue` per snapshot-aware btree, ~10 in the current format); the scan's WAL
+cost is a handful of cursor checkpoints, regardless of how many keys are involved.
 
 **Synchronous step (`SnapshotDelete` WAL op).**
 1. In the snapshots btree, set `SNAPSHOT_FLAG_DELETED` in `SnapshotNode.flags`. The node remains in
@@ -2236,7 +2253,7 @@ queries:
 | -------------------------------------------- | ----------------------------------------- | ------------------------- |
 | `ObjectTable` (positional accessor over `BTreeNodeCache`) | §5 radix tree of `BtreeKind::ObjectTable` leaves; per-record access = (radix descent → leaf `BlockRef`) → cache lookup → 128 B slot at `oid_local % 2044` | leaves cached per `BTreeNodeCache` policy below; no separate resident array (1.28 GiB at 10 M objects, ≥ TiBs at the 48-bit cap) |
 | `LocationTable` (positional accessor over `BTreeNodeCache`) | §6.1 radix tree of `BtreeKind::LocationTable` leaves; per-record access = same descent → 48 B slot at `oid_local % 5440` | shares `BTreeNodeCache`; same eviction policy as `ObjectTable` |
-| `TagIndex { HashMap<TagId, TagStore> }`      | TagIndexDirectory + TagBitmap pages       | mmap-pinned roaring containers |
+| `TagIndex { HashMap<TagId, TagStore> }`      | TagDirectory + TagBitmap pages            | mmap-pinned roaring containers |
 | `KvIndex { HashMap<(TagId,u64), RoaringBitmap> }` | KvDirectory + buckets                  | resident, lazy-load buckets |
 | `RangeIndex` (`BTreeMap<(TagId, NormKey), Roaring>`) | B+ tree pages                       | resident, paged in     |
 | `ForwardIndex { HashMap<u64, SmallVec<...>> }` | B+ tree                                  | LRU-cached pages       |
@@ -2436,7 +2453,7 @@ forward index roughly in half (~660 MiB at this scale).
 | ---------------------- | --------- | -------------------------------------------------- |
 | Superblock × 3         | 12 KiB    | Fixed                                              |
 | WAL                    | 64 MiB    | Btree-update journal (§3); mirrored across devices |
-| Bucket alloc table     | ~180 MiB  | 16 M buckets with packed `bucket_no`               |
+| Bucket alloc table     | ~280 MiB  | 16 M buckets × ~18 B/entry (16 B value + ~2 B packed `bucket_no`) |
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
 | Object table (records) | 1.28 GiB  | Positional — no key packing applies                |
 | Object table (radix)   | < 1 MiB   | Single inner node (depth 2 total)                  |
@@ -2451,7 +2468,7 @@ forward index roughly in half (~660 MiB at this scale).
 | Path contexts          | 50 MiB    | One large project; path hashes don't pack          |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
 | Snapshot key overhead  | ~50 MiB   | Per-snapshot unique keys across all snapshot-aware btrees |
-| **Total metadata**     | **~4.0 GiB** | Replicated to every node; dominated by object records (1.28 GiB) and forward index (1.24 GiB) |
+| **Total metadata**     | **~4.1 GiB** | Replicated to every node; dominated by object records (1.28 GiB) and forward index (1.24 GiB) |
 
 **Transient overhead** (not in steady state — fills during specific events, drains afterwards):
 
@@ -2514,7 +2531,7 @@ enum WorkKind {
 }
 
 #[repr(C, packed)]
-struct WorkItem {                            // 48 B base + variable owner_key
+struct WorkItem {                            // 48 bytes
     target_kind: u8,                         // OwnerKind from §6.2
     work_kind: u8,                           // WorkKind
     attempt_count: u8,
@@ -2522,7 +2539,7 @@ struct WorkItem {                            // 48 B base + variable owner_key
     flags: u32,                              // WORK_FLAG_*
     enqueued_lsn: u64,
     desired_state_ref: BlockRef,             // 16 B → CBOR(DesiredState) for variable detail
-    owner_key: [u8; 16],                     // owning key in target btree (packed)
+    owner_key: [u8; 16],                     // owning key in target btree (zero-padded per §6.2)
 }
 
 // WorkItem.flags bits
