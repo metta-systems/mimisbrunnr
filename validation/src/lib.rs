@@ -16,6 +16,80 @@ use std::mem::size_of;
 pub const BLOCK_FLAG_ENCRYPTED:    u32 = 1 << 0;
 pub const BLOCK_FLAG_CONTINUATION: u32 = 1 << 1;
 
+// =====================================================================
+// §1.3 BlockKind / BtreeKind discriminants — pinned numerically.
+// Reordering or renumbering is a format break. Mirrors the doc tables
+// verbatim; any divergence between this list and the engine's enum
+// definitions is caught at integration time.
+// =====================================================================
+
+// BlockKind (BlockHeader.kind, magic = "MIMR")
+pub const BLOCK_KIND_SUPERBLOCK:        u16 = 0;
+pub const BLOCK_KIND_ZONE_MAP:          u16 = 1;
+pub const BLOCK_KIND_WAL_SEGMENT:       u16 = 2;
+pub const BLOCK_KIND_TAG_BITMAP_PAGE:   u16 = 3;
+pub const BLOCK_KIND_KV_HASH_DIRECTORY: u16 = 4;
+pub const BLOCK_KIND_KV_HASH_BUCKET:    u16 = 5;
+pub const BLOCK_KIND_OVERFLOW_RECORD:   u16 = 6;
+pub const BLOCK_KIND_CHECKPOINT:        u16 = 7;
+pub const BLOCK_KIND_POOL_STATE_ROOT:   u16 = 8;
+pub const BLOCK_KIND_SEQUENCE_PAGE:     u16 = 9;   // §8.3 OrderedStore page
+pub const BLOCK_KIND_RANKED_PAGE:       u16 = 10;  // §8.3 RankedStore page
+pub const BLOCK_KIND_COUNT:             u16 = 11;
+// Sanity: every BlockKind must be unique and densely numbered from 0.
+const _: () = assert!(BLOCK_KIND_RANKED_PAGE + 1 == BLOCK_KIND_COUNT);
+
+// BtreeKind (BtreeNodeHeader.kind, magic = "MIMB")
+pub const BTREE_KIND_OBJECT_TABLE:            u16 = 0;
+pub const BTREE_KIND_OBJECT_HISTORY:          u16 = 1;
+pub const BTREE_KIND_LOCATION_TABLE:          u16 = 2;
+pub const BTREE_KIND_LOCATION_HISTORY:        u16 = 3;
+pub const BTREE_KIND_BACKPOINTER:             u16 = 4;
+pub const BTREE_KIND_FORWARD:                 u16 = 5;
+pub const BTREE_KIND_FORWARD_OVERFLOW:        u16 = 6;
+pub const BTREE_KIND_TAG_DIRECTORY:           u16 = 7;
+pub const BTREE_KIND_RANGE:                   u16 = 8;
+pub const BTREE_KIND_CHUNK_INDEX:             u16 = 9;
+pub const BTREE_KIND_CHUNK_LIST:              u16 = 10;
+pub const BTREE_KIND_KV_DIRECTORY:            u16 = 11;
+pub const BTREE_KIND_VALUE_SPILL:             u16 = 12;
+pub const BTREE_KIND_ONTOLOGY:                u16 = 13;
+pub const BTREE_KIND_PATH_CONTEXT:            u16 = 14;
+pub const BTREE_KIND_SUBSCRIPTIONS:           u16 = 15;
+pub const BTREE_KIND_SNAPSHOTS:               u16 = 16;
+pub const BTREE_KIND_BUCKET_ALLOC:            u16 = 17;
+pub const BTREE_KIND_FREESPACE_LRU:           u16 = 18;
+pub const BTREE_KIND_DISK_DESCRIPTORS:        u16 = 19;
+pub const BTREE_KIND_PLACEMENT_RULES:         u16 = 20;
+pub const BTREE_KIND_CLUSTER_PEERS:           u16 = 21;
+pub const BTREE_KIND_RECONCILE_WORK:          u16 = 22;
+pub const BTREE_KIND_RECONCILE_HIGH_PRIO:     u16 = 23;
+pub const BTREE_KIND_RECONCILE_WORK_PHYS:     u16 = 24;
+pub const BTREE_KIND_RECONCILE_HIGH_PRIO_PHYS:u16 = 25;
+pub const BTREE_KIND_RECONCILE_PENDING:       u16 = 26;
+pub const BTREE_KIND_RECONCILE_SCAN:          u16 = 27;
+pub const BTREE_KIND_COUNT:                   u16 = 28;
+const _: () = assert!(BTREE_KIND_RECONCILE_SCAN + 1 == BTREE_KIND_COUNT);
+
+// §11.5 — snapshot-aware btrees. Synchronous SnapshotDelete cost is
+// `1 + N` WAL entries where N is this count. Doc claim: "8 in the current
+// format: the six in §11.2's table plus the two radix sidecars".
+pub const SNAPSHOT_AWARE_BTREE_COUNT: usize = 8;
+const _: () = {
+    // Enumerate them so additions to BtreeKind force a review here.
+    let snapshot_aware: [u16; SNAPSHOT_AWARE_BTREE_COUNT] = [
+        BTREE_KIND_OBJECT_HISTORY,    // sidecar
+        BTREE_KIND_LOCATION_HISTORY,  // sidecar
+        BTREE_KIND_FORWARD,
+        BTREE_KIND_TAG_DIRECTORY,
+        BTREE_KIND_RANGE,
+        BTREE_KIND_ONTOLOGY,
+        BTREE_KIND_PATH_CONTEXT,      // manifest only — directory itself is snapshot-agnostic
+        BTREE_KIND_SUBSCRIPTIONS,
+    ];
+    let _ = snapshot_aware;
+};
+
 // BtreeNodeHeader.flags
 pub const BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS: u8 = 1 << 0;
 
@@ -1047,9 +1121,8 @@ pub const FWD_INNER_ENTRY_BYTES: usize = FWD_ENTRY_KEY_BYTES_CEIL + size_of::<Bl
 const _: () = assert!(FWD_INNER_ENTRY_BYTES == 19);
 pub const FWD_INNER_CHILDREN_PER_RUN: usize =
     fwd_payload_n_runs(1) / FWD_INNER_ENTRY_BYTES;
-// 262 008 / 19 ≈ 13 790 — comfortably above the prose's "~13 000".
-const _: () = assert!(FWD_INNER_CHILDREN_PER_RUN >= 13_000);
-const _: () = assert!(FWD_INNER_CHILDREN_PER_RUN <= 14_000);
+// 262 008 / 19 = 13 789 — pin the doc's tightened "~13 789" figure.
+const _: () = assert!(FWD_INNER_CHILDREN_PER_RUN == 13_789);
 
 // =====================================================================
 // §9.2 Range-index leaf packing (4-field key: attr_id, value, oid, snapshot).
@@ -1070,3 +1143,50 @@ pub const RANGE_ENTRIES_PER_RUN_WORST: usize = RANGE_PAYLOAD_PER_RUN / 28;
 // Pin the prose's "~9 350–10 900 entries" range.
 const _: () = assert!(RANGE_ENTRIES_PER_RUN_BEST  >= 10_900 && RANGE_ENTRIES_PER_RUN_BEST  < 11_000);
 const _: () = assert!(RANGE_ENTRIES_PER_RUN_WORST >=  9_350 && RANGE_ENTRIES_PER_RUN_WORST <  9_500);
+
+// =====================================================================
+// §12.4 Freespace LRU fragmentation_band: ⌈255 × dirty / sectors⌉
+// Endpoints:
+//   band == 0   iff dirty == 0 (empty bucket — full free)
+//   band == 255 when dirty is full *or near-full* (the formula saturates
+//               for the last few sectors because ⌈255·d/s⌉ rounds up)
+// Intermediate dirty values map into 1..=254. Reorder cost is bounded by
+// allocation pressure, not write volume: bands are recomputed lazily when
+// dirty_sectors crosses an 8-sector boundary (§12.4 prose).
+// =====================================================================
+pub const fn fragmentation_band(dirty: u64, sectors_per_bucket: u64) -> u8 {
+    let band = (255u64 * dirty).div_ceil(sectors_per_bucket);
+    band as u8
+}
+// Default bucket: 1 MiB / 4 KiB = 256 sectors.
+const _: () = assert!(fragmentation_band(0,   256) == 0);     // empty → 0
+const _: () = assert!(fragmentation_band(1,   256) == 1);     // barely occupied → 1
+const _: () = assert!(fragmentation_band(128, 256) == 128);   // half full → 128
+const _: () = assert!(fragmentation_band(254, 256) == 254);   // ⌈255*254/256⌉ = 254
+const _: () = assert!(fragmentation_band(255, 256) == 255);   // saturates one sector early
+const _: () = assert!(fragmentation_band(256, 256) == 255);   // fully occupied → 255
+// 4 MiB bucket: 1024 sectors. Coarser scaling — multiple dirty values map
+// to the same band, and saturation kicks in earlier (relative to capacity).
+const _: () = assert!(fragmentation_band(0,    1024) == 0);
+const _: () = assert!(fragmentation_band(1,    1024) == 1);   // ⌈255/1024⌉ = 1
+const _: () = assert!(fragmentation_band(1024, 1024) == 255); // fully occupied
+// Monotonicity sanity: band is non-decreasing in dirty.
+const _: () = assert!(fragmentation_band(64,  256) <= fragmentation_band(128, 256));
+const _: () = assert!(fragmentation_band(128, 256) <= fragmentation_band(192, 256));
+// Empty-iff-zero invariant (used by foreground allocator to scan band == 0).
+const _: () = assert!(fragmentation_band(0, 256)  == 0 && fragmentation_band(1, 256)  != 0);
+const _: () = assert!(fragmentation_band(0, 1024) == 0 && fragmentation_band(1, 1024) != 0);
+
+// =====================================================================
+// §1.5.5 depth table (10 M objects, 5000 tags, 100 snapshots) — pin the
+// concrete tier counts cited in the prose. Forward leaves are computed
+// at the §7.2 inline-spill threshold (8 assertions/object).
+// =====================================================================
+const _: () = assert!(OBJECT_TABLE_LEAVES_10M   == 4_893);    // depth 1, fits under one inner
+const _: () = assert!(OBJECT_TABLE_LEAVES_10M   <= INNER_ENTRIES);
+const _: () = assert!(LOCATION_TABLE_LEAVES_10M == 1_839);
+const _: () = assert!(LOCATION_TABLE_LEAVES_10M <= INNER_ENTRIES);
+const _: () = assert!(FWD_LEAVES_10M_K8         == 5_082);
+const _: () = assert!(FWD_LEAVES_10M_K8         <= INNER_ENTRIES);
+// Tag directory at 5000 tags × 100 snapshots (no divergence): single leaf.
+const _: () = assert!(5_000 <= TAG_DIR_ENTRIES_PER_RUN);

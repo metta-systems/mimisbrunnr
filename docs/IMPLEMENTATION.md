@@ -91,17 +91,22 @@ construction. CRC is computed with the CRC slot itself zeroed.
 `BlockKind` enumerates:
 
 ```rust
+// Discriminants are pinned: any insertion goes at the end with the next free
+// value; existing variants never renumber. On-disk records carry these
+// numbers literally, so reordering is a format break.
 #[repr(u16)]
 enum BlockKind {
-    Superblock,
-    ZoneMap,
-    WalSegment,                              // WAL header / segment marker
-    TagBitmapPage,                           // roaring bitmap framing (4 KiB; §8.2)
-    KvHashDirectory,                         // extendible-hash directory (4 KiB; §9.1)
-    KvHashBucket,                            // extendible-hash bucket (4 KiB; §9.1)
-    OverflowRecord,                          // per-object tag/attr overflow (4 KiB; §5.2)
-    Checkpoint,                              // checkpoint block within the WAL
-    PoolStateRoot,                           // pool-state root block (4 KiB; §10.4)
+    Superblock        = 0,
+    ZoneMap           = 1,
+    WalSegment        = 2,   // WAL header / segment marker
+    TagBitmapPage     = 3,   // roaring bitmap framing (4 KiB; §8.2)
+    KvHashDirectory   = 4,   // extendible-hash directory (4 KiB; §9.1)
+    KvHashBucket      = 5,   // extendible-hash bucket (4 KiB; §9.1)
+    OverflowRecord    = 6,   // per-object tag/attr overflow (4 KiB; §5.2)
+    Checkpoint        = 7,   // checkpoint block within the WAL
+    PoolStateRoot     = 8,   // pool-state root block (4 KiB; §10.4)
+    SequencePage      = 9,   // §8.3 OrderedStore page (singly-linked chain)
+    RankedPage        = 10,  // §8.3 RankedStore page (singly-linked chain)
 }
 ```
 
@@ -109,36 +114,38 @@ Large-node regions (256 KiB B+ tree nodes and radix leaves; §1.5) carry **`Btre
 of type `BtreeKind` instead of `BlockHeader.kind`:
 
 ```rust
+// Discriminants are pinned per BlockKind's rule: insertions append, existing
+// variants never renumber.
 #[repr(u16)]
 enum BtreeKind {
-    ObjectTable,        // §5 radix leaves & inners (current view)
-    ObjectHistory,      // §11.2 sidecar: (oid, snapshot) → ObjectRecord overrides
-    LocationTable,      // §6.1 radix leaves & inners (current view)
-    LocationHistory,    // §11.2 sidecar: (oid, snapshot) → ObjectLocation overrides
-    Backpointer,        // §6.2 reverse-mapping B+ tree (snapshot-agnostic)
-    Forward,            // §7 forward index B+ tree (snapshot-aware key)
-    ForwardOverflow,    // §7.2 per-object assertion spill (positional, no sorted runs)
-    TagDirectory,       // §8.1 tag directory B+ tree (snapshot-aware)
-    Range,              // §9.2 range index B+ tree (snapshot-aware)
-    ChunkIndex,         // §9.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
-    ChunkList,          // §9.3 per-object FastCDC chunk-list region (positional, no sorted runs)
-    KvDirectory,        // §9.1 extendible-hash directory spillover (positional)
-    ValueSpill,         // value-hash → CBOR(Value); content-addressed
-    Ontology,           // §10.1 ontology / dag B+ tree (snapshot-aware)
-    PathContext,        // §10.3 path context B+ tree (snapshot-aware)
-    Subscriptions,      // §10.2 subscription B+ tree (snapshot-aware)
-    Snapshots,          // §11.1 snapshot tree (SnapshotId → SnapshotNode)
-    BucketAlloc,        // §12.2 per-disk bucket alloc B+ tree (physical)
-    FreespaceLru,       // §12.4 per-disk freespace LRU B+ tree (physical)
-    DiskDescriptors,    // §10.4 disk descriptors overflow tree (>12 disks)
-    PlacementRules,     // §10.4 placement rules (heterogeneous, CBOR values)
-    ClusterPeers,       // §10.4 cluster peers (NodeId → PeerRecord)
-    ReconcileWork,      // §17.2 normal-priority reconcile queue (logical order)
-    ReconcileHighPrio,     // §17.2 high-priority reconcile queue
-    ReconcileWorkPhys,  // §17.2 physical-LBA-ordered work index (HDD pools)
-    ReconcileHighPrioPhys, // §17.2 physical-LBA-ordered high-prio index (HDD pools)
-    ReconcilePending,   // §17.2 failed items awaiting device-config retry
-    ReconcileScan,      // §17.3 in-progress scan cursors
+    ObjectTable           = 0,   // §5 radix leaves & inners (current view)
+    ObjectHistory         = 1,   // §11.2 sidecar: (oid, snapshot) → ObjectRecord overrides
+    LocationTable         = 2,   // §6.1 radix leaves & inners (current view)
+    LocationHistory       = 3,   // §11.2 sidecar: (oid, snapshot) → ObjectLocation overrides
+    Backpointer           = 4,   // §6.2 reverse-mapping B+ tree (snapshot-agnostic)
+    Forward               = 5,   // §7 forward index B+ tree (snapshot-aware key)
+    ForwardOverflow       = 6,   // §7.2 per-object assertion spill (positional, no sorted runs)
+    TagDirectory          = 7,   // §8.1 tag directory B+ tree (snapshot-aware)
+    Range                 = 8,   // §9.2 range index B+ tree (snapshot-aware)
+    ChunkIndex            = 9,   // §9.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
+    ChunkList             = 10,  // §9.3 per-object FastCDC chunk-list region (positional, no sorted runs)
+    KvDirectory           = 11,  // §9.1 extendible-hash directory spillover (positional, no sorted runs)
+    ValueSpill            = 12,  // value-hash → CBOR(Value); content-addressed
+    Ontology              = 13,  // §10.1 ontology / dag B+ tree (snapshot-aware)
+    PathContext           = 14,  // §10.3 path context B+ tree (snapshot-aware)
+    Subscriptions         = 15,  // §10.2 subscription B+ tree (snapshot-aware)
+    Snapshots             = 16,  // §11.1 snapshot tree (SnapshotId → SnapshotNode)
+    BucketAlloc           = 17,  // §12.2 per-disk bucket alloc B+ tree (physical)
+    FreespaceLru          = 18,  // §12.4 per-disk freespace LRU B+ tree (physical)
+    DiskDescriptors       = 19,  // §10.4 disk descriptors overflow tree (>12 disks)
+    PlacementRules        = 20,  // §10.4 placement rules (heterogeneous, CBOR values)
+    ClusterPeers          = 21,  // §10.4 cluster peers (NodeId → PeerRecord)
+    ReconcileWork         = 22,  // §17.2 normal-priority reconcile queue (logical order)
+    ReconcileHighPrio     = 23,  // §17.2 high-priority reconcile queue
+    ReconcileWorkPhys     = 24,  // §17.2 physical-LBA-ordered work index (HDD pools)
+    ReconcileHighPrioPhys = 25,  // §17.2 physical-LBA-ordered high-prio index (HDD pools)
+    ReconcilePending      = 26,  // §17.2 failed items awaiting device-config retry
+    ReconcileScan         = 27,  // §17.3 in-progress scan cursors
 }
 ```
 
@@ -165,11 +172,16 @@ compaction (§1.5.4) that writes the new node(s) into a fresh bucket region.
 Two large-node variants share the same outer envelope but differ in their internal layout:
 
 - **B+ tree node** (forward index, range index, alloc table, freespace LRU, ontology, path
-  contexts, subscriptions): a sequence of **sorted runs** of keyed records. New updates append
-  a new sorted run; periodic full compaction merges all of a node's sorted runs back into one.
-- **Radix leaf** (object table, location table): a positional array of fixed-size records. No
-  internal sorted runs — the WAL journal (§3.4) serves as the per-leaf update log; on flush the
-  leaf is rewritten from the merged in-memory state.
+  contexts, subscriptions, tag directory, chunk index, value spill, snapshots, disk descriptors,
+  placement rules, cluster peers, reconcile queues): a sequence of **sorted runs** of keyed
+  records. New updates append a new sorted run; periodic full compaction merges all of a node's
+  sorted runs back into one.
+- **Positional region** (object table, location table — radix leaves; *and* `ForwardOverflow`
+  §7.2, `KvDirectory` spillover §9.1, `ChunkList` §9.3): a positional array of fixed-size
+  records or `BlockRef` slots. No internal sorted runs — for radix leaves the WAL journal (§3.4)
+  serves as the per-leaf update log and the leaf is rewritten from the merged in-memory state on
+  flush; for the per-object overflow/list regions, growth is a single rewrite and chains via a
+  trailing `BlockRef` slot.
 
 > **Terminology.** A *sorted run* is the bcachefs concept of a `bset` ("btree set") — a single
 > append-only sorted-by-key commit unit within a btree node. The on-disk magic tag for one is
@@ -299,12 +311,20 @@ on typical workloads.
 
 #### 1.5.5 Why this matters
 
-For a 10 M-object pool, the radix object table is **2 levels deep (depth = 1: 1 inner + leaf)**;
-tag, range, and forward indexes are **2–3 levels deep (depth = 1–2)**. (See the depth
-convention in §5: *depth* counts inner levels, *levels* counts inner + leaf tiers — a
-depth-*N* tree has *N + 1* tiers.) Each node access is a single sequential I/O of 256 KiB —
-critical for HDD performance and friendly to SSD command queues. The cache holds whole nodes,
-so intra-node lookups are memory-resident after the first hit.
+For a 10 M-object pool with 5 000 tags and ~100 snapshots, every tree is shallow:
+
+| Tree                | Depth  | Tiers  | Notes                                      |
+| ------------------- | ------ | ------ | ------------------------------------------ |
+| Object table (§5)   | 1      | 2      | 4 893 leaves under 1 inner                 |
+| Location table (§6.1)| 1     | 2      | 1 839 leaves under 1 inner                 |
+| Forward index (§7)  | 1      | 2      | 5 082 leaves under 1 inner                 |
+| Tag directory (§8.1)| 0      | 1      | 5 000 entries fit in a single 7 081-entry leaf |
+| Range index (§9.2)  | 0–1    | 1–2    | depends on attribute cardinality           |
+
+(See the depth convention in §5: *depth* counts inner levels, *levels* counts inner + leaf
+tiers — a depth-*N* tree has *N + 1* tiers.) Each node access is a single sequential I/O of
+256 KiB — critical for HDD performance and friendly to SSD command queues. The cache holds
+whole nodes, so intra-node lookups are memory-resident after the first hit.
 
 #### 1.5.6 Sorted-run format descriptors and packed keys
 
@@ -416,7 +436,7 @@ inspected per memory fetch during binary search.
 The superblock is the only structure with a fixed location and is written 3× (offsets 0, 4096, and
 last-4096-of-device) for redundancy.
 
-### 2.1 Superblock layout (4 KiB, version 2)
+### 2.1 Superblock layout (4 KiB, version 1)
 
 ```rust
 #[repr(C, packed)]
@@ -1353,8 +1373,9 @@ unpacked 8 bytes.
   separator key — without it, an oid whose `(oid, *)` cluster spans a leaf boundary would be
   unrepresentable (the inner separator would collide with the same `oid` on both sides). With
   §1.5.6 packing the trailing `snapshot` packs to ~0 bits when one snapshot dominates a sorted
-  run, so the cost is marginal: 2–4 byte packed keys + 16 B BlockRef = ~18–20 B per entry; one
-  full sorted run packs ~13 000 children. Tree at 10 M objects: **depth 1** (1 inner + leaves; 2 tiers total).
+  run, so the cost is marginal: a 3 B ceiled key + 16 B BlockRef = 19 B per entry; one full
+  sorted run packs 13 789 children (⌊262 008 / 19⌋). Tree at 10 M objects: **depth 1** (1 inner
+  + leaves; 2 tiers total).
 - **Leaf node** (level 0): sorted runs of `LeafEntry` records:
 
 ```rust
@@ -1418,9 +1439,9 @@ The **key** (`oid`) is packed; the **value** (`header`, body) stays byte-aligned
 format descriptor records `oid_base = leaf.min_oid` and `oid_bits = ⌈log₂(leaf.max_oid −
 leaf.min_oid + 1)⌉`.
 
-At "8 assertions per object" (the §7.2 inline-spill threshold; per-entry ≈ 2.5 B packed
-`(oid, snapshot)` key + 2 B header + 128 B inline body = 133 B), a leaf packs 1 969 entries
-total. Sorted runs share the region's payload bytes (§1.5.2 appends them into the same 256 KiB
+At "8 assertions per object" (the §7.2 inline-spill threshold; per-entry = 3 B ceiled
+`(oid, snapshot)` key (the average is 2.5 B; integer math uses the ceiling) + 2 B header
++ 128 B inline body = 133 B), a leaf packs 1 969 entries total. Sorted runs share the region's payload bytes (§1.5.2 appends them into the same 256 KiB
 region), so adding sorted runs does not multiply capacity — each new run consumes 72 B of
 overhead (32 B `SortedRunHeader` + 40 B `SortedRunKeyFormat` for the 2-field key) and slightly
 reduces the entry budget. With 4 active sorted runs the leaf still carries 1 968 entries
@@ -1557,7 +1578,7 @@ Each `SequencePage` and `RankedPage` is a 4 KiB block under the standard §1.3 f
 
 ```
 SequencePage (4 KiB):
-  BlockHeader  { kind = TagBitmapPage, format_version = 1 }       // 32 B
+  BlockHeader  { kind = SequencePage, format_version = 1 }        // 32 B
   entry_count: u16                                                //  2 B
   _pad: [u8; 6]                                                   //  6 B
   next: BlockRef                   // 0 = tail of chain            // 16 B
@@ -1567,7 +1588,7 @@ SequencePage (4 KiB):
                                                                   // = 4096 B
 
 RankedPage (4 KiB):
-  BlockHeader  { kind = TagBitmapPage, format_version = 1 }       // 32 B
+  BlockHeader  { kind = RankedPage, format_version = 1 }          // 32 B
   entry_count: u16                                                //  2 B
   _pad: [u8; 6]                                                   //  6 B
   next: BlockRef                   // 0 = tail of chain            // 16 B
@@ -2081,7 +2102,8 @@ and its existing backpointer is valid for both snapshots. Backpointers are physi
 Deleting a snapshot is **two operations**: a small synchronous step that takes the snapshot
 out of visibility, and a long-running background scan that physically reclaims the keys.
 The synchronous step's WAL cost is `1 + N` entries (one `SnapshotDelete` plus one
-`ReconcileEnqueue` per snapshot-aware btree, ~10 in the current format); the scan's WAL
+`ReconcileEnqueue` per snapshot-aware btree — 8 in the current format: the six in §11.2's
+table plus the two radix sidecars `ObjectHistory` and `LocationHistory`); the scan's WAL
 cost is a handful of cursor checkpoints, regardless of how many keys are involved.
 
 **Synchronous step (`SnapshotDelete` WAL op).**
@@ -2334,14 +2356,23 @@ A second **§1.5 B+ tree** per disk (`DiskDescriptorOnDisk.freespace_root`), key
 `(fragmentation_band, bucket_no)`:
 
 ```
-fragmentation_band: u8     // 0 = empty (full free); 1..255 = ⌈255 × dirty_sectors / sectors_per_bucket⌉
+fragmentation_band: u8     // ⌈255 × dirty_sectors / sectors_per_bucket⌉
+                           //   = 0   iff dirty_sectors == 0   (empty / full-free)
+                           //   = 255 when dirty is at or near full (formula saturates
+                           //         for the last few sectors because of the ceiling)
+                           //   ∈ 1..=254 in between
 bucket_no: u32
 ```
 
 where `sectors_per_bucket = 1 << (Superblock.bucket_size_log2 - 12)` (the count of 4 KiB
 sectors in one bucket — 256 for the default 1 MiB bucket, 1024 for the 4 MiB maximum).
-The band is `0` exactly when `dirty_sectors == 0`; otherwise it scales linearly into 1..=255
-so that fully-occupied buckets land at band 255 and barely-occupied ones at band 1.
+Band 0 is reserved for the "fully free" allocator fast path (foreground allocator scans
+`fragmentation_band == 0` only) and is reached *only* when `dirty_sectors == 0`. Band 255
+is the most-fragmented end and absorbs the last sector or two of occupancy via the ceiling
+— at the default 256 sectors, dirty ∈ {255, 256} both map to 255. Intermediate bands
+scale roughly linearly. Bands are recomputed lazily when `dirty_sectors` crosses an
+8-sector boundary, keeping freespace-LRU churn proportional to allocation pressure rather
+than to write volume.
 
 Used by:
 
@@ -2349,10 +2380,6 @@ Used by:
   write streams.
 - **Copy GC**: scans the most-fragmented non-empty buckets to reclaim space (§12.6).
 - **Cache eviction**: cached-replica buckets carry their own LRU, layered on top.
-
-Bands are recomputed lazily — a bucket's band is updated when `dirty_sectors` crosses an 8-sector
-boundary, keeping freespace-LRU churn proportional to allocation pressure rather than to
-write volume.
 
 ### 12.5 Allocator behaviour
 
