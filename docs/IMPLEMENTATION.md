@@ -987,9 +987,9 @@ transfers at the other. The five-regime table below shows how the design scales:
 | Avg chunk | Typical workload                   | Chunks      | `ChunkInsertBatch` ops (≤ 76/op) | `ChunkListAppend` ops (one per 6 551-entry region) | Cumulative WAL bytes (worst case: 1 sector/op) | WAL append rate at 530 MiB/s plaintext |
 | --------- | ---------------------------------- | ----------- | -------------------------------- | -------------------------------------------------- | ---------------------------------------------- | -------------------------------------- |
 | **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 110 377                          | 1 281                                              | ~436 MiB (1.3 % of plaintext)                  | ~7.3 MiB/s                             |
-| 16 KiB    | VM disks, databases                | 2 097 152   | 27 595                           | 320                                                | ~109 MiB (0.33 %)                              | ~1.8 MiB/s                             |
-| 256 KiB   | generic FastCDC default            | 131 072     | 1 725                            | 20                                                 | ~6.8 MiB (0.020 %)                             | ~114 KiB/s                             |
-| 1 MiB     | backup-tool default (restic-class) | 32 768      | 432                              | 5                                                  | ~1.7 MiB (0.0052 %)                            | ~29 KiB/s                              |
+| 16 KiB    | VM disks, databases                | 2 097 152   | 27 595                           | 321                                                | ~109 MiB (0.33 %)                              | ~1.8 MiB/s                             |
+| 256 KiB   | generic FastCDC default            | 131 072     | 1 725                            | 21                                                 | ~6.8 MiB (0.020 %)                             | ~114 KiB/s                             |
+| 1 MiB     | backup-tool default (restic-class) | 32 768      | 432                              | 6                                                  | ~1.7 MiB (0.0052 %)                            | ~29 KiB/s                              |
 | **8 MiB** | large extreme — pure resumability  | 4 096       | 54                               | 1                                                  | ~220 KiB (0.00067 %)                           | ~3.6 KiB/s                             |
 
 The spread is roughly **2 000×** across regimes on every axis — the same op set covers all
@@ -2948,7 +2948,7 @@ forward index roughly in half (~660 MiB at this scale).
 | Ontology               | <10 MiB   | Modules + DAG                                      |
 | Subscriptions          | ~700 KiB  | Per 1 000 subs with packed `sub_id`                |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
-| Snapshot key overhead  | ~50 MiB   | Per-snapshot divergent keys across the 8 snapshot-aware btrees (see breakdown below) |
+| Snapshot key overhead  | ~50 MiB   | Per-snapshot divergent keys across the 7 snapshot-aware btrees (see breakdown below) |
 | **Total metadata**     | **~4.0 GiB** | Replicated to every node; dominated by object records (1.19 GiB) and forward index (1.24 GiB) |
 
 **Snapshot key overhead breakdown.** "Snapshot key overhead" is the sum of *divergent* keys —
@@ -2966,7 +2966,7 @@ snapshot, typical for sync-driven snapshotting):
 | `Range` divergent leaf entries       | ~1 000 × ~25 B packed = ~25 KiB  | ~2.5 MiB |
 | `TagDirectory` divergent entries     | ~50 × 48 B = ~2.5 KiB (tags rarely diverge per snapshot)  | ~250 KiB |
 | `Ontology`, `Subscriptions`         | usually 0 (catalogs change rarely)         | <1 MiB combined |
-| **Sum** (≈ 100 KiB / snap × 100)     |                   | **~100 MiB raw** |
+| **Sum** (≈ 1 MiB / snap × 100)       |                   | **~100 MiB raw** |
 
 The raw arithmetic gives ~100 MiB; the table's ~50 MiB figure accounts for §1.5.6 packing
 benefits (the trailing `snapshot` field packs to ~0 bits when one snapshot dominates a sorted

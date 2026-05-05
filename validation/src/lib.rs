@@ -1240,9 +1240,9 @@ pub const CHUNK_4KIB_WAL_BYTES_MAX:     usize = wal_bytes_for(CHUNK_AVG_4KIB);
 const _: () = assert!(CHUNK_4KIB_CHUNKS    == 8_388_608);                    // 8 M
 const _: () = assert!(CHUNK_4KIB_INSERT_OPS == 110_377);                     // ~110 K
 const _: () = assert!(CHUNK_4KIB_LIST_OPS   == 1_281);                       // ~1.28 K
-// ~447 MiB worst-case — exceeds 64 MiB ring by ~7×; ring cycles continuously.
-const _: () = assert!(CHUNK_4KIB_WAL_BYTES_MAX > 7 * WAL_RING_BYTES_DEFAULT);
-const _: () = assert!(CHUNK_4KIB_WAL_BYTES_MAX < 8 * WAL_RING_BYTES_DEFAULT);
+// ~436 MiB worst-case — exceeds 64 MiB ring by ~6.8×; ring cycles continuously.
+const _: () = assert!(CHUNK_4KIB_WAL_BYTES_MAX > 6 * WAL_RING_BYTES_DEFAULT);
+const _: () = assert!(CHUNK_4KIB_WAL_BYTES_MAX < 7 * WAL_RING_BYTES_DEFAULT);
 
 // --- 16 KiB (VM / database canonical workload) -------------------------
 pub const CHUNK_AVG_16KIB:              usize = 16 * 1024;
@@ -1252,7 +1252,7 @@ pub const CHUNK_16KIB_LIST_OPS:         usize = list_ops_for(CHUNK_AVG_16KIB);
 pub const CHUNK_16KIB_WAL_BYTES_MAX:    usize = wal_bytes_for(CHUNK_AVG_16KIB);
 const _: () = assert!(CHUNK_16KIB_CHUNKS    == 2_097_152);                   // ~2 M
 const _: () = assert!(CHUNK_16KIB_INSERT_OPS == 27_595);                     // ~28 K
-const _: () = assert!(CHUNK_16KIB_LIST_OPS   == 320);
+const _: () = assert!(CHUNK_16KIB_LIST_OPS   == 321);
 // ~115 MiB worst-case — exceeds ring by ~1.8×; ring cycles ~2× over the write.
 const _: () = assert!(CHUNK_16KIB_WAL_BYTES_MAX > WAL_RING_BYTES_DEFAULT);
 const _: () = assert!(CHUNK_16KIB_WAL_BYTES_MAX < 2 * WAL_RING_BYTES_DEFAULT);
@@ -1265,7 +1265,7 @@ pub const CHUNK_256KIB_LIST_OPS:        usize = list_ops_for(CHUNK_AVG_256KIB);
 pub const CHUNK_256KIB_WAL_BYTES_MAX:   usize = wal_bytes_for(CHUNK_AVG_256KIB);
 const _: () = assert!(CHUNK_256KIB_CHUNKS    == 131_072);                    // ~131 K
 const _: () = assert!(CHUNK_256KIB_INSERT_OPS == 1_725);
-const _: () = assert!(CHUNK_256KIB_LIST_OPS   == 20);
+const _: () = assert!(CHUNK_256KIB_LIST_OPS   == 21);
 // ~7 MiB — fits inside the ring with room to spare.
 const _: () = assert!(CHUNK_256KIB_WAL_BYTES_MAX < WAL_RING_BYTES_DEFAULT / 8);
 
@@ -1277,7 +1277,7 @@ pub const CHUNK_1MIB_LIST_OPS:          usize = list_ops_for(CHUNK_AVG_1MIB);
 pub const CHUNK_1MIB_WAL_BYTES_MAX:     usize = wal_bytes_for(CHUNK_AVG_1MIB);
 const _: () = assert!(CHUNK_1MIB_CHUNKS    == 32_768);
 const _: () = assert!(CHUNK_1MIB_INSERT_OPS == 432);
-const _: () = assert!(CHUNK_1MIB_LIST_OPS   == 5);
+const _: () = assert!(CHUNK_1MIB_LIST_OPS   == 6);
 // ~1.8 MiB total.
 
 // --- 8 MiB extreme (large-chunk / resumability regime) -----------------
