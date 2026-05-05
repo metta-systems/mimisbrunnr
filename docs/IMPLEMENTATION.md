@@ -2382,10 +2382,11 @@ and its existing backpointer is valid for both snapshots. Backpointers are physi
 Deleting a snapshot is **two operations**: a small synchronous step that takes the snapshot
 out of visibility, and a long-running background scan that physically reclaims the keys.
 The synchronous step's WAL cost is `1 + N` entries (one `SnapshotDelete` plus one
-`ReconcileEnqueue` per snapshot-aware btree — 7 in the current format: the five in §11.2's
-table (Forward, Range, TagDirectory, Ontology, Subscriptions) plus the two radix sidecars
-`ObjectHistory` and `LocationHistory`); the scan's WAL
-cost is a handful of cursor checkpoints, regardless of how many keys are involved.
+`ReconcileEnqueue` per snapshot-aware btree — N = 7 in the current format, every
+yes-row of §11.2's table: `Forward`, `Range`, `TagDirectory`, `Ontology`,
+`Subscriptions`, plus the two radix sidecars `ObjectHistory` and `LocationHistory`).
+The scan's WAL cost is a handful of cursor checkpoints, regardless of how many keys
+are involved.
 
 **Synchronous step (`SnapshotDelete` WAL op).**
 1. In the snapshots btree, set `SNAPSHOT_FLAG_DELETED` in `SnapshotNode.flags`. The node remains in
@@ -2740,6 +2741,7 @@ queries:
 | -------------------------------------------- | ----------------------------------------- | ------------------------- |
 | `ObjectTable` (positional accessor over `BTreeNodeCache`) | §5 radix tree of `BtreeKind::ObjectTable` leaves; per-record access = (radix descent → leaf `BlockRef`) → cache lookup → 128 B slot at `oid_local % 2044` | leaves cached per `BTreeNodeCache` policy below; no separate resident array (~1.19 GiB at 10 M objects, ≥ TiBs at the 48-bit cap) |
 | `LocationTable` (positional accessor over `BTreeNodeCache`) | §6.1 radix tree of `BtreeKind::LocationTable` leaves; per-record access = same descent → 48 B slot at `oid_local % 5440` | shares `BTreeNodeCache`; same eviction policy as `ObjectTable` |
+| `ObjectHistory`, `LocationHistory` (snapshot-override sidecars) | §11.2 — `BtreeKind::ObjectHistory` / `BtreeKind::LocationHistory` keyed by `(oid, snapshot)`; consulted only for non-current-snapshot reads | shares `BTreeNodeCache`; typically cold (current-snapshot reads bypass) |
 | `TagIndex { HashMap<TagId, TagStore> }`      | TagDirectory + TagBitmap pages            | mmap-pinned roaring containers |
 | `KvIndex { HashMap<(TagId,u64), RoaringBitmap> }` | KvDirectory + buckets                  | resident, lazy-load buckets |
 | `RangeIndex` (`BTreeMap<(TagId, NormKey), Roaring>`) | B+ tree pages                       | resident, paged in     |

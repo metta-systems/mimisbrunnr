@@ -135,6 +135,38 @@ pub const LEAF_ENTRY_TOTAL_MASK: u16 = 0x7FFF;
 const _: () = assert!(LEAF_ENTRY_SPILL_FLAG | LEAF_ENTRY_TOTAL_MASK == 0xFFFF);
 const _: () = assert!(LEAF_ENTRY_SPILL_FLAG & LEAF_ENTRY_TOTAL_MASK == 0);
 
+// §11.3 — whiteout (snapshot tombstone) sentinel encodings, per leaf shape.
+// The snapshot-aware leaves don't share a common discriminator slot; the
+// whiteout encoding is per leaf shape.
+//
+//   Forward (§7.1):  LeafEntry.header == LEAF_ENTRY_SPILL_FLAG  (spill bit set,
+//                    total = 0). Real spills imply total > 8, so total = 0 in
+//                    spill mode is the unambiguous tombstone.
+//   Range (§9.2):    leaf BlockRef value zeroed (disk_id = block_no =
+//                    generation = 0) — never a valid bitmap pointer.
+//   TagDirectory (§8.1): TagIndexLeafEntry.store_kind == STORE_KIND_WHITEOUT
+//                    with store_root zeroed.
+//   Ontology, Subscriptions (§10.1, §10.2): CBOR null (0xF6) at the value
+//                    position, in place of the usual record.
+//   ObjectHistory, LocationHistory (§11.2): a 1-byte discriminator precedes
+//                    the shadowed record; 0xFF == KEY_TYPE_WHITEOUT means
+//                    whiteout, otherwise the record follows.
+pub const FORWARD_WHITEOUT_HEADER:  u16 = LEAF_ENTRY_SPILL_FLAG;            // total = 0, spill set
+pub const STORE_KIND_WHITEOUT:      u8  = 0xFF;                             // §8.1 TagDirectory
+pub const CBOR_NULL_BYTE:           u8  = 0xF6;                             // §10.1, §10.2
+pub const KEY_TYPE_WHITEOUT:        u8  = 0xFF;                             // §11.2 history sidecars
+// Forward whiteout: header has the spill bit set with total = 0.
+const _: () = assert!(FORWARD_WHITEOUT_HEADER & LEAF_ENTRY_TOTAL_MASK == 0);
+const _: () = assert!(FORWARD_WHITEOUT_HEADER & LEAF_ENTRY_SPILL_FLAG != 0);
+// STORE_KIND_WHITEOUT must not collide with a real store_kind (Simple,
+// Ordered, Ranked are 0/1/2 by §8.3 prose; reserve 0xFF).
+pub const STORE_KIND_SIMPLE:  u8 = 0;
+pub const STORE_KIND_ORDERED: u8 = 1;
+pub const STORE_KIND_RANKED:  u8 = 2;
+const _: () = assert!(STORE_KIND_WHITEOUT != STORE_KIND_SIMPLE);
+const _: () = assert!(STORE_KIND_WHITEOUT != STORE_KIND_ORDERED);
+const _: () = assert!(STORE_KIND_WHITEOUT != STORE_KIND_RANKED);
+
 // SnapshotNode.flags
 pub const SNAPSHOT_FLAG_LEAF:    u8 = 1 << 0;
 pub const SNAPSHOT_FLAG_DELETED: u8 = 1 << 1;
@@ -1158,9 +1190,10 @@ const _: () = assert!(WAL_MAX_PAYLOAD_ENCRYPTED == 4_036);
 const _: () = assert!(WAL_OP_MAX_PAYLOAD == 4_036);
 
 // §3.3 variable-length op-field caps that keep every op under WAL_OP_MAX_PAYLOAD
-// even with CBOR overhead. Sized so the largest op (Checkpoint with a 424 B
-// RootPointer, or SnapshotCreate with a 256 B label) stays comfortably below
-// the sector bound. owner_key is naturally bounded by §6.2's 16 B BackpointerValue.
+// even with CBOR overhead. Sized so the largest op (Checkpoint with a 408 B
+// RootPointer plus ~20 B CBOR framing, or SnapshotCreate with a 256 B label)
+// stays comfortably below the sector bound. owner_key is naturally bounded
+// by §6.2's 16 B BackpointerValue.
 pub const WAL_LABEL_MAX_BYTES:      usize = 256;
 pub const WAL_CURSOR_KEY_MAX_BYTES: usize = 256;
 pub const WAL_OWNER_KEY_BYTES:      usize = 16;     // §6.2 BackpointerValue.owner_key
