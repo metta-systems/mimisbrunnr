@@ -647,12 +647,12 @@ struct WalHeader {                           // 4096 bytes (one block)
     write_cursor: u64,                       // [40..48]  byte offset within WAL ring
     read_cursor: u64,                        // [48..56]  oldest entry not yet checkpointed
     used_bytes: u64,                         // [56..64]
-    last_checkpoint_lsn: u64,                // [64..72]
-    last_checkpoint_offset: u64,             // [72..80]  block_no of newest Checkpoint block
-    segment_size: u32,                       // [80..84]  typically 1 MiB
-    _pad: u32,                               // [84..88]  align to u64
-    encryption_keyid: [u8; 16],              // [88..104]
-    _reserved: [u8; 3988],                   // [104..4092]
+    last_checkpoint_lsn: u64,                // [64..72]  newest Checkpoint entry's LSN;
+                                             //           recovery scans forward from there
+    segment_size: u32,                       // [72..76]  typically 1 MiB
+    _pad: u32,                               // [76..80]  align to u64
+    encryption_keyid: [u8; 16],              // [80..96]
+    _reserved: [u8; 3996],                   // [96..4092]
     // trailing CRC32C at [4092..4096] inside BlockHeader's frame
 }
 ```

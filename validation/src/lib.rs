@@ -286,12 +286,13 @@ pub struct WalHeader {
     pub write_cursor: u64,              //    8
     pub read_cursor: u64,               //    8
     pub used_bytes: u64,                //    8
-    pub last_checkpoint_lsn: u64,       //    8
-    pub last_checkpoint_offset: u64,    //    8
+    pub last_checkpoint_lsn: u64,       //    8  newest Checkpoint entry's LSN;
+                                        //       no separate physical pointer — recovery
+                                        //       scans forward from this LSN.
     pub segment_size: u32,              //    4
     pub _pad: u32,                      //    4
     pub encryption_keyid: [u8; 16],     //   16
-    pub _reserved: [u8; 3988],          // 3988
+    pub _reserved: [u8; 3996],          // 3996
     pub trailing_crc: u32,              //    4
 }
 const _: () = assert!(size_of::<WalHeader>() == 4096);
