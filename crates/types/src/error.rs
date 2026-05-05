@@ -1,63 +1,33 @@
-/// Common error types for the Mímisbrunnr filesystem.
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("object not found: {0}")]
-    ObjectNotFound(crate::ObjectId),
+//! Crate-level error type.
+//!
+//! Per `docs/REWRITE_CONTRACT.md` §2, every crate exposes a single
+//! `thiserror`-derived error enum. Public APIs return `Result<T, TypesError>`.
 
-    #[error("tag not found: {0}")]
-    TagNotFound(crate::TagId),
+use thiserror::Error;
 
-    #[error("invalid object state: expected {expected:?}, found {found:?}")]
-    InvalidObjectState {
-        expected: crate::ObjectState,
-        found: crate::ObjectState,
-    },
+/// Errors produced by `mimisbrunnr-types`.
+#[derive(Debug, Error)]
+pub enum TypesError {
+    /// CBOR encoding failure (e.g. ran out of memory while writing).
+    #[error("CBOR encoding failed: {0}")]
+    CborEncode(String),
 
-    #[error("storage I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    /// CBOR decoding failure (truncated input, type mismatch, etc.).
+    #[error("CBOR decoding failed: {0}")]
+    CborDecode(String),
 
-    #[error("data corruption: {message}")]
-    Corruption { message: String },
-
-    #[error("capacity exceeded: {message}")]
-    CapacityExceeded { message: String },
-
-    #[error("invalid argument: {message}")]
-    InvalidArgument { message: String },
-
-    #[error("ontology violation: {message}")]
-    OntologyViolation { message: String },
-
-    #[error("cycle detected in implication DAG")]
-    CycleDetected,
-
-    #[error("context not found: {0}")]
-    ContextNotFound(String),
-
-    #[error("context already exists: {0}")]
-    ContextAlreadyExists(String),
-
-    #[error("path not found{}: {path}", context.as_ref().map(|c| format!(" in context {c}")).unwrap_or_default())]
-    PathNotFound {
-        context: Option<String>,
-        path: String,
-    },
+    /// `Value::Scoped` whose `inner` is itself a `Scoped` — disallowed by
+    /// IMPL §4.3 (nested scopes are a format error).
+    #[error("Value::Scoped may not directly contain another Scoped value")]
+    NestedScopedValue,
 }
 
-#[cfg(test)]
-mod tests {
-    use {super::*, crate::ObjectId};
-
-    #[test]
-    fn error_display() {
-        let e = Error::ObjectNotFound(ObjectId::new(1, 42));
-        assert_eq!(format!("{e}"), "object not found: obj:1:42");
+impl TypesError {
+    pub(crate) fn cbor_encode<E: std::fmt::Display>(e: E) -> Self {
+        Self::CborEncode(e.to_string())
     }
 
-    #[test]
-    fn io_error_conversion() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
-        let e: Error = io_err.into();
-        assert!(matches!(e, Error::Io(_)));
+    pub(crate) fn cbor_decode<E: std::fmt::Display>(e: E) -> Self {
+        Self::CborDecode(e.to_string())
     }
 }

@@ -1,33 +1,92 @@
-use crate::NodeId;
+//! Globally unique [`ObjectId`] (DESIGN §2.1).
+//!
+//! Bit layout:
+//! ```text
+//! 63                           48 47                                       0
+//! ┌─────────────────────────────┬──────────────────────────────────────────┐
+//! │       node id (u16)         │              local seq (u48)             │
+//! └─────────────────────────────┴──────────────────────────────────────────┘
+//! ```
+//!
+//! 16-bit node prefix lets cluster nodes mint IDs with zero coordination, and
+//! the 48-bit local sequence is large enough that exhaustion is not a
+//! practical concern (281 trillion IDs per node).
 
-/// Globally unique object identifier.
-///
-/// Top 16 bits encode the originating node ID, bottom 48 bits are
-/// a monotonically increasing local sequence number. This allows
-/// independent creation across cluster nodes with zero coordination.
-#[derive(Debug, PartialEq, Copy, Clone, Eq, PartialOrd, Ord, Hash)]
+use arbitrary_int::u48;
+use bitbybit::bitfield;
+use serde::{Deserialize, Serialize};
+
+use crate::ids::NodeId;
+
+/// Object identifier — 64 bits total, packed as `node:16 || local:48`.
+#[bitfield(u64, default = 0)]
+#[derive(PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId {
-    node: NodeId,
-    local: u64,
+    /// Local sequence (low 48 bits).
+    #[bits(0..=47, rw)]
+    local: u48,
+    /// Originating cluster node (high 16 bits).
+    #[bits(48..=63, rw)]
+    node: u16,
 }
 
 impl ObjectId {
-    pub fn new(node: NodeId, local: u64) -> Self {
-        Self { node, local }
+    /// Construct from `(node, local)`. `local` is silently masked to 48 bits.
+    #[inline]
+    pub const fn from_parts(node: NodeId, local: u64) -> Self {
+        let masked = local & 0x0000_ffff_ffff_ffff;
+        Self::DEFAULT.with_node(node).with_local(u48::new(masked))
     }
 
-    pub fn node(&self) -> NodeId {
-        self.node
+    /// Convert to its raw `u64` representation.
+    #[inline]
+    pub const fn to_u64(self) -> u64 {
+        self.raw_value()
     }
 
-    pub fn local(&self) -> u64 {
-        self.local
+    /// Construct from a raw `u64`.
+    #[inline]
+    pub const fn from_u64(raw: u64) -> Self {
+        Self::new_with_raw_value(raw)
+    }
+
+    /// Cluster node that minted this id.
+    #[inline]
+    pub const fn node_id(self) -> NodeId {
+        self.node()
+    }
+
+    /// Local sequence — the low 48 bits, returned widened to `u64`.
+    #[inline]
+    pub const fn local_seq(self) -> u64 {
+        self.local().value()
+    }
+}
+
+impl std::fmt::Debug for ObjectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectId")
+            .field("node", &self.node_id())
+            .field("local", &self.local_seq())
+            .finish()
     }
 }
 
 impl std::fmt::Display for ObjectId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "obj:{:x}:{}", self.node, self.local)
+        write!(f, "obj:{:x}:{}", self.node_id(), self.local_seq())
+    }
+}
+
+impl Serialize for ObjectId {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        self.to_u64().serialize(ser)
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectId {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        u64::deserialize(de).map(Self::from_u64)
     }
 }
 
@@ -36,53 +95,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trip_node_and_local() {
-        let id = ObjectId::new(42, 1_000_000);
-        assert_eq!(id.node(), 42);
-        assert_eq!(id.local(), 1_000_000);
+    fn round_trip_parts_to_u64() {
+        let id = ObjectId::from_parts(0xabcd, 0x0000_0001_2345_6789);
+        let raw = id.to_u64();
+        let back = ObjectId::from_u64(raw);
+        assert_eq!(back.node_id(), 0xabcd);
+        assert_eq!(back.local_seq(), 0x0000_0001_2345_6789);
+        assert_eq!(id, back);
     }
 
     #[test]
-    fn zero_node() {
-        let id = ObjectId::new(0, 123);
-        assert_eq!(id.node(), 0);
-        assert_eq!(id.local(), 123);
+    fn raw_layout_matches_spec() {
+        // node=0x1234 occupies bits 48..64, local=0x5_6789_abcd_ef occupies
+        // bits 0..48. Packed u64 = (node as u64 << 48) | local.
+        let id = ObjectId::from_parts(0x1234, 0x0567_89ab_cdef);
+        let expected: u64 = (0x1234u64 << 48) | 0x0567_89ab_cdef;
+        assert_eq!(id.to_u64(), expected);
     }
 
     #[test]
-    fn max_node() {
-        let id = ObjectId::new(u64::MAX, 0);
-        assert_eq!(id.node(), u64::MAX);
-        assert_eq!(id.local(), 0);
+    fn local_high_bits_are_masked() {
+        // Construct with a >48-bit local; the 16 high bits should be discarded
+        // rather than corrupting the node field.
+        let id = ObjectId::from_parts(7, u64::MAX);
+        assert_eq!(id.node_id(), 7);
+        assert_eq!(id.local_seq(), 0x0000_ffff_ffff_ffff);
     }
 
     #[test]
-    fn max_local() {
-        let max_local = 0xffff_ffff_ffff;
-        let id = ObjectId::new(1, max_local);
-        assert_eq!(id.node(), 1);
-        assert_eq!(id.local(), max_local);
-    }
-
-    // #[test]
-    // fn raw_round_trip() {
-    //     let id = ObjectId::new(7, 999);
-    //     let raw = id.raw_value();
-    //     assert_eq!(ObjectId::from_raw(raw), id);
-    // }
-
-    #[test]
-    fn display_format() {
-        let id = ObjectId::new(1, 42);
-        assert_eq!(format!("{id}"), "obj:1:42");
-    }
-
-    #[test]
-    fn ordering() {
-        let a = ObjectId::new(1, 1);
-        let b = ObjectId::new(1, 2);
-        let c = ObjectId::new(2, 1);
+    fn ordering_by_node_then_local() {
+        let a = ObjectId::from_parts(1, 100);
+        let b = ObjectId::from_parts(1, 200);
+        let c = ObjectId::from_parts(2, 0);
         assert!(a < b);
         assert!(b < c);
+    }
+
+    #[test]
+    fn serde_round_trip_via_cbor() {
+        let id = ObjectId::from_parts(42, 1_000_000);
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&id, &mut buf).unwrap();
+        let back: ObjectId = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(id, back);
     }
 }

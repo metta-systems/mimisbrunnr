@@ -1,407 +1,490 @@
+//! Superblock — IMPL §2.1 / §2.2.
+//!
+//! Three redundant copies are written at byte offsets `0`, `4096`, and
+//! `device_capacity - 4096`. The active copy is the one with the highest
+//! `(seq, lsn)` pair (per its active root) whose CRC validates.
+
 use {
-    crate::{
-        StorageError,
-        layout::{ExtentLayout, ZoneExtent},
-    },
+    bytemuck::{Pod, Zeroable},
     log::trace,
+    static_assertions::const_assert_eq,
 };
 
-/// Magic bytes identifying a Mímisbrunnr superblock: "MIMIS\x01\x00\x00"
-const MAGIC: [u8; 8] = *b"MIMIR\x01\0\0";
+use crate::{
+    block::{BLOCK_SIZE, BlockHeader, BlockKind, block_crc},
+    block_device::BlockDevice,
+    error::StorageError,
+    root_pointer::{BlockRef, RootPointer},
+    zone_map::ZoneExtent,
+};
 
-/// Current on-disk format version.
-const FORMAT_VERSION: u32 = 1;
+/// `"MIMISBRUNNR\0\0\0\0\0"` full magic. IMPL §1.4 / §2.1.
+pub const SUPERBLOCK_MAGIC_FULL: [u8; 16] = *b"MIMISBRUNNR\0\0\0\0\0";
 
-/// Superblock size in bytes (fits in one 4K block).
-const SUPERBLOCK_BYTES: usize = 128;
+/// 16-byte placeholder for the inline `ChunkParamsRecord`. The full struct
+/// is owned by §9.3 in a later phase; we store the bytes opaquely so the
+/// Superblock layout remains stable.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, Eq, PartialEq)]
+pub struct ChunkParamsRecord {
+    pub bytes: [u8; 16],
+}
 
-/// The superblock anchors the filesystem. Written at three locations:
-/// offset 0, offset 4K, and at end-4K (backup).
+const_assert_eq!(core::mem::size_of::<ChunkParamsRecord>(), 16);
+
+/// 4 KiB superblock layout. IMPL §2.1.
 ///
-/// Binary layout (128 bytes, all little-endian):
-/// ```text
-///  [0..8]    magic
-///  [8..12]   format_version
-///  [12..14]  node_id
-///  [14..16]  disk_id
-///  [16..24]  device_capacity
-///  [24..32]  index_zone_offset   (first extent)
-///  [32..40]  index_zone_size     (first extent)
-///  [40..48]  metadata_zone_offset (first extent)
-///  [48..56]  metadata_zone_size   (first extent)
-///  [56..64]  blob_zone_offset    (first extent)
-///  [64..72]  blob_zone_size      (first extent)
-///  [72..80]  wal_offset
-///  [80..88]  alloc_bitmap_offset
-///  [88..96]  alloc_bitmap_size
-///  [96..104] creation_timestamp_ns
-///  [104..112] last_checkpoint_lsn
-///  [112..120] zone_map_offset (0 = single-extent zones, >0 = read ZoneMap for full extents)
-///  [120..124] checksum (CRC32C of bytes [0..120])
-///  [124..128] padding
-/// ```
-#[derive(Debug, Clone)]
+/// **Active-root selection** uses the `seq` / `lsn` of the *active* root
+/// (`active_root` field), so corrupting one copy and not its pair still
+/// allows recovery via the inactive root.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct Superblock {
-    pub node_id: u16,
-    pub disk_id: u16,
-    pub layout: ExtentLayout,
-    pub creation_timestamp_ns: i64,
-    pub last_checkpoint_lsn: u64,
-    /// Offset of the zone map block on disk. 0 means single-extent zones (inline in superblock).
-    pub zone_map_offset: u64,
+    pub header: BlockHeader,                  // [0..32]    kind = Superblock
+    pub magic_full: [u8; 16],                 // [32..48]   "MIMISBRUNNR\0\0\0\0\0"
+    pub fs_uuid: [u8; 16],                    // [48..64]
+    pub node_id: u16,                         // [64..66]
+    pub disk_id: u16,                         // [66..68]
+    pub media_type: u8,                       // [68..69]
+    pub tier: u8,                             // [69..70]
+    pub _pad0: [u8; 2],                       // [70..72]
+    pub device_capacity: u64,                 // [72..80]
+    pub block_size_log2: u8,                  // [80..81]
+    pub _pad1: [u8; 7],                       // [81..88]
+    pub creation_timestamp_ns: i64,           // [88..96]
+    pub last_mount_timestamp_ns: i64,         // [96..104]
+    pub mount_count: u64,                     // [104..112]
+
+    pub root_a: RootPointer,                  // [112..520]   408 B
+    pub root_b: RootPointer,                  // [520..928]
+    pub active_root: u8,                      // [928..929]   0 = a, 1 = b
+    pub _pad2: [u8; 7],                       // [929..936]
+
+    pub wal_offset: u64,                      // [936..944]
+    pub wal_size: u64,                        // [944..952]
+    pub bucket_size_log2: u8,                 // [952..953]
+    pub copygc_reserve_pct: u8,               // [953..954]
+    pub btree_node_size_log2: u8,             // [954..955]
+    pub _pad3: [u8; 5],                       // [955..960]
+    pub bootstrap_buckets: u32,               // [960..964]
+    pub _pad4: [u8; 4],                       // [964..968]
+    pub zone_map_offset: u64,                 // [968..976]
+
+    pub index_zone: ZoneExtent,               // [976..1000]
+    pub metadata_zone: ZoneExtent,            // [1000..1024]
+    pub blob_zone: ZoneExtent,                // [1024..1048]
+
+    pub encryption_keyid: [u8; 16],           // [1048..1064]
+    pub fs_format_version: u32,               // [1064..1068]
+    pub fs_min_on_disk: u32,                  // [1068..1072]
+    pub compat_features: u64,                 // [1072..1080]
+    pub ro_compat_features: u64,              // [1080..1088]
+    pub incompat_features: u64,               // [1088..1096]
+    pub downgrade_log_ref: BlockRef,          // [1096..1112]
+
+    pub default_chunking_threshold: u64,      // [1112..1120]
+    pub default_chunking: ChunkParamsRecord,  // [1120..1136]
+
+    pub _reserved: [u8; 2956],                // [1136..4092]
+    pub crc: u32,                             // [4092..4096]
 }
 
-impl PartialEq for Superblock {
-    fn eq(&self, other: &Self) -> bool {
-        self.node_id == other.node_id
-            && self.disk_id == other.disk_id
-            && self.creation_timestamp_ns == other.creation_timestamp_ns
-            && self.last_checkpoint_lsn == other.last_checkpoint_lsn
-            && self.zone_map_offset == other.zone_map_offset
-            // Compare layout fields that are serialized
-            && self.layout.device_capacity == other.layout.device_capacity
-            && self.layout.wal_offset == other.layout.wal_offset
-            && self.layout.alloc_bitmap_offset == other.layout.alloc_bitmap_offset
-            && self.layout.alloc_bitmap_size == other.layout.alloc_bitmap_size
-            && self.layout.index_extents == other.layout.index_extents
-            && self.layout.metadata_extents == other.layout.metadata_extents
-            && self.layout.blob_extents == other.layout.blob_extents
-    }
-}
+const_assert_eq!(core::mem::size_of::<Superblock>(), 4096);
 
-impl Eq for Superblock {}
+/// CRC-slot offset within the 4 KiB block.
+const SUPERBLOCK_CRC_OFFSET: usize = 4092;
 
 impl Superblock {
-    /// Create a new superblock for the given layout.
-    pub fn new(node_id: u16, disk_id: u16, layout: ExtentLayout) -> Self {
-        Self {
-            node_id,
-            disk_id,
-            layout,
-            creation_timestamp_ns: 0,
-            last_checkpoint_lsn: 0,
-            zone_map_offset: 0,
+    /// Build a zero-initialised superblock with default identity fields and
+    /// pre-populated with the `format`-time inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_blank(
+        fs_uuid: [u8; 16],
+        node_id: u16,
+        disk_id: u16,
+        media_type: u8,
+        tier: u8,
+        device_capacity: u64,
+        bucket_size_log2: u8,
+        btree_node_size_log2: u8,
+        bootstrap_buckets: u32,
+        wal_offset: u64,
+        wal_size: u64,
+        index_zone: ZoneExtent,
+        metadata_zone: ZoneExtent,
+        blob_zone: ZoneExtent,
+        format_version: u16,
+    ) -> Self {
+        let mut sb: Self = bytemuck::Zeroable::zeroed();
+        sb.header = BlockHeader::new(
+            BlockKind::Superblock,
+            format_version,
+            (BLOCK_SIZE - 32 - 4) as u32,
+        );
+        sb.magic_full = SUPERBLOCK_MAGIC_FULL;
+        sb.fs_uuid = fs_uuid;
+        sb.node_id = node_id;
+        sb.disk_id = disk_id;
+        sb.media_type = media_type;
+        sb.tier = tier;
+        sb.device_capacity = device_capacity;
+        sb.block_size_log2 = 12;
+        sb.bucket_size_log2 = bucket_size_log2;
+        sb.btree_node_size_log2 = btree_node_size_log2;
+        sb.bootstrap_buckets = bootstrap_buckets;
+        sb.wal_offset = wal_offset;
+        sb.wal_size = wal_size;
+        sb.index_zone = index_zone;
+        sb.metadata_zone = metadata_zone;
+        sb.blob_zone = blob_zone;
+        sb.fs_format_version = format_version as u32;
+        sb.fs_min_on_disk = format_version as u32;
+        sb.copygc_reserve_pct = 8;
+        sb.active_root = 0;
+        sb.root_a.recompute_crc();
+        sb.root_b.recompute_crc();
+        sb.recompute_crc();
+        sb
+    }
+
+    /// Recompute and store the trailing CRC (`bytes[0..4092]` with the CRC
+    /// slot zeroed).
+    pub fn recompute_crc(&mut self) {
+        self.crc = 0;
+        let crc = block_crc(&bytemuck::bytes_of(self)[..SUPERBLOCK_CRC_OFFSET]);
+        self.crc = crc;
+    }
+
+    /// Validate the trailing CRC.
+    pub fn verify_crc(&self) -> Result<(), StorageError> {
+        let expected = { self.crc };
+        let mut copy = *self;
+        copy.crc = 0;
+        let actual = block_crc(&bytemuck::bytes_of(&copy)[..SUPERBLOCK_CRC_OFFSET]);
+        if expected == actual {
+            Ok(())
+        } else {
+            Err(StorageError::CrcMismatch { expected, actual })
         }
     }
 
-    /// Serialize to a 128-byte buffer.
-    ///
-    /// Only the first extent of each zone is stored inline. If zones have
-    /// multiple extents, the caller must also write a ZoneMap block and set
-    /// `zone_map_offset` before calling this.
-    pub fn to_bytes(&self) -> [u8; SUPERBLOCK_BYTES] {
-        let mut buf = [0u8; SUPERBLOCK_BYTES];
-        let l = &self.layout;
-
-        buf[0..8].copy_from_slice(&MAGIC);
-        buf[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        buf[12..14].copy_from_slice(&self.node_id.to_le_bytes());
-        buf[14..16].copy_from_slice(&self.disk_id.to_le_bytes());
-        buf[16..24].copy_from_slice(&l.device_capacity.to_le_bytes());
-        // First extent of each zone (bootstrap info)
-        buf[24..32].copy_from_slice(&l.index_zone_offset().to_le_bytes());
-        buf[32..40].copy_from_slice(&l.index_extents[0].size.to_le_bytes());
-        buf[40..48].copy_from_slice(&l.metadata_zone_offset().to_le_bytes());
-        buf[48..56].copy_from_slice(&l.metadata_extents[0].size.to_le_bytes());
-        buf[56..64].copy_from_slice(&l.blob_zone_offset().to_le_bytes());
-        buf[64..72].copy_from_slice(&l.blob_extents[0].size.to_le_bytes());
-        buf[72..80].copy_from_slice(&l.wal_offset.to_le_bytes());
-        buf[80..88].copy_from_slice(&l.alloc_bitmap_offset.to_le_bytes());
-        buf[88..96].copy_from_slice(&l.alloc_bitmap_size.to_le_bytes());
-        buf[96..104].copy_from_slice(&self.creation_timestamp_ns.to_le_bytes());
-        buf[104..112].copy_from_slice(&self.last_checkpoint_lsn.to_le_bytes());
-        buf[112..120].copy_from_slice(&self.zone_map_offset.to_le_bytes());
-
-        let crc = crc32fast::hash(&buf[0..120]);
-        buf[120..124].copy_from_slice(&crc.to_le_bytes());
-
-        buf
+    /// Return the active `RootPointer`, picked by `active_root`.
+    pub fn active_root_pointer(&self) -> &RootPointer {
+        if self.active_root == 0 {
+            &self.root_a
+        } else {
+            &self.root_b
+        }
     }
 
-    /// Deserialize from a 128-byte buffer.
-    ///
-    /// Reconstructs the layout with single extents from the inline data.
-    /// If `zone_map_offset` is non-zero, the caller should read the ZoneMap
-    /// block and replace the extent lists with the full data.
-    pub fn from_bytes(buf: &[u8; SUPERBLOCK_BYTES]) -> Result<Self, StorageError> {
-        if buf[0..8] != MAGIC {
-            return Err(StorageError::InvalidMagic);
-        }
+    /// The byte offsets at which the 3 superblock copies live on a device of
+    /// `capacity` bytes. IMPL §2.
+    pub fn copy_offsets(capacity: u64) -> [u64; 3] {
+        [0, BLOCK_SIZE as u64, capacity - BLOCK_SIZE as u64]
+    }
 
-        let version = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        if version != FORMAT_VERSION {
-            return Err(StorageError::UnsupportedVersion(version));
-        }
-
-        let expected_crc = u32::from_le_bytes(buf[120..124].try_into().unwrap());
-        let actual_crc = crc32fast::hash(&buf[0..120]);
-        if expected_crc != actual_crc {
-            return Err(StorageError::ChecksumMismatch {
-                expected: expected_crc,
-                actual: actual_crc,
+    /// Format a fresh device: write the same blank superblock to all 3
+    /// redundant locations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn format(
+        device: &dyn BlockDevice,
+        fs_uuid: [u8; 16],
+        node_id: u16,
+        disk_id: u16,
+        media_type: u8,
+        tier: u8,
+        bucket_size_log2: u8,
+        btree_node_size_log2: u8,
+        bootstrap_buckets: u32,
+        wal_offset: u64,
+        wal_size: u64,
+        index_zone: ZoneExtent,
+        metadata_zone: ZoneExtent,
+        blob_zone: ZoneExtent,
+        format_version: u16,
+    ) -> Result<Self, StorageError> {
+        let capacity = device.capacity();
+        if capacity < (BLOCK_SIZE as u64) * 3 {
+            return Err(StorageError::DeviceTooSmall {
+                need: (BLOCK_SIZE as u64) * 3,
+                have: capacity,
             });
         }
-
-        let node_id = u16::from_le_bytes(buf[12..14].try_into().unwrap());
-        let disk_id = u16::from_le_bytes(buf[14..16].try_into().unwrap());
-        let device_capacity = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-        let index_zone_offset = u64::from_le_bytes(buf[24..32].try_into().unwrap());
-        let index_zone_size = u64::from_le_bytes(buf[32..40].try_into().unwrap());
-        let metadata_zone_offset = u64::from_le_bytes(buf[40..48].try_into().unwrap());
-        let metadata_zone_size = u64::from_le_bytes(buf[48..56].try_into().unwrap());
-        let blob_zone_offset = u64::from_le_bytes(buf[56..64].try_into().unwrap());
-        let blob_zone_size = u64::from_le_bytes(buf[64..72].try_into().unwrap());
-        let wal_offset = u64::from_le_bytes(buf[72..80].try_into().unwrap());
-        let alloc_bitmap_offset = u64::from_le_bytes(buf[80..88].try_into().unwrap());
-        let alloc_bitmap_size = u64::from_le_bytes(buf[88..96].try_into().unwrap());
-        let creation_timestamp_ns = i64::from_le_bytes(buf[96..104].try_into().unwrap());
-        let last_checkpoint_lsn = u64::from_le_bytes(buf[104..112].try_into().unwrap());
-        let zone_map_offset = u64::from_le_bytes(buf[112..120].try_into().unwrap());
-
-        let layout = ExtentLayout {
-            index_extents: vec![ZoneExtent::new(index_zone_offset, index_zone_size)],
-            metadata_extents: vec![ZoneExtent::new(metadata_zone_offset, metadata_zone_size)],
-            blob_extents: vec![ZoneExtent::new(blob_zone_offset, blob_zone_size)],
-            device_capacity,
-            superblock_primary: 0,
-            superblock_copy: crate::SUPERBLOCK_SIZE,
-            wal_offset,
-            alloc_bitmap_offset,
-            alloc_bitmap_size,
-            block_class_map_offset: 0,
-            block_class_map_size: 0,
-            superblock_backup: device_capacity - crate::SUPERBLOCK_SIZE,
-        };
-
-        Ok(Self {
+        let sb = Self::new_blank(
+            fs_uuid,
             node_id,
             disk_id,
-            layout,
-            creation_timestamp_ns,
-            last_checkpoint_lsn,
-            zone_map_offset,
-        })
-    }
-
-    /// Write superblock to all three locations on the device.
-    pub fn write_to(&self, dev: &dyn crate::BlockDevice) -> Result<(), StorageError> {
-        trace!(
-            "superblock::write_to primary={:#x} copy={:#x} backup={:#x}",
-            self.layout.superblock_primary,
-            self.layout.superblock_copy,
-            self.layout.superblock_backup
+            media_type,
+            tier,
+            capacity,
+            bucket_size_log2,
+            btree_node_size_log2,
+            bootstrap_buckets,
+            wal_offset,
+            wal_size,
+            index_zone,
+            metadata_zone,
+            blob_zone,
+            format_version,
         );
-        let bytes = self.to_bytes();
-        // Pad to full block
-        let mut block = [0u8; crate::BLOCK_SIZE as usize];
-        block[..SUPERBLOCK_BYTES].copy_from_slice(&bytes);
-
-        dev.write_at(self.layout.superblock_primary, &block)?;
-        dev.write_at(self.layout.superblock_copy, &block)?;
-        dev.write_at(self.layout.superblock_backup, &block)?;
-        dev.sync()?;
-        Ok(())
-    }
-
-    /// Read and validate superblock from the primary location.
-    /// Falls back to copy and backup on failure.
-    ///
-    /// If `zone_map_offset` is non-zero, the caller should subsequently read
-    /// the ZoneMap block to get the full extent lists and update the layout.
-    pub fn read_from(dev: &dyn crate::BlockDevice) -> Result<Self, StorageError> {
-        let mut block = [0u8; crate::BLOCK_SIZE as usize];
-
-        // Try primary
-        trace!("superblock::read_from trying primary at offset 0");
-        if dev.read_at(0, &mut block).is_ok() {
-            let bytes: &[u8; SUPERBLOCK_BYTES] = block[..SUPERBLOCK_BYTES].try_into().unwrap();
-            if let Ok(sb) = Self::from_bytes(bytes) {
-                return Ok(sb);
-            }
+        let bytes = bytemuck::bytes_of(&sb);
+        for off in Self::copy_offsets(capacity) {
+            device.write_at(off, bytes)?;
         }
-
-        // Try copy at offset 4K
-        trace!(
-            "superblock::read_from trying copy at offset {:#x}",
-            crate::SUPERBLOCK_SIZE
-        );
-        if dev.read_at(crate::SUPERBLOCK_SIZE, &mut block).is_ok() {
-            let bytes: &[u8; SUPERBLOCK_BYTES] = block[..SUPERBLOCK_BYTES].try_into().unwrap();
-            if let Ok(sb) = Self::from_bytes(bytes) {
-                return Ok(sb);
-            }
-        }
-
-        // Try backup at end
-        trace!("superblock::read_from trying backup");
-        // we need to know the device size
-        let cap = dev.capacity();
-        if cap >= crate::SUPERBLOCK_SIZE {
-            let backup_offset = cap - crate::SUPERBLOCK_SIZE;
-            if dev.read_at(backup_offset, &mut block).is_ok() {
-                let bytes: &[u8; SUPERBLOCK_BYTES] = block[..SUPERBLOCK_BYTES].try_into().unwrap();
-                if let Ok(sb) = Self::from_bytes(bytes) {
-                    return Ok(sb);
-                }
-            }
-        }
-
-        Err(StorageError::InvalidMagic)
-    }
-
-    /// Read superblock and load full extent layout from ZoneMap if present.
-    ///
-    /// This is the preferred way to load a superblock — it handles the
-    /// two-phase read (superblock → zone map) automatically.
-    pub fn read_with_extents(dev: &dyn crate::BlockDevice) -> Result<Self, StorageError> {
-        let mut sb = Self::read_from(dev)?;
-        if sb.zone_map_offset != 0 {
-            let extents = crate::ZoneMap::read_from(dev, sb.zone_map_offset)?;
-            sb.layout.index_extents = extents.index;
-            sb.layout.metadata_extents = extents.metadata;
-            sb.layout.blob_extents = extents.blob;
-        }
+        device.sync()?;
         Ok(sb)
+    }
+
+    /// Open an already-formatted device. Reads all 3 redundant copies, picks
+    /// the one with the highest `(active_root.seq, active_root.lsn)` whose
+    /// own CRC validates.
+    pub fn open(device: &dyn BlockDevice) -> Result<Self, StorageError> {
+        let capacity = device.capacity();
+        if capacity < (BLOCK_SIZE as u64) * 3 {
+            return Err(StorageError::DeviceTooSmall {
+                need: (BLOCK_SIZE as u64) * 3,
+                have: capacity,
+            });
+        }
+        let mut best: Option<(u64, u64, Superblock)> = None;
+        for off in Self::copy_offsets(capacity) {
+            let mut buf = vec![0u8; BLOCK_SIZE];
+            if device.read_at(off, &mut buf).is_err() {
+                continue;
+            }
+            let sb: Superblock = match bytemuck::try_from_bytes::<Superblock>(&buf) {
+                Ok(s) => *s,
+                Err(_) => continue,
+            };
+            if sb.magic_full != SUPERBLOCK_MAGIC_FULL {
+                trace!("superblock copy@{off} bad magic");
+                continue;
+            }
+            if sb.verify_crc().is_err() {
+                trace!("superblock copy@{off} crc fail");
+                continue;
+            }
+            let active = sb.active_root_pointer();
+            if active.verify_crc().is_err() {
+                // Active root corrupt — try the inactive root before discarding.
+                let inactive = if sb.active_root == 0 { &sb.root_b } else { &sb.root_a };
+                if inactive.verify_crc().is_err() {
+                    trace!("superblock copy@{off} both roots corrupt");
+                    continue;
+                }
+                // Synthesise a working copy where the inactive becomes active.
+                let mut healed = sb;
+                healed.active_root ^= 1;
+                healed.recompute_crc();
+                let key_seq = { inactive.seq };
+                let key_lsn = { inactive.lsn };
+                trace!(
+                    "superblock copy@{off} healed via inactive root seq={key_seq} lsn={key_lsn}"
+                );
+                let cand = (key_seq, key_lsn, healed);
+                if best
+                    .as_ref()
+                    .is_none_or(|b| (cand.0, cand.1) > (b.0, b.1))
+                {
+                    best = Some(cand);
+                }
+                continue;
+            }
+            let key_seq = { active.seq };
+            let key_lsn = { active.lsn };
+            let cand = (key_seq, key_lsn, sb);
+            if best
+                .as_ref()
+                .is_none_or(|b| (cand.0, cand.1) > (b.0, b.1))
+            {
+                best = Some(cand);
+            }
+        }
+        best.map(|(_, _, sb)| sb).ok_or(StorageError::NoValidSuperblock)
+    }
+
+    /// Commit a new `RootPointer`, executing steps 5–6 of the IMPL §2.2 atomic
+    /// commit protocol:
+    ///
+    /// 5. Write the new pointer into the **inactive** slot of all 3 superblock
+    ///    copies, flip `active_root`, recompute CRC, write all 3, fsync.
+    /// 6. (Caller's job: advance WAL `read_cursor` once this returns Ok.)
+    ///
+    /// Steps 1–4 (quiesce, flush dirty pages, append `Checkpoint` WAL entry,
+    /// fsync the WAL) live in the WAL/engine crates and run before this call.
+    pub fn commit_root(
+        &mut self,
+        device: &dyn BlockDevice,
+        mut new: RootPointer,
+    ) -> Result<(), StorageError> {
+        new.recompute_crc();
+        if self.active_root == 0 {
+            self.root_b = new;
+            self.active_root = 1;
+        } else {
+            self.root_a = new;
+            self.active_root = 0;
+        }
+        self.recompute_crc();
+        let bytes = bytemuck::bytes_of(self);
+        for off in Self::copy_offsets(device.capacity()) {
+            device.write_at(off, bytes)?;
+        }
+        device.sync()?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use {
         super::*,
-        crate::{BlockDevice, layout::MIN_DEVICE_SIZE},
+        crate::file_device::FileBlockDevice,
+        tempfile::NamedTempFile,
     };
 
-    fn test_superblock() -> Superblock {
-        let layout = ExtentLayout::compute(256 * 1024 * 1024).unwrap();
-        let mut sb = Superblock::new(1, 0, layout);
-        sb.creation_timestamp_ns = 1_700_000_000_000_000_000;
-        sb.last_checkpoint_lsn = 42;
-        sb
+    fn dummy_extent(off: u64, len: u64) -> ZoneExtent {
+        ZoneExtent { offset: off, length: len, flags: 0, _pad: 0 }
+    }
+
+    fn fmt_default(dev: &FileBlockDevice) -> Superblock {
+        Superblock::format(
+            dev,
+            [0xAB; 16],
+            1,
+            2,
+            0,
+            0,
+            20,
+            18,
+            64,
+            0x1_0000,
+            0x10_0000,
+            dummy_extent(0x100_0000, 0x10_0000),
+            dummy_extent(0x110_0000, 0x10_0000),
+            dummy_extent(0x120_0000, 0x10_0000),
+            1,
+        )
+        .unwrap()
     }
 
     #[test]
-    fn serialize_round_trip() {
-        let sb = test_superblock();
-        let bytes = sb.to_bytes();
-        let sb2 = Superblock::from_bytes(&bytes).unwrap();
-        assert_eq!(sb, sb2);
+    fn superblock_size_4096() {
+        assert_eq!(core::mem::size_of::<Superblock>(), 4096);
     }
 
     #[test]
-    fn invalid_magic_rejected() {
-        let sb = test_superblock();
-        let mut bytes = sb.to_bytes();
-        bytes[0] = b'X';
-        assert!(matches!(
-            Superblock::from_bytes(&bytes),
-            Err(StorageError::InvalidMagic)
-        ));
+    fn format_open_round_trip() {
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+        let sb_w = fmt_default(&dev);
+        let sb_r = Superblock::open(&dev).unwrap();
+        let w_node = { sb_w.node_id };
+        let r_node = { sb_r.node_id };
+        assert_eq!(w_node, r_node);
+        let w_disk = { sb_w.disk_id };
+        let r_disk = { sb_r.disk_id };
+        assert_eq!(w_disk, r_disk);
     }
 
     #[test]
-    fn corrupted_checksum_rejected() {
-        let sb = test_superblock();
-        let mut bytes = sb.to_bytes();
-        bytes[50] ^= 0xFF; // Flip a byte in the data
-        assert!(matches!(
-            Superblock::from_bytes(&bytes),
-            Err(StorageError::ChecksumMismatch { .. })
-        ));
+    fn active_root_selection_picks_highest_seq() {
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+        let mut sb = fmt_default(&dev);
+
+        // Build root with seq=5, write to slot A then commit (rotates to B).
+        let mut a_root = RootPointer::default();
+        a_root.seq = 5;
+        a_root.lsn = 50;
+        // Use commit_root to write seq=5 into the (currently inactive) slot.
+        sb.commit_root(&dev, a_root).unwrap();
+
+        // Now commit seq=7.
+        let mut b_root = RootPointer::default();
+        b_root.seq = 7;
+        b_root.lsn = 70;
+        sb.commit_root(&dev, b_root).unwrap();
+
+        // Re-open: active root must be the seq=7 one.
+        let opened = Superblock::open(&dev).unwrap();
+        let active = opened.active_root_pointer();
+        let s = { active.seq };
+        let l = { active.lsn };
+        assert_eq!(s, 7);
+        assert_eq!(l, 70);
     }
 
     #[test]
-    fn write_and_read_from_device() {
-        use crate::FileBlockDevice;
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let cap = 256 * 1024 * 1024u64;
-        let dev = FileBlockDevice::open(tmp.path(), cap).unwrap();
-
-        let layout = ExtentLayout::compute(cap).unwrap();
-        let sb = Superblock::new(7, 0, layout);
-        sb.write_to(&dev).unwrap();
-
-        let sb2 = Superblock::read_from(&dev).unwrap();
-        assert_eq!(sb, sb2);
+    fn open_garbage_device_fails() {
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+        // Device is all zeros — magic check at all 3 copies fails.
+        let err = Superblock::open(&dev).unwrap_err();
+        assert!(matches!(err, StorageError::NoValidSuperblock));
     }
 
     #[test]
-    fn fallback_to_copy_on_primary_corruption() {
-        use crate::FileBlockDevice;
+    fn corrupt_active_copy_falls_back() {
+        // Format, then corrupt copy at offset 0; open should still work via
+        // the other two copies.
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+        let _sb = fmt_default(&dev);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let cap = 256 * 1024 * 1024u64;
-        let dev = FileBlockDevice::open(tmp.path(), cap).unwrap();
+        // Corrupt the first copy's CRC slot.
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        dev.read_at(0, &mut buf).unwrap();
+        buf[SUPERBLOCK_CRC_OFFSET] ^= 0xFF;
+        dev.write_at(0, &buf).unwrap();
 
-        let layout = ExtentLayout::compute(cap).unwrap();
-        let sb = Superblock::new(3, 0, layout);
-        sb.write_to(&dev).unwrap();
-
-        // Corrupt primary superblock
-        dev.write_at(0, &[0xFF; 128]).unwrap();
-
-        let sb2 = Superblock::read_from(&dev).unwrap();
-        assert_eq!(sb, sb2);
+        // Should still open from copies 1 or 2.
+        Superblock::open(&dev).unwrap();
     }
 
     #[test]
-    fn fallback_to_backup_on_both_corruption() {
-        use crate::FileBlockDevice;
+    fn torn_active_root_falls_back_to_inactive() {
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+        let mut sb = fmt_default(&dev);
 
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let cap = 256 * 1024 * 1024u64;
-        let dev = FileBlockDevice::open(tmp.path(), cap).unwrap();
+        // Set root_a to seq=3, then commit a fresh seq=9 root (lands in B).
+        let mut early = RootPointer::default();
+        early.seq = 3;
+        early.lsn = 30;
+        sb.commit_root(&dev, early).unwrap();
 
-        let layout = ExtentLayout::compute(cap).unwrap();
-        let sb = Superblock::new(5, 0, layout);
-        sb.write_to(&dev).unwrap();
+        let mut later = RootPointer::default();
+        later.seq = 9;
+        later.lsn = 90;
+        sb.commit_root(&dev, later).unwrap();
+        // Active is now A (since commit_root toggles), holding seq=9.
 
-        // Corrupt primary and copy
-        dev.write_at(0, &[0xFF; 128]).unwrap();
-        dev.write_at(crate::SUPERBLOCK_SIZE, &[0xFF; 128]).unwrap();
+        // For all 3 superblock copies, corrupt the active root's CRC.
+        for off in Superblock::copy_offsets(dev.capacity()) {
+            let mut buf = vec![0u8; BLOCK_SIZE];
+            dev.read_at(off, &mut buf).unwrap();
+            // active_root field is at offset 928. If 0 ⇒ corrupt root_a (offsets 112..520).
+            let active_byte = buf[928];
+            let (root_off, root_end) = if active_byte == 0 { (112usize, 520usize) } else { (520, 928) };
+            // Flip a byte inside the active root's CRC region.
+            buf[root_end - 1] ^= 0xFF;
+            // Re-checksum the superblock.
+            buf[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4].copy_from_slice(&[0; 4]);
+            let mut tmp_sb_bytes = buf.clone();
+            tmp_sb_bytes[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4].copy_from_slice(&[0; 4]);
+            let new_crc = crc32c::crc32c(&tmp_sb_bytes[..SUPERBLOCK_CRC_OFFSET]);
+            buf[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4]
+                .copy_from_slice(&new_crc.to_le_bytes());
+            dev.write_at(off, &buf).unwrap();
+            // Avoid unused warnings.
+            let _ = root_off;
+        }
 
-        let sb2 = Superblock::read_from(&dev).unwrap();
-        assert_eq!(sb, sb2);
-    }
-
-    #[test]
-    fn min_device_size_works() {
-        let layout = ExtentLayout::compute(MIN_DEVICE_SIZE).unwrap();
-        let sb = Superblock::new(0, 0, layout);
-        let bytes = sb.to_bytes();
-        let sb2 = Superblock::from_bytes(&bytes).unwrap();
-        assert_eq!(sb, sb2);
-    }
-
-    #[test]
-    fn read_with_extents_loads_zone_map() {
-        use crate::{FileBlockDevice, ZoneMap};
-
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let cap = 256 * 1024 * 1024u64;
-        let dev = FileBlockDevice::open(tmp.path(), cap).unwrap();
-
-        let mut layout = ExtentLayout::compute(cap).unwrap();
-        // Add a second extent to the index zone
-        let extra = crate::layout::ZoneExtent::new(100 * crate::BLOCK_SIZE, 10 * crate::BLOCK_SIZE);
-        layout.index_extents.push(extra);
-
-        // Write zone map at a known offset (use alloc_bitmap area for test simplicity)
-        let zone_map_offset = layout.alloc_bitmap_offset;
-        ZoneMap::write_to(&layout, &dev, zone_map_offset).unwrap();
-
-        let mut sb = Superblock::new(1, 0, layout.clone());
-        sb.zone_map_offset = zone_map_offset;
-        sb.write_to(&dev).unwrap();
-
-        // read_from only gets single inline extents
-        let sb_basic = Superblock::read_from(&dev).unwrap();
-        assert_eq!(sb_basic.layout.index_extents.len(), 1);
-
-        // read_with_extents loads the full zone map
-        let sb_full = Superblock::read_with_extents(&dev).unwrap();
-        assert_eq!(sb_full.layout.index_extents.len(), 2);
-        assert_eq!(sb_full.layout.index_extents[1], extra);
+        // Open should heal via the inactive root (the seq=3 one in B).
+        let healed = Superblock::open(&dev).unwrap();
+        let s = { healed.active_root_pointer().seq };
+        assert_eq!(s, 3);
     }
 }

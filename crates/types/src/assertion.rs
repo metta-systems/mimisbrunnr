@@ -1,22 +1,27 @@
+//! Object assertions and tag origins (DESIGN §2.2).
+
+use serde::{Deserialize, Serialize};
+
 use crate::{ObjectId, TagId, Value};
 
 /// A statement about an object — what it is, what it has, how it relates.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Assertion {
-    /// A bare tag: "this object is electronic music"
+    /// Bare tag: "this object is electronic music".
     Tag(TagId),
-    /// A key-value attribute: "artist = Aphex Twin"
+    /// Key-value attribute: `artist = "Aphex Twin"`.
     Attr { key: TagId, value: Value },
-    /// A relation to another object: "member_of playlist:900"
+    /// Relation to another object: `member_of playlist:900`.
     Relation { predicate: TagId, target: ObjectId },
 }
 
-/// Distinguishes how a tag was applied to an object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Provenance of a tag on an object — set explicitly, or derived by the
+/// implication engine?
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TagOrigin {
-    /// Explicitly set by user or application.
+    /// Set explicitly by a user or application.
     Direct,
-    /// Automatically added by the ontology implication engine.
+    /// Inserted by the ontology implication engine (DESIGN §3.3).
     Materialized,
 }
 
@@ -25,12 +30,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tag_assertion() {
+    fn tag_assertion_round_trips_via_cbor() {
         let a = Assertion::Tag(TagId::new(1));
-        match &a {
-            Assertion::Tag(id) => assert_eq!(id.raw(), 1),
-            _ => panic!("expected Tag"),
-        }
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&a, &mut buf).unwrap();
+        let back: Assertion = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(a, back);
     }
 
     #[test]
@@ -39,36 +44,38 @@ mod tests {
             key: TagId::new(10),
             value: Value::Text("Aphex Twin".into()),
         };
-        match &a {
-            Assertion::Attr { key, value } => {
-                assert_eq!(key.raw(), 10);
-                assert_eq!(value.as_text(), Some("Aphex Twin"));
-            }
-            _ => panic!("expected Attr"),
+        if let Assertion::Attr { key, value } = &a {
+            assert_eq!(key.raw(), 10);
+            assert_eq!(value.as_text(), Some("Aphex Twin"));
+        } else {
+            panic!("expected Attr");
         }
     }
 
     #[test]
     fn relation_assertion() {
-        let target = ObjectId::new(1, 900);
+        let target = ObjectId::from_parts(1, 900);
         let a = Assertion::Relation {
             predicate: TagId::new(5),
             target,
         };
-        match &a {
-            Assertion::Relation {
-                predicate,
-                target: t,
-            } => {
-                assert_eq!(predicate.raw(), 5);
-                assert_eq!(*t, target);
-            }
-            _ => panic!("expected Relation"),
+        if let Assertion::Relation { predicate, target: t } = &a {
+            assert_eq!(predicate.raw(), 5);
+            assert_eq!(*t, target);
+        } else {
+            panic!("expected Relation");
         }
     }
 
     #[test]
-    fn tag_origin_equality() {
+    fn tag_origin_distinct() {
         assert_ne!(TagOrigin::Direct, TagOrigin::Materialized);
+    }
+
+    #[test]
+    fn assertion_derives() {
+        // Compile-time check: Clone + Debug + PartialEq + Serialize + Deserialize.
+        fn assert_traits<T: Clone + std::fmt::Debug + PartialEq + Serialize>() {}
+        assert_traits::<Assertion>();
     }
 }

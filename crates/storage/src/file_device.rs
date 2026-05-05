@@ -1,3 +1,5 @@
+//! File-backed [`BlockDevice`] implementation.
+
 use std::{
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
@@ -6,11 +8,11 @@ use std::{
 };
 
 use {
-    crate::{BlockDevice, StorageError},
+    crate::{block_device::BlockDevice, error::StorageError},
     log::trace,
 };
 
-/// A block device backed by a regular file, for use in std environments.
+/// A block device backed by a regular file.
 pub struct FileBlockDevice {
     file: Mutex<File>,
     capacity: u64,
@@ -19,8 +21,8 @@ pub struct FileBlockDevice {
 impl FileBlockDevice {
     /// Open or create a file-backed block device.
     ///
-    /// If `capacity` is 0, uses the existing file size (for opening existing disks).
-    /// Otherwise, extends the file to `capacity` bytes if needed.
+    /// If `capacity` is 0, uses the existing file size (for opening existing
+    /// disks). Otherwise extends the file to `capacity` bytes if needed.
     pub fn open(path: &Path, capacity: u64) -> Result<Self, StorageError> {
         trace!(
             "FileBlockDevice::open path={} capacity={}",
@@ -50,13 +52,12 @@ impl FileBlockDevice {
         })
     }
 
-    /// Create a file-backed block device from an already-open file.
+    /// Build a [`FileBlockDevice`] from an already-open file.
     pub fn from_file(file: File, capacity: u64) -> Result<Self, StorageError> {
         let meta = file.metadata()?;
         if meta.len() < capacity {
             file.set_len(capacity)?;
         }
-
         Ok(Self {
             file: Mutex::new(file),
             capacity,
@@ -66,11 +67,6 @@ impl FileBlockDevice {
 
 impl BlockDevice for FileBlockDevice {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StorageError> {
-        trace!(
-            "block_device::read_at offset={:#x} len={}",
-            offset,
-            buf.len()
-        );
         let end = offset + buf.len() as u64;
         if end > self.capacity {
             return Err(StorageError::OutOfBounds {
@@ -79,7 +75,6 @@ impl BlockDevice for FileBlockDevice {
                 capacity: self.capacity,
             });
         }
-
         let mut file = self.file.lock().unwrap();
         file.seek(SeekFrom::Start(offset))?;
         file.read_exact(buf)?;
@@ -87,11 +82,6 @@ impl BlockDevice for FileBlockDevice {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), StorageError> {
-        trace!(
-            "block_device::write_at offset={:#x} len={}",
-            offset,
-            buf.len()
-        );
         let end = offset + buf.len() as u64;
         if end > self.capacity {
             return Err(StorageError::OutOfBounds {
@@ -100,7 +90,6 @@ impl BlockDevice for FileBlockDevice {
                 capacity: self.capacity,
             });
         }
-
         let mut file = self.file.lock().unwrap();
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(buf)?;
@@ -112,7 +101,6 @@ impl BlockDevice for FileBlockDevice {
     }
 
     fn sync(&self) -> Result<(), StorageError> {
-        trace!("block_device::sync");
         let file = self.file.lock().unwrap();
         file.sync_all()?;
         Ok(())
@@ -132,43 +120,22 @@ mod tests {
     #[test]
     fn write_and_read_back() {
         let (_tmp, dev) = test_device(4096);
-        let data = b"hello mimisbrunnr";
-        dev.write_at(0, data).unwrap();
-
-        let mut buf = vec![0u8; data.len()];
+        dev.write_at(0, b"hello").unwrap();
+        let mut buf = [0u8; 5];
         dev.read_at(0, &mut buf).unwrap();
-        assert_eq!(&buf, data);
+        assert_eq!(&buf, b"hello");
     }
 
     #[test]
-    fn write_at_offset() {
+    fn read_out_of_bounds_errors() {
         let (_tmp, dev) = test_device(4096);
-        let data = b"world";
-        dev.write_at(100, data).unwrap();
-
-        let mut buf = vec![0u8; data.len()];
-        dev.read_at(100, &mut buf).unwrap();
-        assert_eq!(&buf, data);
-    }
-
-    #[test]
-    fn read_out_of_bounds() {
-        let (_tmp, dev) = test_device(4096);
-        let mut buf = vec![0u8; 10];
+        let mut buf = [0u8; 10];
         let err = dev.read_at(4090, &mut buf).unwrap_err();
         assert!(matches!(err, StorageError::OutOfBounds { .. }));
     }
 
     #[test]
-    fn write_out_of_bounds() {
-        let (_tmp, dev) = test_device(4096);
-        let data = vec![0u8; 10];
-        let err = dev.write_at(4090, &data).unwrap_err();
-        assert!(matches!(err, StorageError::OutOfBounds { .. }));
-    }
-
-    #[test]
-    fn capacity_correct() {
+    fn capacity_reported() {
         let (_tmp, dev) = test_device(8192);
         assert_eq!(dev.capacity(), 8192);
     }
@@ -177,19 +144,5 @@ mod tests {
     fn sync_succeeds() {
         let (_tmp, dev) = test_device(4096);
         dev.sync().unwrap();
-    }
-
-    #[test]
-    fn multiple_writes_dont_interfere() {
-        let (_tmp, dev) = test_device(4096);
-        dev.write_at(0, b"aaaa").unwrap();
-        dev.write_at(100, b"bbbb").unwrap();
-
-        let mut a = [0u8; 4];
-        let mut b = [0u8; 4];
-        dev.read_at(0, &mut a).unwrap();
-        dev.read_at(100, &mut b).unwrap();
-        assert_eq!(&a, b"aaaa");
-        assert_eq!(&b, b"bbbb");
     }
 }

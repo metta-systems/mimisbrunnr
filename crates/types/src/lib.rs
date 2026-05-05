@@ -1,29 +1,48 @@
+//! Core data model types for the Mímisbrunnr associative filesystem.
+//!
+//! This crate is foundation-level: it owns the **logical** types referenced by
+//! every other crate (object/tag identifiers, the `Value` ADT, queries, the
+//! ontology surface, placement / storage policy enums, watch/subscription
+//! events, …). It deliberately holds *no* on-disk wire structs — those live in
+//! the infrastructure crate that owns each byte layout (`storage`, `meta`,
+//! `wal`, `index`, …). See `docs/REWRITE_CONTRACT.md` §3 for the full
+//! ownership table.
+//!
+//! All public types are `Send + Sync` unless explicitly noted.
+
+#![forbid(unsafe_code)]
+
 mod assertion;
-mod context;
+mod disk;
 mod error;
+mod timestamp;
+mod ids;
 mod object_id;
 mod object_states;
-mod projection;
+mod ontology;
+mod placement;
+mod presence;
 mod query;
-mod tag_id;
-mod timestamp;
+mod storage_policy;
+mod transform;
 mod value;
+mod watch;
 
-pub use {
-    assertion::{Assertion, TagOrigin},
-    context::PathContextManager,
-    error::Error,
-    object_id::ObjectId,
-    object_states::{CompressionState, EncryptionState, ObjectState},
-    projection::{PathProjection, ProjectedEntry, ProjectedEntryType},
-    query::{CmpOp, Query},
-    tag_id::TagId,
-    timestamp::HybridTimestamp,
-    value::Value,
+pub use assertion::{Assertion, TagOrigin};
+pub use disk::{DiskDescriptor, DiskState, MediaType, StorageTier};
+pub use error::TypesError;
+pub use timestamp::HybridTimestamp;
+pub use ids::{DiskId, ModuleId, NodeId, SubscriptionId, TagId};
+pub use object_id::ObjectId;
+pub use object_states::{CompressionState, EncryptionState, ObjectState};
+pub use ontology::{TagDefinition, TagRelation, TagSemantics, ValueType};
+pub use placement::{ChunkParams, ChunkingAlgo, PlacementRule};
+pub use presence::ContentPresence;
+pub use query::{CmpOp, Query};
+pub use storage_policy::StoragePolicy;
+pub use transform::{CompressionAlgo, EncryptionMode};
+pub use value::{
+    VALUE_INLINE_THRESHOLD, Value, decode_cbor as decode_value_cbor,
+    encode_cbor as encode_value_cbor, value_hash,
 };
-
-pub type NodeId = u64;
-
-pub type DiskId = u16;
-pub type SubscriptionId = u64;
-pub type ModuleId = String;
+pub use watch::{ChangeInterest, SubscriptionState, WatchEvent};

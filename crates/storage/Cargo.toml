@@ -3,12 +3,13 @@ name = "mimisbrunnr-storage"
 description = "Block device abstraction and on-disk layout for Mímisbrunnr"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
-mimisbrunnr-types = { workspace = true }
-bytemuck = { workspace = true }
-crc32fast = { workspace = true }
+bytemuck = { workspace = true, features = ["min_const_generics"] }
+crc32c = { workspace = true }
 log = { workspace = true }
+static_assertions = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

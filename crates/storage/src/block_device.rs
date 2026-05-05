@@ -1,9 +1,12 @@
-use crate::StorageError;
+//! Block device abstraction.
+
+use crate::error::StorageError;
 
 /// Abstraction over a block-addressable storage device.
 ///
-/// All offsets and lengths are in bytes. Implementations must handle
-/// alignment internally if the underlying device requires it.
+/// Offsets and lengths are in **bytes**. Implementations must serialise
+/// concurrent access — reads and writes are expected to be atomic at the
+/// byte level (file system semantics or real disk semantics).
 pub trait BlockDevice: Send + Sync {
     /// Read `buf.len()` bytes starting at `offset`.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), StorageError>;
