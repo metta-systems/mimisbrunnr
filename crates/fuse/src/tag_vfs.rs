@@ -783,19 +783,19 @@ mod tests {
                 self.forward_index
                     .add(oid, Assertion::Tag(tag_id), TagOrigin::Direct);
             }
-            if let Some(n) = name {
-                if let Some(name_tag) = self.dag.lookup("name") {
-                    let val = mimisbrunnr_types::Value::Text(n.to_string());
-                    self.kv_index.insert(name_tag, &val, obj_local);
-                    self.forward_index.add(
-                        oid,
-                        Assertion::Attr {
-                            key: name_tag,
-                            value: val,
-                        },
-                        TagOrigin::Direct,
-                    );
-                }
+            if let Some(n) = name
+                && let Some(name_tag) = self.dag.lookup("name")
+            {
+                let val = mimisbrunnr_types::Value::Text(n.to_string());
+                self.kv_index.insert(name_tag, &val, obj_local);
+                self.forward_index.add(
+                    oid,
+                    Assertion::Attr {
+                        key: name_tag,
+                        value: val,
+                    },
+                    TagOrigin::Direct,
+                );
             }
         }
 
