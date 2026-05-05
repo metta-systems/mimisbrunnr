@@ -488,25 +488,27 @@ its old tail), the additional extents are recorded in a `ZoneMap` block:
 #[repr(C, packed)]
 struct ZoneMap {                             // 4096 bytes
     header: BlockHeader,                     // [0..32]    kind = ZoneMap
-    extent_count: u16,                       // [32..34]   total ZoneExtent records below
+    extent_count: u16,                       // [32..34]   total ZoneMapEntry records below
     _pad: [u8; 6],                           // [34..40]
-    extents: [ZoneMapEntry; 168],            // [40..4072] 168 × 24 B = 4032 B
+    extents: [ZoneMapEntry; 126],            // [40..4072] 126 × 32 B = 4032 B
     _pad_tail: [u8; 20],                     // [4072..4092]
     // trailing CRC32C at [4092..4096]
 }
 
 #[repr(C, packed)]
-struct ZoneMapEntry {                        // 24 bytes
-    zone_kind: u8,                           // 0 = index, 1 = metadata, 2 = blob
-    _pad: [u8; 7],
-    extent: ZoneExtent,                      // 16 B (offset + length only — flags/pad reused)
+struct ZoneMapEntry {                        // 32 bytes
+    zone_kind: u8,                           //  [0..1]   0 = index, 1 = metadata, 2 = blob
+    _pad: [u8; 7],                           //  [1..8]   align embedded extent to u64
+    extent: ZoneExtent,                      //  [8..32]  full 24 B form — same shape as in
+                                             //          Superblock; carries `flags` for
+                                             //          future per-extent hints
 }
 ```
 
 `Superblock.zone_map_offset` is `0` until the first non-contiguous grow; from that point on
 it points to the active `ZoneMap` block. Updates use the same A/B alternation as the
 superblock root (two adjacent blocks; active selected by `BlockHeader.generation`). When a
-zone reaches 168 additional extents, a follow-on `ZoneMap` block is chained via
+zone reaches 126 additional extents, a follow-on `ZoneMap` block is chained via
 `BLOCK_FLAG_CONTINUATION` in `BlockHeader.flags`.
 
 Mount-time zone resolution: walk superblock's first-extent fields, then if `zone_map_offset
