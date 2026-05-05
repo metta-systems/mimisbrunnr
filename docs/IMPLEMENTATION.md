@@ -598,9 +598,12 @@ Within a single device, blocks are addressed by `block_no` (4 KiB unit). Across 
 `(disk_id, block_no)` uniquely identifies a block. Devices may grow; `block_no` is never
 re-mapped.
 
-Zone-relative indexing (e.g. "object id N is at object_table_offset + N*128") is preserved for the
-**ObjectRecord array**, but the array itself lives in COW pages whose physical addresses are
-indirected through `object_table_root` (§5).
+**Positional access** for the `ObjectRecord` and `ObjectLocation` arrays is preserved at the
+*per-leaf* level: the radix descent in §5 / §6.1 resolves `oid_local` to a leaf `BlockRef`,
+and the record lives at slot `oid_local % LEAF_RECORDS` (2044 for the object table, 5440 for
+the location table) within that leaf. The leaves themselves are COW pages whose physical
+addresses are indirected through `object_table_root` / `location_table_root`; there is no
+zone-wide flat array.
 
 ---
 
@@ -1073,10 +1076,11 @@ struct OverflowRecord {                      // 4096 bytes
     _pad: u16,                               // [46..48]
     next_overflow: u64,                      // [48..56]  block_no of the next overflow block,
                                              //           0 if last
-    // [56..4092] = 4036 B variable payload, written in order:
+    // [56..4092] = 4036 B variable payload, written in order with NO inter-element padding
+    // (each section is byte-packed; readers advance the cursor by the consumed bytes):
     //   tag_count × u32                                  (extra tag IDs)
     //   attr_count × OverflowAttr                        (variable: 32 B spilled, 112 B inline)
-    //   relation_count × { predicate: u32, target: u64 } (12 B each)
+    //   relation_count × { predicate: u32, target: u64 } (12 B each, packed)
     // [4092..4096] trailing CRC32C inside BlockHeader's frame
 }
 
@@ -2613,7 +2617,7 @@ forward index roughly in half (~660 MiB at this scale).
 | ---------------------- | --------- | -------------------------------------------------- |
 | Superblock × 3         | 12 KiB    | Fixed                                              |
 | WAL                    | 64 MiB    | Btree-update journal (§3); mirrored across devices |
-| Bucket alloc table     | ~288 MiB  | 16 M buckets × ~18 B/entry (16 B value + ~2 B packed `bucket_no`) |
+| Bucket alloc table     | ~288 MiB  | 16 M buckets × ~18 B/entry (16 B value + ~2 B packed `bucket_no`) + sorted-run overhead (§1.5.1 headers, format descriptors, tail padding) |
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
 | Object table (records) | ~1.19 GiB | Positional — no key packing applies; 4 893 leaves × 256 KiB |
 | Object table (radix)   | < 1 MiB   | Single inner node (depth 1 total)                  |
