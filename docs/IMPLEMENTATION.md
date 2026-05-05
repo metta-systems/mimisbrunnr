@@ -299,10 +299,12 @@ on typical workloads.
 
 #### 1.5.5 Why this matters
 
-For a 10 M-object pool, the radix object table is **2 levels** deep; tag, range, and forward
-indexes are **2–3 levels**. Each node access is a single sequential I/O of 256 KiB — critical
-for HDD performance and friendly to SSD command queues. The cache holds whole nodes, so
-intra-node lookups are memory-resident after the first hit.
+For a 10 M-object pool, the radix object table is **2 levels deep (depth = 1: 1 inner + leaf)**;
+tag, range, and forward indexes are **2–3 levels deep (depth = 1–2)**. (See the depth
+convention in §5: *depth* counts inner levels, *levels* counts inner + leaf tiers — a
+depth-*N* tree has *N + 1* tiers.) Each node access is a single sequential I/O of 256 KiB —
+critical for HDD performance and friendly to SSD command queues. The cache holds whole nodes,
+so intra-node lookups are memory-resident after the first hit.
 
 #### 1.5.6 Sorted-run format descriptors and packed keys
 
@@ -951,6 +953,15 @@ there are no internal sorted runs — positional updates are journalled via §3.
 
 ### Tree depth and capacity
 
+> **Depth convention.** Throughout this document, *depth* counts the **inner levels** of a B+
+> tree or radix tree above the leaves — equivalently, the maximum value of `BtreeNodeHeader.level`
+> present in the tree. A **depth-0** tree is leaf-only (one node, `level = 0`); a **depth-*N***
+> tree has *N* levels of inner nodes plus the leaves, *N + 1* tiers in total. `MAX_LEVELS = 3`
+> bounds *inner* depth, so the deepest tree this format addresses is depth 3 (4 tiers total),
+> covering ≥ 2⁴⁸ objects. A read at depth *N* touches at most `N + 1` nodes; a flush at depth
+> *N* rewrites at most `N + 1` nodes (`(N + 1) × node_size` bytes). The word *levels* is
+> reserved for the total tier count when needed informally.
+
 | Depth (inner levels + leaf) | Max objects                              |
 | --------------------------- | ---------------------------------------- |
 | 0 inner (leaf only)         | 2 044                                    |
@@ -1002,10 +1013,10 @@ rewrite.
 ### COW write path
 
 Nodes are rewritten copy-on-write **only when the journal-reclaim thread flushes them** (§3.4),
-never per mutation. A flush at depth *D* costs roughly *D* × 256 KiB of writes (each level's
-node is rewritten into a fresh region). For the 10 M-object pool that's **2 node rewrites per
-flush** (leaf + root inner), amortised across however many mutations have accumulated against
-that leaf since its last flush.
+never per mutation. A flush at depth *D* costs roughly *(D + 1) × 256 KiB* of writes (one
+rewrite per tier, leaf included). For the 10 M-object pool (depth 1) that's **2 node
+rewrites per flush** (leaf + root inner), amortised across however many mutations have
+accumulated against that leaf since its last flush.
 
 Per-mutation cost is still the WAL append (~80 B). Reads consult the in-memory `LoadedNode`
 (§1.5.3), which holds the on-disk state plus pending journal entries past
@@ -1336,7 +1347,7 @@ unpacked 8 bytes.
   unrepresentable (the inner separator would collide with the same `oid` on both sides). With
   §1.5.6 packing the trailing `snapshot` packs to ~0 bits when one snapshot dominates a sorted
   run, so the cost is marginal: 2–4 byte packed keys + 16 B BlockRef = ~18–20 B per entry; one
-  full sorted run packs ~13 000 children. Tree depth at 10 M objects: **2 levels** (1 inner + leaves).
+  full sorted run packs ~13 000 children. Tree at 10 M objects: **depth 1** (1 inner + leaves; 2 tiers total).
 - **Leaf node** (level 0): sorted runs of `LeafEntry` records:
 
 ```rust
@@ -1431,7 +1442,7 @@ the KV index (§8). Tag and Relation entries are self-contained.
 
 ### 7.4 Properties
 
-- O(log N) lookup by oid (depth 2 at 10 M scale ⇒ ≤ 2 large-node loads).
+- O(log N) lookup by oid (depth 1 at 10 M scale ⇒ ≤ 2 large-node loads: 1 inner + 1 leaf).
 - O(1) per-assertion diffing via `SortedRunHeader.journal_seq` — sync streams sorted runs newer than
   the peer's watermark, exactly the journal-streaming fast path of §11.2.
 - Compact in-memory mirror: a `HashMap<u64, SmallVec<[PackedAssertion; 8]>>` over the loaded

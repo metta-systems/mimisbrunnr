@@ -779,6 +779,17 @@ const _: () = assert!(size_of::<WorkItem>() == 48);
 // =====================================================================
 pub const REGION: usize = 256 * 1024; // 262 144
 
+// §5 depth convention: *depth* counts inner levels above the leaves.
+// MAX_LEVELS bounds inner depth (deepest tree = depth 3 = 4 tiers).
+pub const MAX_LEVELS: usize = 3;
+
+// Per-flush cost at depth D = (D + 1) × REGION (one rewrite per tier,
+// leaf included). Locks down the §5 "COW write path" formula.
+pub const fn flush_cost_bytes(depth: usize) -> usize { (depth + 1) * REGION }
+const _: () = assert!(flush_cost_bytes(0) == REGION);                 // leaf-only
+const _: () = assert!(flush_cost_bytes(1) == 2 * REGION);              // §5 "2 node rewrites" at 10 M
+const _: () = assert!(flush_cost_bytes(MAX_LEVELS) == 4 * REGION);     // 48-bit cap
+
 // --- Inner radix node (level ≥ 1): positional BlockRef array, no bitmap.
 // Empty slots use BlockRef.generation == 0 as the sentinel.
 pub const INNER_PAYLOAD: usize = REGION - size_of::<BtreeNodeHeader>();
