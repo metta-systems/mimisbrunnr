@@ -121,6 +121,7 @@ enum BtreeKind {
     TagDirectory,       // §8.1 tag directory B+ tree (snapshot-aware)
     Range,              // §9.2 range index B+ tree (snapshot-aware)
     ChunkIndex,         // §9.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
+    ChunkList,          // §9.3 per-object FastCDC chunk-list region (positional, no sorted runs)
     KvDirectory,        // §9.1 extendible-hash directory spillover (positional)
     ValueSpill,         // value-hash → CBOR(Value); content-addressed
     Ontology,           // §10.1 ontology / dag B+ tree (snapshot-aware)
@@ -1599,7 +1600,33 @@ Leaf sorted runs store key → `BlockRef` to a roaring bitmap.
 
 Leaf values are roaring bitmaps (per `(attr_id, value_prefix)`), enabling cheap range scans.
 
-### 9.3 Chunk Index (for FastCDC objects)
+### 9.3 Chunk Index and Chunk List (for FastCDC objects)
+
+FastCDC-chunked objects are stored across **two complementary structures** with deliberately
+opposing key shapes. Both are needed; neither subsumes the other.
+
+| Structure    | Keyed by             | Role                                                   | Snapshot? |
+| ------------ | -------------------- | ------------------------------------------------------ | --------- |
+| `ChunkIndex` | `chunk_hash`         | **Content-addressed dedup directory.** One entry per unique chunk in the entire pool. Tells you "where does the chunk with hash X live?" → `BlobRef` to its physical extent, plus a `ref_count`. | snapshot-agnostic |
+| `ChunkList`  | position (per-object) | **Per-object recipe.** One region (chain) per chunked object. Tells you "to reconstruct object O, fetch chunks `[hash₀, hash₁, hash₂, …]` in this order". The hashes are pointers *into* `ChunkIndex` — not the chunk bytes. | snapshot-agnostic (shared prefix via COW) |
+
+The split is the same pattern as Git (object database vs. tree object) or ZFS dedup (DDT vs.
+file extent map):
+
+- **Read** a chunked object: walk its `ChunkList` in order → for each `chunk_hash` look up
+  `ChunkIndex` → get `BlobRef` → read bytes from the blob zone.
+- **Write** a chunked object: FastCDC splits plaintext → for each chunk, hash it and probe
+  `ChunkIndex` → if hit, bump `ref_count`; if miss, write the bytes and insert. Either way,
+  append the hash to the new object's `ChunkList`.
+- **Dedup** falls out for free: two unrelated objects whose plaintext shares chunks share the
+  storage at the byte level via the shared `ChunkIndex` entries — `ref_count` tracks how
+  many `ChunkList`s reference each chunk; physical reclaim happens when it drops to zero.
+
+You can't merge the two: a hash-keyed structure can't preserve order, and a position-keyed
+structure can't dedup. The reverse direction (chunk → which objects use it) is covered by
+the backpointers btree (§6.2) under `OwnerKind::Chunk`.
+
+#### `ChunkIndex` — content-addressed dedup directory
 
 A **B+ tree of large nodes** (§1.5) keyed by `chunk_hash: [u8; 32]`:
 
@@ -1614,10 +1641,41 @@ ChunkIndexLeafEntry {                        // 56 bytes
 
 A 256 KiB leaf packs ~4 600 chunk entries per sorted run.
 
-`ChunkList` per object: array of `(chunk_hash, length)` referenced from `ObjectLocation` when
-chunked (a positional `ChunkList` region; see §1.5 for the radix layout).
+Chunk hashes use BLAKE3 of plaintext (pre-compression) so dedup is content-defined. FastCDC
+(content-defined chunking) decides the chunk boundaries; the chunk index records each unique
+chunk once, refcounted, so two objects sharing common chunks share their storage.
 
-Chunk hashes use BLAKE3 of plaintext (pre-compression) so dedup is content-defined.
+#### `ChunkList` — per-object FastCDC recipe
+
+A chunked object's `ObjectLocation` (§6.1, with `LOCATION_FLAG_CHUNKED`) points at the head of
+a `BtreeKind::ChunkList` chain. The region is a §1.5 large-node region in the positional
+flavour (no sorted runs — single rewrite on growth, like `ForwardOverflow`):
+
+```rust
+struct ChunkListEntry {                      // 40 bytes (8-aligned)
+    chunk_hash: [u8; 32],                    //  [0..32]   BLAKE3 of plaintext, indexes ChunkIndex
+    length: u32,                             // [32..36]   plaintext length of this chunk
+    flags: u32,                              // [36..40]   reserved (e.g. inline-tiny-chunk hint)
+}
+```
+
+Region capacity at 256 KiB:
+
+```
+262 144 (region) − 64 (BtreeNodeHeader) − 16 (trailing chain BlockRef) = 262 064 B
+                                                       ÷ 40 B/entry  = 6 551 entries
+```
+
+Each entry covers a single FastCDC chunk (typical 4 – 64 KiB plaintext); a single region
+therefore covers ≈ 26 MiB – 410 MiB of plaintext at the average chunk size. Larger objects
+chain through the trailing `BlockRef` slot (same convention as `ForwardOverflow`, §7.2).
+Reads stream chunks in order: walk the list, look up each chunk in `ChunkIndex` to find its
+physical extent, fetch.
+
+The list is **snapshot-agnostic** because chunks are content-addressed: two snapshots of the
+same chunked object that happen to share a prefix simply share the prefix portion of their
+ChunkList chains by the usual COW mechanism (a divergent suffix gets its own region; the
+shared prefix is reachable from both).
 
 ---
 

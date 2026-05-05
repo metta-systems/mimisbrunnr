@@ -814,7 +814,24 @@ Content-defined chunking (FastCDC) is only applied where the ontology indicates 
 |VM images, databases|Yes (CDC)|Large, small edits, massive sync savings|
 |Large immutable transfers|Maybe|Fixed-chunk for resumability|
 
-Only ~1% of objects are typically chunked, keeping the chunk index small (~5 MB vs 4 GB if everything were chunked). When active: chunk plaintext, hash each chunk, compress per-chunk, encrypt. 
+Only ~1% of objects are typically chunked, keeping the chunk index small (~5 MB vs 4 GB if everything were chunked). When active: chunk plaintext, hash each chunk, compress per-chunk, encrypt.
+
+**Two complementary structures, not one.** A chunked object is stored across two structures
+with deliberately opposing key shapes (full layout in IMPLEMENTATION §9.3):
+
+- **Chunk index** — content-addressed, keyed by `chunk_hash`. One entry per **unique chunk
+  in the entire pool**, refcounted. This is the dedup directory: "where does the chunk with
+  hash X live?". Two unrelated objects that share chunks share these entries at the byte
+  level.
+- **Chunk list** — positional, keyed by chunk position within an object. One per **chunked
+  object**. This is the per-object recipe: "to reconstruct object O, fetch chunks
+  `[hash₀, hash₁, hash₂, …]` in this order". The hashes are pointers *into* the chunk index,
+  not the chunk bytes.
+
+Reading walks the list and looks up each hash; writing probes the index by hash (dedup) and
+appends the hash to the list. The pattern is the same as Git (object database vs. tree
+object) or ZFS dedup (DDT vs. file extent map): a hash-keyed structure can't preserve order,
+and a position-keyed structure can't dedup, so both are necessary.
 
 ---
 
