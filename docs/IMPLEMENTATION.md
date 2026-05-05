@@ -669,10 +669,13 @@ monotonic counter that drives every COW block update; no separate `seq` is neede
 
 ### 3.2 WAL entry
 
-Entries are byte-packed, never crossing a 4 KiB boundary unless `payload_length` > 4052, in which
-case the entry is split into `Continuation` frames (`BLOCK_FLAG_CONTINUATION`). The bound is
-`4096 − WalEntryHeader (40) − framing CRC32C (4) = 4052` for plaintext entries; encrypted
-entries pay an additional 16 B GCM tag and so split at 4036.
+Entries are byte-packed and **never cross a 4 KiB sector boundary**: each entry is one fully-formed
+`WalEntryHeader`+payload+CRC frame within a single sector. The bound on `payload_length` is
+`4096 − WalEntryHeader (40) − framing CRC32C (4) = 4052 B` plaintext; encrypted entries pay an
+additional 16 B GCM tag and so cap at 4036 B. An attempted append exceeding the bound is a
+programming error: the producer must spill bulk data through the blob zone (§4.1) and reference it
+by hash, not embed it in a WAL op. Sector-aligned framing makes recovery trivial — a torn 4 KiB
+write loses at most one entry, and replay never has to reassemble fragments across sectors.
 
 ```rust
 #[repr(C, packed)]
@@ -787,6 +790,7 @@ BackpointerRemove: { key: BackpointerKey }                                // exp
 
 // Snapshot lifecycle (§11)
 SnapshotCreate   : { new_id: u32, parent_id: u32, current_replacement: u32, label: Option<String> }
+                   // label capped at 256 bytes — one-sector WAL invariant (§3.2)
 SnapshotDelete   : { id: u32 }                                            // marks for async cleanup
 // Note: snapshot deletion does NOT emit per-key WAL ops. The actual
 // re-tag / drop happens via a reconcile-driven scan whose progress is
@@ -796,10 +800,13 @@ SnapshotDelete   : { id: u32 }                                            // mar
 
 // Reconcile (§17)
 ReconcileEnqueue : { work: WorkItem, high_prio: bool, phys_index: bool }
-ReconcileDequeue : { target_kind: u8, owner_key: bytes, work_kind: u8 }   // completion or cancel
+ReconcileDequeue : { target_kind: u8, owner_key: bytes, work_kind: u8 }   // completion or cancel;
+                   //   owner_key capped at 16 bytes (§6.2)
 ReconcileMove    : { from_loc: BlockRef, to_loc: BlockRef, owner_key: bytes }
-                   // atomic location-update for move-path completion
-ReconcileScanStep: { scan_id: u64, btree: BtreeKind, cursor_key: bytes }  // resumable progress
+                   // atomic location-update for move-path completion;
+                   //   owner_key capped at 16 bytes (§6.2)
+ReconcileScanStep: { scan_id: u64, btree: BtreeKind, cursor_key: bytes }  // resumable progress;
+                   //   cursor_key capped at 256 bytes — one-sector WAL invariant (§3.2)
 
 // Sorted-run format mutations (§1.5.6)
 FormatPromote    : { node_ref: BlockRef, sorted_run_seq: u32, new_format: SortedRunKeyFormat }

@@ -973,15 +973,32 @@ const _: () = assert!(OBJECT_TABLE_LEAVES_10M == 4_893);    // §16: 4 893 leave
 const _: () = assert!(LOCATION_TABLE_LEAVES_10M == 1_839);  // §16: 1 839 leaves
 
 // =====================================================================
-// §3.2 / §3 max in-frame WAL payload_length before Continuation framing.
-// 4096 − WalEntryHeader (40) − framing CRC (4) = 4052 plaintext;
-// encrypted is 16 B narrower (GCM tag).
+// §3.2 hard cap: a single WAL op fits in one 4 KiB sector. No continuation
+// framing — bulk data goes through the blob zone (§4.1) and is referenced
+// by hash. Sector-aligned framing keeps recovery trivial: a torn 4 KiB
+// write loses at most one entry, and replay never reassembles fragments.
+//   plaintext bound : 4096 − WalEntryHeader (40) − framing CRC (4)        = 4052
+//   encrypted bound : plaintext − GCM tag (16)                            = 4036
+// `WAL_OP_MAX_PAYLOAD` is the conservative cap producers must enforce
+// (works in both modes; debug_assert! in the appender catches violations).
 // =====================================================================
 pub const BLOCK_SIZE: usize = 4096;
 pub const WAL_MAX_PAYLOAD_PLAINTEXT: usize = BLOCK_SIZE - WAL_ENTRY_PLAINTEXT_OVERHEAD;
 pub const WAL_MAX_PAYLOAD_ENCRYPTED: usize = BLOCK_SIZE - WAL_ENTRY_ENCRYPTED_OVERHEAD;
+pub const WAL_OP_MAX_PAYLOAD:        usize = WAL_MAX_PAYLOAD_ENCRYPTED;
 const _: () = assert!(WAL_MAX_PAYLOAD_PLAINTEXT == 4_052);
 const _: () = assert!(WAL_MAX_PAYLOAD_ENCRYPTED == 4_036);
+const _: () = assert!(WAL_OP_MAX_PAYLOAD == 4_036);
+
+// §3.3 variable-length op-field caps that keep every op under WAL_OP_MAX_PAYLOAD
+// even with CBOR overhead. Sized so the largest op (Checkpoint with a 424 B
+// RootPointer, or SnapshotCreate with a 256 B label) stays comfortably below
+// the sector bound. owner_key is naturally bounded by §6.2's 16 B BackpointerValue.
+pub const WAL_LABEL_MAX_BYTES:      usize = 256;
+pub const WAL_CURSOR_KEY_MAX_BYTES: usize = 256;
+pub const WAL_OWNER_KEY_BYTES:      usize = 16;     // §6.2 BackpointerValue.owner_key
+const _: () = assert!(WAL_LABEL_MAX_BYTES      < WAL_OP_MAX_PAYLOAD);
+const _: () = assert!(WAL_CURSOR_KEY_MAX_BYTES < WAL_OP_MAX_PAYLOAD);
 
 // =====================================================================
 // §7.2 ForwardOverflow region: positional PackedAssertion array minus
