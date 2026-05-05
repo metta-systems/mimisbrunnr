@@ -1794,19 +1794,22 @@ stored in the **snapshots btree** (`BtreeKind::Snapshots`, a §1.5 B+ tree keyed
 
 ```rust
 #[repr(C, packed)]
-struct SnapshotNode {                        // 64 bytes
-    id: u32,                                 // self-id (also the btree key)
-    parent: u32,                             // 0 = root snapshot
-    first_child: u32,                        // first child id (0 = leaf)
-    next_sibling: u32,                       // next sibling under same parent (0 = last)
-    depth: u16,                              // distance from root
-    flags: u8,                               // SNAPSHOT_FLAG_*
-    _pad: u8,
-    ancestor_bitmap: u128,                   // bits[i] = "id − i is an ancestor", i ∈ 0..128
-    skiplist: [u32; 3],                      // randomised ancestor IDs for O(log n) deep checks
-    created_ns: i64,
-    label_offset: u32,                       // into a string heap; 0 = unlabelled
-    _reserved: u32,
+struct SnapshotNode {                        // 64 bytes — fits one cache line
+    id: u32,                                 //  [0..4]   self-id (also the btree key)
+    parent: u32,                             //  [4..8]   0 = root snapshot
+    first_child: u32,                        //  [8..12]  first child id (0 = leaf)
+    next_sibling: u32,                       // [12..16]  next sibling under same parent (0 = last)
+    ancestor_bitmap: u128,                   // [16..32]  bits[i] = "id − i is an ancestor",
+                                             //           i ∈ 0..128 — placed at offset 16 so
+                                             //           the u128 hits its natural alignment
+                                             //           on the hot ancestry-check path
+    skiplist: [u32; 3],                      // [32..44]  randomised ancestor IDs for O(log n) deep checks
+    depth: u16,                              // [44..46]  distance from root
+    flags: u8,                               // [46..47]  SNAPSHOT_FLAG_*
+    _pad: u8,                                // [47..48]
+    created_ns: i64,                         // [48..56]
+    label_offset: u32,                       // [56..60]  into a string heap; 0 = unlabelled
+    _reserved: u32,                          // [60..64]
 }
 
 // SnapshotNode.flags bits
