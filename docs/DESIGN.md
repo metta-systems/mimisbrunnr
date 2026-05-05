@@ -412,7 +412,7 @@ Core principle: **data outlives apps.** Tags your music app created are still yo
 
 ## 5. Index Layer
 
-Five index structures, all RAM-resident with WAL persistence:
+Five index structures. On disk they are persistent B+ trees of 256 KiB large nodes with WAL-fronted updates (IMPLEMENTATION.md §1.5, §7–§9); in memory each carries a hot mirror over the loaded nodes' merged views. The shapes below describe the logical / in-memory form:
 
 ### 5.1 Tag Inverted Index
 
@@ -482,21 +482,20 @@ Methods: `direct_tags(oid)` and `materialized_tags(oid)` for per-origin filterin
 
 ### 6.1 Raw Disk Zones
 
-The filesystem operates directly on raw block devices:
+The filesystem operates directly on raw block devices. Each disk is divided into fixed-size **buckets** (default 1 MiB; configurable 256 KiB–4 MiB at format time) — a bcachefs-derived allocation primitive that gives constant-time bucket invalidation via generation numbers, native fit for SMR/zoned drives, and crash-safe pointer staleness detection. Within a bucket, writes are **append-only**; a bucket is reused only after its generation is bumped, atomically invalidating every pointer that referenced its previous contents.
 
 ```
  0                    Superblock primary (4KB)
  4K                   Superblock copy (4KB)
- 8K                   Write-Ahead Log (64MB circular buffer)
- 8K+64M               Allocation bitmap (1 bit per block, block-aligned)
- ...                  Block class map (4 bits per block, nibble-packed)
- ...                  ┌───────────────────────────────────┐
+ ...                  Write-Ahead Log (64 MiB circular buffer)
+                      ┌───────────────────────────────────┐
                       │  Zone 1: INDEX ZONE               │
                       │  Tag bitmaps, ontology, KV index  │
                       │  3% of usable space (first extent)│
                       ├───────────────────────────────────┤
                       │  Zone 2: METADATA ZONE            │
-                      │  Object records, location table   │
+                      │  Object records, location table,  │
+                      │  forward index, backpointers      │
                       │  2% of usable space (first extent)│
                       ├───────────────────────────────────┤
                       │  Zone 3: BLOB ZONE                │
@@ -507,39 +506,17 @@ The filesystem operates directly on raw block devices:
  end-4K               Superblock backup copy
 ```
 
-**Growable zones:** Each zone starts as a single contiguous extent but can grow by appending additional extents. When zones have multiple extents, a **ZoneMap** (4 KiB block with its own CRC32C) is written to track all extent offsets/sizes (up to 80 extents per zone). The superblock's `zone_map_offset` field points to this block (0 until any zone is grown; the in-superblock extent descriptors remain authoritative for the initial extent).
+**Superblock.** A 4 KiB block written 3× (offsets 0, 4096, last-4096-of-device) for redundancy. Holds a `BlockHeader`, pool/disk identity (UUID, node_id, disk_id, media_type, tier), capacity, format-version fields, two alternating `RootPointer` slots for atomic root commit (§6.4), static layout pointers (`wal_offset`, `bucket_size_log2`, `btree_node_size_log2`), zone extents (`index_zone`, `metadata_zone`, `blob_zone` of type `ZoneExtent`), feature-flag words (`compat`, `ro_compat`, `incompat`), and the pool-wide default chunking policy (§3.5). See IMPLEMENTATION.md §2.1 for the full byte layout.
 
-**Block classification:** A nibble-packed block class map (2 blocks per byte) tracks which zone owns each block: `Free(0)`, `Index(1)`, `Metadata(2)`, `Blob(3)`. This enables extent-based allocation within zones.
+**Growable zones:** Each zone starts as a single contiguous extent. When grown non-contiguously, additional extents are recorded in a **ZoneMap** block (4 KiB; up to 126 extents per block, chained for more); `Superblock.zone_map_offset` is `0` until the first non-contiguous grow.
 
-**Allocation bitmap:** One bit per 4 KiB block. First-fit allocator for contiguous block ranges. Persisted to disk and loaded at mount time.
+**Atomic root commit.** All persistent B+ tree / radix-tree roots are anchored in a single `RootPointer` (~408 B) inside the superblock. Two slots (`root_a`, `root_b`) alternate with `active_root` selecting the live one — a torn write never produces a corrupt root. Routine mutations land in the WAL; the superblock root is flipped only at checkpoint cadence (§6.4 / IMPLEMENTATION.md §2.2, §3.5).
 
-**Superblock binary layout** (128 bytes, stored at 3 locations, all little-endian):
-
-```
-[0..8]      magic: b"MIMIR\x01\0\0"
-[8..12]     format_version: u32 (currently 1)
-[12..14]    node_id: u16
-[14..16]    disk_id: u16
-[16..24]    device_capacity: u64
-[24..32]    index_zone_offset: u64    (first extent)
-[32..40]    index_zone_size: u64      (first extent)
-[40..48]    metadata_zone_offset: u64 (first extent)
-[48..56]    metadata_zone_size: u64   (first extent)
-[56..64]    blob_zone_offset: u64     (first extent)
-[64..72]    blob_zone_size: u64       (first extent)
-[72..80]    wal_offset: u64
-[80..88]    alloc_bitmap_offset: u64
-[88..96]    alloc_bitmap_size: u64
-[96..104]   creation_timestamp_ns: i64
-[104..112]  last_checkpoint_lsn: u64
-[112..120]  zone_map_offset: u64      (0 until any zone is grown; >0 = read ZoneMap)
-[120..124]  checksum: CRC32C of bytes [0..120]
-[124..128]  padding
-```
+**Allocation is bucket-based, not bitmap-based.** Per-disk free space is tracked via two B+ trees (`BucketAllocEntry` table + `FreespaceLruEntry` LRU), rooted in each disk's `DiskDescriptorOnDisk`. A bucket carries `(generation, data_type, dirty_sectors, last_modify_lsn)`; pointers (`BlockRef`) self-validate against the destination bucket's generation. See IMPLEMENTATION.md §12 for the full allocation protocol.
 
 ### 6.2 Object Records
 
-Fixed-size, array-indexed by ID for O(1) lookup:
+Fixed-size 128-byte records, addressed by `ObjectId.local`. Physically held in a **COW radix tree of 256 KiB large nodes** (IMPLEMENTATION.md §1.5, §5): leaves pack 2044 records each; depth grows with the populated id space (depth 1 covers 33 M objects, depth 3 reaches the full 48-bit local-id space). Lookup is a radix descent ending at `oid_local % 2044` within the resolved leaf — one large-node load per inner level.
 
 ```rust
 #[repr(u8)]
@@ -556,79 +533,91 @@ enum CompressionState { None = 0, Zstd = 1, Lz4 = 2 }
 #[repr(u8)]
 enum EncryptionState { None = 0, Hctr2Aes128 = 1, XtsAes256 = 2 }
 
-struct ObjectRecord {               // 128 bytes, cache-line aligned
-    id: u64,                        // [0..8]
-    generation: u32,                // [8..12] for future ID reuse safety
-    state: ObjectState,             // [12..13]
-    content_hash: [u8; 32],         // [13..45] BLAKE3 of plaintext
-    blob_offset: u64,               // [45..53]
-    blob_length: u64,               // [53..61]
-    created_ns: i64,                // [61..69]
-    modified_ns: i64,               // [69..77]
-    tag_count: u16,                 // [77..79]
-    attr_count: u16,                // [79..81]
-    inline_tags: [u32; 4],          // [81..97] 4 tags inline
-    overflow_offset: u64,           // [97..105]
-    compression: CompressionState,  // [105..106]
-    encryption: EncryptionState,    // [106..107]
-    stored_size: u64,               // [107..115]
-    // [115..128] reserved/padding
+#[repr(C)]
+struct ObjectRecord {                   // 128 bytes
+    id: u64,                            // [0..8]
+    generation: u32,                    // [8..12]   for future ID reuse safety
+    state: ObjectState,                 // [12..13]
+    flags: u8,                          // [13..14]  OBJECT_FLAG_HAS_OVERFLOW | OBJECT_FLAG_CHUNKED
+    record_version: u16,                // [14..16]  per-record structural version
+    content_hash: [u8; 32],             // [16..48]  BLAKE3 of plaintext
+    blob_offset: u64,                   // [48..56]
+    blob_length: u64,                   // [56..64]
+    created_ns: i64,                    // [64..72]
+    modified_ns: i64,                   // [72..80]
+    tag_count: u16,                     // [80..82]  object-wide totals
+    attr_count: u16,                    // [82..84]
+    compression: CompressionState,      // [84..85]
+    encryption: EncryptionState,        // [85..86]
+    relation_count: u16,                // [86..88]
+    inline_tags: [u32; 4],              // [88..104] valid iff !(flags & HAS_OVERFLOW)
+    overflow_offset: u64,               // [104..112]
+    stored_size: u64,                   // [112..120]
+    last_modify_lsn: u64,               // [120..128] for snapshot diffing
 }
 ```
 
-Binary layout is packed little-endian (not `#[repr(C)]` aligned) to fit exactly 128 bytes. Lookup: single read at `zone2_base + id * 128`. 10M objects = 1.28 GB.
+Object-wide totals (`tag_count`, `attr_count`, `relation_count`) live in the record. When `OBJECT_FLAG_HAS_OVERFLOW` is set, `inline_tags` is ignored and **all** tags + attrs + relations live in the overflow chain (a 4 KiB `OverflowRecord` block in the metadata zone, addressed by `overflow_offset`, chained for objects exceeding ~200 assertions). When the flag is clear, `attr_count` and `relation_count` are guaranteed `0` — only the four `inline_tags` slots store anything inline. See IMPLEMENTATION.md §5.1, §5.2 for the overflow record layout.
 
 ### 6.3 Location Table
 
-Maps objects to physical extents, supporting multi-disk pools:
+Maps objects to physical extents. Same COW-radix-tree machinery as the object table (IMPLEMENTATION.md §6.1), parameterised for 48-byte `ObjectLocation` records — leaves pack 5 440 records each:
 
 ```rust
-struct ObjectLocation {         // 40 bytes, little-endian packed
-    disk_id: u16,               // [0..2]
-    extent_offset: u64,         // [2..10]
-    extent_length: u64,         // [10..18]
-    replica_count: u8,          // [18..19]
-    replicas: [ReplicaRef; 3],  // [19..40] 3 × 7 bytes
+#[repr(C, align(8))]
+struct ObjectLocation {         // 48 bytes
+    flags: u8,                  // [0..1]   LOCATION_FLAG_CHUNKED | LOCATION_FLAG_REMOTE_ONLY
+    replica_count: u8,          // [1..2]   1..=4; total physical copies
+    _pad: [u8; 6],              // [2..8]
+    extent_length: u64,         // [8..16]  bytes (chunked: plaintext logical length)
+    replicas: [ReplicaRef; 4],  // [16..48] slots [replica_count..4] are zeroed
 }
 
-struct ReplicaRef {             // 7 bytes
+#[repr(C)]
+struct ReplicaRef {             // 8 bytes — bucket-relative, mirrors §6.2's BackpointerKey
     disk_id: u16,               // [0..2]
-    offset: u64,                // [2..7] stored as 5 bytes (lower 40 bits)
+    sector_offset: u16,         // [2..4]   4 KiB sector within bucket
+    bucket_no: u32,              // [4..8]   bucket within disk
 }
 ```
+
+**Symmetric replicas.** Every physical copy of an extent lives inline in `replicas[0..replica_count]`; there is no distinguished "primary". `replicas[0]` is the read-preferred copy by convention. The cap of 4 inline replicas bounds the maximum replication factor — workloads needing more durability use erasure coding (a separate code path; see IMPLEMENTATION.md §17).
+
+For chunked objects (`LOCATION_FLAG_CHUNKED`), `replicas[]` describe replicas of the head **`ChunkList` region** (§9.6), not the user data; the chunks themselves are content-addressed and replicated independently via the chunk index. `extent_length` is the plaintext logical length (sum of chunk plaintext lengths).
+
+A complementary **backpointer table** (`(disk_id, bucket_no, sector_offset) → owning key`) is maintained for copygc, scrub, evacuation, and resilver — turning O(pool size) operations into O(data on affected bucket). See IMPLEMENTATION.md §6.2.
 
 ### 6.4 Write-Ahead Log
 
-All mutations go through the WAL — 64 MB circular buffer on the fastest disk, mirrored to a second disk. Checkpointing flushes dirty bitmaps and metadata to their zones. Crash recovery replays from last checkpoint.
+The WAL is the **btree-update journal** — a 64 MiB circular buffer (configurable; multiple of 4 KiB) hosted on the pool's hot-tier disks (NVMe/SSD). Cold and Glacier tiers are excluded — their latency would dominate fsync. Mutations land in the WAL first; B+ tree / radix-tree pages are rewritten lazily by a journal-reclaim thread (IMPLEMENTATION.md §3.4), so per-mutation cost is one ~80 B journal append rather than a full-page rewrite. Checkpointing periodically flips the superblock's atomic root pointer (§3.5 of IMPL).
+
+**Mirroring across hot disks.** WAL appends fan out to every hot-tier disk's ring under a single shared LSN — typically the fastest disk as primary plus one mirror. A user fsync waits for the append to land on at least the configured replica count (default 2). Recovery picks whichever ring has the highest valid LSN.
+
+**Header.** The WAL header is itself a 4 KiB block (`BlockKind::WalSegment`), A/B-alternated using `BlockHeader.generation`, holding `next_lsn`, `write_cursor`, `read_cursor`, `used_bytes`, `last_checkpoint_lsn`, `segment_size`, and `encryption_keyid`. See IMPLEMENTATION.md §3.1.
+
+**Entry framing.** Each entry is a 40-byte `WalEntryHeader` + payload + framing CRC, fitting inside one 4 KiB sector — never crossing a sector boundary, so a torn 4 KiB write loses at most one entry. Header carries `magic("WALR")`, `op_kind`, `format_version`, `flags`, `lsn`, a 16-byte `HybridTimestamp`, `payload_length`, and `payload_crc`. Payloads are CBOR-encoded; the heterogeneous op shapes (`AddTag` vs `WriteBlob` differ wildly) make CBOR the right choice for write-once-read-once journal payloads.
 
 ```rust
 enum WalOpKind {
-    CreateObject = 1,
-    DeleteObject = 2,
-    AddTag = 3,
-    RemoveTag = 4,
-    SetAttr = 5,
-    RemoveAttr = 6,
-    AddRelation = 7,
-    RemoveRelation = 8,
-    WriteBlob = 9,
-    Checkpoint = 10,
-}
-
-struct WalEntry {
-    lsn: u64,
-    op_kind: WalOpKind,
-    payload: Vec<u8>,
+    CreateObject, DeleteObject,
+    AddTag, RemoveTag,
+    SetAttr, RemoveAttr,
+    AddRelation, RemoveRelation,
+    WriteBlob,                                 // non-chunked objects
+    ChunkInsertBatch, ChunkListAppend,         // chunked-object flow (§9.6)
+    ChunkListReplace, ChunkListShrink, ChunkObjectFinalize,
+    BucketAlloc, BucketWrite, BucketGenBump, BucketDiscard,    // §6.1 allocation
+    BackpointerInsert, BackpointerRemove,
+    TagBitmapGrow, TagBitmapShrink,
+    SnapshotCreate, SnapshotDelete,
+    SnapshotUnlink, SnapshotDepthUpdate,
+    ReconcileEnqueue, ReconcileDequeue, ReconcileMove, ReconcileScanStep,
+    FormatPromote,
+    Checkpoint,
 }
 ```
 
-**WAL header** (64 bytes): 
-
-`magic(8) | next_lsn(8) | write_cursor(8) | read_cursor(8) | used(8) | last_checkpoint_lsn(8) | crc32(4) | reserved(12)`. 
-
-**Entry format**: 
-
-`lsn(8) | op_kind(1) | payload_length(4) | payload | crc32(4)`.
+**Encryption.** Entries optionally encrypt payloads with **AES-256-GCM** when `WAL_ENTRY_FLAG_ENCRYPTED` is set: nonce = 64-bit `lsn || 32-bit zero` (unique by LSN monotonicity), AAD = the first 36 bytes of the entry header (everything except `payload_crc`), tag (16 B) appended before the trailing framing CRC. See IMPLEMENTATION.md §3.2 for the full read/write order.
 
 Extended oplog retention (compressed segments on disk) supports dormant subscriptions catching up after being offline.
 
@@ -823,9 +812,9 @@ enum CompressionAlgo { None, Zstd(i32 /* level 1-22 */), Lz4 }
 
 enum EncryptionMode {
     None,
-    Hctr2 { object_id: u64 },    // wide-block, length-preserving
-    Xts,                          // narrow-block, length-preserving
-    AesGcm { nonce: u64 },       // authenticated, for WAL
+    Hctr2 { object_id: u64 },    // wide-block, length-preserving (blob zone)
+    Xts,                          // narrow-block, length-preserving (metadata/index zones)
+    AesGcm,                       // authenticated; nonce = 64-bit LSN || 32-bit zero (WAL)
     ChaCha20Poly1305,             // network/sync messages
 }
 
@@ -871,7 +860,7 @@ Two fundamentally different regimes using the correct cryptographic mode for eac
 
 AES-GCM is **not** used for disk encryption — it expands data, catastrophically fails on nonce reuse (power loss), and requires per-sector stored nonces. XTS and HCTR2 derive all state from sector address and key.
 
-**Tweak construction:** HCTR2 tweaks include the object ID so identical content in different objects encrypts differently.
+**Tweak construction:** HCTR2 tweaks are `(object_id || block_no_within_extent)` so identical content in different objects encrypts differently. XTS tweaks on metadata/index blocks are `block_no`.
 
 ⁉️This prevents deduplication though? #todo 
 
@@ -1458,7 +1447,7 @@ tier = "hot"
 capacity_bytes = 1073741824
 ```
 
-Index state is currently persisted as JSON in the index zone (correctness-first; binary serialization planned). Round-trip: `brunnr create` → `mimir tag/query` → `mimir` save/load works end-to-end.
+Index state is currently persisted as CBOR (length-prefixed) in the index zone — chosen over JSON for compactness and over a fully fixed binary layout for current-MVP simplicity. The target on-disk format (B+ trees of 256 KiB large nodes, fixed binary leaves, atomic root commit) is specified in IMPLEMENTATION.md. Round-trip: `brunnr create` → `mimir tag/query` → `mimir` save/load works end-to-end.
 
 ---
 
