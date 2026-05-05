@@ -67,31 +67,30 @@ pub const BTREE_KIND_CHUNK_LIST:              u16 = 11;
 pub const BTREE_KIND_BACKPOINTER:             u16 = 12;
 // Catalogs (snapshot-aware)
 pub const BTREE_KIND_ONTOLOGY:                u16 = 13;
-pub const BTREE_KIND_PATH_CONTEXT:            u16 = 14;
-pub const BTREE_KIND_SUBSCRIPTIONS:           u16 = 15;
+pub const BTREE_KIND_SUBSCRIPTIONS:           u16 = 14;
 // Snapshot tree itself
-pub const BTREE_KIND_SNAPSHOTS:               u16 = 16;
+pub const BTREE_KIND_SNAPSHOTS:               u16 = 15;
 // Per-disk physical allocation
-pub const BTREE_KIND_BUCKET_ALLOC:            u16 = 17;
-pub const BTREE_KIND_FREESPACE_LRU:           u16 = 18;
+pub const BTREE_KIND_BUCKET_ALLOC:            u16 = 16;
+pub const BTREE_KIND_FREESPACE_LRU:           u16 = 17;
 // Pool / cluster state
-pub const BTREE_KIND_DISK_DESCRIPTORS:        u16 = 19;
-pub const BTREE_KIND_PLACEMENT_RULES:         u16 = 20;
-pub const BTREE_KIND_CLUSTER_PEERS:           u16 = 21;
+pub const BTREE_KIND_DISK_DESCRIPTORS:        u16 = 18;
+pub const BTREE_KIND_PLACEMENT_RULES:         u16 = 19;
+pub const BTREE_KIND_CLUSTER_PEERS:           u16 = 20;
 // Reconcile queues (transient)
-pub const BTREE_KIND_RECONCILE_WORK:          u16 = 22;
-pub const BTREE_KIND_RECONCILE_HIGH_PRIO:     u16 = 23;
-pub const BTREE_KIND_RECONCILE_WORK_PHYS:     u16 = 24;
-pub const BTREE_KIND_RECONCILE_HIGH_PRIO_PHYS:u16 = 25;
-pub const BTREE_KIND_RECONCILE_PENDING:       u16 = 26;
-pub const BTREE_KIND_RECONCILE_SCAN:          u16 = 27;
-pub const BTREE_KIND_COUNT:                   u16 = 28;
+pub const BTREE_KIND_RECONCILE_WORK:          u16 = 21;
+pub const BTREE_KIND_RECONCILE_HIGH_PRIO:     u16 = 22;
+pub const BTREE_KIND_RECONCILE_WORK_PHYS:     u16 = 23;
+pub const BTREE_KIND_RECONCILE_HIGH_PRIO_PHYS:u16 = 24;
+pub const BTREE_KIND_RECONCILE_PENDING:       u16 = 25;
+pub const BTREE_KIND_RECONCILE_SCAN:          u16 = 26;
+pub const BTREE_KIND_COUNT:                   u16 = 27;
 const _: () = assert!(BTREE_KIND_RECONCILE_SCAN + 1 == BTREE_KIND_COUNT);
 
 // §11.5 — snapshot-aware btrees. Synchronous SnapshotDelete cost is
-// `1 + N` WAL entries where N is this count. Doc claim: "8 in the current
-// format: the six in §11.2's table plus the two radix sidecars".
-pub const SNAPSHOT_AWARE_BTREE_COUNT: usize = 8;
+// `1 + N` WAL entries where N is this count. Doc claim: "7 in the current
+// format: the five in §11.2's table plus the two radix sidecars".
+pub const SNAPSHOT_AWARE_BTREE_COUNT: usize = 7;
 const _: () = {
     // Enumerate them so additions to BtreeKind force a review here.
     let snapshot_aware: [u16; SNAPSHOT_AWARE_BTREE_COUNT] = [
@@ -101,7 +100,6 @@ const _: () = {
         BTREE_KIND_TAG_DIRECTORY,
         BTREE_KIND_RANGE,
         BTREE_KIND_ONTOLOGY,
-        BTREE_KIND_PATH_CONTEXT,      // manifest only — directory itself is snapshot-agnostic
         BTREE_KIND_SUBSCRIPTIONS,
     ];
     let _ = snapshot_aware;
@@ -135,10 +133,6 @@ pub const LEAF_ENTRY_SPILL_FLAG: u16 = 1 << 15;
 pub const LEAF_ENTRY_TOTAL_MASK: u16 = 0x7FFF;
 const _: () = assert!(LEAF_ENTRY_SPILL_FLAG | LEAF_ENTRY_TOTAL_MASK == 0xFFFF);
 const _: () = assert!(LEAF_ENTRY_SPILL_FLAG & LEAF_ENTRY_TOTAL_MASK == 0);
-
-// PathContextHeader.flags
-pub const PATH_CONTEXT_FLAG_READ_ONLY: u16 = 1 << 0;
-pub const PATH_CONTEXT_FLAG_EPHEMERAL: u16 = 1 << 1;
 
 // SnapshotNode.flags
 pub const SNAPSHOT_FLAG_LEAF:    u8 = 1 << 0;
@@ -278,7 +272,7 @@ pub struct ZoneMap {
 const _: () = assert!(size_of::<ZoneMap>() == 4096);
 
 // =====================================================================
-// §2.2 RootPointer — 424 B
+// §2.2 RootPointer — 408 B
 // Anchors every persistent btree root atomically (one COW commit flips
 // the active superblock root; every tree advances together).
 // =====================================================================
@@ -298,7 +292,6 @@ pub struct RootPointer {
     pub value_spill_root: BlockRef,
     pub backpointer_root: BlockRef,
     pub ontology_root: BlockRef,
-    pub path_context_root: BlockRef,
     pub subscriptions_root: BlockRef,
     pub pool_state_root: BlockRef,
     pub snapshot_chain_root: BlockRef,
@@ -314,7 +307,7 @@ pub struct RootPointer {
     pub flags: u32,
     pub crc: u32,
 }
-const _: () = assert!(size_of::<RootPointer>() == 424);
+const _: () = assert!(size_of::<RootPointer>() == 408);
 
 // =====================================================================
 // §2.1 Superblock — 4096 B
@@ -338,30 +331,30 @@ pub struct Superblock {
     pub creation_timestamp_ns: i64,             // [88..96]
     pub last_mount_timestamp_ns: i64,           // [96..104]
     pub mount_count: u64,                       // [104..112]
-    pub root_a: RootPointer,                    // [112..536]
-    pub root_b: RootPointer,                    // [536..960]
-    pub active_root: u8,                        // [960..961]
-    pub _pad2: [u8; 7],                         // [961..968]
-    pub wal_offset: u64,                        // [968..976]
-    pub wal_size: u64,                          // [976..984]
-    pub bucket_size_log2: u8,                   // [984..985]
-    pub copygc_reserve_pct: u8,                 // [985..986]
-    pub btree_node_size_log2: u8,               // [986..987]
-    pub _pad3: [u8; 5],                         // [987..992]
-    pub bootstrap_buckets: u32,                 // [992..996]
-    pub _pad4: [u8; 4],                         // [996..1000]
-    pub zone_map_offset: u64,                   // [1000..1008]
-    pub index_zone: ZoneExtent,                 // [1008..1032]
-    pub metadata_zone: ZoneExtent,              // [1032..1056]
-    pub blob_zone: ZoneExtent,                  // [1056..1080]
-    pub encryption_keyid: [u8; 16],             // [1080..1096]
-    pub fs_format_version: u32,                 // [1096..1100]
-    pub fs_min_on_disk: u32,                    // [1100..1104]
-    pub compat_features: u64,                   // [1104..1112]
-    pub ro_compat_features: u64,                // [1112..1120]
-    pub incompat_features: u64,                 // [1120..1128]
-    pub downgrade_log_ref: BlockRef,            // [1128..1144]
-    pub _reserved: [u8; 2948],                  // [1144..4092]
+    pub root_a: RootPointer,                    // [112..520]
+    pub root_b: RootPointer,                    // [520..928]
+    pub active_root: u8,                        // [928..929]
+    pub _pad2: [u8; 7],                         // [929..936]
+    pub wal_offset: u64,                        // [936..944]
+    pub wal_size: u64,                          // [944..952]
+    pub bucket_size_log2: u8,                   // [952..953]
+    pub copygc_reserve_pct: u8,                 // [953..954]
+    pub btree_node_size_log2: u8,               // [954..955]
+    pub _pad3: [u8; 5],                         // [955..960]
+    pub bootstrap_buckets: u32,                 // [960..964]
+    pub _pad4: [u8; 4],                         // [964..968]
+    pub zone_map_offset: u64,                   // [968..976]
+    pub index_zone: ZoneExtent,                 // [976..1000]
+    pub metadata_zone: ZoneExtent,              // [1000..1024]
+    pub blob_zone: ZoneExtent,                  // [1024..1048]
+    pub encryption_keyid: [u8; 16],             // [1048..1064]
+    pub fs_format_version: u32,                 // [1064..1068]
+    pub fs_min_on_disk: u32,                    // [1068..1072]
+    pub compat_features: u64,                   // [1072..1080]
+    pub ro_compat_features: u64,                // [1080..1088]
+    pub incompat_features: u64,                 // [1088..1096]
+    pub downgrade_log_ref: BlockRef,            // [1096..1112]
+    pub _reserved: [u8; 2980],                  // [1112..4092]
     pub trailing_crc: u32,                      // [4092..4096]
 }
 const _: () = assert!(size_of::<Superblock>() == 4096);
@@ -750,20 +743,9 @@ pub struct ChunkListEntry {
 }
 const _: () = assert!(size_of::<ChunkListEntry>() == 40);
 
-// =====================================================================
-// §10.3 PathContextHeader — 48 B
-// =====================================================================
-#[repr(C)]
-pub struct PathContextHeader {
-    pub name_offset: u32,
-    pub name_len: u16,
-    pub flags: u16,
-    pub manifest_root: BlockRef,
-    pub entry_count: u64,
-    pub last_refresh_ns: i64,
-    pub last_modify_lsn: u64,
-}
-const _: () = assert!(size_of::<PathContextHeader>() == 48);
+// §10.3 — Path projections are encoded as ordinary tag/attribute assertions
+// (Value::Scoped { context, inner }; §4.3). Nothing here to validate at the
+// layout level; ontology validation handles the type rules.
 
 // =====================================================================
 // §10.4 DiskDescriptorOnDisk — 256 B (path: [u8; 192])

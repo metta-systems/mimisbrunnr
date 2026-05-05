@@ -146,24 +146,23 @@ enum BtreeKind {
     Backpointer           = 12,  // §6.2 reverse-mapping B+ tree (snapshot-agnostic)
     // Catalogs (snapshot-aware)
     Ontology              = 13,  // §10.1 ontology / dag B+ tree (snapshot-aware)
-    PathContext           = 14,  // §10.3 path context B+ tree (snapshot-aware)
-    Subscriptions         = 15,  // §10.2 subscription B+ tree (snapshot-aware)
+    Subscriptions         = 14,  // §10.2 subscription B+ tree (snapshot-aware)
     // Snapshot tree itself
-    Snapshots             = 16,  // §11.1 snapshot tree (SnapshotId → SnapshotNode)
+    Snapshots             = 15,  // §11.1 snapshot tree (SnapshotId → SnapshotNode)
     // Per-disk physical allocation
-    BucketAlloc           = 17,  // §12.2 per-disk bucket alloc B+ tree (physical)
-    FreespaceLru          = 18,  // §12.4 per-disk freespace LRU B+ tree (physical)
+    BucketAlloc           = 16,  // §12.2 per-disk bucket alloc B+ tree (physical)
+    FreespaceLru          = 17,  // §12.4 per-disk freespace LRU B+ tree (physical)
     // Pool / cluster state
-    DiskDescriptors       = 19,  // §10.4 disk descriptors overflow tree (>12 disks)
-    PlacementRules        = 20,  // §10.4 placement rules (heterogeneous, CBOR values)
-    ClusterPeers          = 21,  // §10.4 cluster peers (NodeId → PeerRecord)
+    DiskDescriptors       = 18,  // §10.4 disk descriptors overflow tree (>12 disks)
+    PlacementRules        = 19,  // §10.4 placement rules (heterogeneous, CBOR values)
+    ClusterPeers          = 20,  // §10.4 cluster peers (NodeId → PeerRecord)
     // Reconcile queues (transient)
-    ReconcileWork         = 22,  // §17.2 normal-priority reconcile queue (logical order)
-    ReconcileHighPrio     = 23,  // §17.2 high-priority reconcile queue
-    ReconcileWorkPhys     = 24,  // §17.2 physical-LBA-ordered work index (HDD pools)
-    ReconcileHighPrioPhys = 25,  // §17.2 physical-LBA-ordered high-prio index (HDD pools)
-    ReconcilePending      = 26,  // §17.2 failed items awaiting device-config retry
-    ReconcileScan         = 27,  // §17.3 in-progress scan cursors
+    ReconcileWork         = 21,  // §17.2 normal-priority reconcile queue (logical order)
+    ReconcileHighPrio     = 22,  // §17.2 high-priority reconcile queue
+    ReconcileWorkPhys     = 23,  // §17.2 physical-LBA-ordered work index (HDD pools)
+    ReconcileHighPrioPhys = 24,  // §17.2 physical-LBA-ordered high-prio index (HDD pools)
+    ReconcilePending      = 25,  // §17.2 failed items awaiting device-config retry
+    ReconcileScan         = 26,  // §17.3 in-progress scan cursors
 }
 ```
 
@@ -474,38 +473,38 @@ struct Superblock {                          // 4096 bytes total
     last_mount_timestamp_ns: i64,            //  [96..104]
     mount_count: u64,                        // [104..112]
 
-    // Two alternating root pointers — atomic commit. RootPointer = 424 bytes (§2.2).
-    root_a: RootPointer,                     // [112..536]
-    root_b: RootPointer,                     // [536..960]
-    active_root: u8,                         // [960..961]   0 = a, 1 = b
-    _pad2: [u8; 7],                          // [961..968]
+    // Two alternating root pointers — atomic commit. RootPointer = 408 bytes (§2.2).
+    root_a: RootPointer,                     // [112..520]
+    root_b: RootPointer,                     // [520..928]
+    active_root: u8,                         // [928..929]   0 = a, 1 = b
+    _pad2: [u8; 7],                          // [929..936]
 
     // Static layout pointers (set at format time, not written again).
-    wal_offset: u64,                         // [968..976]
-    wal_size: u64,                           // [976..984]
-    bucket_size_log2: u8,                    // [984..985]   e.g. 20 = 1 MiB bucket
-    copygc_reserve_pct: u8,                  // [985..986]   default 8 (range 5..=21)
-    btree_node_size_log2: u8,                // [986..987]   default 18 = 256 KiB (§1.5)
-    _pad3: [u8; 5],                          // [987..992]
-    bootstrap_buckets: u32,                  // [992..996]   reserved leading buckets (sb + WAL + …)
-    _pad4: [u8; 4],                          // [996..1000]
-    zone_map_offset: u64,                    // [1000..1008] 0 until any zone is grown
+    wal_offset: u64,                         // [936..944]
+    wal_size: u64,                           // [944..952]
+    bucket_size_log2: u8,                    // [952..953]   e.g. 20 = 1 MiB bucket
+    copygc_reserve_pct: u8,                  // [953..954]   default 8 (range 5..=21)
+    btree_node_size_log2: u8,                // [954..955]   default 18 = 256 KiB (§1.5)
+    _pad3: [u8; 5],                          // [955..960]
+    bootstrap_buckets: u32,                  // [960..964]   reserved leading buckets (sb + WAL + …)
+    _pad4: [u8; 4],                          // [964..968]
+    zone_map_offset: u64,                    // [968..976]   0 until any zone is grown
 
     // Initial-extent zone descriptors. Always authoritative for the first extent;
     // additional extents (if any) are listed in the ZoneMap block.
-    index_zone:    ZoneExtent,               // [1008..1032] 24 bytes
-    metadata_zone: ZoneExtent,               // [1032..1056]
-    blob_zone:     ZoneExtent,               // [1056..1080]
+    index_zone:    ZoneExtent,               // [976..1000]  24 bytes
+    metadata_zone: ZoneExtent,               // [1000..1024]
+    blob_zone:     ZoneExtent,               // [1024..1048]
 
-    encryption_keyid: [u8; 16],              // [1080..1096] key identifier (not the key)
-    fs_format_version: u32,                  // [1096..1100] §15 — current writing version
-    fs_min_on_disk: u32,                     // [1100..1104] §15 — minimum version of any record on disk
-    compat_features: u64,                    // [1104..1112] §15.2 — old readers tolerate
-    ro_compat_features: u64,                 // [1112..1120] §15.2 — old readers mount RO
-    incompat_features: u64,                  // [1120..1128] §15.2 — old readers refuse
-    downgrade_log_ref: BlockRef,             // [1128..1144] §15.5 — chain of historical features
+    encryption_keyid: [u8; 16],              // [1048..1064] key identifier (not the key)
+    fs_format_version: u32,                  // [1064..1068] §15 — current writing version
+    fs_min_on_disk: u32,                     // [1068..1072] §15 — minimum version of any record on disk
+    compat_features: u64,                    // [1072..1080] §15.2 — old readers tolerate
+    ro_compat_features: u64,                 // [1080..1088] §15.2 — old readers mount RO
+    incompat_features: u64,                  // [1088..1096] §15.2 — old readers refuse
+    downgrade_log_ref: BlockRef,             // [1096..1112] §15.5 — chain of historical features
 
-    _reserved: [u8; 2948],                   // [1144..4092] zeroed, available for future fields
+    _reserved: [u8; 2980],                   // [1112..4092] zeroed, available for future fields
     // trailing CRC32C at [4092..4096] lives inside BlockHeader's frame
 }
 
@@ -563,7 +562,7 @@ windows:
 
 ```rust
 #[repr(C, packed)]
-struct RootPointer {                         // 424 bytes
+struct RootPointer {                         // 408 bytes
     seq: u64,                                //   [0..8]    monotonic; larger seq wins
     lsn: u64,                                //   [8..16]   WAL LSN this root corresponds to
 
@@ -580,28 +579,27 @@ struct RootPointer {                         // 424 bytes
     value_spill_root:         BlockRef,      // [160..176]  §7.3   content-addressed by value_hash
     backpointer_root:         BlockRef,      // [176..192]  §6.2   physical (snapshot-agnostic)
     ontology_root:            BlockRef,      // [192..208]  §10.1
-    path_context_root:        BlockRef,      // [208..224]  §10.3
-    subscriptions_root:       BlockRef,      // [224..240]  §10.2
-    pool_state_root:          BlockRef,      // [240..256]  §10.4  scalars + inline disks
-    snapshot_chain_root:      BlockRef,      // [256..272]  §11.1  snapshots btree
+    subscriptions_root:       BlockRef,      // [208..224]  §10.2
+    pool_state_root:          BlockRef,      // [224..240]  §10.4  scalars + inline disks
+    snapshot_chain_root:      BlockRef,      // [240..256]  §11.1  snapshots btree
 
     // Reconcile btrees (§17.2). Zeroed when unused; *_phys variants are
     // populated only when a rotational disk is present in the pool.
-    reconcile_work_root:      BlockRef,      // [272..288]
-    reconcile_high_prio_root:     BlockRef,      // [288..304]
-    reconcile_work_phys_root: BlockRef,      // [304..320]
-    reconcile_high_prio_phys_root: BlockRef, // [320..336]
-    reconcile_pending_root:   BlockRef,      // [336..352]
-    reconcile_scan_root:      BlockRef,      // [352..368]  §17.3  in-progress scan cursors
+    reconcile_work_root:      BlockRef,      // [256..272]
+    reconcile_high_prio_root:     BlockRef,      // [272..288]
+    reconcile_work_phys_root: BlockRef,      // [288..304]
+    reconcile_high_prio_phys_root: BlockRef, // [304..320]
+    reconcile_pending_root:   BlockRef,      // [320..336]
+    reconcile_scan_root:      BlockRef,      // [336..352]  §17.3  in-progress scan cursors
 
     // Pool-state btrees (§10.4). Promoted from PoolStateRoot for uniform
     // root-anchoring of every btree.
-    disks_overflow_root:      BlockRef,      // [368..384]  populated iff disk_count > 12
-    placement_rules_root:     BlockRef,      // [384..400]  placement rules
-    cluster_peers_root:       BlockRef,      // [400..416]  cluster peers
+    disks_overflow_root:      BlockRef,      // [352..368]  populated iff disk_count > 12
+    placement_rules_root:     BlockRef,      // [368..384]  placement rules
+    cluster_peers_root:       BlockRef,      // [384..400]  cluster peers
 
-    flags: u32,                              // [416..420]
-    crc: u32,                                // [420..424]  CRC32C of bytes [0..420]
+    flags: u32,                              // [400..404]
+    crc: u32,                                // [404..408]  CRC32C of bytes [0..404]
 }
 ```
 
@@ -951,12 +949,19 @@ Routine mutations do **not** flip the superblock root.
 binary layout is wasteful. It is encoded as **CBOR** with a fixed tag scheme:
 
 ```
-Value ::= 0  Text(string)            // CBOR major-type 3
-        | 1  Int(i64)                // CBOR major-type 0/1
-        | 2  Float(f64)              // CBOR major-type 7
+Value ::= 0  Text(string)                // CBOR major-type 3
+        | 1  Int(i64)                    // CBOR major-type 0/1
+        | 2  Float(f64)                  // CBOR major-type 7
         | 3  Timestamp(i64)
-        | 4  Blob(bytes)             // CBOR major-type 2; large blobs spilled — see below
+        | 4  Blob(bytes)                 // CBOR major-type 2; large blobs spilled — see below
+        | 5  Scoped { context: TagId, inner: Box<Value> }  // §4.3 — scoped attribute value
 ```
+
+`Scoped` is the canonical way to carry "this attribute applies in the context of tag *C*" —
+e.g. an object's `unix-path` value scoped by a `unix-path-context:rpi4-sdcard` tag. It is
+recursive (the inner Value can be any variant *except* another `Scoped` — nested scopes are a
+format error). The pattern generalises: any attribute can be scoped by any tag, not only the
+unix-path projection use case.
 
 ### 4.1 Inlined vs spilled values
 
@@ -972,6 +977,33 @@ Value ::= 0  Text(string)            // CBOR major-type 3
 The type_tag prefix prevents `Int(42)` from colliding with `Text("42")`. SipHash is keyed by a
 per-pool secret (stored in superblock-adjacent metadata, not the superblock itself) to defeat hash
 flooding.
+
+### 4.3 Scoped values
+
+`Value::Scoped { context, inner }` lets the same attribute key carry different values under
+different scopes without inflating the tag namespace. The hash and comparison rules are:
+
+- `value_hash(Scoped { context, inner }) = SipHash-2-4(... || type_tag(5) || context || cbor(inner))`.
+  Two scoped values with the same `context` and equal inner values hash identically; differing
+  contexts hash differently. KV equality lookups against a scoped attribute key (e.g. "find every
+  object whose `unix-path` value is `Scoped(rpi4, "/boot/vesper")`") are therefore exact hash hits.
+- For range / prefix scans, `NormalisedKey` (§9.2) prepends the 4-byte `context` TagId before the
+  inner value's normalised encoding. Prefix scans over `(context, *)` give the manifest of every
+  scoped value under one context — no separate manifest tree needed.
+- The query optimiser is free to rewrite `attr=K AND scope=C` as a KV/Range probe with a synthetic
+  `Scoped { C, * }` key.
+
+A `Scoped` whose inner is also `Scoped` is rejected at parse time. Attributes that are *never*
+context-scoped (e.g. `created_ns`) simply never use this variant; readers see plain values and
+do not need to be scope-aware.
+
+**Type validation.** `Scoped` is **transparent to ontology type-checking**: an attribute
+declared with `value_type = "text"` accepts both `Text(...)` and `Scoped { context, inner: Text(...) }`.
+The validator strips the `Scoped` wrapper and recurses on `inner`. Scoping is therefore
+**orthogonal** to value-type — any attribute can be scoped without altering its declared
+type, and the ontology does not need a separate `scopable` flag. The validator additionally
+checks that `context` is a `TagId` whose definition has `Grouping` semantics; non-grouping
+tags cannot be used as scopes.
 
 ---
 
@@ -1822,43 +1854,36 @@ from the record. Cursor (LSN), state, retention, debounce config, and the `Query
 inside the CBOR record — query trees are heterogeneous and infrequently rewritten, so CBOR
 overhead is negligible.
 
-### 10.3 Path contexts
+### 10.3 Path projections
 
-```
-PathContextRoot:
-  §1.5 B+ tree, key = name_hash → PathContextHeader (48 bytes)
-              (snapshot-agnostic — the directory of contexts itself doesn't diverge
-               per snapshot; per §11.2, divergence lives in each context's manifest)
+Mímisbrunnr does not have a "directory" object or a bespoke filesystem-projection structure.
+Unix-style paths are an **export format**, not the truth (per
+`details_Unix path projection.md`). They are encoded as ordinary tag/attribute assertions:
 
-  Manifest is a §1.5 B+ tree keyed by (path-string-hash, snapshot: u32) → ProjectedEntry
-              (96 bytes inline + spill for Symlink targets and long paths).
-              Snapshot-aware (§11.2): the trailing `snapshot` packs to ~0 bits when one
-              snapshot dominates a sorted run.
-```
+- An object's path is an `Attr(unix-path, Value::Text("..."))` assertion (§7.1, multi-valued —
+  the same object can hold any number of `unix-path` values, mirroring a hardlinked file).
+- A **context** (e.g. `rpi4-sdcard`, `debian-package`, `project-vesper`) is just a tag with
+  `Grouping` semantics, registered via the ontology (§10.1). An object belongs to a context
+  by carrying that tag.
+- A path that differs *per context* uses `Value::Scoped { context, inner }` (§4.3) — e.g.
+  `Attr(unix-path, Scoped(rpi4, Text("/boot/vesper")))`. Per-context overrides for `unix-mode`,
+  `unix-uid`, `unix-gid` follow the same pattern.
+- The **ordered manifest** (for tarball / package export) reuses the existing `Ordered`
+  tag-store (§8.3) on the context tag: `unix-path-context:rpi4-sdcard.store_kind = Ordered`
+  gives sequential traversal in user-defined order.
+- **Per-context stats** are derivable: `entry_count = bitmap.cardinality(context_tag_id)`,
+  `last_modify_lsn = max(last_modify_lsn over members)`. No header needed.
+- **Read-only / ephemeral context** policy lives on the *tag definition* in the ontology
+  alongside any other tag policy.
+- **There is no symlink kind.** An object that should appear at multiple paths simply carries
+  multiple `unix-path` assertions; this is the hardlink semantics, applied uniformly. Symlinks
+  exist in Unix only because a single inode can hold one path; Mímisbrunnr objects can hold
+  many, so the symlink kludge has no purpose here.
 
-```rust
-#[repr(C)]
-struct PathContextHeader {                   // 48 bytes
-    name_offset: u32,                        //  [0..4]   into the per-context string heap
-    name_len: u16,                           //  [4..6]
-    flags: u16,                              //  [6..8]   PATH_CONTEXT_FLAG_*
-    manifest_root: BlockRef,                 //  [8..24]  root of the §1.5 manifest tree
-    entry_count: u64,                        // [24..32] total ProjectedEntries (manifest size hint)
-    last_refresh_ns: i64,                    // [32..40] last full re-projection timestamp
-    last_modify_lsn: u64,                    // [40..48] for snapshot diffing
-}
-
-// PathContextHeader.flags bits
-const PATH_CONTEXT_FLAG_READ_ONLY: u16 = 1 << 0;  // immutable view; mutations rejected
-const PATH_CONTEXT_FLAG_EPHEMERAL: u16 = 1 << 1;  // not persisted across mounts
-```
-
-`entry_count`, `last_refresh_ns`, and `last_modify_lsn` are the per-context "stats" — they
-let `mimir context list` answer size and freshness questions without dereferencing
-`manifest_root`.
-
-Per-object reverse mappings (which object → which paths in which contexts) live in the forward
-index as a special assertion kind, so listing all paths of an object is one forward-index hit.
+Path projection is a convention layered on existing primitives. Listing all paths of an
+object is one forward-index hit (`Attr(unix-path, *)` assertions on the object). Listing
+all objects in a context is one tag-bitmap fetch. Building a tarball iterates the context's
+`Ordered` store.
 
 ### 10.4 Pool state
 
@@ -2005,11 +2030,9 @@ field is part of the **key**, not the value — it participates in ordering and 
 §1.5.6 format descriptor packs to ~0 bits when one snapshot dominates.
 
 **Inheritance for nested structures.** Snapshot-aware *directory* entries inherit the field
-on the directory key. The objects they point at — bitmap pages, value-spill blobs, manifest
-inner trees — are content-addressed and shared across snapshots; only the directory entry
-that selects them carries the snapshot id. For `PathContext` specifically, the
-`PathContextHeader` (the per-context directory entry) is snapshot-agnostic; the
-`ProjectedEntry` records inside each context's manifest btree carry the snapshot.
+on the directory key. The objects they point at — bitmap pages, value-spill blobs — are
+content-addressed and shared across snapshots; only the directory entry that selects them
+carries the snapshot id.
 
 | Btree              | Snapshot-aware? | Notes                                         |
 | ------------------ | --------------- | --------------------------------------------- |
@@ -2021,7 +2044,6 @@ that selects them carries the snapshot id. For `PathContext` specifically, the
 | `Backpointer`      | no              | physical state, not logical                    |
 | `BucketAlloc`, `FreespaceLru` | no | physical state                              |
 | `Ontology`         | yes             | snapshot freezes the ontology version          |
-| `PathContext`      | manifest only   | header is snapshot-agnostic; `ProjectedEntry` keys carry snapshot |
 | `Subscriptions`    | yes             | per-snapshot watch state                       |
 | `ValueSpill`       | no              | content-addressed by `value_hash`              |
 
@@ -2119,8 +2141,9 @@ and its existing backpointer is valid for both snapshots. Backpointers are physi
 Deleting a snapshot is **two operations**: a small synchronous step that takes the snapshot
 out of visibility, and a long-running background scan that physically reclaims the keys.
 The synchronous step's WAL cost is `1 + N` entries (one `SnapshotDelete` plus one
-`ReconcileEnqueue` per snapshot-aware btree — 8 in the current format: the six in §11.2's
-table plus the two radix sidecars `ObjectHistory` and `LocationHistory`); the scan's WAL
+`ReconcileEnqueue` per snapshot-aware btree — 7 in the current format: the five in §11.2's
+table (Forward, Range, TagDirectory, Ontology, Subscriptions) plus the two radix sidecars
+`ObjectHistory` and `LocationHistory`); the scan's WAL
 cost is a handful of cursor checkpoints, regardless of how many keys are involved.
 
 **Synchronous step (`SnapshotDelete` WAL op).**
@@ -2477,7 +2500,6 @@ queries:
 | `OntologyState`                              | OntologyRoot                              | fully resident         |
 | `ImplicationDag` (`petgraph::Graph<TagId, ()>`) | dag pages                              | fully resident         |
 | `SubscriptionEngine`                         | SubscriptionsRoot                         | fully resident         |
-| `PathContextManager`                         | PathContextRoot                           | fully resident         |
 | `PoolManager`                                | PoolStateRoot                             | fully resident         |
 | `BucketCache` (`HashMap<(DiskId, u32), BucketAllocEntry>`) | per-disk buckets B+ tree    | hot buckets pinned, cold paged in |
 | `WritePoints` (`HashMap<(DiskId, DataType, StreamTag), OpenBucket>`) | derived             | resident; ~hundreds of entries |
@@ -2683,13 +2705,12 @@ forward index roughly in half (~660 MiB at this scale).
 | Object table (radix)   | < 1 MiB   | Single inner node (depth 1 total)                  |
 | Location table         | ~460 MiB  | Positional — no key packing; 1 839 leaves × 256 KiB |
 | Backpointers           | ~267 MiB  | §6.2 — 10 M extents × ~28 B packed                 |
-| Forward index          | ~1.24 GiB | §7 / §1.5 B+ tree, 1 968 entries/leaf at 8 assertions/object → 5 082 leaves + 1 inner |
+| Forward index          | ~1.24 GiB | §7 / §1.5 B+ tree, 1 968 entries/leaf at 8 assertions/object → 5 082 leaves + 1 inner. Includes any `unix-path` and other path-projection attributes (§10.3) — those are ordinary `Attr` assertions. |
 | Tag inverted index     | 200–400 MiB | Roaring bitmaps (4 KiB framed), 5 000 tags       |
 | KV index               | ~100 MiB  | Extendible hash + roaring bitmaps                  |
 | Range index            | ~20 MiB   | §1.5 B+ tree, packed (`attr_id` constant per leaf) |
 | Ontology               | <10 MiB   | Modules + DAG                                      |
 | Subscriptions          | ~700 KiB  | Per 1 000 subs with packed `sub_id`                |
-| Path contexts          | 50 MiB    | One large project; path hashes don't pack          |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
 | Snapshot key overhead  | ~50 MiB   | Per-snapshot divergent keys across the 8 snapshot-aware btrees (see breakdown below) |
 | **Total metadata**     | **~4.0 GiB** | Replicated to every node; dominated by object records (1.19 GiB) and forward index (1.24 GiB) |
@@ -2708,7 +2729,7 @@ snapshot, typical for sync-driven snapshotting):
 | `Forward` divergent leaf entries     | ~5 000 × ~20 B packed = ~100 KiB | ~10 MiB |
 | `Range` divergent leaf entries       | ~1 000 × ~25 B packed = ~25 KiB  | ~2.5 MiB |
 | `TagDirectory` divergent entries     | ~50 × 48 B = ~2.5 KiB (tags rarely diverge per snapshot)  | ~250 KiB |
-| `Ontology`, `PathContext`, `Subscriptions` | usually 0 (catalogs change rarely) | <1 MiB combined |
+| `Ontology`, `Subscriptions`         | usually 0 (catalogs change rarely)         | <1 MiB combined |
 | **Sum** (≈ 100 KiB / snap × 100)     |                   | **~100 MiB raw** |
 
 The raw arithmetic gives ~100 MiB; the table's ~50 MiB figure accounts for §1.5.6 packing

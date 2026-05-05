@@ -1080,38 +1080,33 @@ Object: vesper-kernel-binary
 
 ### 12.2 Path Contexts
 
-A **path context** is itself an object — a named Unix filesystem projection containing a manifest of path-to-object mappings:
+A **path context** is just a tag with `Grouping` semantics, defined in the
+`unix-interop` ontology module. Members of the context carry the `unix-path-context:<name>`
+tag; their per-context paths and metadata are ordinary scoped attribute assertions.
 
-```rust
-struct PathProjection {
-    context: Option<String>,        // named context, or None for unscoped
-    entries: Vec<ProjectedEntry>,
-}
+There is **no symlink kind**. Unix needs symlinks because each inode has only one path;
+Mímisbrunnr objects can hold many `unix-path` assertions, so an object that should appear
+at multiple paths simply asserts multiple values — the hardlink semantics, applied
+uniformly. When projecting *out* to a Unix tree the projector picks one path as the real
+file and emits the rest as hardlinks (or duplicate copies on filesystems that lack them).
 
-struct ProjectedEntry {
-    object: Option<ObjectId>,       // None for synthesized directories
-    path: String,
-    entry_type: ProjectedEntryType,
-}
-
-enum ProjectedEntryType {
-    File { mode: u32, uid: u32, gid: u32 },
-    Symlink { target: String },
-    Directory { mode: u32 },    // virtual — synthesized from paths
-}
-
-/// Manages named contexts and an unscoped (context-free) projection
-struct PathContextManager {
-    contexts: HashMap<String, PathProjection>,
-    unscoped: PathProjection,
-}
-```
-
-Directories are virtual entries synthesized from the paths — no directory objects exist in Mímisbrunnr.
+Directories are virtual — synthesised from the paths at projection time. No directory
+objects exist in Mímisbrunnr.
 
 ### 12.3 Storage
 
-Dual storage for each projection entry: the context object holds the manifest (fast full-tree export), and each object carries its path assertion for that context (fast per-object lookup). Both updated atomically.
+Path projections reuse the existing tag/attribute machinery — there is no bespoke
+`PathContext` data structure on disk:
+
+- **Membership** in a context: the object carries the `unix-path-context:<name>` tag.
+- **Path** in a context: an `Attr(unix-path, Value::Scoped { context: tag, inner: Text(...) })`
+  assertion. Unscoped values (plain `Text(...)`) are visible in every context as the default.
+- **Per-context overrides** (mode, uid, gid): same `Scoped` form, applied to the matching
+  attribute.
+- **Ordered manifest** (for tarball export): the existing `Ordered` tag-store on the
+  context tag (IMPLEMENTATION.md §8.3).
+
+See IMPLEMENTATION.md §10.3 for the full encoding contract and §4.3 for `Value::Scoped`.
 
 ### 12.4 Export
 
@@ -1323,7 +1318,6 @@ enum OpKind {
 ```rust
 struct DiskEngine {
     engine: Engine,
-    context_mgr: PathContextManager,
     blobs: HashMap<u64, Vec<u8>>,
     primary_device: FileBlockDevice,
     superblock: Superblock,
