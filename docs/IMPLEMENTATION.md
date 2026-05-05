@@ -556,7 +556,7 @@ struct RootPointer {                         // 424 bytes
 
     // Pool-state btrees (§10.4). Promoted from PoolStateRoot for uniform
     // root-anchoring of every btree.
-    disks_overflow_root:      BlockRef,      // [368..384]  populated iff disk_count > 8
+    disks_overflow_root:      BlockRef,      // [368..384]  populated iff disk_count > 12
     placement_rules_root:     BlockRef,      // [384..400]  placement rules
     cluster_peers_root:       BlockRef,      // [400..416]  cluster peers
 
@@ -932,10 +932,12 @@ there are no internal sorted runs — positional updates are journalled via §3.
 | 0 inner (leaf only)         | 2 044                                    |
 | 1 inner                     | 2 044 × 16 380 ≈ 33 M                    |
 | 2 inner                     | 2 044 × 16 380² ≈ 548 G                  |
+| 3 inner                     | 2 044 × 16 380³ ≈ 9 P                    |
 
-A 10 M-object pool sits in a **single-inner-level tree** (root inner + leaves; depth 2). The
-full 48-bit local-id space is reachable at depth 3 (≈ 9 P objects). The 4-bit `level` field in
-`BtreeNodeHeader` supports depths 0–15.
+A 10 M-object pool sits in a **single-inner-level tree** (root inner + leaves; depth 1). The
+full 48-bit local-id space is reachable at depth 3 (≈ 9 P objects). The `level` field in
+`BtreeNodeHeader` is a `u8`, but only 4 bits are used by convention, representing levels 0–15
+which is *plenty* for all intents and purposes.
 
 `RootPointer.object_table_root` is a `BlockRef` to the topmost node; the node's
 `BtreeNodeHeader.level` identifies whether it is a leaf (very small pool) or an inner node.
@@ -1279,7 +1281,7 @@ per sorted run.
 
 #### Footprint
 
-Per 10 M objects with average 1 extent each: 10 M backpointers × ~28 B packed ≈ **280 MiB**.
+Per 10 M objects with average 1 extent each: 10 M backpointers × ~28 B packed ≈ **267 MiB**.
 Plus a few thousand btree-node backpointers (~100 KiB) and ~5 000 tag-bitmap backpointers
 (~140 KiB). Negligible compared to existing per-object metadata.
 
@@ -1372,13 +1374,13 @@ format descriptor records `oid_base = leaf.min_oid` and `oid_bits = ⌈log₂(le
 leaf.min_oid + 1)⌉`.
 
 At "8 assertions per object" (the §7.2 inline-spill threshold; per-entry ≈ 2.5 B packed
-`(oid, snapshot)` key + 2 B header + 128 B inline body = ~133 B), a leaf packs ~1 970 entries
+`(oid, snapshot)` key + 2 B header + 128 B inline body = 133 B), a leaf packs 1 969 entries
 total. Sorted runs share the region's payload bytes (§1.5.2 appends them into the same 256 KiB
 region), so adding sorted runs does not multiply capacity — each new run consumes 72 B of
 overhead (32 B `SortedRunHeader` + 40 B `SortedRunKeyFormat` for the 2-field key) and slightly
-reduces the entry budget. With 4 active sorted runs the leaf still carries ~1 968 entries
+reduces the entry budget. With 4 active sorted runs the leaf still carries 1 968 entries
 before §1.5.4 triggers full compaction. Smaller objects pack denser: 4 assertions per entry
-→ ~3 800 entries per leaf.
+→ 3 797 entries per leaf (3 794 with 4 active sorted runs).
 
 ### 7.2 Spill
 
@@ -1452,7 +1454,7 @@ On-disk, leaf sorted runs use the §1.5.6 packed-key encoding with **two key fie
 but clustered ids); `snapshot` packs to ~0 bits when one snapshot dominates, a few bits
 otherwise. The 40 bytes of value following the key stay byte-aligned. Per-key on-disk cost is
 ~37 B. A 256 KiB leaf sorted run (262 144 − 64 − 32 − 40 = 262 008 B payload) holds
-**~7 080 entries**. For 5 000 tags × ~100 snapshots without divergence (one entry per tag,
+**7 081 entries**. For 5 000 tags × ~100 snapshots without divergence (one entry per tag,
 shared across snapshots) the full directory fits in **a single leaf** (depth 0); pools where
 many tags diverge across snapshots, or pools with hundreds of thousands of tags, extend the
 tree to depth 1 (~115 M-entry capacity).
@@ -2375,7 +2377,7 @@ queries:
 
 | In-memory type                               | Mirrors on-disk                           | Lifetime                  |
 | -------------------------------------------- | ----------------------------------------- | ------------------------- |
-| `ObjectTable` (positional accessor over `BTreeNodeCache`) | §5 radix tree of `BtreeKind::ObjectTable` leaves; per-record access = (radix descent → leaf `BlockRef`) → cache lookup → 128 B slot at `oid_local % 2044` | leaves cached per `BTreeNodeCache` policy below; no separate resident array (1.28 GiB at 10 M objects, ≥ TiBs at the 48-bit cap) |
+| `ObjectTable` (positional accessor over `BTreeNodeCache`) | §5 radix tree of `BtreeKind::ObjectTable` leaves; per-record access = (radix descent → leaf `BlockRef`) → cache lookup → 128 B slot at `oid_local % 2044` | leaves cached per `BTreeNodeCache` policy below; no separate resident array (~1.19 GiB at 10 M objects, ≥ TiBs at the 48-bit cap) |
 | `LocationTable` (positional accessor over `BTreeNodeCache`) | §6.1 radix tree of `BtreeKind::LocationTable` leaves; per-record access = same descent → 48 B slot at `oid_local % 5440` | shares `BTreeNodeCache`; same eviction policy as `ObjectTable` |
 | `TagIndex { HashMap<TagId, TagStore> }`      | TagDirectory + TagBitmap pages            | mmap-pinned roaring containers |
 | `KvIndex { HashMap<(TagId,u64), RoaringBitmap> }` | KvDirectory + buckets                  | resident, lazy-load buckets |
@@ -2579,13 +2581,13 @@ forward index roughly in half (~660 MiB at this scale).
 | ---------------------- | --------- | -------------------------------------------------- |
 | Superblock × 3         | 12 KiB    | Fixed                                              |
 | WAL                    | 64 MiB    | Btree-update journal (§3); mirrored across devices |
-| Bucket alloc table     | ~280 MiB  | 16 M buckets × ~18 B/entry (16 B value + ~2 B packed `bucket_no`) |
+| Bucket alloc table     | ~288 MiB  | 16 M buckets × ~18 B/entry (16 B value + ~2 B packed `bucket_no`) |
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
-| Object table (records) | 1.28 GiB  | Positional — no key packing applies                |
-| Object table (radix)   | < 1 MiB   | Single inner node (depth 2 total)                  |
-| Location table         | 480 MiB   | Positional — no key packing                        |
-| Backpointers           | ~280 MiB  | §6.2 — 10 M extents × ~28 B packed                 |
-| Forward index          | ~1.24 GiB | §7 / §1.5 B+ tree, ~1 968 entries/leaf at 8 assertions/object → 5 082 leaves + 1 inner |
+| Object table (records) | ~1.19 GiB | Positional — no key packing applies; 4 893 leaves × 256 KiB |
+| Object table (radix)   | < 1 MiB   | Single inner node (depth 1 total)                  |
+| Location table         | ~459 MiB  | Positional — no key packing; 1 838 leaves × 256 KiB |
+| Backpointers           | ~267 MiB  | §6.2 — 10 M extents × ~28 B packed                 |
+| Forward index          | ~1.24 GiB | §7 / §1.5 B+ tree, 1 968 entries/leaf at 8 assertions/object → 5 082 leaves + 1 inner |
 | Tag inverted index     | 200–400 MiB | Roaring bitmaps (4 KiB framed), 5 000 tags       |
 | KV index               | ~100 MiB  | Extendible hash + roaring bitmaps                  |
 | Range index            | ~20 MiB   | §1.5 B+ tree, packed (`attr_id` constant per leaf) |
@@ -2594,13 +2596,13 @@ forward index roughly in half (~660 MiB at this scale).
 | Path contexts          | 50 MiB    | One large project; path hashes don't pack          |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
 | Snapshot key overhead  | ~50 MiB   | Per-snapshot unique keys across all snapshot-aware btrees |
-| **Total metadata**     | **~4.1 GiB** | Replicated to every node; dominated by object records (1.28 GiB) and forward index (1.24 GiB) |
+| **Total metadata**     | **~4.0 GiB** | Replicated to every node; dominated by object records (1.19 GiB) and forward index (1.24 GiB) |
 
 **Transient overhead** (not in steady state — fills during specific events, drains afterwards):
 
 | Structure              | Size       | Trigger                                           |
 | ---------------------- | ---------- | ------------------------------------------------- |
-| Reconcile work btrees  | < 1 MiB idle, ~480 MiB during disk evacuation / cluster resilver | §17.10 |
+| Reconcile work btrees  | < 1 MiB idle, ~458 MiB during disk evacuation / cluster resilver | §17.10 |
 | `ReconcileScan` cursors| < 1 MiB    | Per active scan; ~hundreds of bytes each          |
 | `SnapshotCleanup` work | < 1 MiB    | Bounded by the count of snapshot-aware btrees, not key count (§11.5) |
 
@@ -2828,7 +2830,7 @@ Work-item btrees are transient — fill during migration events, drain to near-e
 state. Typical bounds:
 
 - Idle pool: < 1 MiB across all reconcile btrees.
-- Disk evacuation in progress (~10 M items, all of an evacuated disk's blob extents): ~480 MiB
+- Disk evacuation in progress (~10 M items, all of an evacuated disk's blob extents): ~458 MiB
   while in flight; drains to zero on completion.
 - Cluster resilver after a disk failure: similar.
 

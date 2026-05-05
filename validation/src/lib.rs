@@ -7,7 +7,7 @@ use std::mem::size_of;
 
 // =====================================================================
 // Symbolic flag constants — mirrors §1.3, §1.5.1, §1.5.6, §3.1, §3.2,
-// §5.1, §6.1, §7.1, §10.3, §11.1, §12.2, §17.2.
+// §5.1, §6.1, §7.1, §10.3, §11.1, §12.2 (BucketAllocEntry), §17.2.
 // Asserted-by-existence: any code referring to these names compiles iff
 // the constants stay defined here.
 // =====================================================================
@@ -53,7 +53,7 @@ pub const PATH_CONTEXT_FLAG_EPHEMERAL: u16 = 1 << 1;
 pub const SNAPSHOT_FLAG_LEAF:    u8 = 1 << 0;
 pub const SNAPSHOT_FLAG_DELETED: u8 = 1 << 1;
 
-// BucketAllocKey.flags
+// BucketAllocEntry.flags
 pub const BUCKET_FLAG_NEEDS_DISCARD:      u8 = 1 << 0;
 pub const BUCKET_FLAG_PINNED_BY_SNAPSHOT: u8 = 1 << 1;
 
@@ -745,17 +745,17 @@ const _: () = assert!(size_of::<SnapshotNode>() == 64);
 const _: () = assert!(std::mem::offset_of!(SnapshotNode, ancestor_bitmap) == 16);
 
 // =====================================================================
-// §12.2 BucketAllocKey — 16 B
+// §12.2 BucketAllocEntry — 16 B
 // =====================================================================
 #[repr(C, packed)]
-pub struct BucketAllocKey {
+pub struct BucketAllocEntry {
     pub generation: u32,
     pub data_type: u8,
     pub flags: u8,
     pub dirty_sectors: u16,
     pub last_modify_lsn: u64,
 }
-const _: () = assert!(size_of::<BucketAllocKey>() == 16);
+const _: () = assert!(size_of::<BucketAllocEntry>() == 16);
 
 // =====================================================================
 // §17.2 WorkItem — 48 B
