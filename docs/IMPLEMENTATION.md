@@ -387,8 +387,10 @@ in-memory sorted run state.
 | Snapshots btree   | 4 B (snap_id) | 2 B           | 50%    | Sequential snapshot ids           |
 | Path / chunk hash | 8 / 32 B     | unchanged      | 0%     | Random-looking hashes — packing skipped |
 
-Random-looking content hashes (chunk index, path-string hashes) bypass packing via
-`bit_width = 64` and `base = 0` — they keep the explicit form.
+Random-looking content hashes (chunk index, path-string hashes) bypass packing by encoding
+each 64-bit limb of the hash as one `FieldFormat` with `bit_width = 64` and `base = 0` — a
+32 B BLAKE3 chunk hash uses four such fields, an 8 B path-string hash uses one. The packed
+form is then bit-for-bit identical to the unpacked hash bytes.
 
 **Footprint impact.** Combined across the metadata zone, packing reduces B+ tree footprint by
 ~30% and improves cache utilisation proportionally — more keys per cache line means more keys
@@ -552,6 +554,12 @@ struct RootPointer {                         // 424 bytes
 
 `BlockRef` is `{ disk_id: u16, _pad: u16, block_no: u32, generation: u64 }` — 16 bytes,
 self-validating against the destination block's header.
+
+`BlobRef` is `{ disk_id: u16, _pad: u16, block_no: u32, length: u64 }` — also 16 bytes, used to
+address a contiguous payload extent within the blob zone (§4.1, §5.2's `OverflowAttr` spill,
+§9.3's chunk index leaf). Unlike `BlockRef`, it carries an explicit `length` (in bytes) rather
+than a generation; freshness is derived from the owning record's bucket-generation check at
+deref time.
 
 **Commit protocol** (invoked per the cadence in §3.5, *not* per mutation):
 
@@ -991,8 +999,9 @@ For objects with more than 4 tags, any attributes, or any relations, a separate
 **OverflowRecord** lives in the metadata zone, addressed by `overflow_offset`.
 `OBJECT_FLAG_HAS_OVERFLOW` is set in `ObjectRecord.flags`; while it's set, `inline_tags` is
 **ignored** and **all** tags + attrs + relations for the object live in the overflow chain
-(not split between inline and overflow). When the flag is clear, `relation_count` is
-guaranteed `0` (no inline relation storage exists). The object-wide totals stay in
+(not split between inline and overflow). When the flag is clear, both `attr_count` and
+`relation_count` are guaranteed `0` (no inline storage exists for either — only the four
+`inline_tags` slots, gated by `tag_count ≤ 4`). The object-wide totals stay in
 `ObjectRecord.{tag,attr,relation}_count` (each capped at u16 max ≈ 65 K — beyond that, switch
 to the per-object B+ tree escape hatch).
 
@@ -1439,15 +1448,20 @@ fit in one block, the directory and containers are co-located.
 
 ```
 OrderedStore root block:
-  members: BlockRef → TagBitmap
-  sequence: BlockRef → SequencePages
-  sequence_count: u64
+  members:        BlockRef → TagBitmap
+  sequence_head:  BlockRef → first SequencePage in a singly-linked chain
+  sequence_count: u64                  // total ObjectIds across the chain
 
 RankedStore root block:
-  members: BlockRef → TagBitmap
-  ranked: BlockRef → RankedPages
-  ranked_count: u64
+  members:        BlockRef → TagBitmap
+  ranked_head:    BlockRef → first RankedPage in a singly-linked chain
+  ranked_count:   u64                  // total entries across the chain
 ```
+
+Each `SequencePage` / `RankedPage` ends with a `next: BlockRef` slot (zero on the tail page);
+walking the logical array is a forward chain traversal. Pages are sized to hold a whole 4 KiB
+block of entries; appending to the array writes a new page (when the tail is full) and updates
+the previous tail's `next` pointer in the same checkpoint as the new page.
 
 Each `SequencePage` and `RankedPage` is a 4 KiB block under the standard §1.3 framing
 (`BlockHeader` + payload + trailing CRC32C):
@@ -1457,7 +1471,8 @@ SequencePage (4 KiB):
   BlockHeader  { kind = TagBitmapPage, format_version = 1 }       // 32 B
   entry_count: u16                                                //  2 B
   _pad: [u8; 6]                                                   //  6 B
-  entries: [u64; 506]              // ObjectIds                    // 4048 B
+  next: BlockRef                   // 0 = tail of chain            // 16 B
+  entries: [u64; 504]              // ObjectIds                    // 4032 B
   _pad_tail: [u8; 4]                                              //  4 B
   trailing CRC32C                                                 //  4 B
                                                                   // = 4096 B
@@ -1466,7 +1481,8 @@ RankedPage (4 KiB):
   BlockHeader  { kind = TagBitmapPage, format_version = 1 }       // 32 B
   entry_count: u16                                                //  2 B
   _pad: [u8; 6]                                                   //  6 B
-  entries: [{ oid: u64, score: f32, _pad: u32 }; 253]   // 16 B   // 4048 B
+  next: BlockRef                   // 0 = tail of chain            // 16 B
+  entries: [{ oid: u64, score: f32, _pad: u32 }; 252]   // 16 B   // 4032 B
   _pad_tail: [u8; 4]                                              //  4 B
   trailing CRC32C                                                 //  4 B
                                                                   // = 4096 B
@@ -1900,6 +1916,11 @@ Divergence happens only where modifications occur. If N already has children fro
 snapshots / rollbacks, those nodes follow N₂ in the sibling chain (`N₂.next_sibling`) — the
 total ordering reflects creation recency, head-first.
 
+The `SnapshotCreate` WAL op (§3.3) records this as
+`{ new_id, parent_id, current_replacement, label }` where `new_id ↔ N₂` (the frozen snapshot),
+`parent_id ↔ N` (the previous current), and `current_replacement ↔ N₁` (the new writable head
+to which subsequent mutations are tagged).
+
 A new `BackpointerInsert` is **not** issued for shared extents — the underlying blob is unchanged
 and its existing backpointer is valid for both snapshots. Backpointers are physical, not logical
 (§6.2 / §11.2 table), so they're snapshot-agnostic.
@@ -2101,12 +2122,12 @@ freespace LRU.
 
 One **§1.5 B+ tree** per disk, rooted at `DiskDescriptorOnDisk.buckets_root`, keyed by
 `bucket_no: u32`. With key packing (§1.5.6) sequential bucket numbers compress to ~2 B per key,
-so a 256 KiB leaf packs ~14 600 BucketAllocKey entries per sorted run; a 16 M-bucket disk fits in
+so a 256 KiB leaf packs ~14 600 BucketAllocEntry entries per sorted run; a 16 M-bucket disk fits in
 **depth 1** (single inner node + ~1 100 leaves):
 
 ```rust
 #[repr(C, packed)]
-struct BucketAllocKey {                      // 16 bytes
+struct BucketAllocEntry {                      // 16 bytes
     generation: u32,                         // monotonic; matched by BlockRef.generation
     data_type: u8,                           // BucketDataType (below)
     flags: u8,                               // BUCKET_FLAG_*
@@ -2114,7 +2135,7 @@ struct BucketAllocKey {                      // 16 bytes
     last_modify_lsn: u64,                    // for snapshot-diffing the alloc table itself
 }
 
-// BucketAllocKey.flags bits
+// BucketAllocEntry.flags bits
 const BUCKET_FLAG_NEEDS_DISCARD:      u8 = 1 << 0;  // queued for TRIM (§12.7)
 const BUCKET_FLAG_PINNED_BY_SNAPSHOT: u8 = 1 << 1;  // contents reachable from a live snapshot
 
@@ -2148,7 +2169,7 @@ in_bucket   = block_no &  ((1 << (bucket_size_log2 - 12)) - 1)
 Dereference protocol:
 
 1. Compute `bucket_no` from `block_no`.
-2. Look up `BucketAllocKey` (hot buckets pinned in RAM).
+2. Look up `BucketAllocEntry` (hot buckets pinned in RAM).
 3. If `key.generation != ref.generation`, the pointer is **stale**: silently dropped on reads,
    logged as a corruption signal during scrub.
 
@@ -2197,7 +2218,7 @@ a fresh bucket is opened from the freespace LRU.
 
 Per-zone hints (§2.1) are advisory rather than hard partitions: a zone defines the *preferred*
 disk region for a data type, but the allocator can spill across zone boundaries when the zone
-runs short. The authoritative classification is `BucketAllocKey.data_type` per bucket.
+runs short. The authoritative classification is `BucketAllocEntry.data_type` per bucket.
 
 ### 12.6 Copy GC
 
@@ -2236,7 +2257,7 @@ On unclean shutdown:
 1. Each disk's `buckets_root` is loaded from the last committed `RootPointer`.
 2. WAL replay applies pending bucket-lifecycle entries (`BucketAlloc`, `BucketWrite`,
    `BucketGenBump`, `BucketDiscard`) in LSN order.
-3. Any block whose `BlockRef.generation` does not match the recovered `BucketAllocKey.generation`
+3. Any block whose `BlockRef.generation` does not match the recovered `BucketAllocEntry.generation`
    is treated as stale and ignored — exactly as it would be at runtime.
 
 The combination of "WAL is authoritative for recent transitions" and "generation mismatches
@@ -2262,7 +2283,7 @@ queries:
 | `SubscriptionEngine`                         | SubscriptionsRoot                         | fully resident         |
 | `PathContextManager`                         | PathContextRoot                           | fully resident         |
 | `PoolManager`                                | PoolStateRoot                             | fully resident         |
-| `BucketCache` (`HashMap<(DiskId, u32), BucketAllocKey>`) | per-disk buckets B+ tree    | hot buckets pinned, cold paged in |
+| `BucketCache` (`HashMap<(DiskId, u32), BucketAllocEntry>`) | per-disk buckets B+ tree    | hot buckets pinned, cold paged in |
 | `WritePoints` (`HashMap<(DiskId, DataType, StreamTag), OpenBucket>`) | derived             | resident; ~hundreds of entries |
 | `BTreeNodeCache` (`HashMap<BlockRef, LoadedNode>` + LRU) | §1.5 large nodes (256 KiB each) | journal-pinned nodes never evicted; clean nodes LRU. Working-set ≈ 100–500 hot nodes ⇒ 25–125 MiB. |
 | `BackpointerCache` (LRU of bucket-prefix scan results) | §6.2 backpointer btree leaves | populated on demand by copygc / scrub / resilver |
@@ -2515,8 +2536,8 @@ Each is just a different `WorkKind` in the same queue. New mismatch types are ad
 
 ### 17.2 Work-item btrees
 
-Five §1.5 B+ trees, all `BtreeKind::Reconcile*` (a sixth, `ReconcileScan`, holds resumable
-scan cursors and is described in §17.3):
+Six §1.5 B+ trees, all `BtreeKind::Reconcile*` — five work queues plus `ReconcileScan` for
+resumable scan cursors (described in §17.3):
 
 ```rust
 enum WorkKind {
@@ -2554,6 +2575,7 @@ const WORK_FLAG_PERSISTENT:  u32 = 1 << 1;  // do not drop on completion (audit 
 | `ReconcileWorkPhys`    | physical LBA (disk_id, bucket, sector_offset) | HDD-backed pools — sequential processing avoids seeks. Maintained as a parallel index alongside `ReconcileWork`. |
 | `ReconcileHighPrioPhys`   | same                                  | High-priority physical-order index.          |
 | `ReconcilePending`     | logical key                           | Failed items. Retried only after device-config events; avoids spin loops on permanently-blocked work. |
+| `ReconcileScan`        | scan_id                               | Resumable scan cursors (§17.3); not a work queue. One record per active scan. |
 
 Whether to maintain `*_Phys` indexes is set per-disk via `DiskDescriptorOnDisk` (rotational
 hint). Pure NVMe pools skip them.
