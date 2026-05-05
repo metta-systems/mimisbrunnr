@@ -865,6 +865,22 @@ BackpointerRemove: { key: BackpointerKey }                                // exp
 // Implicit removal: a BucketGenBump invalidates all of that bucket's backpointers lazily
 // (stale entries detected by gen mismatch on the next scan, no per-bp WAL op needed).
 
+// Tag bitmap allocation lifecycle (§8.1, §8.2)
+TagBitmapGrow    : { tag_id: u32, snapshot: u32, store_kind: u8, new_root: BlockRef }
+                   // A tag's bitmap was allocated, relocated, or extended into a new
+                   //   region. Replay sets the matching TagDirectory entry's store_root
+                   //   (and store_kind) to new_root. Emitted on first AddTag for a new
+                   //   (tag, snapshot) pair, on bitmap region growth past 4 KiB, and
+                   //   after reconcile-driven moves of a tag-bitmap extent.
+TagBitmapShrink  : { tag_id: u32, snapshot: u32 }
+                   // A tag's bitmap is now empty (cardinality dropped to 0). Replay
+                   //   removes the TagDirectory entry; the bitmap region is reclaimed
+                   //   via bucket-gen bump. Emitted by the last RemoveTag for the
+                   //   (tag, snapshot) pair.
+// AddTag / RemoveTag (above) carry membership changes; TagBitmapGrow / TagBitmapShrink
+// carry pointer / lifecycle changes. The split decouples WAL replay from the
+// TagDirectory leaf shape — recovery never has to mimic the runtime allocation policy.
+
 // Snapshot lifecycle (§11)
 SnapshotCreate   : { new_id: u32, parent_id: u32, current_replacement: u32, label: Option<String> }
                    // label capped at 256 bytes — one-sector WAL invariant (§3.2)
@@ -874,6 +890,22 @@ SnapshotDelete   : { id: u32 }                                            // mar
 // checkpointed via ReconcileScanStep (§11.5, §17.3). The scan is
 // idempotent: a re-tagged leaf no longer matches the deleted snapshot
 // id, so resuming from a stale cursor after crash is safe.
+
+// Snapshot-tree topology mutations (§11.5 SnapshotTreeReorg pass)
+SnapshotUnlink     : { id: u32, parent: u32, prev_sibling: u32 }
+                     // Remove `id` from the snapshots btree. If prev_sibling != 0,
+                     //   set prev_sibling.next_sibling = id.next_sibling; otherwise set
+                     //   parent.first_child = id.next_sibling. Emitted at the end of
+                     //   a SnapshotCleanup scan (§11.5) once all keys at `id` have
+                     //   been re-tagged or dropped.
+SnapshotDepthUpdate: { id: u32, new_depth: u16, new_skiplist: [u32; 3], new_ancestor_bitmap: u128 }
+                     // Recompute ancestry data for a snapshot node whose effective
+                     //   parent changed because an ancestor was unlinked. Emitted in
+                     //   batches by the SnapshotTreeReorg pass — one per affected
+                     //   descendant. Replay updates the snapshots btree leaf in place.
+// The reorg decomposes into N × SnapshotDepthUpdate followed by one SnapshotUnlink per
+// removed snapshot. Each op fits comfortably in one sector (max ~50 B), and replay is
+// local to the snapshots btree.
 
 // Reconcile (§17)
 ReconcileEnqueue : { work: WorkItem, high_prio: bool, phys_index: bool }
@@ -965,11 +997,11 @@ of it, only the constants change.
 
 **Cumulative ≠ simultaneous.** The 64 MiB ring is circular. Steady-state ring fill is bounded
 by *reclaim latency*, not by total traffic over the operation. Reclaim's job is flushing
-ChunkIndex leaves (256 KiB regions packing ~4 600 chunks each); the leaf-flush rate it must
-sustain to keep the ring drained is `chunks_per_second / 4 600` leaves/s — equivalently,
-`(producer_plaintext_rate / avg_chunk_size) / 4 600` leaves/s. At 530 MiB/s plaintext:
+ChunkIndex leaves (256 KiB regions packing 4 678 chunks each); the leaf-flush rate it must
+sustain to keep the ring drained is `chunks_per_second / 4 678` leaves/s — equivalently,
+`(producer_plaintext_rate / avg_chunk_size) / 4 678` leaves/s. At 530 MiB/s plaintext:
 
-- **4 KiB regime:** ~135 K chunks/s ÷ 4 600 = ~29 leaves/s = ~7.5 MiB/s of leaf rewrites.
+- **4 KiB regime:** ~135 K chunks/s ÷ 4 678 = ~29 leaves/s = ~7.4 MiB/s of leaf rewrites.
   Comfortably within NVMe write bandwidth (~1–3 GiB/s typical) but no longer trivial; this
   is where reclaim genuinely has to keep up. Cumulative WAL exceeds the 64 MiB ring by ~7×,
   so the ring cycles continuously.
@@ -1807,6 +1839,10 @@ Hash-based on disk via **extendible hashing** keyed by `(tag_id, value_hash)`. T
 the one structure that does **not** use the §1.5 large-node B+ tree format — point-equality
 lookups benefit more from hash-bucket addressing.
 
+`value_hash` is computed transparently over `Value::Scoped` wrappers — see §4.3. A scoped
+attribute and an unscoped one with the same inner content hash to **different** values, so
+they land in different KV buckets without any branching at the lookup site.
+
 ```
 KvDirectory (single 4 KiB block, addressed by RootPointer.kv_index_root):
    header (BlockHeader, kind = KvHashDirectory)                                        // 32 B
@@ -1845,8 +1881,12 @@ faceted enumeration, range comparisons).
 ### 9.2 Range Index
 
 A **B+ tree of large nodes** (§1.5) keyed by `(attr_id: u32, value: NormalisedKey, oid: u64,
-snapshot: u32)` — 32 B unpacked (snapshot-aware per §11.2). With per-run key packing (§1.5.6)
-this is the structure that benefits most:
+snapshot: u32)` — 32 B unpacked (snapshot-aware per §11.2). For scoped attribute values
+(§4.3), `NormalisedKey` prepends the 4-byte context `TagId` before the inner value's
+encoding, so prefix scans over `(attr_id, context, *)` give the manifest of every scoped
+value under one context — no separate manifest tree needed.
+
+With per-run key packing (§1.5.6) this is the structure that benefits most:
 
 - `attr_id` is almost always **constant** within a leaf (a leaf covers one or two adjacent
   attributes) → 0 bits per key.
@@ -1911,7 +1951,10 @@ ChunkIndexLeafEntry {                        // 56 bytes
 }
 ```
 
-A 256 KiB leaf packs ~4 600 chunk entries per sorted run.
+A 256 KiB leaf packs **4 678 chunk entries per sorted run** —
+`(262 144 − 64 [BtreeNodeHeader] − 32 [SortedRunHeader] − 72 [4-field key format])
+÷ 56 = 4 678`. Random-looking BLAKE3 hashes bypass §1.5.6 packing (each 32 B hash uses
+four `bit_width = 64` field formats), so per-key cost is the unpacked 56 B.
 
 Chunk hashes use BLAKE3 of plaintext (pre-compression) so dedup is content-defined. FastCDC
 (content-defined chunking) decides the chunk boundaries; the chunk index records each unique
@@ -2375,11 +2418,17 @@ scan from a stale cursor after a crash is a no-op for already-processed leaves. 
 removes the need for any per-key undo or redo log.
 
 **Completion.** When the scan reaches the end of every snapshot-aware btree, a final
-`SnapshotNode` removal is performed: the deleted node is unlinked from its parent's sibling
-list (parent's `first_child` is advanced past it, or its predecessor's `next_sibling` is
-spliced over it), and the `depth`/`skiplist` fields of descendants are recomputed in a single
-batched `SnapshotTreeReorg` pass (deferred to the next checkpoint quiesce — see §3.5 — to
-avoid racing with live ancestry queries).
+**SnapshotTreeReorg pass** runs (deferred to the next checkpoint quiesce — see §3.5 — to
+avoid racing with live ancestry queries). The pass emits, in this order:
+
+1. One `SnapshotDepthUpdate` (§3.3) per affected descendant — recomputed
+   `depth` / `skiplist` / `ancestor_bitmap` reflecting the new effective parent.
+2. One `SnapshotUnlink` (§3.3) per deleted snapshot — splices the node out of its
+   parent's sibling chain.
+
+Each op is small (≤ ~50 B) and replays locally against the snapshots btree leaf.
+Decomposing the pass into per-edit ops (rather than a single bulk reorg op) keeps each
+WAL entry within the §3.2 sector cap regardless of how many descendants are affected.
 
 **Constraints.**
 - A snapshot with more than one non-deleted child cannot collapse during cleanup; all but one

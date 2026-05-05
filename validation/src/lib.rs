@@ -723,6 +723,54 @@ pub struct RankedPage {
 const _: () = assert!(size_of::<RankedPage>() == 4096);
 
 // =====================================================================
+// §9.1 KvBucket explicit packing — assert the 144-entry calculation
+// matches the 4 KiB block budget exactly. The overall size_of assertion
+// already proves it indirectly; this version pins the arithmetic so the
+// doc's 144 figure stays load-bearing.
+// =====================================================================
+pub const KV_BUCKET_HEADER:           usize = size_of::<BlockHeader>();      // 32
+pub const KV_BUCKET_LOCAL_DEPTH:      usize = 1;
+pub const KV_BUCKET_ENTRY_COUNT:      usize = 2;
+pub const KV_BUCKET_PAD_PRE_ENTRIES:  usize = 1;
+pub const KV_BUCKET_PAD_TAIL:         usize = 24;
+pub const KV_BUCKET_TRAILING_CRC:     usize = 4;
+pub const KV_BUCKET_OVERHEAD:         usize =
+    KV_BUCKET_HEADER
+        + KV_BUCKET_LOCAL_DEPTH
+        + KV_BUCKET_ENTRY_COUNT
+        + KV_BUCKET_PAD_PRE_ENTRIES
+        + KV_BUCKET_PAD_TAIL
+        + KV_BUCKET_TRAILING_CRC;
+pub const KV_BUCKET_ENTRIES:          usize =
+    (BLOCK_SIZE - KV_BUCKET_OVERHEAD) / size_of::<KvBucketEntry>();
+const _: () = assert!(KV_BUCKET_ENTRIES == 144);
+const _: () =
+    assert!(KV_BUCKET_OVERHEAD + KV_BUCKET_ENTRIES * size_of::<KvBucketEntry>() == BLOCK_SIZE);
+
+// =====================================================================
+// §10.4 inline-disks limit — must match Superblock's PoolStateRoot.inline_disks
+// array length and the doc's "disk_count ≤ 12 → inline" rule.
+// =====================================================================
+pub const INLINE_DISK_LIMIT: usize = 12;
+const _: () = assert!(
+    size_of::<PoolStateRoot>()
+        == size_of::<BlockHeader>()
+            + 4 + 4                                          // disk_count + cluster_node_count
+            + INLINE_DISK_LIMIT * size_of::<DiskDescriptorOnDisk>()
+            + 980 + 4                                        // _reserved + trailing_crc
+);
+
+// =====================================================================
+// §16 Bucket-alloc footprint — 16 Mi buckets × 18 B/entry ≈ 288 MiB.
+// Pinning the arithmetic catches unit drift (MB vs MiB) at build time.
+// =====================================================================
+pub const ALLOC_BUCKETS_16TIB_DISK:    usize = 16 * 1024 * 1024;             // 1 MiB buckets
+pub const ALLOC_ENTRY_BYTES_PACKED:    usize = 18;                            // 16 B value + ~2 B packed bucket_no
+pub const ALLOC_FOOTPRINT_BYTES:       usize =
+    ALLOC_BUCKETS_16TIB_DISK * ALLOC_ENTRY_BYTES_PACKED;
+const _: () = assert!(ALLOC_FOOTPRINT_BYTES == 288 * 1024 * 1024);            // == 288 MiB exactly
+
+// =====================================================================
 // §9.3 ChunkIndexLeafEntry — 56 B
 // =====================================================================
 #[repr(C, packed)]
@@ -1147,7 +1195,23 @@ const _: () = assert!(CHUNK_LIST_REPLACE_MAX_HASHES == 125);
 // real-world parameter range and pin every figure in the doc's spectrum table.
 // All compute over a 32 GiB bulk write with no dedup.
 pub const CHUNK_LIST_ENTRIES_PER_REGION: usize = CHUNK_LIST_ENTRIES;        // 6_551
-pub const CHUNK_INDEX_LEAF_ENTRIES:      usize = 4_600;                      // §9.3 prose figure
+
+// ChunkIndex is a snapshot-agnostic B+ tree keyed by `chunk_hash: [u8; 32]`. The key
+// is a hash, so the §1.5.6 packed-key encoding skips packing; each key is encoded as
+// four 64-bit `FieldFormat` limbs. Per-run overhead = SortedRunHeader (32) + key format
+// (8 + 4×16 = 72) = 104 B; per entry = 56 B (§9.3 ChunkIndexLeafEntry).
+pub const CHUNK_INDEX_RUN_KEY_FORMAT: usize = 8 + 4 * size_of::<FieldFormat>();
+const _: () = assert!(CHUNK_INDEX_RUN_KEY_FORMAT == 72);
+pub const CHUNK_INDEX_RUN_OVERHEAD:   usize =
+    size_of::<SortedRunHeader>() + CHUNK_INDEX_RUN_KEY_FORMAT;
+const _: () = assert!(CHUNK_INDEX_RUN_OVERHEAD == 104);
+pub const CHUNK_INDEX_RUN_PAYLOAD: usize =
+    REGION - size_of::<BtreeNodeHeader>() - CHUNK_INDEX_RUN_OVERHEAD;
+pub const CHUNK_INDEX_LEAF_ENTRIES: usize =
+    CHUNK_INDEX_RUN_PAYLOAD / size_of::<ChunkIndexLeafEntry>();
+// 261 976 / 56 = 4 678 — the doc's "~4 600" prose figure rounds conservatively;
+// we pin the exact derivation here so §9.3 stays honest.
+const _: () = assert!(CHUNK_INDEX_LEAF_ENTRIES == 4_678);
 const _: () = assert!(CHUNK_LIST_ENTRIES_PER_REGION == 6_551);
 
 pub const CHUNK_BULK_WRITE_BYTES:        usize = 32 * 1024 * 1024 * 1024;   // 32 GiB
