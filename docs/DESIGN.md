@@ -882,13 +882,13 @@ Mutations generate sync operations replicated across nodes via hybrid logical cl
 
 ```rust
 /// Hybrid Logical Clock timestamp for total ordering without coordination
-struct HybridTimestamp {
-    wall_ms: u64,       // wall-clock milliseconds
-    logical: u16,       // logical counter for same-ms ordering
-    node_id: NodeId,    // originating node
+struct HybridTimestamp {            // 16 B
+    physical_ns: i64,               // [0..8]   monotonic wall-clock nanoseconds
+    logical:     u16,               // [8..10]  same-tick disambiguation
+    node_id:     NodeId,            // [10..12] originating node (NodeId = u16)
+    _pad:        u32,               // [12..16] tail pad to multiple-of-8
 }
-// Packed to u64: [wall_ms: 48 bits][logical: 16 bits]
-// Total order: wall_ms → logical → node_id
+// Total order: physical_ns → logical → node_id
 
 struct SyncOp {
     timestamp: HybridTimestamp,

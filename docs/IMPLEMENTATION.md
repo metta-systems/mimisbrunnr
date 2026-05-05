@@ -681,13 +681,17 @@ struct WalEntryHeader {                      // 40 bytes
 }
 
 // HybridTimestamp is the cluster-wide hybrid logical clock for total ordering
-// without coordination (DESIGN §10.4). Sort order: wall_ms → logical → node_id.
+// without coordination (DESIGN §10.4). Sort order: physical_ns → logical → node_id.
+// Resolution is nanoseconds (matches every other *_ns field in the format —
+// ObjectRecord.created_ns/modified_ns, SnapshotNode.created_ns,
+// Superblock.creation_timestamp_ns, etc.). At ns granularity, two events colliding
+// inside one tick is rare, so a 16-bit `logical` counter is plenty.
 #[repr(C, packed)]
 struct HybridTimestamp {                     // 16 bytes
-    wall_ms: u64,                            // [0..8]   wall-clock milliseconds
-    logical: u16,                            // [8..10]  logical counter for same-ms ordering
-    node_id: u16,                            // [10..12] originating node (NodeId)
-    _pad: u32,                               // [12..16] tail pad to multiple-of-8 (§1.1)
+    physical_ns: i64,                        // [0..8]   monotonic wall-clock nanoseconds
+    logical:     u16,                        // [8..10]  same-tick disambiguation
+    node_id:     u16,                        // [10..12] originating node (NodeId)
+    _pad:        u32,                        // [12..16] tail pad to multiple-of-8 (§1.1)
 }
 
 // WalEntryHeader.flags bits

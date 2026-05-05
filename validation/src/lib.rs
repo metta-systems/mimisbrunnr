@@ -298,14 +298,21 @@ const _: () = assert!(size_of::<WalHeader>() == 4096);
 
 // =====================================================================
 // §3.2 WalEntryHeader — 40 B
+// HybridTimestamp uses ns resolution (matches every other *_ns field on disk)
+// and u16 node_id (matches Superblock.node_id). Sort order: physical_ns →
+// logical → node_id (DESIGN §10.4).
 // =====================================================================
 #[repr(C, packed)]
 pub struct HybridTimestamp {
-    pub physical_ns: i64,
-    pub logical: u32,
-    pub node_id: u32,
+    pub physical_ns: i64,    // [0..8]   monotonic wall-clock nanoseconds
+    pub logical: u16,        // [8..10]  same-tick disambiguation
+    pub node_id: u16,        // [10..12] originating node (matches Superblock.node_id)
+    pub _pad: u32,           // [12..16] tail pad to multiple-of-8
 }
 const _: () = assert!(size_of::<HybridTimestamp>() == 16);
+const _: () = assert!(std::mem::offset_of!(HybridTimestamp, physical_ns) == 0);
+const _: () = assert!(std::mem::offset_of!(HybridTimestamp, logical) == 8);
+const _: () = assert!(std::mem::offset_of!(HybridTimestamp, node_id) == 10);
 
 #[repr(C, packed)]
 pub struct WalEntryHeader {
