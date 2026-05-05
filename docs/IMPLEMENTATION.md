@@ -844,10 +844,29 @@ journal_head]` whose key range intersects the node, producing the merged live vi
 is bounded by journal size (~800 K entries worst-case), but the reclaim thresholds keep typical
 lag under ~10 K entries per node.
 
-**Write-once-under-read-lock.** Because rewrites are full-node COW (a fresh page at a fresh
-location), the flush thread holds only a *shared* lock on the source DirtyNode while it builds
-the new page contents. The exclusive lock is taken only at the moment the parent BlockRef is
-swapped — milliseconds, regardless of node size. Readers are never blocked on disk I/O.
+**Locking model.** Two independent lock domains govern btree state. The mutation pipeline in
+§13 and the flush thread cooperate through them without a shared coarse mutex:
+
+- **Per-tree write mutex** (mutation path). One mutex per snapshot-aware btree, plus one for
+  the WAL ring. It serialises LSN allocation, the WAL append, and the in-memory-mirror
+  update — the steps that must be atomic across concurrent writers. It is released before
+  any per-node bookkeeping. The current implementation may use a single coarse engine-wide
+  mutex covering all trees; that is correct but trades scalability for simplicity and is
+  expected to refine into per-tree locks as contention emerges.
+- **Per-DirtyNode rwlock** (flush path). One rwlock per loaded node. Because rewrites are
+  full-node COW (a fresh page at a fresh location), the flush thread holds only the *shared*
+  lock on the source DirtyNode while it builds the new page contents. The *exclusive* lock
+  is taken only at the moment the parent `BlockRef` is swapped — milliseconds, regardless of
+  node size. The mutation path also takes the per-DirtyNode exclusive lock briefly, after
+  releasing the per-tree mutex, to bump `pending_lsn_max` / `pending_count` on affected
+  nodes; this is uncontended in steady state because the flush thread holds shared most of
+  the time.
+
+The two domains are independent: a flush of node A runs concurrently with a mutation hitting
+node B, and a mutation on node A only contends with a flush of node A at the brief
+exclusive-swap moment. **Readers** consult the arc-swap'd index handle and are never blocked
+on either lock — never on the per-tree mutex (writers release it before any disk I/O), never
+on a DirtyNode lock (readers go through the arc-swap'd snapshot, not the live DirtyNode).
 
 **Durability semantics.**
 
@@ -2399,20 +2418,27 @@ queries:
 | `OpLog` (`VecDeque<OpLogEntry>`)             | recent WAL tail                           | trimmed at checkpoint  |
 
 `Engine` (DESIGN §15) owns these and is wrapped by `DiskEngine` which adds `FileBlockDevice`,
-superblock, allocator, and snapshot manager. All mutations follow:
+superblock, allocator, and snapshot manager. All mutations follow the pipeline below; see
+§3.4's *Locking model* for the lock domains referenced here:
 
 ```
-1. Acquire engine write lock
+1. Acquire the per-tree write mutex (§3.4) for the target btree.
 2. Tag the mutation with the **current snapshot id** (§11.2) — for snapshot-aware btrees, the
-   key includes `snapshot = current_snapshot_id`
-3. Append WAL entry (fsync if durability mode = sync)
-4. Apply to in-memory mirror (idempotent on lsn)
-5. Update affected btree nodes' journal pins: set/extend `pending_lsn_max`, increment
-   `pending_count`. Page rewrites are deferred to the journal-reclaim thread (§3.4).
-6. Release write lock
+   key includes `snapshot = current_snapshot_id`.
+3. Append WAL entry (fsync if durability mode = sync).
+4. Apply to in-memory mirror (idempotent on lsn).
+5. Release the per-tree write mutex.
+6. Take per-DirtyNode exclusive locks briefly to bump `pending_lsn_max` /
+   `pending_count` on each affected node. Page rewrites are deferred to the
+   journal-reclaim thread (§3.4).
 ```
 
-Reads are mostly lock-free against an `arc-swap`'d snapshot of the relevant index handle.
+The per-tree mutex covers steps 1–4 (LSN allocation, WAL append, in-memory-mirror update);
+step 6's per-DirtyNode locks are independent and uncontended in steady state because the
+flush thread holds the same DirtyNode rwlock in *shared* mode while building new pages. The
+implementation may collapse the per-tree mutex into a single coarse engine-wide mutex; that
+is a scalability tradeoff, not a correctness one. **Reads** consult the arc-swap'd index
+handle and are never blocked on either lock domain.
 
 ### 13.1 Roaring bitmap representation
 
