@@ -331,7 +331,7 @@ on typical workloads.
 
 For a 10 M-object pool with 5 000 tags and ~100 snapshots, every tree is shallow:
 
-| Tree                | Depth  | Tiers  | Notes                                      |
+| Tree                | Depth  | Levels | Notes                                      |
 | ------------------- | ------ | ------ | ------------------------------------------ |
 | Object table (§5)   | 1      | 2      | 4 893 leaves under 1 inner                 |
 | Location table (§6.1)| 1     | 2      | 1 839 leaves under 1 inner                 |
@@ -339,10 +339,10 @@ For a 10 M-object pool with 5 000 tags and ~100 snapshots, every tree is shallow
 | Tag directory (§8.1)| 0      | 1      | 5 000 entries fit in a single 7 081-entry leaf |
 | Range index (§9.2)  | 0–1    | 1–2    | depends on attribute cardinality           |
 
-(See the depth convention in §5: *depth* counts inner levels, *levels* counts inner + leaf
-tiers — a depth-*N* tree has *N + 1* tiers.) Each node access is a single sequential I/O of
-256 KiB — critical for HDD performance and friendly to SSD command queues. The cache holds
-whole nodes, so intra-node lookups are memory-resident after the first hit.
+(See the depth convention in §5: *depth* counts inner levels above the leaves; *levels* is the
+total count — a depth-*N* tree has *N + 1* levels.) Each node access is a single sequential
+I/O of 256 KiB — critical for HDD performance and friendly to SSD command queues. The cache
+holds whole nodes, so intra-node lookups are memory-resident after the first hit.
 
 #### 1.5.6 Sorted-run format descriptors and packed keys
 
@@ -902,9 +902,7 @@ lag under ~10 K entries per node.
 - **Per-tree write mutex** (mutation path). One mutex per snapshot-aware btree, plus one for
   the WAL ring. It serialises LSN allocation, the WAL append, and the in-memory-mirror
   update — the steps that must be atomic across concurrent writers. It is released before
-  any per-node bookkeeping. The current implementation may use a single coarse engine-wide
-  mutex covering all trees; that is correct but trades scalability for simplicity and is
-  expected to refine into per-tree locks as contention emerges.
+  any per-node bookkeeping.
 - **Per-DirtyNode rwlock** (flush path). One rwlock per loaded node. Because rewrites are
   full-node COW (a fresh page at a fresh location), the flush thread holds only the *shared*
   lock on the source DirtyNode while it builds the new page contents. The *exclusive* lock
@@ -1001,11 +999,12 @@ there are no internal sorted runs — positional updates are journalled via §3.
 > **Depth convention.** Throughout this document, *depth* counts the **inner levels** of a B+
 > tree or radix tree above the leaves — equivalently, the maximum value of `BtreeNodeHeader.level`
 > present in the tree. A **depth-0** tree is leaf-only (one node, `level = 0`); a **depth-*N***
-> tree has *N* levels of inner nodes plus the leaves, *N + 1* tiers in total. `MAX_LEVELS = 3`
-> bounds *inner* depth, so the deepest tree this format addresses is depth 3 (4 tiers total),
+> tree has *N* inner levels plus the leaf level, *N + 1* levels in total. `MAX_LEVELS = 3`
+> bounds *inner* depth, so the deepest tree this format addresses is depth 3 (4 levels total),
 > covering ≥ 2⁴⁸ objects. A read at depth *N* touches at most `N + 1` nodes; a flush at depth
-> *N* rewrites at most `N + 1` nodes (`(N + 1) × node_size` bytes). The word *levels* is
-> reserved for the total tier count when needed informally.
+> *N* rewrites at most `N + 1` nodes (`(N + 1) × node_size` bytes). The plural *levels* is the
+> informal name for the total layer count when prose calls for it; the singular *level* refers
+> to a specific layer, matching the `BtreeNodeHeader.level` field value.
 
 | Depth (inner levels + leaf) | Max objects                              |
 | --------------------------- | ---------------------------------------- |
@@ -1059,7 +1058,7 @@ rewrite.
 
 Nodes are rewritten copy-on-write **only when the journal-reclaim thread flushes them** (§3.4),
 never per mutation. A flush at depth *D* costs roughly *(D + 1) × 256 KiB* of writes (one
-rewrite per tier, leaf included). For the 10 M-object pool (depth 1) that's **2 node
+rewrite per level, leaf included). For the 10 M-object pool (depth 1) that's **2 node
 rewrites per flush** (leaf + root inner), amortised across however many mutations have
 accumulated against that leaf since its last flush.
 
@@ -1393,7 +1392,7 @@ unpacked 8 bytes.
   §1.5.6 packing the trailing `snapshot` packs to ~0 bits when one snapshot dominates a sorted
   run, so the cost is marginal: a 3 B ceiled key + 16 B BlockRef = 19 B per entry; one full
   sorted run packs 13 789 children (⌊262 008 / 19⌋). Tree at 10 M objects: **depth 1** (1 inner
-  + leaves; 2 tiers total).
+  level + leaves; 2 levels total).
 - **Leaf node** (level 0): sorted runs of `LeafEntry` records:
 
 ```rust
@@ -2508,10 +2507,8 @@ superblock, allocator, and snapshot manager. All mutations follow the pipeline b
 
 The per-tree mutex covers steps 1–4 (LSN allocation, WAL append, in-memory-mirror update);
 step 6's per-DirtyNode locks are independent and uncontended in steady state because the
-flush thread holds the same DirtyNode rwlock in *shared* mode while building new pages. The
-implementation may collapse the per-tree mutex into a single coarse engine-wide mutex; that
-is a scalability tradeoff, not a correctness one. **Reads** consult the arc-swap'd index
-handle and are never blocked on either lock domain.
+flush thread holds the same DirtyNode rwlock in *shared* mode while building new pages.
+**Reads** consult the arc-swap'd index handle and are never blocked on either lock domain.
 
 ### 13.1 Roaring bitmap representation
 
@@ -2694,8 +2691,33 @@ forward index roughly in half (~660 MiB at this scale).
 | Subscriptions          | ~700 KiB  | Per 1 000 subs with packed `sub_id`                |
 | Path contexts          | 50 MiB    | One large project; path hashes don't pack          |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
-| Snapshot key overhead  | ~50 MiB   | Per-snapshot unique keys across all snapshot-aware btrees |
+| Snapshot key overhead  | ~50 MiB   | Per-snapshot divergent keys across the 8 snapshot-aware btrees (see breakdown below) |
 | **Total metadata**     | **~4.0 GiB** | Replicated to every node; dominated by object records (1.19 GiB) and forward index (1.24 GiB) |
+
+**Snapshot key overhead breakdown.** "Snapshot key overhead" is the sum of *divergent* keys —
+keys whose value at one snapshot differs from its value at an ancestor. Shared keys cost nothing
+extra (one entry, visible in every snapshot whose ancestry reaches it via §11.3). The ~50 MiB
+figure assumes the canonical workload of 100 snapshots taken roughly hourly over an actively
+mutated pool with **~5 000 mutations/snapshot** (≈ 0.05 % of the 10 M objects diverging per
+snapshot, typical for sync-driven snapshotting):
+
+| Source of divergence                 | Per snapshot      | × 100 snapshots |
+| ------------------------------------ | ----------------- | --------------- |
+| `ObjectHistory` sidecar (oid, snap → ObjectRecord override) | ~5 000 × 128 B = ~640 KiB | ~64 MiB |
+| `LocationHistory` sidecar (oid, snap → ObjectLocation override) | ~5 000 × 48 B = ~240 KiB | ~24 MiB |
+| `Forward` divergent leaf entries     | ~5 000 × ~20 B packed = ~100 KiB | ~10 MiB |
+| `Range` divergent leaf entries       | ~1 000 × ~25 B packed = ~25 KiB  | ~2.5 MiB |
+| `TagDirectory` divergent entries     | ~50 × 48 B = ~2.5 KiB (tags rarely diverge per snapshot)  | ~250 KiB |
+| `Ontology`, `PathContext`, `Subscriptions` | usually 0 (catalogs change rarely) | <1 MiB combined |
+| **Sum** (≈ 100 KiB / snap × 100)     |                   | **~100 MiB raw** |
+
+The raw arithmetic gives ~100 MiB; the table's ~50 MiB figure accounts for §1.5.6 packing
+benefits (the trailing `snapshot` field packs to ~0 bits when one snapshot dominates a sorted
+run) and the fact that not every divergent oid touches every snapshot-aware tree. Workloads
+with **lower mutation rates** (cold archive snapshots taken daily) drop into the single-digit
+MiB range; **higher rates** (~50 K mutations/snapshot, e.g. an actively edited dataset) push
+this row into the GiB range — a deliberate tradeoff of snapshot frequency × pool churn versus
+disk space, surfaced via §11.8's retention policy.
 
 **Transient overhead** (not in steady state — fills during specific events, drains afterwards):
 
