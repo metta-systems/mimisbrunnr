@@ -1291,9 +1291,13 @@ keys share the leaf's key range (typically a span of 10⁴ – 10⁵ contiguous 
 descriptor's `bit_width` settles around 16–20 bits — encoding `oid` as 2–3 bytes versus the
 unpacked 8 bytes.
 
-- **Inner node** (`BtreeKind::Forward`, level ≥ 1): one or more sorted runs of `(packed_oid_key,
-  child: BlockRef)` pairs. With 2–3 byte packed keys + 16 B BlockRef = ~18–19 B per entry; one
-  full sorted run packs ~14 500 children. Tree depth at 10 M objects: **2 levels** (1 inner + leaves).
+- **Inner node** (`BtreeKind::Forward`, level ≥ 1): one or more sorted runs of
+  `(packed_(oid, snapshot)_key, child: BlockRef)` pairs. The `snapshot` field is part of the
+  separator key — without it, an oid whose `(oid, *)` cluster spans a leaf boundary would be
+  unrepresentable (the inner separator would collide with the same `oid` on both sides). With
+  §1.5.6 packing the trailing `snapshot` packs to ~0 bits when one snapshot dominates a sorted
+  run, so the cost is marginal: 2–4 byte packed keys + 16 B BlockRef = ~18–20 B per entry; one
+  full sorted run packs ~13 000 children. Tree depth at 10 M objects: **2 levels** (1 inner + leaves).
 - **Leaf node** (level 0): sorted runs of `LeafEntry` records:
 
 ```rust
