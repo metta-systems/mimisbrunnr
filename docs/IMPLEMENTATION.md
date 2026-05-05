@@ -25,8 +25,18 @@ Goals:
 ### 1.1 Byte order, alignment, packing
 
 - All multi-byte integers are **little-endian**.
-- All fixed-size on-disk structs are `#[repr(C)]`, with `Pod + Zeroable` from `bytemuck`. This
-  permits `bytemuck::cast_slice` over an mmapped region for zero-copy traversal.
+- All fixed-size on-disk structs are `#[repr(C)]` (or `#[repr(C, packed)]` — see below), with
+  `Pod + Zeroable` from `bytemuck`. This permits `bytemuck::cast_slice` over an mmapped region
+  for zero-copy traversal.
+- `#[repr(C, packed)]` is the **common form** in this document. Every field is placed at an
+  offset chosen by hand and documented inline (e.g. `// [12..20]`); explicit `_pad` arrays
+  fill any gaps. Because the layout is already aligned by construction, `packed` strips
+  Rust's implicit padding without changing the byte image and without introducing unaligned
+  loads in practice — readers either `bytemuck::cast` whole records (which copies the bytes
+  into an aligned local) or read individual fields via `read_unaligned` on platforms that
+  need it. `#[repr(C)]` (no `packed`) is used when the struct is large and accessed
+  field-at-a-time (e.g. `ObjectRecord`, `TagDirectory` leaf entries) so the compiler can
+  emit aligned loads on hot paths.
 - No bit-packed fields cross a byte boundary (use a `u32` flags word, not C bitfields).
 - All structs are sized as a multiple of 8 bytes; explicit `_pad` arrays document tail padding.
 - Strings on disk are UTF-8, length-prefixed (`u16 len`), never NUL-terminated.
@@ -594,11 +604,29 @@ indirected through `object_table_root` (§5).
 ## 3. Write-Ahead Log
 
 The WAL is the **btree-update journal**: a 64 MiB circular log (configurable; must be a multiple
-of 4 KiB) on the fastest disk, mirrored to a second disk. Each entry records one key-level
-mutation (add tag, write extent, bucket transition, …). Btree nodes on disk are **not** rewritten
-per mutation — they are rewritten lazily when journal reclaim or memory pressure demands it
-(§3.4). The journal is therefore the **source of truth** for any btree state newer than each
-node's `BlockHeader.lsn`.
+of 4 KiB), hosted on the pool's **hot-tier** disks (`StorageTier::Hot` — NVMe / SSD; see
+DESIGN §8.1). On disks that don't carry a ring, `Superblock.wal_offset` and `wal_size` are
+simply `0` — no allocation, no reservation. Adding a ring later (e.g. a cold disk being
+promoted to hot, or an operator widening the mirror) is a routine allocation: 64 MiB is a
+trivial reservation on cold-tier capacities, so the format doesn't pre-allocate the slot.
+
+Each entry records one key-level mutation (add tag, write extent, bucket transition, …).
+Btree nodes on disk are **not** rewritten per mutation — they are rewritten lazily when
+journal reclaim or memory pressure demands it (§3.4). The journal is therefore the **source
+of truth** for any btree state newer than each node's `BlockHeader.lsn`.
+
+**Mirroring across hot disks.** WAL appends fan out to every hot-tier disk's ring as the same
+byte sequence under a single shared LSN — typically the fastest disk as primary plus one
+mirror (DESIGN §8.2 illustrates NVMe primary + SSD mirror, with the HDD carrying no ring).
+Cold and Glacier-tier disks are deliberately excluded: their latency would dominate fsync
+and they exist to hold cold blob extents, not hot mutation state. A user fsync waits for the
+append to land on at least the configured replica count of hot rings (default 2) before
+returning; recovery picks whichever ring has the highest valid LSN and uses the others to
+fill any missing entries. Per-disk rings share an LSN namespace because each is the same
+logical journal, just persisted in parallel.
+
+If the pool has only one hot-tier disk, the WAL runs unmirrored on that disk and the user is
+responsible for accepting the durability tradeoff (or adding a second hot disk).
 
 Per-mutation cost is one ≈ 80-byte journal append. Btree page rewrites are amortised across all
 mutations that touched each node since its last flush. A tag mutation that touches four index
@@ -2336,10 +2364,12 @@ The on-disk layout is encryption-aware but encryption-agnostic:
   - **Nonce**: 96 bits = 64-bit LSN || 32-bit zero. Nonces are unique by construction — LSNs
     are monotonically allocated and never repeat under one key. AES-GCM is *not* a
     nonce-misuse-resistant scheme; uniqueness must be enforced and reuse is catastrophic.
-  - **LSN wrap**: the 64-bit LSN space (~1.8 × 10¹⁹ values) cannot wrap within any realistic
-    deployment lifetime — at 10⁶ entries/s sustained, wrap takes ~580 000 years. The format
-    nevertheless rejects `next_lsn` rollover and requires key rotation (a fresh `DiskKey`)
-    before the boundary; a wrap under the same key would reuse a nonce.
+  - **LSN wrap is forbidden.** The 64-bit LSN space (~1.8 × 10¹⁹ values) cannot wrap within
+    any realistic deployment lifetime — at 10⁶ entries/s sustained, wrap takes ~580 000
+    years. The implementation **panics on `next_lsn` overflow** rather than wrapping; this
+    is treated as an unrecoverable invariant violation, since reusing an LSN under the same
+    `DiskKey` would reuse a GCM nonce (§14) and break confidentiality + integrity.
+    Operationally there is no "near-the-boundary" code path to test or rotate around.
   - **AAD**: the first 36 bytes of `WalEntryHeader` — every field except `payload_crc` —
     authenticating magic, op_kind, format_version, flags, lsn, timestamp, and payload_length.
     Header-swap attacks (re-binding a valid ciphertext to a different LSN or op_kind) are
