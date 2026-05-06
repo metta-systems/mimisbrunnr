@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use {
     bytemuck::{Pod, Zeroable},
-    mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
+    mimisbrunnr_storage::{BlockDevice, BtreeKind, LoadedNode, SortedRun},
     mimisbrunnr_types::{TagId, Value, value_hash},
     roaring::RoaringBitmap,
     serde::{Deserialize, Serialize},
@@ -270,22 +270,38 @@ impl KvIndex {
         })
     }
 
-    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
-    /// on `device`. Replaces the region wholesale via
-    /// [`BtreeRegion::write_full`].
+    /// Write the in-memory state into a fresh 256 KiB region at byte
+    /// `offset` on `device`.
+    ///
+    /// **R1c-A1**: writes via the IMPL §9.1 native extendible-hash
+    /// layout — `KvDirectory` 4 KiB block at slot 0, `KvBucket` 4 KiB
+    /// blocks in slots `1..=bucket_count`, `TagBitmapPage` 4 KiB
+    /// blocks one per `(tag_id, value_hash)` entry in the trailing
+    /// slots. Replaces R1b-1's CBOR sorted-run path
+    /// ([`Self::to_loaded_node`] / [`Self::from_loaded_node`] stay
+    /// available for tooling but are no longer the engine's
+    /// persistence path).
+    ///
+    /// ## Capacity (R1c-A1)
+    ///
+    /// The 256 KiB region holds 64 × 4 KiB blocks. Layout is:
+    /// 1 directory + `bucket_count` buckets + `entry_count` bitmap
+    /// pages. Practical entry cap is ~62 (depth=0 single bucket); the
+    /// real spec capacity (~9 000 entries per region with global_depth
+    /// ≥ 4 + bucket_alloc-driven page pool) needs Tier 3 D3 sub-bucket
+    /// allocation to move bitmap pages out of the kv_index_root region.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
         offset: u64,
     ) -> Result<(), IndexError> {
-        let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, KvIndexKey, KvIndexValue>(device, offset, &mut node)?;
-        Ok(())
+        flush_extendible_hash(self, device, offset)
     }
 
-    /// Read the in-memory state from the 256 KiB region at byte `offset` on
-    /// `device`. An all-zero region is treated as "empty index" and returns
-    /// [`Self::default`].
+    /// Read the in-memory state from the 256 KiB region at byte `offset`
+    /// on `device`. An all-zero region returns [`Self::default`].
+    ///
+    /// **R1c-A1**: reads via the native extendible-hash layout.
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
         offset: u64,
@@ -295,13 +311,190 @@ impl KvIndex {
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, KvIndexKey, KvIndexValue>(
-            device,
-            offset,
-            BtreeKind::KvDirectory,
-        )?;
-        Self::from_loaded_node(&node)
+        load_extendible_hash(device, offset)
     }
+}
+
+// ---------- Extendible-hash region layout (R1c-A1) ----------
+
+/// Slot size — every block in the region is 4 KiB.
+const SLOT_SIZE: u64 = mimisbrunnr_storage::BLOCK_SIZE as u64;
+
+/// Total slot count in a 256 KiB region.
+const SLOTS_PER_REGION: usize = (256 * 1024) / 4096; // = 64
+
+/// Compute the directory index for `(tag_id, value_hash)` at the
+/// current `global_depth`. Uses the top `global_depth` bits of
+/// `value_hash` so a depth bump (split) is a 1-bit-shift refinement.
+fn directory_index(value_hash: u64, global_depth: u8) -> u32 {
+    if global_depth == 0 {
+        0
+    } else {
+        (value_hash >> (64 - global_depth as u32)) as u32
+    }
+}
+
+/// Pick `global_depth` from entry count: ceil(log2(ceil(N / 144))).
+fn select_global_depth(entry_count: usize) -> u8 {
+    if entry_count <= crate::kv_bucket::KV_BUCKET_MAX_ENTRIES {
+        return 0;
+    }
+    let buckets_needed = entry_count.div_ceil(crate::kv_bucket::KV_BUCKET_MAX_ENTRIES);
+    let mut depth = 0u8;
+    while (1usize << depth) < buckets_needed {
+        depth += 1;
+        if depth > crate::kv_directory::KV_DIRECTORY_MAX_INLINE_DEPTH {
+            // Will error on the layout-cap check below.
+            break;
+        }
+    }
+    depth
+}
+
+fn slot_block_ref(region_offset: u64, slot_idx: usize, disk_id: u16) -> mimisbrunnr_storage::BlockRef {
+    let absolute = region_offset + (slot_idx as u64) * SLOT_SIZE;
+    let block_no = (absolute / SLOT_SIZE) as u32;
+    mimisbrunnr_storage::BlockRef {
+        disk_id,
+        _pad: 0,
+        block_no,
+        generation: 1,
+    }
+}
+
+fn flush_extendible_hash<D: BlockDevice>(
+    idx: &KvIndex,
+    device: &D,
+    offset: u64,
+) -> Result<(), IndexError> {
+    let entry_count = idx.entries.len();
+    let global_depth = select_global_depth(entry_count);
+    if global_depth > crate::kv_directory::KV_DIRECTORY_MAX_INLINE_DEPTH {
+        return Err(IndexError::Roaring(format!(
+            "KvIndex needs global_depth {} which exceeds R1c-A1 inline cap {}; \
+             add buckets via the bucket allocator (Tier 3 D3) to expand",
+            global_depth,
+            crate::kv_directory::KV_DIRECTORY_MAX_INLINE_DEPTH
+        )));
+    }
+    let bucket_count = 1usize << global_depth;
+    // Layout cap: 1 directory + bucket_count buckets + entry_count bitmap pages.
+    if 1 + bucket_count + entry_count > SLOTS_PER_REGION {
+        return Err(IndexError::Roaring(format!(
+            "KvIndex region too small under R1c-A1: directory(1) + buckets({}) \
+             + bitmaps({}) > {} slots; Tier 3 D3 moves bitmaps out of the region",
+            bucket_count, entry_count, SLOTS_PER_REGION
+        )));
+    }
+
+    // 1. Build buckets in memory (assign each entry to a bucket via hash).
+    let mut buckets: Vec<crate::kv_bucket::KvBucketBlock> = (0..bucket_count)
+        .map(|_| crate::kv_bucket::KvBucketBlock::new(global_depth))
+        .collect();
+
+    // Stable iteration order so the on-disk layout is deterministic
+    // (BTreeMap-sorted by (tag_id, value_hash)).
+    let mut sorted_entries: Vec<((TagId, u64), &RoaringBitmapSerde)> =
+        idx.entries.iter().map(|(k, v)| (*k, v)).collect();
+    sorted_entries.sort_by_key(|((t, h), _)| (t.raw(), *h));
+
+    // 2. Reserve a bitmap-page slot per entry, write bitmap pages, and
+    //    record their BlockRefs in the corresponding buckets.
+    let bitmap_slot_base = 1 + bucket_count;
+    for (i, ((tag, value_hash), bm_serde)) in sorted_entries.iter().enumerate() {
+        let bitmap_slot = bitmap_slot_base + i;
+        let bitmap_block_ref = slot_block_ref(offset, bitmap_slot, 0);
+        let bitmap_byte_offset = offset + (bitmap_slot as u64) * SLOT_SIZE;
+        let mut page = crate::tag_bitmap_page::TagBitmapPage::from_bitmap(&bm_serde.0)
+            .map_err(|e| IndexError::Roaring(e.to_string()))?;
+        page.write(device, bitmap_byte_offset)
+            .map_err(|e| IndexError::Roaring(e.to_string()))?;
+
+        // Place into the matching bucket.
+        let dir_idx = directory_index(*value_hash, global_depth);
+        let bucket = &mut buckets[dir_idx as usize];
+        bucket
+            .upsert(tag.raw(), *value_hash, bitmap_block_ref)
+            .map_err(|e| IndexError::Roaring(e.to_string()))?;
+    }
+
+    // 3. Write each bucket to its slot.
+    for (bucket_idx, bucket) in buckets.iter_mut().enumerate() {
+        let slot_idx = 1 + bucket_idx;
+        let bucket_byte_offset = offset + (slot_idx as u64) * SLOT_SIZE;
+        bucket
+            .write(device, bucket_byte_offset)
+            .map_err(|e| IndexError::Roaring(e.to_string()))?;
+    }
+
+    // 4. Build + write the directory. Each directory[i] points to its
+    //    bucket; with global_depth ≤ N, multiple directory entries may
+    //    point to the same bucket (extendible-hash semantics). Under
+    //    R1c-A1 directory entries map 1:1 to buckets.
+    let mut dir = crate::kv_directory::KvDirectoryBlock::new(global_depth)
+        .map_err(|e| IndexError::Roaring(e.to_string()))?;
+    for bucket_idx in 0..bucket_count {
+        let slot_idx = 1 + bucket_idx;
+        let bucket_block_ref = slot_block_ref(offset, slot_idx, 0);
+        dir.set_entry(bucket_idx as u32, bucket_block_ref);
+    }
+    dir.write(device, offset)
+        .map_err(|e| IndexError::Roaring(e.to_string()))?;
+
+    Ok(())
+}
+
+fn load_extendible_hash<D: BlockDevice>(
+    device: &D,
+    offset: u64,
+) -> Result<KvIndex, IndexError> {
+    use crate::{kv_bucket::KvBucketBlock, kv_directory::KvDirectoryBlock, tag_bitmap_page::TagBitmapPage};
+
+    let dir = KvDirectoryBlock::read(device, offset)
+        .map_err(|e| IndexError::Roaring(e.to_string()))?;
+    let bucket_count = dir.count() as usize;
+
+    let mut entries: HashMap<(TagId, u64), RoaringBitmapSerde> = HashMap::new();
+    let mut seen_buckets: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for dir_idx in 0..bucket_count as u32 {
+        let bucket_ref = dir.get_entry(dir_idx);
+        let bucket_block_no = { bucket_ref.block_no };
+        if bucket_block_no == 0 {
+            // Unused slot (extendible-hash directory may map multiple
+            // entries to fewer buckets pre-R1c-A1's 1:1 layout, but the
+            // unused-slot guard catches drift).
+            continue;
+        }
+        // De-dup: when global_depth grows but local_depth lags, multiple
+        // dir entries point at the same bucket.
+        if !seen_buckets.insert(bucket_block_no) {
+            continue;
+        }
+        let bucket_byte_offset = (bucket_block_no as u64) * SLOT_SIZE;
+        let bucket = KvBucketBlock::read(device, bucket_byte_offset)
+            .map_err(|e| IndexError::Roaring(e.to_string()))?;
+        for entry in bucket.iter() {
+            let bitmap_ref = entry.bitmap_ref;
+            let bitmap_block_no = { bitmap_ref.block_no };
+            if bitmap_block_no == 0 {
+                continue;
+            }
+            let bitmap_byte_offset = (bitmap_block_no as u64) * SLOT_SIZE;
+            let page = TagBitmapPage::read(device, bitmap_byte_offset)
+                .map_err(|e| IndexError::Roaring(e.to_string()))?;
+            let bm = page
+                .to_bitmap()
+                .map_err(|e| IndexError::Roaring(e.to_string()))?;
+            let tag_id = { entry.tag_id };
+            let value_hash = { entry.value_hash };
+            entries.insert((TagId::new(tag_id), value_hash), RoaringBitmapSerde(bm));
+        }
+    }
+
+    Ok(KvIndex {
+        entries,
+        secret: [0u8; 16],
+    })
 }
 
 // ---------- KvIndexKey / KvIndexValue (B+ tree wire types) ----------

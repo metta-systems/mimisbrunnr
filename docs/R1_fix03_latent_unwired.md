@@ -170,7 +170,14 @@ WAL truncation could orphan in-memory pending journal entries.
 
 ---
 
-## D3. Bucket alignment for B+ tree regions
+## D3. Bucket alignment for B+ tree regions  (unblocks A2 multi-level)
+
+> **Cross-ref:** Tier 1 A2's leaf-only landing accepts that trees stay
+> at fixed offsets across commits. A2 *multi-level* (inner-node
+> descent + tree growth + COW write path) needs the allocator to
+> hand out fresh buckets per flush — that's exactly D3's job. Land
+> D3 before resuming A2 multi-level.
+
 
 **Spec:** IMPL §1.5.5 — "A 256 KiB node in a 1 MiB bucket means **4
 nodes per bucket**, which is the typical packing".

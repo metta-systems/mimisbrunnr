@@ -201,6 +201,21 @@ copies the previous RootPointer with only `seq` and `lsn` bumped. Every
 
 ## A2. ObjectTable / LocationTable positional radix tree  (depends on D1, D2)
 
+**Status (2026-05-06):**
+- **Leaf-only path: DONE.** `crates/meta/src/{object_leaf,location_leaf}.rs`
+  ship the spec's byte-exact 256 KiB leaf layouts. ObjectTable /
+  LocationTable's `flush_to_region` / `load_from_region` use them.
+  Limit: `oid_local ≥ 2044` (or 5440 for locations) returns
+  `MetaError::OidOutOfRange`.
+- **Multi-level (inner nodes, descent, tree growth, COW) — DEFERRED:**
+  blocked on **Tier 3 D3** (COW reallocation). Without D3 the tree
+  can't move leaves to fresh buckets on flush; growing the tree's
+  root level needs allocator-driven inner-node placement that D3
+  unlocks. Tracked as todo "A2 multi-level" in
+  `memory/project_r1c_progress.md`. Resume order: D3 → A2
+  multi-level.
+
+
 **Spec:** IMPL §5 (ObjectTable), §6.1 (LocationTable). COW radix tree of large
 nodes. Leaf: 2044 × `ObjectRecord` (128 B) + 256 B occupancy bitmap + 32 B
 trailer. Inner: 16 380 × `BlockRef`. Address translation:

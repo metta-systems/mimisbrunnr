@@ -1410,6 +1410,55 @@ fn small_pool_disk_path(tmp: &TempDir) -> std::path::PathBuf {
 }
 
 #[test]
+fn kv_index_on_disk_uses_native_extendible_hash_layout() {
+    // KvIndex now writes a 4 KiB KvDirectory at the kv_index_root
+    // offset; the directory's BlockHeader carries kind=KvHashDirectory
+    // and magic="MIMR". One bucket and one bitmap page should follow.
+    use mimisbrunnr_storage::{BLOCK_PREAMBLE_MAGIC_BLOCK, BlockDevice, BlockKind};
+    use mimisbrunnr_types::Value;
+
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+    let key = de.engine.register_tag("year");
+    let oid = de.create_object().unwrap();
+    de.set_attr(oid, key, Value::Int(2025)).unwrap();
+    de.commit().unwrap();
+    let root_block_no = { de.superblock.active_root_pointer().kv_index_root.block_no };
+    let kv_dir_offset = root_block_no as u64 * 4096;
+    drop(de);
+
+    let dev = mimisbrunnr_storage::FileBlockDevice::open_read_only(
+        small_pool_disk_path(&tmp),
+    )
+    .unwrap();
+
+    // Directory header.
+    let mut header = [0u8; 8];
+    dev.read_at(kv_dir_offset, &mut header).unwrap();
+    let preamble: &mimisbrunnr_storage::BlockPreamble =
+        bytemuck::from_bytes(&header);
+    assert_eq!({ preamble.magic }, BLOCK_PREAMBLE_MAGIC_BLOCK);
+    assert_eq!({ preamble.kind }, BlockKind::KvHashDirectory as u16);
+
+    // Bucket 0 sits at kv_dir_offset + 4 KiB.
+    let bucket_offset = kv_dir_offset + 4096;
+    let mut bheader = [0u8; 8];
+    dev.read_at(bucket_offset, &mut bheader).unwrap();
+    let bpreamble: &mimisbrunnr_storage::BlockPreamble =
+        bytemuck::from_bytes(&bheader);
+    assert_eq!({ bpreamble.kind }, BlockKind::KvHashBucket as u16);
+
+    // Bitmap page sits at kv_dir_offset + 2 × 4 KiB.
+    let bitmap_offset = kv_dir_offset + 8192;
+    let mut bmh = [0u8; 8];
+    dev.read_at(bitmap_offset, &mut bmh).unwrap();
+    let bm_preamble: &mimisbrunnr_storage::BlockPreamble =
+        bytemuck::from_bytes(&bmh);
+    assert_eq!({ bm_preamble.kind }, BlockKind::TagBitmapPage as u16);
+}
+
+#[test]
 fn rootpointer_survives_open_cycle() {
     let tmp = TempDir::new().unwrap();
     let (cfg, cfg_path) = small_pool(&tmp);
