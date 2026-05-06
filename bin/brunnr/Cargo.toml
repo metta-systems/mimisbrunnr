@@ -5,13 +5,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Enables `brunnr mount` / `brunnr mount-unix`. Requires libfuse on the host.
+fuse = ["dep:mimisbrunnr-fuse", "dep:fuser"]
+
 [dependencies]
-mimisbrunnr = { workspace = true }
-mimisbrunnr-fuse = { workspace = true, features = ["fuse"] }
+mimisbrunnr-engine = { workspace = true }
+mimisbrunnr-pool = { workspace = true }
+mimisbrunnr-types = { workspace = true }
+mimisbrunnr-fuse = { workspace = true, optional = true, features = ["fuse"] }
 clap = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
-fuser = { workspace = true }
+fuser = { workspace = true, optional = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

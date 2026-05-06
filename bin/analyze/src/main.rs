@@ -1,1663 +1,742 @@
+//! `analyze` — read-only visual inspector for a Mímisbrunnr pool.
+//!
+//! Phase 7d rewrite. Opens a pool via [`DiskEngine::open`] (read-write today —
+//! see `OPEN_READ_ONLY_TODO`), builds a [`PoolSnapshot`] of the in-memory state
+//! plus on-disk header metadata, and renders it via either:
+//!
+//! - an `egui` GUI with tabs (Pool / Disk / WAL / Objects / Tags / Ontology),
+//! - a plain-text dump (`--dump`),
+//! - a JSON-ish dump (`--json`).
+//!
+//! The GUI is read-only and does not poll for changes — it shows a static
+//! snapshot taken at startup.
+
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    path::PathBuf,
+    collections::BTreeMap,
+    path::{Path, PathBuf},
 };
 
-use {clap::Parser, eframe::egui};
+use clap::Parser;
+use eframe::egui;
 
 use mimisbrunnr::{
-    engine::DiskEngine,
-    index::ForwardEntry,
-    meta::RECORD_SIZE,
-    ontology::{TagDefinition, TagSemantics},
-    pool::PoolConfig,
-    storage::ZoneType,
-    types::{Assertion, CompressionState, ObjectId, ObjectState, TagId, TagOrigin, Value},
+    engine::{DiskEngine, OpKind, OpLogEntry},
+    meta::ObjectRecord,
+    ontology::TagSemantics,
+    pool::{PoolConfig, PoolStatus},
+    storage::{BlockDevice, RootPointer, Superblock},
+    types::{
+        Assertion, CompressionState, DiskId, MediaType, ObjectId, ObjectState, StorageTier, TagId,
+        Value,
+    },
+    wal::{Wal, WalEntry, WalOp, WalOpKind},
 };
 
-// ── CLI ──────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------
+// CLI
+// -----------------------------------------------------------------------
 
-#[derive(Parser)]
-#[command(name = "analyze", about = "Visual pool analyzer for Mímisbrunnr")]
+#[derive(Parser, Debug)]
+#[command(
+    name = "analyze",
+    about = "Read-only visual inspector for a Mímisbrunnr pool"
+)]
 struct Cli {
-    /// Path to pool.toml
+    /// Path to pool.toml.
+    #[arg(long)]
     pool: PathBuf,
+
+    /// Print a plain-text dump and exit (no GUI). Useful for CI.
+    #[arg(long, conflicts_with = "json")]
+    dump: bool,
+
+    /// Print a JSON-ish dump and exit (no GUI).
+    #[arg(long)]
+    json: bool,
 }
 
-// ── Snapshot ─────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------
+// PoolSnapshot — pre-extracted, GUI-frame-stable view of the pool.
+// -----------------------------------------------------------------------
 
-/// Pre-extracted pool data for the UI (no borrow lifetime issues).
-struct PoolSnapshot {
-    config: PoolConfig,
-    node_id: u64,
-    tags: Vec<TagInfo>,
-    tag_by_id: HashMap<u32, usize>,
-    objects: Vec<ObjInfo>,
-    implications: Vec<(u32, u32)>,
-    contexts: Vec<ContextInfo>,
-    placement_rules: Vec<String>,
-    default_compression: String,
-    blob_count: usize,
-    total_blob_bytes: u64,
-    /// Path to the primary disk file for raw reads.
-    disk_path: PathBuf,
-    /// Metadata zone offset on disk.
-    metadata_zone_offset: u64,
-    /// Index zone offset on disk.
-    index_zone_offset: u64,
-    /// Blob zone offset on disk.
-    blob_zone_offset: u64,
+/// Static snapshot of a pool's state as observed at startup.
+///
+/// Captured *once* by [`build_snapshot`]; the GUI never re-reads the disk.
+#[derive(Debug, Clone)]
+pub struct PoolSnapshot {
+    /// `pool.toml` configuration as supplied to the engine.
+    pub pool_config: PoolConfig,
+    /// Live `PoolManager` capacity / health view at snapshot time.
+    pub pool_status: PoolStatus,
+    /// Engine-level node id.
+    pub node_id: u16,
+    /// Per-disk on-disk header summaries.
+    pub disks: Vec<DiskSummary>,
+    /// Tag-index snapshot, sorted by descending cardinality.
+    pub tags: Vec<TagSnapshot>,
+    /// Object-record snapshot.
+    pub objects: Vec<ObjectSnapshot>,
+    /// Total object count (active + tombstoned).
+    pub total_objects: usize,
+    /// Total tag count.
+    pub total_tags: usize,
+    /// Engine-level oplog tail (most-recent first).
+    pub oplog: Vec<OpLogEntryView>,
+    /// Recent WAL entries, newest first; lifted from the primary disk's WAL.
+    pub wal_entries: Vec<WalEntryView>,
+    /// Header summary for the primary disk's WAL ring.
+    pub wal_header: WalHeaderView,
+    /// Installed ontology modules.
+    pub modules: Vec<ModuleSnapshot>,
+    /// Edges in the implication DAG (`from_id`, `to_id`).
+    pub implications: Vec<(u32, u32)>,
 }
 
-#[derive(Clone)]
-struct TagInfo {
-    id: TagId,
-    name: String,
-    semantics: String,
-    object_count: u32,
-    implies: Vec<u32>,
-    implied_by: Vec<u32>,
+/// On-disk identity / layout summary for one disk in the pool.
+#[derive(Debug, Clone)]
+pub struct DiskSummary {
+    pub disk_id: DiskId,
+    pub path: PathBuf,
+    pub media_type: MediaType,
+    pub tier: StorageTier,
+    pub capacity_bytes: u64,
+    pub used_bytes: u64,
+    pub state: String,
+    /// Decoded superblock (only the primary disk for now — see TODO below).
+    pub superblock: Option<SuperblockView>,
+    pub root_pointer: Option<RootPointerView>,
 }
 
-#[derive(Clone)]
-struct ObjInfo {
-    oid: ObjectId,
-    id_raw: u64,
-    local: u64,
-    state: ObjectState,
-    compression: CompressionState,
-    blob_length: u64,
-    stored_size: u64,
-    created_ns: i64,
-    modified_ns: i64,
-    generation: u32,
-    content_hash: [u8; 32],
-    tag_count: u16,
-    attr_count: u16,
-    direct_tags: Vec<u32>,
-    materialized_tags: Vec<u32>,
-    attrs: Vec<(String, String)>,
-    paths: Vec<(String, String)>,
-    has_blob: bool,
-    blob_size: Option<usize>,
-    /// First 4 KiB of blob data (from in-memory store) for hex preview.
-    blob_preview: Vec<u8>,
-    /// Physical disk offset of the 128-byte ObjectRecord.
-    record_disk_offset: u64,
-    /// Physical disk offset of blob data (from ObjectRecord).
-    blob_disk_offset: u64,
+/// Decoded view of the fields most useful to an operator.
+#[derive(Debug, Clone)]
+pub struct SuperblockView {
+    pub fs_uuid: [u8; 16],
+    pub node_id: u16,
+    pub disk_id: u16,
+    pub media_type: MediaType,
+    pub tier: StorageTier,
+    pub device_capacity: u64,
+    pub creation_timestamp_ns: i64,
+    pub last_mount_timestamp_ns: i64,
+    pub mount_count: u64,
+    pub bucket_size_log2: u8,
+    pub btree_node_size_log2: u8,
+    pub wal_offset: u64,
+    pub wal_size: u64,
+    pub index_zone_offset: u64,
+    pub index_zone_length: u64,
+    pub metadata_zone_offset: u64,
+    pub metadata_zone_length: u64,
+    pub blob_zone_offset: u64,
+    pub blob_zone_length: u64,
+    pub fs_format_version: u32,
 }
 
-#[derive(Clone)]
-struct ContextInfo {
-    name: String,
-    entry_count: usize,
+/// Decoded `RootPointer` summary.
+#[derive(Debug, Clone)]
+pub struct RootPointerView {
+    pub seq: u64,
+    pub lsn: u64,
+    pub flags: u32,
+    /// `(field_name, "disk_id:block_no@gen")` for each B+ tree root slot.
+    pub roots: Vec<(&'static str, String)>,
 }
 
-fn extract_snapshot(de: &DiskEngine) -> PoolSnapshot {
-    let engine = de.engine();
-    let layout = &de.superblock().layout;
+/// Snapshot of the WAL header.
+#[derive(Debug, Clone, Default)]
+pub struct WalHeaderView {
+    pub next_lsn: u64,
+    pub write_cursor: u64,
+    pub read_cursor: u64,
+    pub used_bytes: u64,
+    pub data_capacity: u64,
+    pub last_checkpoint_lsn: u64,
+}
 
-    // Tags
-    let all_tag_ids = engine.dag.all_tags();
-    let mut tags: Vec<TagInfo> = Vec::new();
-    let mut tag_by_id: HashMap<u32, usize> = HashMap::new();
+/// One WAL entry, decoded into a view.
+#[derive(Debug, Clone)]
+pub struct WalEntryView {
+    pub lsn: u64,
+    pub op_kind: u8,
+    pub op_kind_name: String,
+    pub payload_length: u32,
+    pub timestamp_ns: i64,
+    /// CBOR-pretty payload preview, lazily computed via [`WalOp::decode`].
+    pub payload_preview: String,
+}
 
-    for tid in &all_tag_ids {
-        let def: Option<&TagDefinition> = engine.dag.get(*tid);
-        let bitmap = engine.tag_index.bitmap(*tid);
-        let object_count = bitmap.map_or(0, |b| b.len() as u32);
+/// One tag in the index, with a small member preview.
+#[derive(Debug, Clone)]
+pub struct TagSnapshot {
+    pub id: TagId,
+    pub name: String,
+    pub semantics: String,
+    pub object_count: u32,
+    /// First few member oids (raw form).
+    pub member_preview: Vec<u64>,
+}
 
-        let implies: Vec<u32> = engine
-            .dag
-            .direct_implies(*tid)
-            .iter()
-            .map(|t| t.raw())
-            .collect();
+/// One object's metadata view.
+#[derive(Debug, Clone)]
+pub struct ObjectSnapshot {
+    pub oid: ObjectId,
+    pub state: ObjectState,
+    pub compression: CompressionState,
+    pub blob_length: u64,
+    pub stored_size: u64,
+    pub generation: u32,
+    pub direct_tags: Vec<u32>,
+    pub materialized_tags: Vec<u32>,
+    pub attrs: Vec<(String, String)>,
+}
 
-        let info = TagInfo {
-            id: *tid,
-            name: def.map_or_else(|| format!("tag_{}", tid.raw()), |d| d.name.clone()),
-            semantics: def.map_or_else(
-                || "unknown".into(),
-                |d| match &d.semantics {
-                    TagSemantics::Label => "label".into(),
-                    TagSemantics::Attribute { value_type } => format!("attr({value_type:?})"),
-                    TagSemantics::Grouping => "grouping".into(),
-                    TagSemantics::OrderedCollection { .. } => "ordered".into(),
-                    TagSemantics::Hierarchical => "hierarchical".into(),
-                },
-            ),
-            object_count,
-            implies,
-            implied_by: Vec::new(),
-        };
-        tag_by_id.insert(tid.raw(), tags.len());
-        tags.push(info);
+/// One installed ontology module.
+#[derive(Debug, Clone)]
+pub struct ModuleSnapshot {
+    pub id: String,
+    pub version: String,
+    pub name: String,
+    pub installed_tags: usize,
+    pub installed_implications: usize,
+}
+
+/// View of one `OpLogEntry`.
+#[derive(Debug, Clone)]
+pub struct OpLogEntryView {
+    pub lsn: u64,
+    pub timestamp_ns: i64,
+    pub op_summary: String,
+}
+
+// -----------------------------------------------------------------------
+// build_snapshot — pure logic, no GUI deps. Tested separately.
+// -----------------------------------------------------------------------
+
+/// Build a [`PoolSnapshot`] from a live `DiskEngine`.
+///
+/// Reads the primary device's superblock + WAL ring straight from disk (read
+/// path only) and walks the in-memory engine mirrors for the rest.
+pub fn build_snapshot(engine: &DiskEngine) -> PoolSnapshot {
+    let pool_config = engine.config.clone();
+    let pool_status = engine.pool.status();
+    let node_id = engine.engine.node_id;
+
+    let disks = collect_disks(engine, &pool_config);
+    let tags = collect_tags(engine);
+    let objects = collect_objects(engine);
+    let oplog = collect_oplog(&engine.engine.oplog);
+    let wal_entries = collect_wal_entries(&engine.wal, engine.primary_device.as_ref());
+    let wal_header = wal_header_view(&engine.wal);
+    let modules = collect_modules(engine);
+    let implications: Vec<(u32, u32)> = engine
+        .engine
+        .ontology
+        .dag
+        .edges()
+        .map(|(f, t)| (f.raw(), t.raw()))
+        .collect();
+
+    let total_objects = engine.engine.object_count();
+    let total_tags = engine.engine.tag_index.tag_count();
+
+    PoolSnapshot {
+        pool_config,
+        pool_status,
+        node_id,
+        disks,
+        tags,
+        objects,
+        total_objects,
+        total_tags,
+        oplog,
+        wal_entries,
+        wal_header,
+        modules,
+        implications,
     }
+}
 
-    // Build implied_by reverse edges
-    let implications: Vec<(u32, u32)> = {
-        let mut imps = Vec::new();
-        // Collect edges first to avoid borrow conflict
-        let edges: Vec<(u32, u32)> = tags
-            .iter()
-            .flat_map(|t| t.implies.iter().map(move |&target| (t.id.raw(), target)))
-            .collect();
-        for (from, to) in &edges {
-            imps.push((*from, *to));
-            if let Some(&idx) = tag_by_id.get(to) {
-                tags[idx].implied_by.push(*from);
-            }
-        }
-        imps
-    };
-
-    // Objects
-    let mut objects: Vec<ObjInfo> = Vec::new();
-    for rec in engine.object_table.iter() {
-        let node = rec.id >> 48;
-        let local = rec.id & 0x0000_FFFF_FFFF_FFFF;
-        let oid = ObjectId::new(node, local);
-
-        let entries: &[ForwardEntry] = engine.forward_index.get(oid);
-        let mut direct_tags = Vec::new();
-        let mut materialized_tags = Vec::new();
-        let mut attrs = Vec::new();
-
-        for entry in entries {
-            match (&entry.assertion, &entry.origin) {
-                (Assertion::Tag(tid), TagOrigin::Direct) => direct_tags.push(tid.raw()),
-                (Assertion::Tag(tid), TagOrigin::Materialized) => materialized_tags.push(tid.raw()),
-                (Assertion::Attr { key, value }, _) => {
-                    let key_name = engine
-                        .dag
-                        .get(*key)
-                        .map_or_else(|| format!("attr_{}", key.raw()), |d| d.name.clone());
-                    attrs.push((key_name, format_value(value)));
-                }
-                _ => {}
-            }
-        }
-
-        let record_disk_offset = layout
-            .logical_to_physical(ZoneType::Metadata, local * RECORD_SIZE as u64)
-            .unwrap_or(0);
-
-        // Read transformed blob data from blob zone
-        let blob_data = de.read_blob(oid).ok().filter(|b| !b.is_empty());
-
-        // Paths
-        let ctx_entries = de.context_mgr.contexts_for_object(oid);
-        let paths: Vec<(String, String)> = ctx_entries
-            .iter()
-            .map(|(ctx, entry)| {
-                let ctx_name = ctx.map_or("(unscoped)".to_string(), |s| s.to_string());
-                (ctx_name, entry.path.clone())
-            })
-            .collect();
-
-        objects.push(ObjInfo {
-            oid,
-            id_raw: rec.id,
-            local,
-            state: rec.state(),
-            compression: rec.compression(),
-            blob_length: rec.blob_length,
-            stored_size: rec.stored_size,
-            created_ns: rec.created_ns,
-            modified_ns: rec.modified_ns,
-            generation: rec.generation,
-            content_hash: rec.content_hash,
-            tag_count: rec.tag_count,
-            attr_count: rec.attr_count,
-            direct_tags,
-            materialized_tags,
-            attrs,
-            paths,
-            has_blob: blob_data.is_some(),
-            blob_size: blob_data.as_ref().map(|b| b.len()),
-            blob_preview: blob_data
-                .map(|b| b[..b.len().min(4096)].to_vec())
-                .unwrap_or_default(),
-            record_disk_offset,
-            blob_disk_offset: rec.blob_offset,
+fn collect_disks(engine: &DiskEngine, cfg: &PoolConfig) -> Vec<DiskSummary> {
+    let primary_id = cfg.primary().map(|d| d.id);
+    let mut out = Vec::with_capacity(cfg.disks.len());
+    for entry in &cfg.disks {
+        let runtime = engine.pool.runtime(entry.id);
+        let used = runtime.map(|r| r.used_bytes).unwrap_or(0);
+        let state = runtime
+            .map(|r| format!("{:?}", r.state))
+            .unwrap_or_else(|| "Unknown".to_string());
+        let (sb, root) = if Some(entry.id) == primary_id {
+            (
+                Some(superblock_view(&engine.superblock)),
+                Some(root_pointer_view(engine.superblock.active_root_pointer())),
+            )
+        } else {
+            // TODO(rewrite-phase-N): walk other disks' superblocks via their
+            // own `BlockDevice` runtime view. Phase 7d: primary only.
+            (None, None)
+        };
+        out.push(DiskSummary {
+            disk_id: entry.id,
+            path: entry.path.clone(),
+            media_type: entry.media_type,
+            tier: entry.tier,
+            capacity_bytes: entry.capacity_bytes,
+            used_bytes: used,
+            state,
+            superblock: sb,
+            root_pointer: root,
         });
     }
+    out
+}
 
-    // Contexts
-    let mut contexts: Vec<ContextInfo> = Vec::new();
-    for ctx_name in de.context_mgr.list_contexts() {
-        if let Ok(proj) = de.context_mgr.get_context(ctx_name) {
-            contexts.push(ContextInfo {
-                name: ctx_name.to_string(),
-                entry_count: proj.len(),
+fn superblock_view(sb: &Superblock) -> SuperblockView {
+    SuperblockView {
+        fs_uuid: { sb.fs_uuid },
+        node_id: { sb.node_id },
+        disk_id: { sb.disk_id },
+        media_type: sb.media_type().unwrap_or(MediaType::Ssd),
+        tier: sb.tier().unwrap_or(StorageTier::Hot),
+        device_capacity: { sb.device_capacity },
+        creation_timestamp_ns: { sb.creation_timestamp_ns },
+        last_mount_timestamp_ns: { sb.last_mount_timestamp_ns },
+        mount_count: { sb.mount_count },
+        bucket_size_log2: { sb.bucket_size_log2 },
+        btree_node_size_log2: { sb.btree_node_size_log2 },
+        wal_offset: { sb.wal_offset },
+        wal_size: { sb.wal_size },
+        index_zone_offset: { sb.index_zone.offset },
+        index_zone_length: { sb.index_zone.length },
+        metadata_zone_offset: { sb.metadata_zone.offset },
+        metadata_zone_length: { sb.metadata_zone.length },
+        blob_zone_offset: { sb.blob_zone.offset },
+        blob_zone_length: { sb.blob_zone.length },
+        fs_format_version: { sb.fs_format_version },
+    }
+}
+
+fn root_pointer_view(rp: &RootPointer) -> RootPointerView {
+    let fmt = |b: &mimisbrunnr::storage::BlockRef| -> String {
+        let disk = { b.disk_id };
+        let block = { b.block_no };
+        let gen_ = { b.generation };
+        format!("{disk}:{block}@{gen_}")
+    };
+    let roots = vec![
+        ("object_table_root", fmt(&{ rp.object_table_root })),
+        ("object_history_root", fmt(&{ rp.object_history_root })),
+        ("location_table_root", fmt(&{ rp.location_table_root })),
+        ("location_history_root", fmt(&{ rp.location_history_root })),
+        ("forward_index_root", fmt(&{ rp.forward_index_root })),
+        ("tag_index_root", fmt(&{ rp.tag_index_root })),
+        ("kv_index_root", fmt(&{ rp.kv_index_root })),
+        ("range_index_root", fmt(&{ rp.range_index_root })),
+        ("chunk_index_root", fmt(&{ rp.chunk_index_root })),
+        ("value_spill_root", fmt(&{ rp.value_spill_root })),
+        ("backpointer_root", fmt(&{ rp.backpointer_root })),
+        ("ontology_root", fmt(&{ rp.ontology_root })),
+        ("subscriptions_root", fmt(&{ rp.subscriptions_root })),
+        ("pool_state_root", fmt(&{ rp.pool_state_root })),
+        ("snapshot_chain_root", fmt(&{ rp.snapshot_chain_root })),
+        ("placement_rules_root", fmt(&{ rp.placement_rules_root })),
+        ("cluster_peers_root", fmt(&{ rp.cluster_peers_root })),
+    ];
+    RootPointerView {
+        seq: { rp.seq },
+        lsn: { rp.lsn },
+        flags: { rp.flags },
+        roots,
+    }
+}
+
+fn collect_tags(engine: &DiskEngine) -> Vec<TagSnapshot> {
+    let dag = &engine.engine.ontology.dag;
+    let mut tags: Vec<TagSnapshot> = Vec::new();
+    for (tag_id, store) in engine.engine.tag_index.iter() {
+        let bitmap = store.members();
+        let count = bitmap.len() as u32;
+        let preview: Vec<u64> = bitmap.iter().take(8).map(u64::from).collect();
+        let def = engine.engine.ontology.tags.get(tag_id);
+        let (name, semantics) = match def {
+            Some(d) => (d.name.clone(), semantics_label(&d.semantics)),
+            None => (format!("tag_{}", tag_id.raw()), "unknown".to_string()),
+        };
+        tags.push(TagSnapshot {
+            id: *tag_id,
+            name,
+            semantics,
+            object_count: count,
+            member_preview: preview,
+        });
+    }
+    // Also include tags that exist in the ontology but have empty bitmaps,
+    // so the Ontology tab matches the tag-index tab counts.
+    for tag_id in dag.tags() {
+        if engine.engine.tag_index.get(tag_id).is_none() {
+            let def = engine.engine.ontology.tags.get(&tag_id);
+            let (name, semantics) = match def {
+                Some(d) => (d.name.clone(), semantics_label(&d.semantics)),
+                None => (format!("tag_{}", tag_id.raw()), "unknown".to_string()),
+            };
+            tags.push(TagSnapshot {
+                id: tag_id,
+                name,
+                semantics,
+                object_count: 0,
+                member_preview: vec![],
             });
         }
     }
-    let unscoped_count = de.context_mgr.unscoped().len();
-    if unscoped_count > 0 {
-        contexts.push(ContextInfo {
-            name: "(unscoped)".to_string(),
-            entry_count: unscoped_count,
+    // Sort by descending cardinality, then by name for deterministic output.
+    tags.sort_by(|a, b| {
+        b.object_count
+            .cmp(&a.object_count)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    tags
+}
+
+fn semantics_label(s: &TagSemantics) -> String {
+    match s {
+        TagSemantics::Label => "label".into(),
+        TagSemantics::Attribute { value_type } => format!("attr({value_type:?})"),
+        TagSemantics::Grouping => "grouping".into(),
+        TagSemantics::OrderedCollection { .. } => "ordered".into(),
+        TagSemantics::Hierarchical => "hierarchical".into(),
+    }
+}
+
+fn collect_objects(engine: &DiskEngine) -> Vec<ObjectSnapshot> {
+    let mut out = Vec::with_capacity(engine.engine.object_count());
+    for (raw, rec) in engine.engine.object_table.iter() {
+        let oid = ObjectId::from_u64(*raw);
+        let mut direct_tags = Vec::new();
+        let mut materialized_tags = Vec::new();
+        let mut attrs = Vec::new();
+        for (assertion, origin) in engine.engine.forward_index.assertions_of(oid) {
+            match assertion {
+                Assertion::Tag(t) => match origin {
+                    mimisbrunnr::types::TagOrigin::Direct => direct_tags.push(t.raw()),
+                    mimisbrunnr::types::TagOrigin::Materialized => materialized_tags.push(t.raw()),
+                },
+                Assertion::Attr { key, value } => {
+                    let key_name = engine
+                        .engine
+                        .ontology
+                        .tags
+                        .get(key)
+                        .map(|d| d.name.clone())
+                        .unwrap_or_else(|| format!("attr_{}", key.raw()));
+                    attrs.push((key_name, format_value(value)));
+                }
+                Assertion::Relation { .. } => {}
+            }
+        }
+        let state = rec.state().unwrap_or(ObjectState::Active);
+        let compression = rec.compression().unwrap_or(CompressionState::None);
+        out.push(ObjectSnapshot {
+            oid,
+            state,
+            compression,
+            blob_length: { rec.blob_length },
+            stored_size: { rec.stored_size },
+            generation: { rec.generation },
+            direct_tags,
+            materialized_tags,
+            attrs,
         });
     }
-
-    // Placement rules
-    let placement_rules: Vec<String> = engine.rules().iter().map(format_rule).collect();
-
-    // Blob stats — compute from object records
-    let blob_count = objects.iter().filter(|o| o.has_blob).count();
-    let total_blob_bytes: u64 = objects.iter().map(|o| o.stored_size).sum();
-
-    // Get disk path from config
-    let disk_path = de
-        .config()
-        .primary_disk()
-        .map(|d| PathBuf::from(&d.path))
-        .unwrap_or_default();
-
-    PoolSnapshot {
-        config: PoolConfig::load(&PathBuf::from("")).unwrap_or_else(|_| PoolConfig::new(0)),
-        node_id: engine.node_id(),
-        tags,
-        tag_by_id,
-        objects,
-        implications,
-        contexts,
-        placement_rules,
-        default_compression: format!("{:?}", engine.rules()),
-        blob_count,
-        total_blob_bytes,
-        disk_path,
-        metadata_zone_offset: layout.metadata_zone_offset(),
-        index_zone_offset: layout.index_zone_offset(),
-        blob_zone_offset: layout.blob_zone_offset(),
-    }
+    // Sort by node then local seq for stable presentation.
+    out.sort_by_key(|o| (o.oid.node_id(), o.oid.local_seq()));
+    out
 }
 
 fn format_value(v: &Value) -> String {
     match v {
         Value::Text(s) => format!("\"{s}\""),
         Value::Int(n) => n.to_string(),
-        Value::Float(f) => format!("{f:.2}"),
+        Value::Float(f) => format!("{f}"),
         Value::Timestamp(t) => format!("ts:{t}"),
         Value::Blob(b) => format!("<{} bytes>", b.len()),
-    }
-}
-
-fn format_rule(rule: &mimisbrunnr::pool::PlacementRule) -> String {
-    use mimisbrunnr::pool::PlacementRule;
-    match rule {
-        PlacementRule::Compress { query, algo } => {
-            format!("Compress({query:?} → {algo:?})")
-        }
-        PlacementRule::Pin { query, tier } => {
-            format!("Pin({query:?} → {})", tier.name())
-        }
-        PlacementRule::Prefer {
-            query,
-            tier,
-            priority,
-        } => {
-            format!("Prefer({query:?} → {} p={priority})", tier.name())
-        }
-        PlacementRule::Replicate {
-            query,
-            min_replicas,
-            across_disks,
-        } => {
-            format!("Replicate({query:?} ×{min_replicas} across={across_disks})")
-        }
-        PlacementRule::Colocate { query } => format!("Colocate({query:?})"),
-        PlacementRule::AutoTier {
-            hot_threshold_days,
-            warm_threshold_days,
-            cold_after,
-        } => {
-            format!(
-                "AutoTier(hot<{hot_threshold_days}d warm<{warm_threshold_days}d cold>{cold_after}d)"
-            )
+        Value::Scoped { context, inner } => {
+            format!("scoped(ctx={}, {})", context.raw(), format_value(inner))
         }
     }
 }
 
-fn format_hash(hash: &[u8; 32]) -> String {
-    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-    format!("{}…{}", &hex[..8], &hex[56..])
+fn collect_oplog(log: &mimisbrunnr::engine::OpLog) -> Vec<OpLogEntryView> {
+    let mut out: Vec<OpLogEntryView> = log
+        .since(0)
+        .map(|e: &OpLogEntry| OpLogEntryView {
+            lsn: e.lsn,
+            timestamp_ns: e.timestamp.physical_ns,
+            op_summary: opkind_summary(&e.op),
+        })
+        .collect();
+    out.reverse(); // most-recent first
+    out
 }
 
-fn format_ns(ns: i64) -> String {
-    if ns == 0 {
-        return "—".into();
-    }
-    let secs = ns / 1_000_000_000;
-    let ms = (ns % 1_000_000_000) / 1_000_000;
-    format!("{secs}.{ms:03}s")
-}
-
-// ── App state ────────────────────────────────────────────────────────
-
-struct AnalyzerApp {
-    snap: PoolSnapshot,
-    pool_path: String,
-
-    // Selection
-    selected_tag: Option<u32>,
-    selected_object: Option<usize>,
-    hovered_tag: Option<u32>,
-    hovered_object: Option<usize>,
-
-    // Filters
-    tag_filter: String,
-    object_filter: String,
-    show_tombstoned: bool,
-
-    // Tag/object label rects (for drawing connection lines)
-    tag_rects: BTreeMap<u32, egui::Rect>,
-    obj_rects: BTreeMap<usize, egui::Rect>,
-
-    // Hex view state
-    hex_cache: HexCache,
-
-    // Hex field rects (populated during hex rendering, used for connection lines)
-    /// Screen rects of named fields in the Object Record hex dump.
-    record_field_rects: BTreeMap<String, egui::Rect>,
-    /// Bounding rect of the Assertions hex bytes area.
-    assertions_bytes_rect: Option<egui::Rect>,
-}
-
-/// Cached raw bytes for the hex viewer, updated on selection change.
-struct HexCache {
-    /// Which object index these bytes belong to (None = stale).
-    cached_for: Option<usize>,
-    /// Raw 128-byte ObjectRecord from disk.
-    record_bytes: Vec<u8>,
-    record_offset: u64,
-    /// Serialized assertions (CBOR of this object's forward entries).
-    assertions_bytes: Vec<u8>,
-    /// Raw blob bytes (from in-memory store or disk).
-    blob_bytes: Vec<u8>,
-    blob_offset: u64,
-}
-
-impl HexCache {
-    fn empty() -> Self {
-        Self {
-            cached_for: None,
-            record_bytes: Vec::new(),
-            record_offset: 0,
-            assertions_bytes: Vec::new(),
-            blob_bytes: Vec::new(),
-            blob_offset: 0,
+fn opkind_summary(op: &OpKind) -> String {
+    match op {
+        OpKind::CreateObject { oid } => format!("CreateObject(#{})", oid.local_seq()),
+        OpKind::DeleteObject { oid } => format!("DeleteObject(#{})", oid.local_seq()),
+        OpKind::AddTag { oid, tag } => {
+            format!("AddTag(#{}, t={})", oid.local_seq(), tag.raw())
         }
-    }
-}
-
-impl AnalyzerApp {
-    fn new(snap: PoolSnapshot, pool_path: String) -> Self {
-        Self {
-            snap,
-            pool_path,
-            selected_tag: None,
-            selected_object: None,
-            hovered_tag: None,
-            hovered_object: None,
-            tag_filter: String::new(),
-            object_filter: String::new(),
-            show_tombstoned: false,
-            tag_rects: BTreeMap::new(),
-            obj_rects: BTreeMap::new(),
-            hex_cache: HexCache::empty(),
-            record_field_rects: BTreeMap::new(),
-            assertions_bytes_rect: None,
+        OpKind::RemoveTag { oid, tag } => {
+            format!("RemoveTag(#{}, t={})", oid.local_seq(), tag.raw())
         }
-    }
-
-    fn objects_for_tag(&self, tag_raw: u32) -> BTreeSet<usize> {
-        let mut result = BTreeSet::new();
-        for (idx, obj) in self.snap.objects.iter().enumerate() {
-            if obj.direct_tags.contains(&tag_raw) || obj.materialized_tags.contains(&tag_raw) {
-                result.insert(idx);
-            }
-        }
-        result
-    }
-
-    fn tags_for_object(&self, obj_idx: usize) -> BTreeSet<u32> {
-        let obj = &self.snap.objects[obj_idx];
-        let mut set: BTreeSet<u32> = obj.direct_tags.iter().copied().collect();
-        set.extend(obj.materialized_tags.iter());
-        set
-    }
-}
-
-impl eframe::App for AnalyzerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Top panel: pool summary
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Mimisbrunnr Pool Analyzer");
-                ui.separator();
-                ui.label(&self.pool_path);
-                ui.separator();
-                ui.label(format!(
-                    "node:{} | {} tags | {} objects | {} blobs ({})",
-                    self.snap.node_id,
-                    self.snap.tags.len(),
-                    self.snap.objects.len(),
-                    self.snap.blob_count,
-                    format_bytes(self.snap.total_blob_bytes),
-                ));
-            });
-        });
-
-        // Bottom panel: placement rules & contexts
-        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if !self.snap.placement_rules.is_empty() {
-                    ui.label("Rules:");
-                    for rule in &self.snap.placement_rules {
-                        ui.label(egui::RichText::new(rule).small().monospace());
-                    }
-                    ui.separator();
-                }
-                if !self.snap.contexts.is_empty() {
-                    ui.label("Contexts:");
-                    for ctx_info in &self.snap.contexts {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} ({})",
-                                ctx_info.name, ctx_info.entry_count
-                            ))
-                            .small(),
-                        );
-                    }
-                }
-                if self.snap.placement_rules.is_empty() && self.snap.contexts.is_empty() {
-                    ui.weak("No placement rules or path contexts defined.");
-                }
-            });
-        });
-
-        // Bottom panel: detail view for selected object/tag
-        // Central panel: Objects | Tags | Detail | (hex columns when selected)
-        egui::CentralPanel::default().show(ctx, |ui| {
-            self.tag_rects.clear();
-            self.obj_rects.clear();
-
-            if self.selected_object.is_some() {
-                self.update_hex_cache();
-            }
-
-            let available_width = ui.available_width();
-            let available_height = ui.available_height();
-            let spacing = ui.spacing().item_spacing.x;
-
-            // Objects | Tags | Record hex | Assertions hex | Blob hex | Detail
-            // Always 6 columns; hex columns are zero-width when no object selected.
-            let col_widths: [f32; 6] = if self.selected_object.is_some() {
-                [0.10, 0.08, 0.22, 0.22, 0.20, 0.18]
-            } else {
-                [0.20, 0.20, 0.0, 0.0, 0.0, 0.60]
-            };
-            let active_cols = col_widths.iter().filter(|&&w| w > 0.0).count();
-            let total_spacing = spacing * (active_cols as f32 - 1.0).max(0.0);
-            let usable = available_width - total_spacing;
-
-            let mut col_x = ui.min_rect().left();
-            let top_y = ui.min_rect().top();
-
-            // Helper: allocate a column rect, advancing col_x
-            let make_col = |col_x: &mut f32, width_frac: f32| -> egui::Rect {
-                let w = usable * width_frac;
-                let rect = egui::Rect::from_min_size(
-                    egui::pos2(*col_x, top_y),
-                    egui::vec2(w, available_height),
-                );
-                *col_x += w + spacing;
-                rect
-            };
-
-            // Column 0: Objects
-            let rect0 = make_col(&mut col_x, col_widths[0]);
-            let mut child0 = ui.new_child(egui::UiBuilder::new().max_rect(rect0));
-            child0.set_clip_rect(rect0);
-            self.draw_object_column(&mut child0);
-
-            // Column 1: Tags
-            let rect1 = make_col(&mut col_x, col_widths[1]);
-            let mut child1 = ui.new_child(egui::UiBuilder::new().max_rect(rect1));
-            child1.set_clip_rect(rect1);
-            self.draw_tag_column(&mut child1);
-
-            if self.selected_object.is_some() {
-                // Column 2: Object Record hex
-                let rect2 = make_col(&mut col_x, col_widths[2]);
-                let mut child2 = ui.new_child(egui::UiBuilder::new().max_rect(rect2));
-                child2.set_clip_rect(rect2);
-                self.draw_hex_record_column(&mut child2);
-
-                // Column 3: Assertions CBOR hex
-                let rect3 = make_col(&mut col_x, col_widths[3]);
-                let mut child3 = ui.new_child(egui::UiBuilder::new().max_rect(rect3));
-                child3.set_clip_rect(rect3);
-                self.draw_hex_assertions_column(&mut child3);
-
-                // Column 4: Blob hex
-                let rect4 = make_col(&mut col_x, col_widths[4]);
-                let mut child4 = ui.new_child(egui::UiBuilder::new().max_rect(rect4));
-                child4.set_clip_rect(rect4);
-                self.draw_hex_blob_column(&mut child4);
-            }
-
-            // Column 5: Detail (always rightmost)
-            let rect5 = make_col(&mut col_x, col_widths[5]);
-            let mut child5 = ui.new_child(egui::UiBuilder::new().max_rect(rect5));
-            child5.set_clip_rect(rect5);
-            egui::ScrollArea::vertical()
-                .id_salt("detail_scroll")
-                .show(&mut child5, |ui| {
-                    self.draw_detail_panel(ui);
-                });
-        });
-
-        // Draw connection lines on top of everything (foreground layer)
-        self.draw_connections(ctx);
-    }
-}
-
-impl AnalyzerApp {
-    fn draw_tag_column(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.strong("Tags");
-            ui.add_space(8.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.tag_filter)
-                    .hint_text("filter…")
-                    .desired_width(120.0),
-            );
-        });
-        ui.separator();
-
-        let filter_lower = self.tag_filter.to_lowercase();
-
-        egui::ScrollArea::vertical()
-            .id_salt("tags_scroll")
-            .show(ui, |ui| {
-                let filtered_indices: Vec<usize> = if filter_lower.is_empty() {
-                    (0..self.snap.tags.len()).collect()
-                } else {
-                    self.snap
-                        .tags
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, t)| t.name.to_lowercase().contains(&filter_lower))
-                        .map(|(i, _)| i)
-                        .collect()
-                };
-
-                for &idx in &filtered_indices {
-                    let tag = &self.snap.tags[idx];
-                    let tag_raw = tag.id.raw();
-                    let is_selected = self.selected_tag == Some(tag_raw);
-                    let is_highlighted = self
-                        .selected_object
-                        .is_some_and(|oi| self.tags_for_object(oi).contains(&tag_raw));
-
-                    let indent = if tag.implied_by.is_empty() { 0.0 } else { 12.0 };
-
-                    ui.horizontal(|ui| {
-                        ui.add_space(indent);
-
-                        let label_text = format!("{} ({})", tag.name, tag.object_count);
-                        let mut text = egui::RichText::new(&label_text);
-                        if is_selected {
-                            text = text.strong().color(egui::Color32::from_rgb(80, 180, 255));
-                        } else if is_highlighted {
-                            text = text.strong().color(egui::Color32::from_rgb(120, 220, 160));
-                        }
-
-                        let response = ui.selectable_label(is_selected, text);
-                        let rect = response.rect;
-                        self.tag_rects.insert(tag_raw, rect);
-
-                        if response.clicked() {
-                            self.selected_tag = if is_selected { None } else { Some(tag_raw) };
-                            // Keep selected_object so hex view stays visible
-                        }
-
-                        if response.hovered() {
-                            self.hovered_tag = Some(tag_raw);
-                            response.show_tooltip_ui(|ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("Tag: {}", tag.name)).strong(),
-                                );
-                                ui.label(format!("ID: {}", tag_raw));
-                                ui.label(format!("Semantics: {}", tag.semantics));
-                                ui.label(format!("Objects: {}", tag.object_count));
-                                if !tag.implies.is_empty() {
-                                    let names: Vec<&str> = tag
-                                        .implies
-                                        .iter()
-                                        .filter_map(|tid| {
-                                            self.snap
-                                                .tag_by_id
-                                                .get(tid)
-                                                .map(|&i| self.snap.tags[i].name.as_str())
-                                        })
-                                        .collect();
-                                    ui.label(format!("Implies: {}", names.join(", ")));
-                                }
-                                if !tag.implied_by.is_empty() {
-                                    let names: Vec<&str> = tag
-                                        .implied_by
-                                        .iter()
-                                        .filter_map(|tid| {
-                                            self.snap
-                                                .tag_by_id
-                                                .get(tid)
-                                                .map(|&i| self.snap.tags[i].name.as_str())
-                                        })
-                                        .collect();
-                                    ui.label(format!("Implied by: {}", names.join(", ")));
-                                }
-                            });
-                        }
-                    });
-                }
-            });
-    }
-
-    fn draw_object_column(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.strong("Objects");
-            ui.add_space(8.0);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.object_filter)
-                    .hint_text("filter…")
-                    .desired_width(120.0),
-            );
-            ui.checkbox(&mut self.show_tombstoned, "tombstoned");
-        });
-        ui.separator();
-
-        let highlighted_objects: BTreeSet<usize> = self
-            .selected_tag
-            .map_or(BTreeSet::new(), |t| self.objects_for_tag(t));
-
-        let filter_lower = self.object_filter.to_lowercase();
-
-        egui::ScrollArea::vertical()
-            .id_salt("objects_scroll")
-            .show(ui, |ui| {
-                for (idx, obj) in self.snap.objects.iter().enumerate() {
-                    if !self.show_tombstoned && obj.state != ObjectState::Active {
-                        continue;
-                    }
-
-                    // Apply text filter (matches on path, tag names, or object id)
-                    if !filter_lower.is_empty() {
-                        let id_str = obj.local.to_string();
-                        let path_match = obj
-                            .paths
-                            .iter()
-                            .any(|(_, p)| p.to_lowercase().contains(&filter_lower));
-                        let tag_match = obj.direct_tags.iter().any(|tid| {
-                            self.snap.tag_by_id.get(tid).is_some_and(|&i| {
-                                self.snap.tags[i]
-                                    .name
-                                    .to_lowercase()
-                                    .contains(&filter_lower)
-                            })
-                        });
-                        if !id_str.contains(&filter_lower) && !path_match && !tag_match {
-                            continue;
-                        }
-                    }
-
-                    let is_selected = self.selected_object == Some(idx);
-                    let is_highlighted = highlighted_objects.contains(&idx);
-
-                    ui.horizontal(|ui| {
-                        // Object label: show path if available, else ID
-                        let display = if let Some((_, path)) = obj.paths.first() {
-                            format!("#{} {}", obj.local, path)
-                        } else {
-                            format!("#{}", obj.local)
-                        };
-
-                        let mut text = egui::RichText::new(&display).monospace();
-                        if is_selected {
-                            text = text.strong().color(egui::Color32::from_rgb(100, 255, 150));
-                        } else if is_highlighted {
-                            text = text.strong().color(egui::Color32::from_rgb(80, 180, 255));
-                        }
-                        if obj.state != ObjectState::Active {
-                            text = text.strikethrough();
-                        }
-
-                        let response = ui.selectable_label(is_selected, text);
-                        let rect = response.rect;
-                        self.obj_rects.insert(idx, rect);
-
-                        if response.clicked() {
-                            self.selected_object = if is_selected { None } else { Some(idx) };
-                            // Keep selected_tag so connection lines stay visible
-                        }
-
-                        if response.hovered() {
-                            self.hovered_object = Some(idx);
-                        }
-
-                        // Compact info after the label
-                        if obj.has_blob {
-                            ui.label(
-                                egui::RichText::new(format_bytes(obj.blob_length))
-                                    .small()
-                                    .weak(),
-                            );
-                        }
-                        if obj.compression != CompressionState::None {
-                            ui.label(
-                                egui::RichText::new(format!("{:?}", obj.compression))
-                                    .small()
-                                    .weak(),
-                            );
-                        }
-                    });
-                }
-            });
-    }
-
-    fn draw_detail_panel(&self, ui: &mut egui::Ui) {
-        if let Some(idx) = self.selected_object {
-            self.draw_object_detail(ui, idx);
-        } else if let Some(tag_raw) = self.selected_tag {
-            self.draw_tag_detail(ui, tag_raw);
-        } else {
-            self.draw_pool_overview(ui);
-        }
-    }
-
-    fn draw_pool_overview(&self, ui: &mut egui::Ui) {
-        ui.heading("Pool Overview");
-        ui.separator();
-
-        ui.label(format!("Node ID: {}", self.snap.node_id));
-        ui.label(format!(
-            "Zones: idx@{:#x} meta@{:#x} blob@{:#x}",
-            self.snap.index_zone_offset, self.snap.metadata_zone_offset, self.snap.blob_zone_offset,
-        ));
-        ui.label(format!("Tags: {}", self.snap.tags.len()));
-        ui.label(format!("Objects: {}", self.snap.objects.len()));
-        ui.label(format!(
-            "Blobs: {} ({})",
-            self.snap.blob_count,
-            format_bytes(self.snap.total_blob_bytes)
-        ));
-
-        if !self.snap.implications.is_empty() {
-            ui.add_space(8.0);
-            ui.strong("Implications");
-            for (from, to) in &self.snap.implications {
-                let from_name = self
-                    .snap
-                    .tag_by_id
-                    .get(from)
-                    .map(|&i| self.snap.tags[i].name.as_str())
-                    .unwrap_or("?");
-                let to_name = self
-                    .snap
-                    .tag_by_id
-                    .get(to)
-                    .map(|&i| self.snap.tags[i].name.as_str())
-                    .unwrap_or("?");
-                ui.label(format!("  {from_name} → {to_name}"));
-            }
-        }
-
-        // Disks from config
-        if !self.snap.config.disks.is_empty() {
-            ui.add_space(8.0);
-            ui.strong("Disks");
-            for disk in &self.snap.config.disks {
-                ui.label(format!(
-                    "  disk{}: {} ({}, {})",
-                    disk.id,
-                    disk.path,
-                    disk.tier,
-                    format_bytes(disk.capacity_bytes),
-                ));
-            }
-        }
-
-        if !self.snap.placement_rules.is_empty() {
-            ui.add_space(8.0);
-            ui.strong("Placement Rules");
-            for rule in &self.snap.placement_rules {
-                ui.label(format!("  {rule}"));
-            }
-        }
-
-        ui.add_space(8.0);
-        ui.weak("Click a tag or object to inspect it.");
-    }
-
-    fn draw_object_detail(&self, ui: &mut egui::Ui, idx: usize) {
-        let obj = &self.snap.objects[idx];
-        ui.heading(format!("Object #{} (node:{})", obj.local, obj.oid.node()));
-        ui.separator();
-
-        egui::Grid::new("obj_detail_grid")
-            .num_columns(2)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.label("State:");
-                ui.label(format!("{:?}", obj.state));
-                ui.end_row();
-
-                ui.label("Raw ID:");
-                ui.label(
-                    egui::RichText::new(format!("{:#x}", obj.id_raw))
-                        .monospace()
-                        .small(),
-                );
-                ui.end_row();
-
-                ui.label("Generation:");
-                ui.label(format!("{}", obj.generation));
-                ui.end_row();
-
-                ui.label("Tags/Attrs:");
-                ui.label(format!("{} / {}", obj.tag_count, obj.attr_count));
-                ui.end_row();
-
-                ui.label("Created:");
-                ui.label(format_ns(obj.created_ns));
-                ui.end_row();
-
-                ui.label("Modified:");
-                ui.label(format_ns(obj.modified_ns));
-                ui.end_row();
-
-                if obj.blob_length > 0 {
-                    ui.label("Blob size:");
-                    ui.label(format_bytes(obj.blob_length));
-                    ui.end_row();
-
-                    ui.label("Stored size:");
-                    ui.label(format!(
-                        "{} ({:?})",
-                        format_bytes(obj.stored_size),
-                        obj.compression
-                    ));
-                    ui.end_row();
-
-                    let ratio = if obj.blob_length > 0 {
-                        (obj.stored_size as f64 / obj.blob_length as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    ui.label("Ratio:");
-                    ui.label(format!("{ratio:.1}%"));
-                    ui.end_row();
-                }
-
-                ui.label("Hash:");
-                ui.label(
-                    egui::RichText::new(format_hash(&obj.content_hash))
-                        .monospace()
-                        .small(),
-                );
-                ui.end_row();
-
-                if obj.has_blob {
-                    ui.label("Blob data:");
-                    ui.label(format!(
-                        "{} in memory",
-                        format_bytes(obj.blob_size.unwrap_or(0) as u64)
-                    ));
-                    ui.end_row();
-                }
-            });
-
-        // Direct tags
-        if !obj.direct_tags.is_empty() {
-            ui.add_space(8.0);
-            ui.strong("Direct Tags");
-            for tid in &obj.direct_tags {
-                let name = self
-                    .snap
-                    .tag_by_id
-                    .get(tid)
-                    .map(|&i| self.snap.tags[i].name.as_str())
-                    .unwrap_or("?");
-                ui.label(format!("  {name} (id:{tid})"));
-            }
-        }
-
-        // Materialized tags
-        if !obj.materialized_tags.is_empty() {
-            ui.add_space(4.0);
-            ui.strong("Materialized Tags");
-            for tid in &obj.materialized_tags {
-                let name = self
-                    .snap
-                    .tag_by_id
-                    .get(tid)
-                    .map(|&i| self.snap.tags[i].name.as_str())
-                    .unwrap_or("?");
-                ui.label(
-                    egui::RichText::new(format!("  {name} (id:{tid})"))
-                        .weak()
-                        .italics(),
-                );
-            }
-        }
-
-        // Attributes
-        if !obj.attrs.is_empty() {
-            ui.add_space(8.0);
-            ui.strong("Attributes");
-            for (key, val) in &obj.attrs {
-                ui.label(format!("  {key} = {val}"));
-            }
-        }
-
-        // Path projections
-        if !obj.paths.is_empty() {
-            ui.add_space(8.0);
-            ui.strong("Path Projections");
-            for (ctx, path) in &obj.paths {
-                ui.label(format!("  [{ctx}] {path}"));
-            }
-        }
-    }
-
-    fn draw_tag_detail(&self, ui: &mut egui::Ui, tag_raw: u32) {
-        let tag_idx = match self.snap.tag_by_id.get(&tag_raw) {
-            Some(&i) => i,
-            None => {
-                ui.label("Tag not found");
-                return;
-            }
-        };
-        let tag = &self.snap.tags[tag_idx];
-
-        ui.heading(format!("Tag: {}", tag.name));
-        ui.separator();
-
-        egui::Grid::new("tag_detail_grid")
-            .num_columns(2)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.label("ID:");
-                ui.label(format!("{}", tag_raw));
-                ui.end_row();
-
-                ui.label("Semantics:");
-                ui.label(&tag.semantics);
-                ui.end_row();
-
-                ui.label("Objects:");
-                ui.label(format!("{}", tag.object_count));
-                ui.end_row();
-            });
-
-        if !tag.implies.is_empty() {
-            ui.add_space(8.0);
-            ui.strong("Implies");
-            for tid in &tag.implies {
-                let name = self
-                    .snap
-                    .tag_by_id
-                    .get(tid)
-                    .map(|&i| self.snap.tags[i].name.as_str())
-                    .unwrap_or("?");
-                ui.label(format!("  → {name}"));
-            }
-        }
-
-        if !tag.implied_by.is_empty() {
-            ui.add_space(4.0);
-            ui.strong("Implied By");
-            for tid in &tag.implied_by {
-                let name = self
-                    .snap
-                    .tag_by_id
-                    .get(tid)
-                    .map(|&i| self.snap.tags[i].name.as_str())
-                    .unwrap_or("?");
-                ui.label(format!("  ← {name}"));
-            }
-        }
-
-        // List objects with this tag
-        let obj_indices = self.objects_for_tag(tag_raw);
-        if !obj_indices.is_empty() {
-            ui.add_space(8.0);
-            ui.strong("Tagged Objects");
-            for &oi in &obj_indices {
-                let obj = &self.snap.objects[oi];
-                let display = if let Some((_, path)) = obj.paths.first() {
-                    format!("  #{} {path}", obj.local)
-                } else {
-                    format!("  #{}", obj.local)
-                };
-                ui.label(egui::RichText::new(display).monospace().small());
-            }
-        }
-    }
-
-    fn draw_connections(&self, ctx: &egui::Context) {
-        // Determine which connections to draw
-        let connections: Vec<(u32, usize)> = if let Some(tag_raw) = self.selected_tag {
-            self.objects_for_tag(tag_raw)
-                .into_iter()
-                .map(|oi| (tag_raw, oi))
-                .collect()
-        } else if let Some(obj_idx) = self.selected_object {
-            let obj = &self.snap.objects[obj_idx];
-            obj.direct_tags
-                .iter()
-                .chain(obj.materialized_tags.iter())
-                .map(|&tid| (tid, obj_idx))
-                .collect()
-        } else {
-            return;
-        };
-
-        // Paint on the foreground layer so lines appear on top of all panels
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Foreground,
-            egui::Id::new("connection_lines"),
-        ));
-
-        // Deduplicate tags so each tag gets one consistent color index
-        let unique_tags: Vec<u32> = {
-            let mut seen = BTreeSet::new();
-            connections
-                .iter()
-                .filter_map(|(t, _)| if seen.insert(*t) { Some(*t) } else { None })
-                .collect()
-        };
-        let tag_color_index: HashMap<u32, usize> = unique_tags
-            .iter()
-            .enumerate()
-            .map(|(i, &t)| (t, i))
-            .collect();
-
-        // Object → Tag lines (objects are left of tags now)
-        for (tag_raw, obj_idx) in &connections {
-            let tag_rect = self.tag_rects.get(tag_raw);
-            let obj_rect = self.obj_rects.get(obj_idx);
-
-            if let (Some(tr), Some(or)) = (tag_rect, obj_rect) {
-                let from = egui::pos2(or.right(), or.center().y);
-                let to = egui::pos2(tr.left(), tr.center().y);
-                let mid_x = (from.x + to.x) / 2.0;
-
-                let ci = tag_color_index.get(tag_raw).copied().unwrap_or(0);
-                let is_materialized = self
-                    .snap
-                    .objects
-                    .get(*obj_idx)
-                    .is_some_and(|o| o.materialized_tags.contains(tag_raw));
-                let alpha = if is_materialized { 140u8 } else { 200u8 };
-                let color = line_color_for(ci, alpha);
-                let width = if is_materialized { 1.5 } else { 2.0 };
-
-                draw_bezier(&painter, from, to, mid_x, egui::Stroke::new(width, color));
-            }
-        }
-
-        // Tag → inline_tags hex bytes (tags column → hex field)
-        if let Some(inline_rect) = self.record_field_rects.get("inline_tags") {
-            let mut drawn_highlight = false;
-            for (tag_raw, _) in &connections {
-                if let Some(tr) = self.tag_rects.get(tag_raw) {
-                    let ci = tag_color_index.get(tag_raw).copied().unwrap_or(0);
-                    let from = egui::pos2(tr.right(), tr.center().y);
-                    let to = egui::pos2(inline_rect.left(), inline_rect.center().y);
-                    let mid_x = (from.x + to.x) / 2.0;
-
-                    let color = line_color_for(ci, 160);
-                    draw_bezier(&painter, from, to, mid_x, egui::Stroke::new(1.5, color));
-
-                    if !drawn_highlight {
-                        let bg = egui::Color32::from_rgba_premultiplied(80, 80, 80, 40);
-                        painter.rect_filled(inline_rect.expand(2.0), 2.0, bg);
-                        drawn_highlight = true;
-                    }
-                }
-            }
-        }
-
-        // Tag → Assertions bytes area
-        if let Some(assert_rect) = self.assertions_bytes_rect {
-            for (tag_raw, _) in &connections {
-                if let Some(tr) = self.tag_rects.get(tag_raw) {
-                    let ci = tag_color_index.get(tag_raw).copied().unwrap_or(0);
-                    let from = egui::pos2(tr.right(), tr.center().y);
-                    let to = egui::pos2(assert_rect.left(), assert_rect.center().y);
-                    let mid_x = (from.x + to.x) / 2.0;
-
-                    let color = line_color_for(ci, 100);
-                    draw_bezier(&painter, from, to, mid_x, egui::Stroke::new(1.0, color));
-                }
-            }
-        }
-
-    }
-
-    fn update_hex_cache(&mut self) {
-        let obj_idx = match self.selected_object {
-            Some(i) => i,
-            None => return,
-        };
-        if self.hex_cache.cached_for == Some(obj_idx) {
-            return;
-        }
-
-        let obj = &self.snap.objects[obj_idx];
-        let disk_path = &self.snap.disk_path;
-
-        // Read object record bytes from disk
-        let mut record_bytes = vec![0u8; RECORD_SIZE];
-        if let Ok(file) = std::fs::File::open(disk_path) {
-            use std::io::{Read, Seek, SeekFrom};
-            let mut file = file;
-            if file.seek(SeekFrom::Start(obj.record_disk_offset)).is_ok() {
-                let _ = file.read_exact(&mut record_bytes);
-            }
-        }
-
-        // Serialize this object's assertions as CBOR for display
-        let assertions_bytes = {
-            let entries = &obj.direct_tags;
-            let materialized = &obj.materialized_tags;
-            let attrs = &obj.attrs;
-
-            // Build a simple serializable representation
-            #[derive(serde::Serialize)]
-            struct AssertionDump {
-                direct_tags: Vec<u32>,
-                materialized_tags: Vec<u32>,
-                attrs: Vec<(String, String)>,
-            }
-            let dump = AssertionDump {
-                direct_tags: entries.clone(),
-                materialized_tags: materialized.clone(),
-                attrs: attrs.clone(),
-            };
-            let mut buf = Vec::new();
-            let _ = ciborium::into_writer(&dump, &mut buf);
-            buf
-        };
-
-        // Use blob preview from snapshot (already extracted from in-memory store)
-        let blob_bytes = obj.blob_preview.clone();
-
-        self.hex_cache = HexCache {
-            cached_for: Some(obj_idx),
-            record_bytes,
-            record_offset: obj.record_disk_offset,
-            assertions_bytes,
-            blob_bytes,
-            blob_offset: obj.blob_disk_offset,
-        };
-    }
-
-    fn draw_hex_record_column(&mut self, ui: &mut egui::Ui) {
-        self.record_field_rects.clear();
-
-        ui.strong("Object Record");
-        ui.label(
-            egui::RichText::new(format!(
-                "offset {:#010x}  ({} bytes)",
-                self.hex_cache.record_offset, RECORD_SIZE
-            ))
-            .small()
-            .weak(),
-        );
-        ui.separator();
-        let fields = record_field_ranges();
-        egui::ScrollArea::vertical()
-            .id_salt("hex_record")
-            .show(ui, |ui| {
-                let rects = draw_hex_dump(
-                    ui,
-                    &self.hex_cache.record_bytes,
-                    self.hex_cache.record_offset,
-                    Some(&fields),
-                );
-                self.record_field_rects = rects;
-            });
-    }
-
-    fn draw_hex_assertions_column(&mut self, ui: &mut egui::Ui) {
-        self.assertions_bytes_rect = None;
-
-        ui.strong("Assertions (CBOR)");
-        ui.label(
-            egui::RichText::new(format!(
-                "serialized  ({} bytes)",
-                self.hex_cache.assertions_bytes.len()
-            ))
-            .small()
-            .weak(),
-        );
-        ui.separator();
-        let assert_response =
-            egui::ScrollArea::vertical()
-                .id_salt("hex_assertions")
-                .show(ui, |ui| {
-                    draw_hex_dump(ui, &self.hex_cache.assertions_bytes, 0, None);
-                });
-        self.assertions_bytes_rect = Some(assert_response.inner_rect);
-    }
-
-    fn draw_hex_blob_column(&mut self, ui: &mut egui::Ui) {
-
-        ui.strong("Blob Data");
-        if !self.hex_cache.blob_bytes.is_empty() {
-            ui.label(
-                egui::RichText::new(format!(
-                    "offset {:#010x}  ({} bytes shown)",
-                    self.hex_cache.blob_offset,
-                    self.hex_cache.blob_bytes.len()
-                ))
-                .small()
-                .weak(),
-            );
-        } else {
-            ui.label(egui::RichText::new("no blob data").small().weak());
-        }
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .id_salt("hex_blob")
-            .show(ui, |ui| {
-                draw_hex_dump(
-                    ui,
-                    &self.hex_cache.blob_bytes,
-                    self.hex_cache.blob_offset,
-                    None,
-                );
-            });
-    }
-}
-
-// ── Hex dump rendering ──────────────────────────────────────────────
-
-/// A named byte range for highlighting in the hex dump.
-/// A palette of 12 visually distinct colors for connection lines.
-const LINE_PALETTE: [egui::Color32; 12] = [
-    egui::Color32::from_rgb(230, 25, 75),   // red
-    egui::Color32::from_rgb(60, 180, 75),   // green
-    egui::Color32::from_rgb(0, 130, 200),   // blue
-    egui::Color32::from_rgb(245, 130, 48),  // orange
-    egui::Color32::from_rgb(145, 30, 180),  // purple
-    egui::Color32::from_rgb(70, 240, 240),  // cyan
-    egui::Color32::from_rgb(240, 50, 230),  // magenta
-    egui::Color32::from_rgb(210, 245, 60),  // lime
-    egui::Color32::from_rgb(250, 190, 212), // pink
-    egui::Color32::from_rgb(0, 128, 128),   // teal
-    egui::Color32::from_rgb(220, 190, 255), // lavender
-    egui::Color32::from_rgb(170, 110, 40),  // brown
-];
-
-/// Get a distinct line color for a tag (by index in the connection list).
-fn line_color_for(index: usize, alpha: u8) -> egui::Color32 {
-    let base = LINE_PALETTE[index % LINE_PALETTE.len()];
-    egui::Color32::from_rgba_premultiplied(
-        (base.r() as u16 * alpha as u16 / 255) as u8,
-        (base.g() as u16 * alpha as u16 / 255) as u8,
-        (base.b() as u16 * alpha as u16 / 255) as u8,
-        alpha,
-    )
-}
-
-/// Draw a cubic bezier curve between two points.
-fn draw_bezier(
-    painter: &egui::Painter,
-    from: egui::Pos2,
-    to: egui::Pos2,
-    mid_x: f32,
-    stroke: egui::Stroke,
-) {
-    painter.add(egui::Shape::CubicBezier(
-        egui::epaint::CubicBezierShape::from_points_stroke(
-            [from, egui::pos2(mid_x, from.y), egui::pos2(mid_x, to.y), to],
-            false,
-            egui::Color32::TRANSPARENT,
-            stroke,
+        OpKind::SetAttr { oid, key, value } => format!(
+            "SetAttr(#{}, k={}, v={})",
+            oid.local_seq(),
+            key.raw(),
+            format_value(value)
         ),
+        OpKind::RemoveAttr { oid, key, .. } => {
+            format!("RemoveAttr(#{}, k={})", oid.local_seq(), key.raw())
+        }
+        OpKind::AddRelation {
+            oid,
+            predicate,
+            target,
+        } => format!(
+            "AddRelation(#{}, p={}, →#{})",
+            oid.local_seq(),
+            predicate.raw(),
+            target.local_seq()
+        ),
+        OpKind::RemoveRelation {
+            oid,
+            predicate,
+            target,
+        } => format!(
+            "RemoveRelation(#{}, p={}, →#{})",
+            oid.local_seq(),
+            predicate.raw(),
+            target.local_seq()
+        ),
+        OpKind::WriteBlob { oid, size, .. } => {
+            format!("WriteBlob(#{}, {} B)", oid.local_seq(), size)
+        }
+    }
+}
+
+fn wal_header_view(wal: &Wal) -> WalHeaderView {
+    WalHeaderView {
+        next_lsn: wal.next_lsn(),
+        write_cursor: wal.write_cursor(),
+        read_cursor: wal.read_cursor(),
+        used_bytes: wal.used_bytes(),
+        data_capacity: wal.data_capacity(),
+        last_checkpoint_lsn: wal.last_checkpoint_lsn(),
+    }
+}
+
+/// Walk the WAL ring (read-only) and capture every entry currently live.
+/// The newest entries land first in the result.
+fn collect_wal_entries(wal: &Wal, device: &dyn BlockDevice) -> Vec<WalEntryView> {
+    let mut out = Vec::new();
+    for result in wal.iter_from(device, 0) {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => break, // surface as truncated history; not a hard error
+        };
+        out.push(decode_wal_entry(&entry));
+    }
+    out.reverse();
+    // Cap to a sensible upper bound for the GUI table.
+    out.truncate(512);
+    out
+}
+
+fn decode_wal_entry(entry: &WalEntry) -> WalEntryView {
+    let op_kind_raw = { entry.header.op_kind };
+    let lsn = { entry.header.lsn };
+    let payload_length = { entry.header.payload_length };
+    let timestamp_ns = { entry.header.timestamp.physical_ns };
+    let (kind_name, payload_preview) = match WalOpKind::from_u8(op_kind_raw) {
+        Ok(kind) => match WalOp::decode(kind, &entry.payload) {
+            Ok(op) => (format!("{kind:?}"), format!("{op:?}")),
+            Err(e) => (format!("{kind:?}"), format!("<decode error: {e}>")),
+        },
+        Err(_) => (format!("unknown({op_kind_raw})"), String::new()),
+    };
+    WalEntryView {
+        lsn,
+        op_kind: op_kind_raw,
+        op_kind_name: kind_name,
+        payload_length,
+        timestamp_ns,
+        payload_preview,
+    }
+}
+
+fn collect_modules(engine: &DiskEngine) -> Vec<ModuleSnapshot> {
+    let mut out: Vec<ModuleSnapshot> = engine
+        .engine
+        .ontology
+        .installed_modules
+        .values()
+        .map(|m| ModuleSnapshot {
+            id: m.id.clone(),
+            version: m.version.clone(),
+            name: m.name.clone(),
+            installed_tags: m.installed_tags.len(),
+            installed_implications: m.installed_implications.len(),
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+// -----------------------------------------------------------------------
+// Plain-text + JSON dumps.
+// -----------------------------------------------------------------------
+
+/// Render the Pool Overview as a plain-text dump.
+pub fn render_dump(snap: &PoolSnapshot) -> String {
+    let mut out = String::new();
+    out.push_str("=== Mímisbrunnr Pool Overview ===\n");
+    out.push_str(&format!("node_id:        {}\n", snap.node_id));
+    out.push_str(&format!(
+        "disks:          {} (capacity={}, used={})\n",
+        snap.pool_status.disk_count,
+        format_bytes(snap.pool_status.total_capacity),
+        format_bytes(snap.pool_status.total_used)
     ));
-}
+    out.push_str(&format!("total_objects:  {}\n", snap.total_objects));
+    out.push_str(&format!("total_tags:     {}\n", snap.total_tags));
+    out.push_str(&format!("oplog_entries:  {}\n", snap.oplog.len()));
+    out.push_str(&format!("wal_next_lsn:   {}\n", snap.wal_header.next_lsn));
+    out.push_str(&format!(
+        "wal_used:       {} / {} ({}%)\n",
+        snap.wal_header.used_bytes,
+        snap.wal_header.data_capacity,
+        wal_used_percent(&snap.wal_header)
+    ));
 
-struct FieldRange {
-    name: &'static str,
-    start: usize,
-    len: usize,
-    color: egui::Color32,
-}
-
-/// Field ranges for the ObjectRecord layout (matches #[repr(C)] Pod struct).
-fn record_field_ranges() -> Vec<FieldRange> {
-    vec![
-        FieldRange {
-            name: "id",
-            start: 0,
-            len: 8,
-            color: egui::Color32::from_rgb(120, 180, 255),
-        },
-        FieldRange {
-            name: "blob_offset",
-            start: 8,
-            len: 8,
-            color: egui::Color32::from_rgb(255, 180, 120),
-        },
-        FieldRange {
-            name: "blob_length",
-            start: 16,
-            len: 8,
-            color: egui::Color32::from_rgb(255, 220, 120),
-        },
-        FieldRange {
-            name: "stored_size",
-            start: 24,
-            len: 8,
-            color: egui::Color32::from_rgb(200, 255, 120),
-        },
-        FieldRange {
-            name: "overflow_off",
-            start: 32,
-            len: 8,
-            color: egui::Color32::from_rgb(180, 180, 255),
-        },
-        FieldRange {
-            name: "created_ns",
-            start: 40,
-            len: 8,
-            color: egui::Color32::from_rgb(255, 160, 200),
-        },
-        FieldRange {
-            name: "modified_ns",
-            start: 48,
-            len: 8,
-            color: egui::Color32::from_rgb(255, 200, 200),
-        },
-        FieldRange {
-            name: "generation",
-            start: 56,
-            len: 4,
-            color: egui::Color32::from_rgb(200, 200, 255),
-        },
-        FieldRange {
-            name: "inline_tags",
-            start: 60,
-            len: 16,
-            color: egui::Color32::from_rgb(120, 255, 200),
-        },
-        FieldRange {
-            name: "tag_count",
-            start: 76,
-            len: 2,
-            color: egui::Color32::from_rgb(200, 255, 255),
-        },
-        FieldRange {
-            name: "attr_count",
-            start: 78,
-            len: 2,
-            color: egui::Color32::from_rgb(200, 255, 255),
-        },
-        FieldRange {
-            name: "state",
-            start: 80,
-            len: 1,
-            color: egui::Color32::from_rgb(255, 120, 120),
-        },
-        FieldRange {
-            name: "compression",
-            start: 81,
-            len: 1,
-            color: egui::Color32::from_rgb(255, 160, 120),
-        },
-        FieldRange {
-            name: "encryption",
-            start: 82,
-            len: 1,
-            color: egui::Color32::from_rgb(255, 200, 160),
-        },
-        FieldRange {
-            name: "pad",
-            start: 83,
-            len: 1,
-            color: egui::Color32::from_rgb(100, 100, 100),
-        },
-        FieldRange {
-            name: "content_hash",
-            start: 84,
-            len: 32,
-            color: egui::Color32::from_rgb(180, 120, 255),
-        },
-        FieldRange {
-            name: "reserved",
-            start: 116,
-            len: 4,
-            color: egui::Color32::from_rgb(80, 80, 80),
-        },
-        FieldRange {
-            name: "compressed_size",
-            start: 120,
-            len: 8,
-            color: egui::Color32::from_rgb(200, 160, 120),
-        },
-    ]
-}
-
-fn field_at_offset(fields: &[FieldRange], offset: usize) -> Option<&FieldRange> {
-    fields
-        .iter()
-        .find(|f| offset >= f.start && offset < f.start + f.len)
-}
-
-/// Draw an ImHex-style hex dump with offset, hex bytes, and ASCII columns.
-/// Returns a map of field name → bounding rect (only when `fields` is provided).
-fn draw_hex_dump(
-    ui: &mut egui::Ui,
-    data: &[u8],
-    base_offset: u64,
-    fields: Option<&Vec<FieldRange>>,
-) -> BTreeMap<String, egui::Rect> {
-    let mut field_rects: BTreeMap<String, egui::Rect> = BTreeMap::new();
-
-    if data.is_empty() {
-        ui.weak("(empty)");
-        return field_rects;
+    out.push_str("\n--- Disks ---\n");
+    for d in &snap.disks {
+        out.push_str(&format!(
+            "  disk{:<3} {:<24}  {:?} {} {} (used {}, state {})\n",
+            d.disk_id,
+            d.path.display(),
+            d.media_type,
+            tier_name(d.tier),
+            format_bytes(d.capacity_bytes),
+            format_bytes(d.used_bytes),
+            d.state,
+        ));
     }
 
-    let painter = ui.painter().clone();
-    // 8 bytes per row keeps columns from overlapping in a 3-column layout.
-    // Row format: "041ef300 06 00 00 00 00 00 00 00 ........" ≈ 42 chars
-    let bytes_per_row = 8;
-
-    for (row_idx, chunk) in data.chunks(bytes_per_row).enumerate() {
-        let row_offset = row_idx * bytes_per_row;
-        let abs_offset = base_offset + row_offset as u64;
-
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-
-            // Offset column (shorter: 6 hex digits for compactness)
-            ui.label(
-                egui::RichText::new(format!("{abs_offset:06x} "))
-                    .monospace()
-                    .weak(),
-            );
-
-            // Hex bytes
-            for (i, &byte) in chunk.iter().enumerate() {
-                let byte_offset = row_offset + i;
-                let field = fields.and_then(|f| field_at_offset(f, byte_offset));
-                let color = field
-                    .map(|f| f.color)
-                    .unwrap_or(egui::Color32::from_rgb(80, 80, 90));
-
-                let hex_text = if i == 3 {
-                    format!("{byte:02x}  ") // extra space at midpoint
-                } else {
-                    format!("{byte:02x} ")
-                };
-
-                let label = ui.label(egui::RichText::new(hex_text).monospace().color(color));
-
-                // Paint a subtle background behind fields
-                if let Some(f) = field {
-                    let bg = egui::Color32::from_rgba_premultiplied(
-                        f.color.r() / 5,
-                        f.color.g() / 5,
-                        f.color.b() / 5,
-                        50,
-                    );
-                    painter.rect_filled(label.rect, 0.0, bg);
-
-                    // Accumulate bounding rect for this field
-                    let entry = field_rects.entry(f.name.to_string()).or_insert(label.rect);
-                    *entry = entry.union(label.rect);
-                }
-
-                // Tooltip on hover showing field name + decoded value
-                if let Some(f) = field
-                    && label.hovered()
-                {
-                    label.show_tooltip_ui(|ui| {
-                        ui.label(egui::RichText::new(f.name).strong());
-                        ui.label(format!(
-                            "offset: {:#x}..{:#x} ({} bytes)",
-                            f.start,
-                            f.start + f.len,
-                            f.len
-                        ));
-                        if f.start + f.len <= data.len() {
-                            let field_bytes = &data[f.start..f.start + f.len];
-                            let decoded = decode_field(f.name, field_bytes);
-                            ui.label(format!("value: {decoded}"));
-                        }
-                    });
-                }
-            }
-
-            // Pad if short row
-            if chunk.len() < bytes_per_row {
-                let missing = bytes_per_row - chunk.len();
-                let pad = " ".repeat(missing * 3 + if chunk.len() <= 3 { 1 } else { 0 });
-                ui.label(egui::RichText::new(pad).monospace());
-            }
-
-            ui.label(egui::RichText::new(" ").monospace());
-
-            // ASCII column
-            let ascii: String = chunk
-                .iter()
-                .map(|&b| {
-                    if (0x20..=0x7e).contains(&b) {
-                        b as char
-                    } else {
-                        '.'
-                    }
-                })
-                .collect();
-
-            let ascii_color = egui::Color32::from_rgb(100, 100, 110);
-            ui.label(egui::RichText::new(ascii).monospace().color(ascii_color));
-        });
+    out.push_str("\n--- Tier breakdown ---\n");
+    for (tier, b) in &snap.pool_status.by_tier {
+        out.push_str(&format!(
+            "  {}: {} disks, {} capacity, {} used\n",
+            tier_name(*tier),
+            b.disk_count,
+            format_bytes(b.capacity_bytes),
+            format_bytes(b.used_bytes),
+        ));
     }
 
-    field_rects
+    out.push_str("\n--- Recent oplog ---\n");
+    for e in snap.oplog.iter().take(16) {
+        out.push_str(&format!("  lsn={:>5}  {}\n", e.lsn, e.op_summary));
+    }
+
+    out.push_str("\n--- Top tags ---\n");
+    for t in snap.tags.iter().take(16) {
+        out.push_str(&format!(
+            "  {:<24} ({:>4}) {}\n",
+            t.name, t.object_count, t.semantics
+        ));
+    }
+
+    out.push_str("\n--- Modules ---\n");
+    for m in &snap.modules {
+        out.push_str(&format!(
+            "  {} v{} ({}, {} tags, {} implications)\n",
+            m.id, m.version, m.name, m.installed_tags, m.installed_implications,
+        ));
+    }
+    out
 }
 
-/// Decode a field's raw bytes into a human-readable string.
-fn decode_field(name: &str, bytes: &[u8]) -> String {
-    match name {
-        "id" | "blob_offset" | "blob_length" | "stored_size" | "overflow_off"
-        | "compressed_size" => {
-            if bytes.len() == 8 {
-                let v = u64::from_le_bytes(bytes.try_into().unwrap());
-                if v == 0 {
-                    "0".into()
-                } else {
-                    format!("{v} ({v:#x})")
-                }
-            } else {
-                format!("{bytes:02x?}")
-            }
-        }
-        "created_ns" | "modified_ns" => {
-            if bytes.len() == 8 {
-                let v = i64::from_le_bytes(bytes.try_into().unwrap());
-                format_ns(v)
-            } else {
-                format!("{bytes:02x?}")
-            }
-        }
-        "generation" => {
-            if bytes.len() == 4 {
-                format!("{}", u32::from_le_bytes(bytes.try_into().unwrap()))
-            } else {
-                format!("{bytes:02x?}")
-            }
-        }
-        "inline_tags" => {
-            if bytes.len() == 16 {
-                let tags: Vec<u32> = bytes
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-                    .collect();
-                format!("{tags:?}")
-            } else {
-                format!("{bytes:02x?}")
-            }
-        }
-        "tag_count" | "attr_count" => {
-            if bytes.len() == 2 {
-                format!("{}", u16::from_le_bytes(bytes.try_into().unwrap()))
-            } else {
-                format!("{bytes:02x?}")
-            }
-        }
-        "state" => match bytes.first() {
-            Some(0) => "Active (0)".into(),
-            Some(1) => "Tombstoned (1)".into(),
-            Some(2) => "BlobReclaim (2)".into(),
-            Some(3) => "Cleared (3)".into(),
-            Some(v) => format!("unknown ({v})"),
-            None => "?".into(),
-        },
-        "compression" => match bytes.first() {
-            Some(0) => "None (0)".into(),
-            Some(1) => "Zstd (1)".into(),
-            Some(2) => "Lz4 (2)".into(),
-            Some(v) => format!("unknown ({v})"),
-            None => "?".into(),
-        },
-        "encryption" => match bytes.first() {
-            Some(0) => "None (0)".into(),
-            Some(1) => "Hctr2Aes128 (1)".into(),
-            Some(2) => "XtsAes256 (2)".into(),
-            Some(v) => format!("unknown ({v})"),
-            None => "?".into(),
-        },
-        "content_hash" => {
-            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            if hex.len() > 16 {
-                format!("{}…{}", &hex[..8], &hex[hex.len() - 8..])
-            } else {
-                hex
-            }
-        }
-        _ => format!("{bytes:02x?}"),
+/// Render the Pool Overview as JSON-ish text. No `serde_json` dep — we hand-format.
+pub fn render_json(snap: &PoolSnapshot) -> String {
+    let mut out = String::new();
+    out.push_str("{\n");
+    out.push_str(&format!("  \"node_id\": {},\n", snap.node_id));
+    out.push_str(&format!("  \"disk_count\": {},\n", snap.pool_status.disk_count));
+    out.push_str(&format!(
+        "  \"total_capacity_bytes\": {},\n",
+        snap.pool_status.total_capacity
+    ));
+    out.push_str(&format!(
+        "  \"total_used_bytes\": {},\n",
+        snap.pool_status.total_used
+    ));
+    out.push_str(&format!("  \"total_objects\": {},\n", snap.total_objects));
+    out.push_str(&format!("  \"total_tags\": {},\n", snap.total_tags));
+    out.push_str(&format!(
+        "  \"wal_next_lsn\": {},\n",
+        snap.wal_header.next_lsn
+    ));
+    out.push_str(&format!(
+        "  \"wal_used_bytes\": {},\n",
+        snap.wal_header.used_bytes
+    ));
+    out.push_str("  \"disks\": [\n");
+    for (i, d) in snap.disks.iter().enumerate() {
+        let comma = if i + 1 == snap.disks.len() { "" } else { "," };
+        out.push_str(&format!(
+            "    {{ \"id\": {}, \"tier\": \"{}\", \"capacity\": {}, \"used\": {}, \"state\": \"{}\" }}{}\n",
+            d.disk_id,
+            tier_name(d.tier),
+            d.capacity_bytes,
+            d.used_bytes,
+            d.state,
+            comma
+        ));
+    }
+    out.push_str("  ],\n");
+    out.push_str("  \"top_tags\": [\n");
+    for (i, t) in snap.tags.iter().take(16).enumerate() {
+        let comma = if i + 1 == snap.tags.iter().take(16).count() {
+            ""
+        } else {
+            ","
+        };
+        out.push_str(&format!(
+            "    {{ \"id\": {}, \"name\": \"{}\", \"count\": {} }}{}\n",
+            t.id.raw(),
+            t.name,
+            t.object_count,
+            comma
+        ));
+    }
+    out.push_str("  ]\n");
+    out.push_str("}\n");
+    out
+}
+
+fn wal_used_percent(h: &WalHeaderView) -> u64 {
+    if h.data_capacity == 0 {
+        0
+    } else {
+        h.used_bytes.saturating_mul(100) / h.data_capacity
+    }
+}
+
+/// Display name for a storage tier (logical types don't expose `name()`).
+fn tier_name(t: StorageTier) -> &'static str {
+    match t {
+        StorageTier::Hot => "Hot",
+        StorageTier::Warm => "Warm",
+        StorageTier::Cold => "Cold",
+        StorageTier::Glacier => "Glacier",
     }
 }
 
@@ -1667,52 +746,682 @@ fn format_bytes(bytes: u64) -> String {
     }
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut val = bytes as f64;
-    let mut unit_idx = 0;
-    while val >= 1024.0 && unit_idx < UNITS.len() - 1 {
+    let mut idx = 0;
+    while val >= 1024.0 && idx < UNITS.len() - 1 {
         val /= 1024.0;
-        unit_idx += 1;
+        idx += 1;
     }
-    if unit_idx == 0 {
+    if idx == 0 {
         format!("{bytes} B")
     } else {
-        format!("{val:.1} {}", UNITS[unit_idx])
+        format!("{val:.1} {}", UNITS[idx])
     }
 }
 
-// ── Main ─────────────────────────────────────────────────────────────
+// -----------------------------------------------------------------------
+// GUI — eframe::App with a simple radio-button tab layout.
+// -----------------------------------------------------------------------
 
-fn main() -> eframe::Result {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Pool,
+    Disk,
+    Wal,
+    Objects,
+    Tags,
+    Ontology,
+}
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Pool => "Pool Overview",
+            Tab::Disk => "Disk Detail",
+            Tab::Wal => "WAL Browser",
+            Tab::Objects => "Object Browser",
+            Tab::Tags => "Tag Index",
+            Tab::Ontology => "Ontology",
+        }
+    }
+}
+
+struct AnalyzerApp {
+    snap: PoolSnapshot,
+    pool_path: String,
+    tab: Tab,
+    /// Disk index currently selected on the Disk tab.
+    selected_disk: usize,
+    /// Selected WAL entry index (for payload pane).
+    selected_wal: Option<usize>,
+    /// Selected object index (for assertion pane).
+    selected_object: Option<usize>,
+}
+
+impl AnalyzerApp {
+    fn new(snap: PoolSnapshot, pool_path: String) -> Self {
+        Self {
+            snap,
+            pool_path,
+            tab: Tab::Pool,
+            selected_disk: 0,
+            selected_wal: None,
+            selected_object: None,
+        }
+    }
+}
+
+impl eframe::App for AnalyzerApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Mímisbrunnr Analyzer");
+                ui.separator();
+                ui.label(&self.pool_path);
+                ui.separator();
+                ui.label(format!(
+                    "node:{} | {} disks | {} objects | {} tags",
+                    self.snap.node_id,
+                    self.snap.pool_status.disk_count,
+                    self.snap.total_objects,
+                    self.snap.total_tags
+                ));
+            });
+            ui.horizontal(|ui| {
+                for tab in [
+                    Tab::Pool,
+                    Tab::Disk,
+                    Tab::Wal,
+                    Tab::Objects,
+                    Tab::Tags,
+                    Tab::Ontology,
+                ] {
+                    ui.selectable_value(&mut self.tab, tab, tab.label());
+                }
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+            Tab::Pool => self.draw_pool_tab(ui),
+            Tab::Disk => self.draw_disk_tab(ui),
+            Tab::Wal => self.draw_wal_tab(ui),
+            Tab::Objects => self.draw_objects_tab(ui),
+            Tab::Tags => self.draw_tags_tab(ui),
+            Tab::Ontology => self.draw_ontology_tab(ui),
+        });
+    }
+}
+
+impl AnalyzerApp {
+    fn draw_pool_tab(&self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("Pool Overview");
+            ui.separator();
+
+            ui.label(format!("node_id: {}", self.snap.node_id));
+            ui.label(format!(
+                "Capacity: {} used / {}",
+                format_bytes(self.snap.pool_status.total_used),
+                format_bytes(self.snap.pool_status.total_capacity)
+            ));
+            ui.label(format!(
+                "Objects: {} | Tags: {} | Oplog: {} entries",
+                self.snap.total_objects,
+                self.snap.total_tags,
+                self.snap.oplog.len(),
+            ));
+
+            ui.add_space(8.0);
+            ui.strong("Disks");
+            for d in &self.snap.disks {
+                ui.label(format!(
+                    "  disk{} {:?} ({}, {}) — {} of {} used [{}]",
+                    d.disk_id,
+                    d.media_type,
+                    tier_name(d.tier),
+                    d.path.display(),
+                    format_bytes(d.used_bytes),
+                    format_bytes(d.capacity_bytes),
+                    d.state,
+                ));
+            }
+
+            ui.add_space(8.0);
+            ui.strong("Tier breakdown");
+            for (tier, b) in &self.snap.pool_status.by_tier {
+                ui.label(format!(
+                    "  {}: {} disks, capacity {}, used {}",
+                    tier_name(*tier),
+                    b.disk_count,
+                    format_bytes(b.capacity_bytes),
+                    format_bytes(b.used_bytes),
+                ));
+            }
+
+            ui.add_space(8.0);
+            ui.strong("Recent oplog (newest first)");
+            for e in self.snap.oplog.iter().take(32) {
+                ui.label(
+                    egui::RichText::new(format!("lsn={:>5} {}", e.lsn, e.op_summary))
+                        .monospace()
+                        .small(),
+                );
+            }
+        });
+    }
+
+    fn draw_disk_tab(&mut self, ui: &mut egui::Ui) {
+        if self.snap.disks.is_empty() {
+            ui.label("No disks configured.");
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Disk:");
+            for (idx, d) in self.snap.disks.iter().enumerate() {
+                ui.selectable_value(&mut self.selected_disk, idx, format!("disk{}", d.disk_id));
+            }
+        });
+        ui.separator();
+        let idx = self.selected_disk.min(self.snap.disks.len() - 1);
+        let d = &self.snap.disks[idx];
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading(format!("disk{} ({})", d.disk_id, d.path.display()));
+            ui.label(format!(
+                "media={:?} tier={} capacity={} used={} state={}",
+                d.media_type,
+                tier_name(d.tier),
+                format_bytes(d.capacity_bytes),
+                format_bytes(d.used_bytes),
+                d.state,
+            ));
+            ui.add_space(8.0);
+
+            if let Some(sb) = &d.superblock {
+                ui.strong("Superblock");
+                draw_kv(ui, "fs_uuid", hex16(&sb.fs_uuid));
+                draw_kv(ui, "node_id", sb.node_id.to_string());
+                draw_kv(ui, "disk_id", sb.disk_id.to_string());
+                draw_kv(ui, "media_type", format!("{:?}", sb.media_type));
+                draw_kv(ui, "tier", tier_name(sb.tier));
+                draw_kv(ui, "device_capacity", format_bytes(sb.device_capacity));
+                draw_kv(ui, "creation_ns", sb.creation_timestamp_ns.to_string());
+                draw_kv(ui, "last_mount_ns", sb.last_mount_timestamp_ns.to_string());
+                draw_kv(ui, "mount_count", sb.mount_count.to_string());
+                draw_kv(ui, "bucket_size_log2", sb.bucket_size_log2.to_string());
+                draw_kv(
+                    ui,
+                    "btree_node_size_log2",
+                    sb.btree_node_size_log2.to_string(),
+                );
+                draw_kv(
+                    ui,
+                    "wal_offset/size",
+                    format!("{:#x} / {}", sb.wal_offset, format_bytes(sb.wal_size)),
+                );
+                draw_kv(
+                    ui,
+                    "index_zone",
+                    format!(
+                        "@{:#x} len {}",
+                        sb.index_zone_offset,
+                        format_bytes(sb.index_zone_length)
+                    ),
+                );
+                draw_kv(
+                    ui,
+                    "metadata_zone",
+                    format!(
+                        "@{:#x} len {}",
+                        sb.metadata_zone_offset,
+                        format_bytes(sb.metadata_zone_length)
+                    ),
+                );
+                draw_kv(
+                    ui,
+                    "blob_zone",
+                    format!(
+                        "@{:#x} len {}",
+                        sb.blob_zone_offset,
+                        format_bytes(sb.blob_zone_length)
+                    ),
+                );
+                draw_kv(ui, "fs_format_version", sb.fs_format_version.to_string());
+            } else {
+                ui.weak("Superblock view not available for non-primary disks (TODO).");
+            }
+
+            ui.add_space(8.0);
+            if let Some(rp) = &d.root_pointer {
+                ui.strong("Active RootPointer");
+                draw_kv(ui, "seq", rp.seq.to_string());
+                draw_kv(ui, "lsn", rp.lsn.to_string());
+                draw_kv(ui, "flags", format!("{:#x}", rp.flags));
+                ui.add_space(4.0);
+                ui.label("B+ tree root slots (disk:block@gen):");
+                for (name, value) in &rp.roots {
+                    ui.label(
+                        egui::RichText::new(format!("  {name:<24} {value}"))
+                            .monospace()
+                            .small(),
+                    );
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.strong("WAL ring (primary disk)");
+            let h = &self.snap.wal_header;
+            draw_kv(ui, "next_lsn", h.next_lsn.to_string());
+            draw_kv(ui, "write_cursor", format!("{:#x}", h.write_cursor));
+            draw_kv(ui, "read_cursor", format!("{:#x}", h.read_cursor));
+            draw_kv(
+                ui,
+                "used_bytes",
+                format!(
+                    "{} / {} ({}%)",
+                    format_bytes(h.used_bytes),
+                    format_bytes(h.data_capacity),
+                    wal_used_percent(h)
+                ),
+            );
+            draw_kv(
+                ui,
+                "last_checkpoint_lsn",
+                h.last_checkpoint_lsn.to_string(),
+            );
+        });
+    }
+
+    fn draw_wal_tab(&mut self, ui: &mut egui::Ui) {
+        if self.snap.wal_entries.is_empty() {
+            ui.label("WAL ring is empty.");
+            return;
+        }
+        let available = ui.available_size();
+        ui.horizontal(|ui| {
+            ui.allocate_ui(egui::vec2(available.x * 0.45, available.y), |ui| {
+                ui.strong("Recent WAL entries (newest first)");
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("wal_list")
+                    .show(ui, |ui| {
+                        for (idx, e) in self.snap.wal_entries.iter().enumerate() {
+                            let label = format!(
+                                "lsn={:>5}  {:<22} {} B  ts={}",
+                                e.lsn, e.op_kind_name, e.payload_length, e.timestamp_ns
+                            );
+                            let selected = self.selected_wal == Some(idx);
+                            if ui
+                                .selectable_label(
+                                    selected,
+                                    egui::RichText::new(label).monospace().small(),
+                                )
+                                .clicked()
+                            {
+                                self.selected_wal = Some(idx);
+                            }
+                        }
+                    });
+            });
+            ui.separator();
+            ui.allocate_ui(egui::vec2(available.x * 0.55, available.y), |ui| {
+                ui.strong("Decoded payload");
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("wal_payload")
+                    .show(ui, |ui| match self.selected_wal {
+                        Some(i) if i < self.snap.wal_entries.len() => {
+                            let e = &self.snap.wal_entries[i];
+                            ui.label(
+                                egui::RichText::new(format!("lsn={} kind={}", e.lsn, e.op_kind_name))
+                                    .strong(),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(&e.payload_preview)
+                                    .monospace()
+                                    .small(),
+                            );
+                        }
+                        _ => {
+                            ui.weak("Click an entry to see its CBOR-decoded payload.");
+                        }
+                    });
+            });
+        });
+    }
+
+    fn draw_objects_tab(&mut self, ui: &mut egui::Ui) {
+        if self.snap.objects.is_empty() {
+            ui.label("No objects in this pool.");
+            return;
+        }
+        let available = ui.available_size();
+        ui.horizontal(|ui| {
+            ui.allocate_ui(egui::vec2(available.x * 0.5, available.y), |ui| {
+                ui.strong("Objects (sorted by id)");
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("objs_list")
+                    .show(ui, |ui| {
+                        for (idx, o) in self.snap.objects.iter().enumerate() {
+                            let mut text = egui::RichText::new(format!(
+                                "#{:>5}  state={:?}  blob={}  tags={}",
+                                o.oid.local_seq(),
+                                o.state,
+                                format_bytes(o.blob_length),
+                                o.direct_tags.len()
+                            ))
+                            .monospace()
+                            .small();
+                            if o.state != ObjectState::Active {
+                                text = text.strikethrough();
+                            }
+                            if ui
+                                .selectable_label(self.selected_object == Some(idx), text)
+                                .clicked()
+                            {
+                                self.selected_object = Some(idx);
+                            }
+                        }
+                    });
+            });
+            ui.separator();
+            ui.allocate_ui(egui::vec2(available.x * 0.5, available.y), |ui| {
+                ui.strong("Detail");
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("obj_detail")
+                    .show(ui, |ui| match self.selected_object {
+                        Some(i) if i < self.snap.objects.len() => {
+                            let o = &self.snap.objects[i];
+                            draw_kv(ui, "oid", format!("{}", o.oid));
+                            draw_kv(ui, "state", format!("{:?}", o.state));
+                            draw_kv(ui, "compression", format!("{:?}", o.compression));
+                            draw_kv(ui, "generation", o.generation.to_string());
+                            draw_kv(ui, "blob_length", format_bytes(o.blob_length));
+                            draw_kv(ui, "stored_size", format_bytes(o.stored_size));
+                            ui.add_space(4.0);
+                            ui.strong("Direct tags");
+                            for t in &o.direct_tags {
+                                ui.label(format!("  {} = {}", t, self.tag_name(*t)));
+                            }
+                            ui.strong("Materialized tags");
+                            for t in &o.materialized_tags {
+                                ui.label(format!("  {} = {}", t, self.tag_name(*t)));
+                            }
+                            ui.strong("Attributes");
+                            for (k, v) in &o.attrs {
+                                ui.label(format!("  {k} = {v}"));
+                            }
+                            ui.add_space(4.0);
+                            ui.weak("(location info — not yet wired)");
+                        }
+                        _ => {
+                            ui.weak("Click an object to inspect its assertions.");
+                        }
+                    });
+            });
+        });
+    }
+
+    fn tag_name(&self, raw: u32) -> &str {
+        self.snap
+            .tags
+            .iter()
+            .find(|t| t.id.raw() == raw)
+            .map(|t| t.name.as_str())
+            .unwrap_or("?")
+    }
+
+    fn draw_tags_tab(&self, ui: &mut egui::Ui) {
+        ui.strong("Tags (sorted by cardinality)");
+        ui.separator();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for t in &self.snap.tags {
+                ui.collapsing(
+                    format!("{} ({})", t.name, t.object_count),
+                    |ui| {
+                        ui.label(format!("id: {}", t.id.raw()));
+                        ui.label(format!("semantics: {}", t.semantics));
+                        if !t.member_preview.is_empty() {
+                            ui.label("member preview:");
+                            for m in &t.member_preview {
+                                ui.label(
+                                    egui::RichText::new(format!("  {m:#x}"))
+                                        .monospace()
+                                        .small(),
+                                );
+                            }
+                        }
+                    },
+                );
+            }
+        });
+    }
+
+    fn draw_ontology_tab(&self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.strong("Installed modules");
+            ui.separator();
+            for m in &self.snap.modules {
+                ui.label(format!(
+                    "  {} v{} ({}): {} tags, {} implications",
+                    m.id, m.version, m.name, m.installed_tags, m.installed_implications,
+                ));
+            }
+            if self.snap.modules.is_empty() {
+                ui.weak("No modules installed.");
+            }
+            ui.add_space(8.0);
+            ui.strong("Implication DAG (adjacency)");
+            ui.separator();
+            // Build a sorted adjacency list by `from` tag.
+            let mut adj: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+            for (from, to) in &self.snap.implications {
+                adj.entry(*from).or_default().push(*to);
+            }
+            if adj.is_empty() {
+                ui.weak("No implications declared.");
+            }
+            for (from, tos) in &adj {
+                let from_name = self.tag_name(*from);
+                let target: Vec<String> = tos
+                    .iter()
+                    .map(|t| format!("{} ({t})", self.tag_name(*t)))
+                    .collect();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "  {from_name} ({from}) → {}",
+                        target.join(", ")
+                    ))
+                    .monospace()
+                    .small(),
+                );
+            }
+        });
+    }
+}
+
+fn draw_kv(ui: &mut egui::Ui, key: &str, value: impl AsRef<str>) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("{key:>22}: ")).weak().small());
+        ui.label(
+            egui::RichText::new(value.as_ref())
+                .monospace()
+                .small(),
+        );
+    });
+}
+
+fn hex16(bytes: &[u8; 16]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// -----------------------------------------------------------------------
+// main()
+// -----------------------------------------------------------------------
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let cli = Cli::parse();
 
-    // Load the pool
-    let config = PoolConfig::load(&cli.pool).unwrap_or_else(|e| {
-        eprintln!("Failed to load pool config {:?}: {e}", cli.pool);
-        std::process::exit(1);
-    });
-
-    let de = DiskEngine::open(&cli.pool).unwrap_or_else(|e| {
-        eprintln!("Failed to open pool: {e}");
-        std::process::exit(1);
-    });
-
-    let mut snap = extract_snapshot(&de);
-    snap.config = config;
-    snap.default_compression = snap.config.default_compression.clone();
-    snap.placement_rules = de.engine().rules().iter().map(format_rule).collect();
-
+    let engine = open_pool_read_only(&cli.pool)?;
+    let snap = build_snapshot(&engine);
     let pool_path = cli.pool.display().to_string();
+
+    if cli.dump {
+        print!("{}", render_dump(&snap));
+        return Ok(());
+    }
+    if cli.json {
+        print!("{}", render_json(&snap));
+        return Ok(());
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1600.0, 900.0])
-            .with_title("Mímisbrunnr Pool Analyzer"),
+            .with_inner_size([1280.0, 800.0])
+            .with_title("Mímisbrunnr Analyzer"),
         ..Default::default()
     };
-
     eframe::run_native(
         "Mímisbrunnr Analyzer",
         options,
         Box::new(|_cc| Ok(Box::new(AnalyzerApp::new(snap, pool_path)))),
     )
+    .map_err(|e| -> Box<dyn std::error::Error> { format!("eframe: {e}").into() })?;
+    Ok(())
+}
+
+/// Open a pool, read-only as far as the analyze tool is concerned.
+///
+/// `OPEN_READ_ONLY_TODO`: The storage `FileBlockDevice::open` does not yet
+/// expose a read-only flag, and the only constructor that opens the WAL +
+/// superblock + replays state is [`DiskEngine::open`] (read-write). For now
+/// we use it; the analyze tool refrains from issuing any mutation calls.
+/// TODO(rewrite-phase-N): add `FileBlockDevice::open_read_only` and a
+/// `DiskEngine::open_read_only` that skips WAL replay's checkpoint flush.
+fn open_pool_read_only(config_path: &Path) -> Result<DiskEngine, Box<dyn std::error::Error>> {
+    Ok(DiskEngine::open(config_path)?)
+}
+
+// Silence unused-import warning when `OBJECT_RECORD_SIZE` constant is added
+// to the imports later. Keeps `meta::ObjectRecord` referenced explicitly.
+#[allow(dead_code)]
+fn _record_size_proof() -> usize {
+    std::mem::size_of::<ObjectRecord>()
+}
+
+// -----------------------------------------------------------------------
+// Tests — snapshot builder + dump formatter only. GUI is compile-only.
+// -----------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mimisbrunnr::pool::DiskConfigEntry;
+    use tempfile::TempDir;
+
+    fn fresh_pool(tmp: &TempDir) -> (PathBuf, DiskEngine) {
+        let toml_path = tmp.path().join("pool.toml");
+        let cfg = PoolConfig {
+            node_id: 1,
+            disks: vec![DiskConfigEntry {
+                id: 1,
+                path: tmp.path().join("disk0.img"),
+                media_type: MediaType::Ssd,
+                tier: StorageTier::Hot,
+                capacity_bytes: 64 * 1024 * 1024,
+            }],
+        };
+        let engine = DiskEngine::create(cfg, toml_path.clone()).expect("create pool");
+        (toml_path, engine)
+    }
+
+    #[test]
+    fn snapshot_empty_pool_has_one_disk() {
+        let tmp = TempDir::new().unwrap();
+        let (_, engine) = fresh_pool(&tmp);
+        let snap = build_snapshot(&engine);
+        assert_eq!(snap.disks.len(), 1);
+        assert_eq!(snap.total_objects, 0);
+        assert_eq!(snap.total_tags, 0);
+        assert_eq!(snap.node_id, 1);
+    }
+
+    #[test]
+    fn snapshot_after_create_and_tag() {
+        let tmp = TempDir::new().unwrap();
+        let (_, mut engine) = fresh_pool(&tmp);
+        let oid1 = engine.create_object().unwrap();
+        let oid2 = engine.create_object().unwrap();
+        let tag = engine.engine.register_tag("demo");
+        engine.add_tag(oid1, tag).unwrap();
+        engine.add_tag(oid2, tag).unwrap();
+
+        let snap = build_snapshot(&engine);
+        assert_eq!(snap.total_objects, 2);
+        assert!(snap.total_tags >= 1);
+        // The tag with most members (demo) sorts first.
+        assert_eq!(snap.tags[0].name, "demo");
+        assert_eq!(snap.tags[0].object_count, 2);
+        assert_eq!(snap.objects.len(), 2);
+        // Oplog should record both creations + both tag adds (some entries
+        // may be evicted but for two ops this is fine).
+        assert!(snap.oplog.len() >= 4);
+        // WAL has at least one entry.
+        assert!(snap.wal_header.next_lsn > 1);
+        assert!(!snap.wal_entries.is_empty());
+    }
+
+    #[test]
+    fn render_dump_contains_disk_count() {
+        let tmp = TempDir::new().unwrap();
+        let (_, engine) = fresh_pool(&tmp);
+        let snap = build_snapshot(&engine);
+        let text = render_dump(&snap);
+        assert!(!text.is_empty());
+        assert!(text.contains("disks:"));
+        assert!(text.contains("1 ")); // disk_count = 1 in the formatted line
+        assert!(text.contains("Mímisbrunnr Pool Overview"));
+    }
+
+    #[test]
+    fn render_json_is_well_formed_ish() {
+        let tmp = TempDir::new().unwrap();
+        let (_, engine) = fresh_pool(&tmp);
+        let snap = build_snapshot(&engine);
+        let text = render_json(&snap);
+        assert!(text.starts_with('{'));
+        assert!(text.trim_end().ends_with('}'));
+        assert!(text.contains("\"node_id\": 1"));
+        assert!(text.contains("\"disk_count\": 1"));
+    }
+
+    #[test]
+    fn wal_entry_view_decodes_create_object() {
+        let tmp = TempDir::new().unwrap();
+        let (_, mut engine) = fresh_pool(&tmp);
+        let _oid = engine.create_object().unwrap();
+        let snap = build_snapshot(&engine);
+        let create_entry = snap
+            .wal_entries
+            .iter()
+            .find(|e| e.op_kind_name == "CreateObject")
+            .expect("expected at least one CreateObject in WAL");
+        assert!(!create_entry.payload_preview.is_empty());
+    }
+
+    #[test]
+    fn snapshot_includes_root_pointer_view() {
+        let tmp = TempDir::new().unwrap();
+        let (_, engine) = fresh_pool(&tmp);
+        let snap = build_snapshot(&engine);
+        let primary = &snap.disks[0];
+        let rp = primary
+            .root_pointer
+            .as_ref()
+            .expect("primary disk has a root pointer");
+        // 17 named slots in our view (subset of the 24 in the spec).
+        assert!(!rp.roots.is_empty());
+    }
 }

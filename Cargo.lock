@@ -148,6 +148,7 @@ dependencies = [
  "log",
  "mimisbrunnr",
  "serde",
+ "tempfile",
 ]
 
 [[package]]
@@ -583,9 +584,12 @@ dependencies = [
  "env_logger",
  "fuser",
  "log",
- "mimisbrunnr",
+ "mimisbrunnr-engine",
  "mimisbrunnr-fuse",
+ "mimisbrunnr-pool",
+ "mimisbrunnr-types",
  "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2123,11 +2127,11 @@ dependencies = [
 name = "mimir"
 version = "0.1.0"
 dependencies = [
- "arbitrary-int",
  "clap",
  "env_logger",
  "log",
  "mimisbrunnr",
+ "tempfile",
 ]
 
 [[package]]
@@ -3010,10 +3014,8 @@ dependencies = [
  "env_logger",
  "log",
  "mimisbrunnr",
- "mimisbrunnr-transform",
  "rand 0.10.0",
- "serde",
- "toml",
+ "tempfile",
 ]
 
 [[package]]

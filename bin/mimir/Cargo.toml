@@ -5,9 +5,19 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "mimir"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mimir"
+path = "src/main.rs"
+
 [dependencies]
 mimisbrunnr = { workspace = true }
-arbitrary-int = { workspace = true }
 clap = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,77 +1,89 @@
-use std::path::{Path, PathBuf};
+//! `mimir` — query / mutation CLI for a Mímisbrunnr pool.
+//!
+//! Phase 7a entry point: parse args with `clap`, open the [`DiskEngine`],
+//! dispatch to a command handler in `mimir::commands`, and `commit()` on the
+//! way out so the WAL is durable.
 
-use clap::{Parser, Subcommand};
+#![forbid(unsafe_code)]
 
-use mimisbrunnr::{
-    engine::{DiskEngine, Engine},
-    ontology::{OntologyModule, TagDefinition, TagSemantics, ValueType},
-    types::{Assertion, ObjectId, Value},
-    unix::{Importer, PathContextManager},
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+    process::ExitCode,
 };
 
-use std::collections::HashMap;
+use clap::{Args, Parser, Subcommand};
+use log::LevelFilter;
 
-#[derive(Parser)]
-#[command(name = "mimir", about = "Mímisbrunnr query engine — ask the well")]
+use mimir::{
+    commands::{self, CommandError},
+    value_parse::ValueKind,
+};
+use mimisbrunnr::engine::DiskEngine;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "mimir",
+    version,
+    about = "Mímisbrunnr query engine — ask the well",
+    long_about = "\
+mimir drives a Mímisbrunnr pool's DiskEngine.
+
+Tag-name resolution: subcommands that take tag names auto-register any \
+tag that the ontology doesn't yet know as a Label-semantics tag. To get \
+richer semantics (Attribute, Grouping, …), install an ontology module \
+via `mimir ontology install <module.toml>` first."
+)]
 struct Cli {
-    /// Path to pool.toml config file.
-    #[arg(long, global = true)]
-    pool: Option<PathBuf>,
+    /// Path to `pool.toml` (or a directory containing one).
+    #[arg(long, default_value = "pool.toml", global = true)]
+    pool: PathBuf,
+
+    /// Bump log level. Repeat for trace.
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
 
     #[command(subcommand)]
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Commands {
-    /// Create a new object. Returns its ID.
-    Create {
-        /// Number of objects to create.
-        #[arg(default_value = "1")]
-        count: u32,
-    },
+    /// Allocate a fresh object id and print it. (Helper — not in DESIGN §A;
+    /// exists so callers have a way to mint ids they can `tag` / `set` /
+    /// `info` against.)
+    Create,
 
     /// Add tags to an object.
     Tag {
-        /// Object ID (local sequence number).
-        #[arg(long)]
-        object: u64,
-
-        /// Tags to add.
+        /// `obj:<n>` reference.
+        oid: String,
+        /// One or more tag names.
+        #[arg(required = true)]
         tags: Vec<String>,
     },
-
-    /// Remove a tag from an object.
-    Untag {
-        /// Object ID.
-        #[arg(long)]
-        object: u64,
-
-        /// Tag to remove.
-        tag: String,
-    },
-
+    /// Remove a single tag from an object.
+    Untag { oid: String, tag: String },
     /// Set an attribute on an object.
     Set {
-        /// Object ID.
-        #[arg(long)]
-        object: u64,
-
-        /// Key=value pair.
-        attr: String,
+        oid: String,
+        key: String,
+        value: String,
+        /// Force a specific value type (int|float|text|timestamp|blob).
+        #[arg(long, value_name = "KIND")]
+        r#type: Option<String>,
     },
+    /// Show every assertion attached to an object.
+    Info { oid: String },
 
-    /// Show all assertions on an object.
-    Info {
-        /// Object ID.
-        #[arg(long)]
-        object: u64,
-    },
+    /// Run a query against the pool.
+    Query(QueryArgs),
 
-    /// Execute a query.
-    Query {
-        /// Query string (e.g., "electronic AND year:2024").
-        query: String,
+    /// Faceted exploration around `<tag>`.
+    Explore {
+        tag: String,
+        #[arg(long, default_value = "16")]
+        max_facets: usize,
     },
 
     /// Ontology management.
@@ -80,870 +92,273 @@ enum Commands {
         action: OntologyAction,
     },
 
-    /// Path projection management.
+    /// Subscription management.
+    Watch {
+        #[command(subcommand)]
+        action: WatchAction,
+    },
+
+    /// Path-projection management.
     Project {
         #[command(subcommand)]
         action: ProjectAction,
     },
-
-    /// Execute a SQL query, or start an interactive SQL REPL if no query given.
-    Sql {
-        /// SQL query to execute. Omit to enter REPL mode.
-        query: Option<String>,
-    },
 }
 
-#[derive(Subcommand)]
+#[derive(Args, Debug)]
+struct QueryArgs {
+    /// Query body. Either an S-expression DSL string or, with `--sql`, a SQL
+    /// SELECT statement.
+    query: String,
+    /// Treat `query` as SQL.
+    #[arg(long)]
+    sql: bool,
+    /// Print the plan instead of executing.
+    #[arg(long)]
+    explain: bool,
+}
+
+#[derive(Subcommand, Debug)]
 enum OntologyAction {
-    /// List registered tags.
+    /// List installed modules.
     List,
-
-    /// Register a new tag.
-    Register {
-        /// Tag name.
-        name: String,
-
-        /// Semantics: label, attribute, grouping, ordered, hierarchical.
-        #[arg(long, default_value = "label")]
-        semantics: String,
-
-        /// Value type for attributes: text, int, float, timestamp, blob.
-        #[arg(long)]
-        value_type: Option<String>,
-    },
-
-    /// Add an implication (from implies to).
-    Imply {
-        /// Source tag name.
-        from: String,
-
-        /// Target tag name.
-        to: String,
-    },
-
-    /// Load an ontology module from a TOML file.
-    Load {
-        /// Path to the ontology TOML file.
-        file: PathBuf,
-    },
+    /// Install a module from `<file.toml>`.
+    Install { file: PathBuf },
+    /// Remove an installed module by id.
+    Remove { module_id: String },
+    /// Show tags not registered by any installed module.
+    Orphans,
+    /// Print a tag definition + its implication closure.
+    Show { tag: String },
+    /// Adopt an orphan tag into a module. (Phase 7a: TODO)
+    Adopt { orphan: String, into: String },
 }
 
-#[derive(Subcommand)]
-enum ProjectAction {
-    /// Import a directory tree.
-    Import {
-        /// Directory to import.
-        path: PathBuf,
-
-        /// Context name (omit for unscoped import).
+#[derive(Subcommand, Debug)]
+enum WatchAction {
+    /// Register a subscription. Query is an S-expression DSL string.
+    Register {
         #[arg(long)]
-        context: Option<String>,
+        name: String,
+        sexpr: String,
     },
-
-    /// Show a project tree.
-    Tree {
-        /// Context name (omit to show unscoped entries).
-        context: Option<String>,
-    },
-
-    /// List all named contexts.
+    /// List all registered subscriptions.
     List,
+    /// Drain pending events from a subscription as JSON-ish lines.
+    Drain { name: String },
+    /// Tear down a subscription.
+    Unsubscribe { name: String },
+    /// Continuously stream events. (Phase 7a: TODO)
+    Stream { name: String },
+}
 
-    /// Export a projection to a directory.
-    Export {
-        /// Context name (omit for unscoped).
+#[derive(Subcommand, Debug)]
+enum ProjectAction {
+    /// Create a path-context grouping tag and an empty projection.
+    CreateContext { name: String },
+    /// List registered path contexts.
+    ListContexts,
+    /// Record `path` for `oid` under `ctx`.
+    SetPath {
+        oid: String,
+        ctx: String,
+        path: String,
+    },
+    /// Print the projected tree for `ctx`.
+    Tree { ctx: String },
+    /// Walk a host directory and create one object per file. Phase 7a does
+    /// not read file contents into the blob store.
+    Import {
+        dir: PathBuf,
         #[arg(long)]
-        context: Option<String>,
-
-        /// Output directory.
+        context: String,
+    },
+    /// Export a context to a directory. (Phase 7a: TODO)
+    Export {
+        ctx: String,
         #[arg(short, long)]
         output: PathBuf,
     },
 }
 
-fn main() {
-    env_logger::init();
+fn main() -> ExitCode {
     let cli = Cli::parse();
+    init_logging(cli.verbose);
 
-    match cli.pool {
-        Some(pool_path) => run_with_pool(&pool_path, cli.command),
-        None => {
-            eprintln!("warning: no --pool specified, using ephemeral in-memory engine");
-            let mut engine = Engine::new(0);
-            let mut ctx_mgr = PathContextManager::new();
-            let mut blobs = HashMap::new();
-            dispatch(&mut engine, &mut ctx_mgr, &mut blobs, cli.command);
-        }
-    }
-}
-
-fn run_with_pool(pool_path: &Path, command: Commands) {
-    let pool_toml = if pool_path.is_dir() {
-        pool_path.join("pool.toml")
-    } else {
-        pool_path.to_path_buf()
-    };
-
-    let mut disk_engine = match DiskEngine::open(&pool_toml) {
-        Ok(de) => de,
+    match dispatch(cli) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!(
-                "error: failed to open pool from {}: {e}",
-                pool_toml.display()
-            );
-            std::process::exit(1);
+            let _ = writeln!(io::stderr(), "error: {e}");
+            ExitCode::from(1)
         }
+    }
+}
+
+fn init_logging(verbose: u8) {
+    let level = match verbose {
+        0 => LevelFilter::Warn,
+        1 => LevelFilter::Info,
+        2 => LevelFilter::Debug,
+        _ => LevelFilter::Trace,
     };
-
-    // Take ctx_mgr out temporarily to avoid double borrow
-    let mut ctx_mgr = std::mem::take(&mut disk_engine.context_mgr);
-    dispatch_disk(&mut disk_engine, &mut ctx_mgr, command);
-    disk_engine.context_mgr = ctx_mgr;
-
-    if let Err(e) = disk_engine.flush() {
-        eprintln!("error: failed to flush to disk: {e}");
-        std::process::exit(1);
-    }
+    let _ = env_logger::Builder::from_default_env()
+        .filter_level(level)
+        .try_init();
 }
 
-fn dispatch_disk(
-    disk_engine: &mut DiskEngine,
-    ctx_mgr: &mut PathContextManager,
-    command: Commands,
-) {
-    match command {
-        Commands::Create { count } => cmd_create(disk_engine.engine_mut(), count),
-        Commands::Tag { object, tags } => cmd_tag(disk_engine.engine_mut(), object, &tags),
-        Commands::Untag { object, tag } => cmd_untag(disk_engine.engine_mut(), object, &tag),
-        Commands::Set { object, attr } => cmd_set(disk_engine.engine_mut(), object, &attr),
-        Commands::Info { object } => cmd_info(disk_engine.engine_mut(), object),
-        Commands::Query { query } => cmd_query(disk_engine.engine_mut(), &query),
-        Commands::Ontology { action } => cmd_ontology(disk_engine.engine_mut(), action),
-        Commands::Project { action } => cmd_project_disk(disk_engine, ctx_mgr, action),
-        Commands::Sql { query } => cmd_sql(disk_engine.engine_mut(), query.as_deref()),
-    }
-}
-
-fn dispatch(
-    engine: &mut Engine,
-    ctx_mgr: &mut PathContextManager,
-    blobs: &mut HashMap<u64, Vec<u8>>,
-    command: Commands,
-) {
-    match command {
-        Commands::Create { count } => cmd_create(engine, count),
-        Commands::Tag { object, tags } => cmd_tag(engine, object, &tags),
-        Commands::Untag { object, tag } => cmd_untag(engine, object, &tag),
-        Commands::Set { object, attr } => cmd_set(engine, object, &attr),
-        Commands::Info { object } => cmd_info(engine, object),
-        Commands::Query { query } => cmd_query(engine, &query),
-        Commands::Ontology { action } => cmd_ontology(engine, action),
-        Commands::Project { action } => cmd_project(engine, ctx_mgr, blobs, action),
-        Commands::Sql { query } => cmd_sql(engine, query.as_deref()),
-    }
-}
-
-fn cmd_create(engine: &mut Engine, count: u32) {
-    for _ in 0..count {
-        match engine.create_object(now_ms()) {
-            Ok(oid) => println!("{oid}"),
-            Err(e) => {
-                eprintln!("error: {e}");
-                return;
-            }
-        }
-    }
-}
-
-fn cmd_tag(engine: &mut Engine, object: u64, tags: &[String]) {
-    let oid = ObjectId::new(engine.node_id(), object);
-
-    for tag_name in tags {
-        match engine.dag.lookup(tag_name) {
-            Some(tag_id) => match engine.add_tag(oid, tag_id, now_ms()) {
-                Ok(materialized) => {
-                    println!("tagged {oid} with {tag_name}");
-                    for m in &materialized {
-                        if let Some(def) = engine.dag.get(*m) {
-                            println!("  (materialized: {})", def.name);
-                        }
-                    }
-                }
-                Err(e) => eprintln!("error: {e}"),
-            },
-            None => eprintln!("error: unknown tag '{tag_name}'"),
-        }
-    }
-}
-
-fn cmd_untag(engine: &mut Engine, object: u64, tag_name: &str) {
-    let oid = ObjectId::new(engine.node_id(), object);
-    match engine.dag.lookup(tag_name) {
-        Some(tag_id) => match engine.remove_tag(oid, tag_id, now_ms()) {
-            Ok(_) => println!("untagged {oid} from {tag_name}"),
-            Err(e) => eprintln!("error: {e}"),
-        },
-        None => eprintln!("error: unknown tag '{tag_name}'"),
-    }
-}
-
-fn cmd_set(engine: &mut Engine, object: u64, attr: &str) {
-    let oid = ObjectId::new(engine.node_id(), object);
-    let Some((key, val)) = attr.split_once('=') else {
-        eprintln!("error: attribute must be in key=value format");
-        return;
-    };
-
-    let tag_id = match engine.dag.lookup(key) {
-        Some(id) => id,
-        None => {
-            eprintln!("error: unknown attribute key '{key}'");
-            return;
-        }
-    };
-
-    // Try to parse as int, then float, then text
-    let value = if let Ok(n) = val.parse::<i64>() {
-        Value::Int(n)
-    } else if let Ok(f) = val.parse::<f64>() {
-        Value::Float(f)
+fn resolve_pool_toml(p: &std::path::Path) -> PathBuf {
+    if p.is_dir() {
+        p.join("pool.toml")
     } else {
-        Value::Text(val.to_string())
-    };
-
-    match engine.set_attr(oid, tag_id, value, now_ms()) {
-        Ok(()) => println!("set {key}={val} on {oid}"),
-        Err(e) => eprintln!("error: {e}"),
+        p.to_path_buf()
     }
 }
 
-fn cmd_info(engine: &Engine, object: u64) {
-    let oid = ObjectId::new(engine.node_id(), object);
-    match engine.get_object(oid) {
-        Ok(rec) => {
-            println!("Object {oid}");
-            println!("  state:    {:?}", rec.state);
-            println!("  blob:     {} bytes", rec.blob_length);
-            println!("  tags:     {}", rec.tag_count);
-            println!("  attrs:    {}", rec.attr_count);
+fn dispatch(cli: Cli) -> Result<(), CommandError> {
+    let pool_toml = resolve_pool_toml(&cli.pool);
+    let mut engine = DiskEngine::open(&pool_toml).map_err(CommandError::Engine)?;
+    let mut stdout = io::stdout().lock();
 
-            if let Ok(assertions) = engine.assertions(oid) {
-                println!("  assertions:");
-                for entry in assertions {
-                    let origin = if entry.origin == mimisbrunnr::types::TagOrigin::Direct {
-                        "direct"
-                    } else {
-                        "materialized"
-                    };
-                    match &entry.assertion {
-                        Assertion::Tag(id) => {
-                            let name = engine.dag.get(*id).map(|d| d.name.as_str()).unwrap_or("?");
-                            println!("    tag:{name} ({origin})");
-                        }
-                        Assertion::Attr { key, value } => {
-                            let name = engine.dag.get(*key).map(|d| d.name.as_str()).unwrap_or("?");
-                            println!("    {name}={value} ({origin})");
-                        }
-                        Assertion::Relation { predicate, target } => {
-                            let name = engine
-                                .dag
-                                .get(*predicate)
-                                .map(|d| d.name.as_str())
-                                .unwrap_or("?");
-                            println!("    {name}→{target} ({origin})");
-                        }
-                    }
-                }
-            }
-        }
-        Err(e) => eprintln!("error: {e}"),
+    let mutated = run(&mut engine, &mut stdout, cli.command)?;
+    drop(stdout);
+
+    if mutated {
+        engine.commit().map_err(CommandError::Engine)?;
     }
+    Ok(())
 }
 
-fn cmd_query(engine: &Engine, query_str: &str) {
-    match engine.query_str(query_str) {
-        Ok(results) => {
-            println!("{} result(s):", results.len());
-            for oid in &results {
-                println!("  {oid}");
-            }
+/// Run a single command. Returns whether the command performed a durable
+/// mutation that should trigger a `commit()` before exit.
+fn run<W: Write>(
+    engine: &mut DiskEngine,
+    out: &mut W,
+    cmd: Commands,
+) -> Result<bool, CommandError> {
+    match cmd {
+        Commands::Create => {
+            commands::run_create(engine, out)?;
+            Ok(true)
         }
-        Err(e) => eprintln!("error: {e}"),
-    }
-}
-
-fn cmd_ontology(engine: &mut Engine, action: OntologyAction) {
-    match action {
-        OntologyAction::List => {
-            let tags = engine.dag.all_tags();
-            if tags.is_empty() {
-                println!("No tags registered.");
-            } else {
-                println!("{} tag(s):", tags.len());
-                for id in tags {
-                    if let Some(def) = engine.dag.get(id) {
-                        let implies = engine.dag.direct_implies(id);
-                        let implies_str = if implies.is_empty() {
-                            String::new()
-                        } else {
-                            let names: Vec<_> = implies
-                                .iter()
-                                .filter_map(|i| engine.dag.get(*i).map(|d| d.name.as_str()))
-                                .collect();
-                            format!(" → {}", names.join(", "))
-                        };
-                        println!("  {} ({:?}){implies_str}", def.name, def.semantics);
-                    }
-                }
-            }
+        Commands::Tag { oid, tags } => {
+            commands::run_tag(engine, out, &oid, &tags)?;
+            Ok(true)
         }
-        OntologyAction::Register {
-            name,
-            semantics,
-            value_type,
+        Commands::Untag { oid, tag } => {
+            commands::run_untag(engine, out, &oid, &tag)?;
+            Ok(true)
+        }
+        Commands::Set {
+            oid,
+            key,
+            value,
+            r#type,
         } => {
-            let sem = match semantics.as_str() {
-                "label" => TagSemantics::Label,
-                "attribute" | "attr" => {
-                    let vt = match value_type.as_deref().unwrap_or("text") {
-                        "text" => ValueType::Text,
-                        "int" => ValueType::Int,
-                        "float" => ValueType::Float,
-                        "timestamp" => ValueType::Timestamp,
-                        "blob" => ValueType::Blob,
-                        other => {
-                            eprintln!("error: unknown value type '{other}'");
-                            return;
-                        }
-                    };
-                    TagSemantics::Attribute { value_type: vt }
-                }
-                "grouping" => TagSemantics::Grouping,
-                "ordered" => TagSemantics::OrderedCollection {
-                    element_constraint: None,
-                },
-                "hierarchical" => TagSemantics::Hierarchical,
-                other => {
-                    eprintln!("error: unknown semantics '{other}'");
-                    return;
-                }
+            let kind = match r#type.as_deref() {
+                None => ValueKind::Auto,
+                Some(s) => ValueKind::parse_kind(s).map_err(CommandError::BadArg)?,
             };
-
-            let id = engine.dag.alloc_tag_id();
-            let def = TagDefinition::new(id, &name, sem);
-            match engine.register_tag(def) {
-                Ok(_) => println!("registered tag '{name}' ({id})"),
-                Err(e) => eprintln!("error: {e}"),
-            }
+            commands::run_set(engine, out, &oid, &key, &value, kind)?;
+            Ok(true)
         }
-        OntologyAction::Imply { from, to } => {
-            let from_id = match engine.dag.lookup(&from) {
-                Some(id) => id,
-                None => {
-                    eprintln!("error: unknown tag '{from}'");
-                    return;
-                }
-            };
-            let to_id = match engine.dag.lookup(&to) {
-                Some(id) => id,
-                None => {
-                    eprintln!("error: unknown tag '{to}'");
-                    return;
-                }
-            };
-            match engine.add_implication(from_id, to_id) {
-                Ok(()) => println!("added implication: {from} → {to}"),
-                Err(e) => eprintln!("error: {e}"),
-            }
+        Commands::Info { oid } => {
+            commands::run_info(engine, out, &oid)?;
+            Ok(false)
         }
-        OntologyAction::Load { file } => {
-            let module = match OntologyModule::from_file(&file) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("error: failed to load {}: {e}", file.display());
-                    return;
-                }
-            };
 
-            let label = module
-                .name
-                .clone()
-                .or_else(|| module.id.clone())
-                .unwrap_or_else(|| file.display().to_string());
-
-            match module.install(&mut engine.dag) {
-                Ok(result) => {
-                    println!("Loaded ontology module '{label}'");
-                    println!(
-                        "  {} tag(s) registered, {} skipped, {} implication(s) added",
-                        result.tags_registered, result.tags_skipped, result.implications_added
-                    );
-                }
-                Err(e) => eprintln!("error: {e}"),
+        Commands::Query(QueryArgs {
+            query,
+            sql,
+            explain,
+        }) => {
+            if sql {
+                commands::run_query_sql(engine, out, &query, explain)?;
+            } else {
+                commands::run_query_sexpr(engine, out, &query, explain)?;
             }
+            Ok(false)
         }
+
+        Commands::Explore { tag, max_facets } => {
+            commands::run_explore(engine, out, &tag, max_facets)?;
+            Ok(false)
+        }
+
+        Commands::Ontology { action } => match action {
+            OntologyAction::List => {
+                commands::run_ontology_list(engine, out)?;
+                Ok(false)
+            }
+            OntologyAction::Install { file } => {
+                commands::run_ontology_install(engine, out, &file)?;
+                Ok(true)
+            }
+            OntologyAction::Remove { module_id } => {
+                commands::run_ontology_remove(engine, out, &module_id)?;
+                Ok(true)
+            }
+            OntologyAction::Orphans => {
+                commands::run_ontology_orphans(engine, out)?;
+                Ok(false)
+            }
+            OntologyAction::Show { tag } => {
+                commands::run_ontology_show(engine, out, &tag)?;
+                Ok(false)
+            }
+            OntologyAction::Adopt { orphan, into } => {
+                commands::run_ontology_adopt(engine, out, &orphan, &into)?;
+                Ok(false)
+            }
+        },
+
+        Commands::Watch { action } => match action {
+            WatchAction::Register { name, sexpr } => {
+                commands::run_watch_register(engine, out, &name, &sexpr)?;
+                Ok(true)
+            }
+            WatchAction::List => {
+                commands::run_watch_list(engine, out)?;
+                Ok(false)
+            }
+            WatchAction::Drain { name } => {
+                commands::run_watch_drain(engine, out, &name)?;
+                Ok(true)
+            }
+            WatchAction::Unsubscribe { name } => {
+                commands::run_watch_unsubscribe(engine, out, &name)?;
+                Ok(true)
+            }
+            WatchAction::Stream { name } => {
+                commands::run_watch_stream(engine, out, &name)?;
+                Ok(false)
+            }
+        },
+
+        Commands::Project { action } => match action {
+            ProjectAction::CreateContext { name } => {
+                commands::run_project_create_context(engine, out, &name)?;
+                Ok(true)
+            }
+            ProjectAction::ListContexts => {
+                commands::run_project_list_contexts(engine, out)?;
+                Ok(false)
+            }
+            ProjectAction::SetPath { oid, ctx, path } => {
+                commands::run_project_set_path(engine, out, &oid, &ctx, &path)?;
+                Ok(true)
+            }
+            ProjectAction::Tree { ctx } => {
+                commands::run_project_tree(engine, out, &ctx)?;
+                Ok(false)
+            }
+            ProjectAction::Import { dir, context } => {
+                commands::run_project_import(engine, out, &dir, &context)?;
+                Ok(true)
+            }
+            ProjectAction::Export { ctx, output } => {
+                commands::run_project_export(engine, out, &ctx, &output)?;
+                Ok(false)
+            }
+        },
     }
-}
-
-fn cmd_project(
-    engine: &mut Engine,
-    ctx_mgr: &mut PathContextManager,
-    blobs: &mut HashMap<u64, Vec<u8>>,
-    action: ProjectAction,
-) {
-    match action {
-        ProjectAction::Import { path, context } => {
-            let ext_tags = HashMap::new();
-            match Importer::import_directory(
-                engine,
-                ctx_mgr,
-                &path,
-                context.as_deref(),
-                &ext_tags,
-                now_ms(),
-            ) {
-                Ok(result) => {
-                    let label = context
-                        .as_deref()
-                        .map(|c| format!("context '{c}'"))
-                        .unwrap_or_else(|| "unscoped".to_string());
-                    println!("Imported {} file(s) into {label}", result.objects_created);
-                    if result.objects_deduped > 0 {
-                        println!(
-                            "  ({} deduplicated by content hash)",
-                            result.objects_deduped
-                        );
-                    }
-                    println!("  Total bytes: {}", result.total_bytes);
-
-                    // Transfer plaintext blob data for in-memory FUSE serving
-                    blobs.extend(result.original_blobs);
-                }
-                Err(e) => eprintln!("error: {e}"),
-            }
-        }
-        ProjectAction::Tree { context } => {
-            let proj = match context.as_deref() {
-                Some(name) => match ctx_mgr.get_context(name) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        return;
-                    }
-                },
-                None => ctx_mgr.unscoped(),
-            };
-            let label = context.as_deref().unwrap_or("(unscoped)");
-            let with_dirs = proj.with_synthesized_dirs();
-            let mut paths: Vec<_> = with_dirs.entries.iter().map(|e| &e.path).collect();
-            paths.sort();
-            println!("{label} ({} entries):", proj.len());
-            for p in paths {
-                println!("  {p}");
-            }
-        }
-        ProjectAction::List => {
-            let contexts = ctx_mgr.list_contexts();
-            if contexts.is_empty() && ctx_mgr.unscoped().is_empty() {
-                println!("No projections.");
-                return;
-            }
-            if !ctx_mgr.unscoped().is_empty() {
-                println!("  (unscoped)  {} entries", ctx_mgr.unscoped().len());
-            }
-            let mut sorted = contexts;
-            sorted.sort();
-            for name in sorted {
-                if let Ok(proj) = ctx_mgr.get_context(name) {
-                    println!("  {name}  {} entries", proj.len());
-                }
-            }
-        }
-        ProjectAction::Export { context, output } => {
-            let proj = match context.as_deref() {
-                Some(name) => match ctx_mgr.get_context(name) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        return;
-                    }
-                },
-                None => ctx_mgr.unscoped(),
-            };
-            match mimisbrunnr::unix::Exporter::export_directory(proj, blobs, &output) {
-                Ok(result) => {
-                    println!(
-                        "Exported {} file(s) to {}",
-                        result.files_written,
-                        output.display()
-                    );
-                }
-                Err(e) => eprintln!("error: {e}"),
-            }
-        }
-    }
-}
-
-fn cmd_project_disk(
-    disk_engine: &mut DiskEngine,
-    ctx_mgr: &mut PathContextManager,
-    action: ProjectAction,
-) {
-    match action {
-        ProjectAction::Import { path, context } => {
-            let ext_tags = HashMap::new();
-            match Importer::import_directory(
-                disk_engine.engine_mut(),
-                ctx_mgr,
-                &path,
-                context.as_deref(),
-                &ext_tags,
-                now_ms(),
-            ) {
-                Ok(result) => {
-                    let label = context
-                        .as_deref()
-                        .map(|c| format!("context '{c}'"))
-                        .unwrap_or_else(|| "unscoped".to_string());
-                    println!("Imported {} file(s) into {label}", result.objects_created);
-                    if result.objects_deduped > 0 {
-                        println!(
-                            "  ({} deduplicated by content hash)",
-                            result.objects_deduped
-                        );
-                    }
-                    println!("  Total bytes: {}", result.total_bytes);
-
-                    // Write transformed blobs to the blob zone on disk
-                    for (oid, data) in &result.transformed_blobs {
-                        if let Err(e) = disk_engine.store_blob(*oid, data) {
-                            eprintln!("error storing blob for {oid}: {e}");
-                        }
-                    }
-                }
-                Err(e) => eprintln!("error: {e}"),
-            }
-        }
-        ProjectAction::Tree { context } => {
-            let proj = match context.as_deref() {
-                Some(name) => match ctx_mgr.get_context(name) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        return;
-                    }
-                },
-                None => ctx_mgr.unscoped(),
-            };
-            let label = context.as_deref().unwrap_or("(unscoped)");
-            let with_dirs = proj.with_synthesized_dirs();
-            let mut paths: Vec<_> = with_dirs.entries.iter().map(|e| &e.path).collect();
-            paths.sort();
-            println!("{label} ({} entries):", proj.len());
-            for p in paths {
-                println!("  {p}");
-            }
-        }
-        ProjectAction::List => {
-            let contexts = ctx_mgr.list_contexts();
-            if contexts.is_empty() && ctx_mgr.unscoped().is_empty() {
-                println!("No projections.");
-                return;
-            }
-            if !ctx_mgr.unscoped().is_empty() {
-                println!("  (unscoped)  {} entries", ctx_mgr.unscoped().len());
-            }
-            let mut sorted = contexts;
-            sorted.sort();
-            for name in sorted {
-                if let Ok(proj) = ctx_mgr.get_context(name) {
-                    println!("  {name}  {} entries", proj.len());
-                }
-            }
-        }
-        ProjectAction::Export { context, output } => {
-            let proj = match context.as_deref() {
-                Some(name) => match ctx_mgr.get_context(name) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        return;
-                    }
-                },
-                None => ctx_mgr.unscoped(),
-            };
-            // Read and decompress blobs from blob zone for export
-            // TODO: implement decompression path for disk-backed export
-            let blobs = HashMap::new();
-            match mimisbrunnr::unix::Exporter::export_directory(proj, &blobs, &output) {
-                Ok(result) => {
-                    println!(
-                        "Exported {} file(s) to {}",
-                        result.files_written,
-                        output.display()
-                    );
-                }
-                Err(e) => eprintln!("error: {e}"),
-            }
-        }
-    }
-}
-
-fn cmd_sql(engine: &Engine, query: Option<&str>) {
-    match query {
-        Some(sql) => execute_sql_query(engine, sql),
-        None => sql_repl(engine),
-    }
-}
-
-fn sql_repl(engine: &Engine) {
-    println!("mimir sql — interactive SQL REPL");
-    println!("Type SQL queries, or .help for commands. End queries with ;");
-    println!();
-
-    let stdin = std::io::stdin();
-    let mut buf = String::new();
-
-    loop {
-        let prompt = if buf.is_empty() { "sql> " } else { "  -> " };
-        eprint!("{prompt}");
-
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("error reading input: {e}");
-                break;
-            }
-        }
-
-        let trimmed = line.trim();
-
-        // Dot-commands (only at the start of input, not mid-statement)
-        if buf.is_empty() {
-            match trimmed {
-                ".quit" | ".exit" | ".q" => break,
-                ".help" | ".h" => {
-                    print_sql_help();
-                    continue;
-                }
-                ".tables" => {
-                    println!("objects  (the only table — all objects in the store)");
-                    continue;
-                }
-                ".tags" => {
-                    let tags = engine.dag.all_tags();
-                    if tags.is_empty() {
-                        println!("No tags registered.");
-                    } else {
-                        for id in tags {
-                            if let Some(def) = engine.dag.get(id) {
-                                println!("  {} ({:?})", def.name, def.semantics);
-                            }
-                        }
-                    }
-                    continue;
-                }
-                ".schema" => {
-                    println!("-- Mímisbrunnr is schemaless. Attributes are dynamic.");
-                    println!("-- Registered attributes:");
-                    for id in engine.dag.all_tags() {
-                        if let Some(def) = engine.dag.get(id)
-                            && let mimisbrunnr::ontology::TagSemantics::Attribute { value_type } =
-                                &def.semantics
-                        {
-                            println!("  {} {:?}", def.name, value_type);
-                        }
-                    }
-                    continue;
-                }
-                "" => continue,
-                _ => {}
-            }
-        }
-
-        buf.push_str(&line);
-
-        // Check if the statement is complete (ends with ;)
-        let trimmed_buf = buf.trim();
-        if trimmed_buf.ends_with(';') {
-            let sql = trimmed_buf.trim_end_matches(';').trim();
-            if !sql.is_empty() {
-                execute_sql_query(engine, sql);
-            }
-            buf.clear();
-        }
-    }
-}
-
-fn execute_sql_query(engine: &Engine, sql: &str) {
-    use mimisbrunnr::sql::{self, QueryResult};
-
-    let result = sql::execute(
-        sql,
-        &engine.tag_index,
-        &engine.kv_index,
-        &engine.forward_index,
-        &engine.dag,
-    );
-
-    match result {
-        Ok(QueryResult::Select { columns, rows }) => {
-            if rows.is_empty() {
-                println!("(0 rows)");
-                return;
-            }
-
-            // Determine column widths
-            let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
-            for row in &rows {
-                for (i, col_name) in columns.iter().enumerate() {
-                    let val = row
-                        .columns
-                        .iter()
-                        .find(|(k, _)| k == col_name)
-                        .map(|(_, v)| format_value(v))
-                        .unwrap_or_default();
-                    if i < widths.len() {
-                        widths[i] = widths[i].max(val.len());
-                    }
-                }
-            }
-
-            // Print header
-            let header: Vec<String> = columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
-                .collect();
-            println!("{}", header.join(" | "));
-            let separator: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-            println!("{}", separator.join("-+-"));
-
-            // Print rows
-            for row in &rows {
-                let vals: Vec<String> = columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col_name)| {
-                        let val = row
-                            .columns
-                            .iter()
-                            .find(|(k, _)| k == col_name)
-                            .map(|(_, v)| format_value(v))
-                            .unwrap_or_default();
-                        format!("{:<width$}", val, width = widths[i])
-                    })
-                    .collect();
-                println!("{}", vals.join(" | "));
-            }
-            println!(
-                "({} row{})",
-                rows.len(),
-                if rows.len() == 1 { "" } else { "s" }
-            );
-        }
-
-        Ok(QueryResult::Aggregate { columns, rows }) => {
-            if rows.is_empty() {
-                println!("(0 rows)");
-                return;
-            }
-
-            let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
-            for row in &rows {
-                for (i, col_name) in columns.iter().enumerate() {
-                    let val = row
-                        .columns
-                        .iter()
-                        .find(|(k, _)| k == col_name)
-                        .map(|(_, v)| format_value(v))
-                        .unwrap_or_default();
-                    if i < widths.len() {
-                        widths[i] = widths[i].max(val.len());
-                    }
-                }
-            }
-
-            let header: Vec<String> = columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| format!("{:<width$}", c, width = widths[i]))
-                .collect();
-            println!("{}", header.join(" | "));
-            let separator: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-            println!("{}", separator.join("-+-"));
-
-            for row in &rows {
-                let vals: Vec<String> = columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col_name)| {
-                        let val = row
-                            .columns
-                            .iter()
-                            .find(|(k, _)| k == col_name)
-                            .map(|(_, v)| format_value(v))
-                            .unwrap_or_default();
-                        format!("{:<width$}", val, width = widths[i])
-                    })
-                    .collect();
-                println!("{}", vals.join(" | "));
-            }
-            println!(
-                "({} row{})",
-                rows.len(),
-                if rows.len() == 1 { "" } else { "s" }
-            );
-        }
-
-        Ok(QueryResult::Scalar(value)) => {
-            println!("{}", format_value(&value));
-        }
-
-        Err(e) => {
-            eprintln!("error: {e}");
-        }
-    }
-}
-
-fn format_value(v: &Value) -> String {
-    match v {
-        Value::Text(s) => s.clone(),
-        Value::Int(i) => i.to_string(),
-        Value::Float(f) => format!("{:.2}", f),
-        Value::Timestamp(t) => t.to_string(),
-        Value::Blob(b) => format!("<blob:{} bytes>", b.len()),
-    }
-}
-
-fn print_sql_help() {
-    println!("Mímisbrunnr SQL REPL commands:");
-    println!();
-    println!("  .help     Show this help");
-    println!("  .quit     Exit the REPL");
-    println!("  .tables   List available tables");
-    println!("  .tags     List registered tags");
-    println!("  .schema   Show registered attributes");
-    println!();
-    println!("SQL syntax:");
-    println!("  SELECT id, name FROM objects WHERE HAS TAG 'electronic';");
-    println!("  SELECT * FROM objects WHERE IS A 'audio' AND year > 2000;");
-    println!("  SELECT artist, COUNT(*) FROM objects GROUP BY artist;");
-    println!("  SELECT * FROM objects WHERE HAS TAG 'source' LIMIT 10;");
-    println!();
-    println!("Extensions:");
-    println!("  HAS TAG 'x'              Tag membership");
-    println!("  HAS ALL TAGS ('x', 'y')  AND of tags");
-    println!("  HAS ANY TAG ('x', 'y')   OR of tags");
-    println!("  IS A 'x'                 Ontology-aware (follows implications)");
-    println!("  NOT HAS TAG 'x'          Exclusion");
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }

@@ -1,479 +1,126 @@
-use std::path::{Path, PathBuf};
+//! `brunnr` — Mímisbrunnr pool management CLI (DESIGN Appendix A).
+//!
+//! Subcommands:
+//!
+//! - `create <disk-spec>...` — format a fresh pool.
+//! - `status` — show pool health, per-disk capacity / used / state, tier
+//!   breakdown.
+//! - `add-disk <path>` / `remove-disk <id-or-path>` — disk lifecycle.
+//! - `mount <mountpoint>` / `mount-unix --context <ctx> <mountpoint>` —
+//!   FUSE mounts (feature-gated behind `--features fuse`).
+//! - `unmount <mountpoint>` — platform-specific unmount.
+
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use mimisbrunnr::{
-    pool::{DiskDescriptor, MediaType, PoolConfig, PoolManager, StorageTier},
-    storage::{ExtentLayout, FileBlockDevice, Superblock, ZoneType},
-    wal::WriteAheadLog,
-};
+mod commands;
 
 #[derive(Parser)]
 #[command(name = "brunnr", about = "Mímisbrunnr pool management")]
 struct Cli {
+    /// Path to the pool configuration TOML. Defaults to `./pool.toml`.
+    #[arg(long, global = true, default_value = "pool.toml")]
+    config: PathBuf,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create a new pool across one or more disk files / devices.
+    /// Create a fresh pool. Each disk-spec is
+    /// `<path>[:tier=hot|warm|cold|glacier][:media=nvme|ssd|hdd|smr|remote][:capacity=N|auto]`.
     Create {
-        /// Paths to disk files or block devices.
+        /// Disk specifications.
         #[arg(required = true)]
-        disks: Vec<PathBuf>,
+        disks: Vec<String>,
 
-        /// Size of each file-backed disk in MiB. Repeatable — one per disk.
-        /// If fewer sizes than disks, the last value is reused.
-        #[arg(long, default_value = "256")]
-        size_mib: Vec<u64>,
-
-        /// Node ID for this machine.
+        /// Node id for this machine.
         #[arg(long, default_value = "0")]
         node_id: u16,
-
-        /// Storage tier for each disk (hot, warm, cold). Repeatable.
-        #[arg(long)]
-        tier: Vec<String>,
     },
 
     /// Show pool status.
-    Status {
-        /// Paths to disk files or block devices forming the pool.
-        #[arg(required = true)]
-        disks: Vec<PathBuf>,
-    },
+    Status,
 
-    /// Add a disk to an existing pool.
+    /// Add a disk to the existing pool.
     AddDisk {
-        /// Path to the new disk file or block device.
-        disk: PathBuf,
+        /// Path to the disk file or block device.
+        path: PathBuf,
 
-        /// An existing disk in the pool (to read pool config from).
-        #[arg(long)]
-        pool_disk: PathBuf,
-
-        /// Size in MiB (for file-backed disks).
-        #[arg(long, default_value = "256")]
-        size_mib: u64,
-
-        /// Storage tier.
+        /// Storage tier: hot | warm | cold | glacier.
         #[arg(long, default_value = "warm")]
         tier: String,
-    },
 
-    /// Begin draining a disk for removal.
-    RemoveDisk {
-        /// Path to the disk to remove.
-        disk: PathBuf,
+        /// Media type: nvme | ssd | hdd | smr | remote.
+        #[arg(long, default_value = "ssd")]
+        media: String,
 
-        /// An existing disk in the pool.
+        /// Capacity in bytes. Omit to inherit from the existing file size.
         #[arg(long)]
-        pool_disk: PathBuf,
+        capacity: Option<u64>,
     },
 
-    /// Mount a path context as a FUSE filesystem.
+    /// Begin draining a disk (does not yet evacuate data).
+    RemoveDisk {
+        /// Disk id (decimal) or path.
+        target: String,
+    },
+
+    /// Mount the full /tags + /ctx filesystem (feature = "fuse").
+    Mount {
+        /// Mount point.
+        mountpoint: PathBuf,
+    },
+
+    /// Mount a single path-context subtree (feature = "fuse").
+    ///
+    /// **Phase 7b note:** this currently mounts the *entire* filesystem;
+    /// the requested context will appear under
+    /// `<mountpoint>/ctx/<context>`. Subtree-only mounts are a TODO.
     MountUnix {
-        /// Mount point directory.
+        /// Mount point.
         mountpoint: PathBuf,
 
-        /// Path to pool.toml.
-        #[arg(long)]
-        pool: PathBuf,
-
-        /// Path context name to mount.
+        /// Path-context name to expose.
         #[arg(long)]
         context: String,
     },
-}
 
-fn parse_tier(s: &str) -> StorageTier {
-    match s.to_lowercase().as_str() {
-        "hot" => StorageTier::Hot,
-        "warm" => StorageTier::Warm,
-        "cold" => StorageTier::Cold,
-        "glacier" => StorageTier::Glacier,
-        _ => {
-            eprintln!("warning: unknown tier '{s}', defaulting to warm");
-            StorageTier::Warm
-        }
-    }
+    /// Unmount a mountpoint (best-effort, platform-specific).
+    Unmount {
+        /// Mount point.
+        mountpoint: PathBuf,
+    },
 }
 
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
 
-    match cli.command {
-        Commands::Create {
-            disks,
-            size_mib,
-            node_id,
-            tier,
-        } => cmd_create(&disks, &size_mib, node_id, &tier),
-        Commands::Status { disks } => cmd_status(&disks),
+    let result = match cli.command {
+        Commands::Create { disks, node_id } => {
+            commands::cmd_create(&cli.config, &disks, node_id)
+        }
+        Commands::Status => commands::cmd_status(&cli.config),
         Commands::AddDisk {
-            disk,
-            pool_disk,
-            size_mib,
+            path,
             tier,
-        } => cmd_add_disk(&disk, &pool_disk, size_mib, &tier),
-        Commands::RemoveDisk { disk, pool_disk } => cmd_remove_disk(&disk, &pool_disk),
+            media,
+            capacity,
+        } => commands::cmd_add_disk(&cli.config, &path, &tier, &media, capacity),
+        Commands::RemoveDisk { target } => commands::cmd_remove_disk(&cli.config, &target),
+        Commands::Mount { mountpoint } => commands::cmd_mount(&cli.config, &mountpoint, None),
         Commands::MountUnix {
             mountpoint,
-            pool,
             context,
-        } => cmd_mount_unix(&pool, &context, &mountpoint),
-    }
-}
-
-fn cmd_create(disk_paths: &[PathBuf], sizes_mib: &[u64], node_id: u16, tiers: &[String]) {
-    if disk_paths.is_empty() {
-        eprintln!("error: at least one disk path required");
-        std::process::exit(1);
-    }
-
-    let mut pool = PoolManager::new();
-    let mut pool_config = PoolConfig::new(node_id);
-
-    println!(
-        "Creating Mímisbrunnr pool with {} disk(s)...",
-        disk_paths.len()
-    );
-
-    for (i, path) in disk_paths.iter().enumerate() {
-        // Per-disk size: use sizes_mib[i], or last value, or default 256
-        let size_mib = sizes_mib
-            .get(i)
-            .or_else(|| sizes_mib.last())
-            .copied()
-            .unwrap_or(256);
-        let capacity = size_mib * 1024 * 1024;
-
-        let tier = tiers.get(i).map(|s| parse_tier(s)).unwrap_or_else(|| {
-            if i == 0 {
-                StorageTier::Hot
-            } else {
-                StorageTier::Warm
-            }
-        });
-
-        // Determine media type from tier (heuristic for file-backed)
-        let media = match tier {
-            StorageTier::Hot => MediaType::NVMe,
-            StorageTier::Warm => MediaType::Ssd,
-            StorageTier::Cold => MediaType::Hdd,
-            StorageTier::Glacier => MediaType::Remote,
-        };
-
-        let disk_id = i as u16;
-
-        // Canonicalize the path for storage in config
-        let abs_path = std::fs::canonicalize(path.parent().unwrap_or(path))
-            .unwrap_or_else(|_| path.parent().unwrap_or(path).to_path_buf())
-            .join(path.file_name().unwrap_or_default());
-
-        // Create/open the file-backed device
-        let dev = match FileBlockDevice::open(path, capacity) {
-            Ok(dev) => dev,
-            Err(e) => {
-                eprintln!("error: failed to open {}: {e}", path.display());
-                std::process::exit(1);
-            }
-        };
-
-        // Compute zone layout
-        let layout = match ExtentLayout::compute(capacity) {
-            Some(l) => l,
-            None => {
-                eprintln!("error: disk too small (need at least ~68 MiB)");
-                std::process::exit(1);
-            }
-        };
-
-        // Write superblock
-        let sb = Superblock::new(node_id, disk_id, layout.clone());
-        if let Err(e) = sb.write_to(&dev) {
-            eprintln!(
-                "error: failed to write superblock to {}: {e}",
-                path.display()
-            );
-            std::process::exit(1);
-        }
-
-        // Initialize WAL
-        match WriteAheadLog::create(&dev, layout.wal_offset, mimisbrunnr::storage::WAL_SIZE) {
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("error: failed to initialize WAL on {}: {e}", path.display());
-                std::process::exit(1);
-            }
-        }
-
-        // Register in pool manager and config
-        let desc = DiskDescriptor::new(disk_id, capacity, media)
-            .with_tier(tier)
-            .with_path(abs_path.to_string_lossy());
-
-        pool.add_disk(desc).unwrap();
-        pool_config.add_disk(disk_id, abs_path.to_string_lossy(), tier.name(), capacity);
-
-        // Show zone layout
-        println!(
-            "  disk {disk_id}: {} ({size_mib} MiB, tier: {tier})",
-            path.display(),
-        );
-        println!(
-            "    zones: index {} KiB, meta {} KiB, blob {} KiB",
-            layout.zone_size(ZoneType::Index) / 1024,
-            layout.zone_size(ZoneType::Metadata) / 1024,
-            layout.zone_size(ZoneType::Blob) / 1024,
-        );
-    }
-
-    // Write pool.toml alongside the first disk
-    let config_dir = disk_paths[0]
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let config_path = config_dir.join("pool.toml");
-    if let Err(e) = pool_config.save(&config_path) {
-        eprintln!("error: failed to write pool config: {e}");
-        std::process::exit(1);
-    }
-
-    println!("Pool created successfully.");
-    println!(
-        "  Total capacity: {} MiB",
-        pool.total_capacity() / (1024 * 1024)
-    );
-    println!("  Disks: {}", pool.online_count());
-    println!("  Config: {}", config_path.display());
-}
-
-fn cmd_status(disk_paths: &[PathBuf]) {
-    if disk_paths.is_empty() {
-        eprintln!("error: specify at least one disk path");
-        std::process::exit(1);
-    }
-
-    println!("Mímisbrunnr Pool Status");
-    println!("{}", "=".repeat(60));
-
-    let mut total_capacity = 0u64;
-
-    for (i, path) in disk_paths.iter().enumerate() {
-        // Try to read superblock
-        let dev = match FileBlockDevice::open(path, 0) {
-            Ok(dev) => dev,
-            Err(e) => {
-                eprintln!("  disk {i}: {} — error: {e}", path.display());
-                continue;
-            }
-        };
-
-        match Superblock::read_with_extents(&dev) {
-            Ok(sb) => {
-                let cap_mib = sb.layout.device_capacity / (1024 * 1024);
-
-                println!("  Disk {} (node={}, disk={}):", i, sb.node_id, sb.disk_id);
-                println!("    Path:      {}", path.display());
-                println!("    Capacity:  {cap_mib} MiB");
-                println!(
-                    "    Index:     {} KiB ({} extent(s))",
-                    sb.layout.zone_size(ZoneType::Index) / 1024,
-                    sb.layout.extents(ZoneType::Index).len(),
-                );
-                println!(
-                    "    Metadata:  {} KiB ({} extent(s))",
-                    sb.layout.zone_size(ZoneType::Metadata) / 1024,
-                    sb.layout.extents(ZoneType::Metadata).len(),
-                );
-                println!(
-                    "    Blob:      {} KiB ({} extent(s))",
-                    sb.layout.zone_size(ZoneType::Blob) / 1024,
-                    sb.layout.extents(ZoneType::Blob).len(),
-                );
-                if sb.zone_map_offset != 0 {
-                    println!("    Zone map:  offset {:#x}", sb.zone_map_offset);
-                }
-                println!("    Checkpoint: LSN {}", sb.last_checkpoint_lsn);
-
-                total_capacity += sb.layout.device_capacity;
-            }
-            Err(e) => {
-                eprintln!(
-                    "  disk {i}: {} — not a valid Mímisbrunnr disk: {e}",
-                    path.display()
-                );
-            }
-        }
-    }
-
-    println!("{}", "-".repeat(60));
-    println!(
-        "  Total pool capacity: {} MiB",
-        total_capacity / (1024 * 1024)
-    );
-}
-
-fn cmd_add_disk(disk_path: &Path, pool_disk: &Path, size_mib: u64, tier_str: &str) {
-    // Read existing pool's superblock to get node_id
-    let existing = match FileBlockDevice::open(pool_disk, 0) {
-        Ok(dev) => match Superblock::read_from(&dev) {
-            Ok(sb) => sb,
-            Err(e) => {
-                eprintln!("error: cannot read pool from {}: {e}", pool_disk.display());
-                std::process::exit(1);
-            }
-        },
-        Err(e) => {
-            eprintln!("error: cannot open {}: {e}", pool_disk.display());
-            std::process::exit(1);
-        }
+        } => commands::cmd_mount(&cli.config, &mountpoint, Some(&context)),
+        Commands::Unmount { mountpoint } => commands::cmd_unmount(&mountpoint),
     };
 
-    let capacity = size_mib * 1024 * 1024;
-    let tier = parse_tier(tier_str);
-    let disk_id = existing.disk_id + 10; // Simple ID assignment
-
-    let dev = match FileBlockDevice::open(disk_path, capacity) {
-        Ok(dev) => dev,
-        Err(e) => {
-            eprintln!("error: failed to open {}: {e}", disk_path.display());
-            std::process::exit(1);
-        }
-    };
-
-    let layout = match ExtentLayout::compute(capacity) {
-        Some(l) => l,
-        None => {
-            eprintln!("error: disk too small");
-            std::process::exit(1);
-        }
-    };
-
-    let sb = Superblock::new(existing.node_id, disk_id, layout.clone());
-    if let Err(e) = sb.write_to(&dev) {
-        eprintln!("error: failed to write superblock: {e}");
-        std::process::exit(1);
-    }
-
-    if let Err(e) = WriteAheadLog::create(&dev, layout.wal_offset, mimisbrunnr::storage::WAL_SIZE) {
-        eprintln!("error: failed to initialize WAL: {e}");
-        std::process::exit(1);
-    }
-
-    println!(
-        "Added disk {disk_id}: {} ({size_mib} MiB, tier: {tier})",
-        disk_path.display()
-    );
-}
-
-fn cmd_remove_disk(disk_path: &Path, _pool_disk: &Path) {
-    println!("Marking {} for drain...", disk_path.display());
-    println!("Note: In a running system, this would begin background migration.");
-    println!("Disk will continue serving reads until all data is migrated.");
-}
-
-fn cmd_mount_unix(pool_path: &Path, context_name: &str, mountpoint: &Path) {
-    use {
-        mimisbrunnr::engine::DiskEngine,
-        mimisbrunnr_fuse::{MimisbrunnrFs, TagVfs, VfsTree},
-    };
-
-    let pool_toml = if pool_path.is_dir() {
-        pool_path.to_path_buf().join("pool.toml")
-    } else {
-        pool_path.to_path_buf()
-    };
-
-    let disk_engine = match DiskEngine::open(&pool_toml) {
-        Ok(de) => de,
-        Err(e) => {
-            eprintln!("error: failed to open pool: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // Get the path context
-    let projection = match disk_engine.context_mgr.get_context(context_name) {
-        Ok(proj) => proj.clone(),
-        Err(e) => {
-            eprintln!("error: {e}");
-            let contexts = disk_engine.context_mgr.list_contexts();
-            if contexts.is_empty() {
-                eprintln!("  No path contexts exist. Import a directory first:");
-                eprintln!(
-                    "    mimir --pool {} project import <dir> --context <name>",
-                    pool_toml.display()
-                );
-            } else {
-                eprintln!("  Available contexts: {}", contexts.join(", "));
-            }
-            std::process::exit(1);
-        }
-    };
-
-    // Build TagVfs from engine's actual indexes (so /tags/ is populated)
-    let engine = disk_engine.engine();
-    let mut tag_vfs = TagVfs::new(
-        engine.tag_index.clone(),
-        engine.kv_index.clone(),
-        engine.forward_index.clone(),
-        engine.dag.clone(),
-    );
-
-    // Add path context with the correct name
-    let tree = VfsTree::from_projection(&projection);
-    tag_vfs.add_context(context_name.to_string(), tree);
-
-    // Populate blob data by reading and decompressing from blob zone
-    let fs = MimisbrunnrFs::from_tag_vfs(tag_vfs);
-    for rec in disk_engine.engine().object_table.iter() {
-        if rec.stored_size == 0 {
-            continue;
-        }
-        let oid = mimisbrunnr::types::ObjectId::new(rec.id >> 48, rec.id & 0x0000_FFFF_FFFF_FFFF);
-        match disk_engine.read_blob_plaintext(oid) {
-            Ok(plaintext) => {
-                fs.set_blob(rec.id, plaintext);
-            }
-            Err(e) => {
-                eprintln!("warning: failed to read blob for {oid}: {e}");
-            }
-        }
-    }
-
-    // Create mountpoint if it doesn't exist
-    if !mountpoint.exists()
-        && let Err(e) = std::fs::create_dir_all(mountpoint)
-    {
-        eprintln!("error: failed to create mountpoint: {e}");
-        std::process::exit(1);
-    }
-
-    println!(
-        "Mounting at {} (tag filesystem + context '{}')",
-        mountpoint.display(),
-        context_name,
-    );
-    println!(
-        "  {} tag(s), {} file(s) in context projection",
-        engine.dag.all_tags().len(),
-        projection.files().count(),
-    );
-    println!("Press Ctrl+C to unmount.");
-
-    let mut config = fuser::Config::default();
-    config.mount_options = vec![
-        fuser::MountOption::RO,
-        fuser::MountOption::FSName("mimisbrunnr".to_string()),
-        fuser::MountOption::AutoUnmount,
-    ];
-    config.acl = fuser::SessionACL::All;
-
-    if let Err(e) = fuser::mount2(fs, mountpoint, &config) {
-        eprintln!("error: FUSE mount failed: {e}");
+    if let Err(e) = result {
+        eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
