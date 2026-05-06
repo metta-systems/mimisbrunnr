@@ -7,7 +7,9 @@
 //! layer.
 
 use mimisbrunnr_index::{ChunkIndex, ForwardIndex, KvIndex, RangeIndex, TagIndex};
-use mimisbrunnr_meta::{LocationTable, OBJECT_RECORD_SIZE, ObjectRecord, ObjectTable};
+use mimisbrunnr_meta::{
+    BackpointerTable, LocationTable, OBJECT_RECORD_SIZE, ObjectRecord, ObjectTable,
+};
 use mimisbrunnr_ontology::{IdAllocator, InstallResult, OntologyModule, OntologyState};
 use mimisbrunnr_query::QueryExecutor;
 use mimisbrunnr_transform::{TransformPipeline, TransformResult};
@@ -38,6 +40,12 @@ pub struct BlobWriteResult {
 pub struct Engine {
     pub object_table: ObjectTable,
     pub location_table: LocationTable,
+    /// Backpointer table — IMPL §6.2. Snapshot-agnostic. The engine
+    /// doesn't drive backpointer mutations yet (that's R4 / R7), but
+    /// the field is present so the empty table round-trips through
+    /// commit / load against its dedicated B+ tree region.
+    /// TODO(rewrite-phase-R4): populate on every blob / chunk write.
+    pub backpointer_table: BackpointerTable,
     pub forward_index: ForwardIndex,
     pub tag_index: TagIndex,
     pub kv_index: KvIndex,
@@ -79,6 +87,7 @@ impl Engine {
         Self {
             object_table: ObjectTable::new(),
             location_table: LocationTable::new(),
+            backpointer_table: BackpointerTable::new(),
             forward_index: ForwardIndex::new(),
             tag_index: TagIndex::new(),
             kv_index: KvIndex::new(),

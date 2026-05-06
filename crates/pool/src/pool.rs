@@ -11,7 +11,8 @@ use {
     bytemuck::{Pod, Zeroable},
     log::trace,
     mimisbrunnr_storage::{
-        BLOCK_PREAMBLE_MAGIC_BLOCK, BLOCK_SIZE, BlockDevice, BlockHeader, BlockKind, block_crc,
+        BLOCK_PREAMBLE_MAGIC_BLOCK, BLOCK_SIZE, BlockDevice, BlockHeader, BlockKind, BtreeKind,
+        BtreeRegion, LoadedNode, SortedRun, block_crc,
     },
     static_assertions::const_assert_eq,
 };
@@ -20,6 +21,12 @@ use crate::{
     disk::{DISK_DESCRIPTOR_ON_DISK_SIZE, DiskDescriptorOnDisk},
     error::PoolError,
 };
+
+/// 256 KiB region size in bytes for the disks-overflow B+ tree (matches
+/// the spec's 18-bit `region_size_log2`).
+#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+pub const DISKS_OVERFLOW_REGION_SIZE: u64 = 256 * 1024;
+const DISKS_OVERFLOW_REGION_SIZE_LOG2: u8 = 18;
 
 /// Number of inline `DiskDescriptorOnDisk` slots.
 pub const POOL_STATE_ROOT_INLINE_DISKS: usize = 12;
@@ -160,6 +167,83 @@ impl PoolStateRoot {
     }
 }
 
+// ----------------------------------------------------------------
+// R1b-11: disks_overflow_root §1.5 B+ tree (CBOR-encoded sorted run).
+// ----------------------------------------------------------------
+//
+// Pools with more than `POOL_STATE_ROOT_INLINE_DISKS` disks overflow the
+// inline `PoolStateRoot.inline_disks[]` array into a `BtreeKind::DiskDescriptors`
+// B+ tree (IMPL §10.4). The region is keyed by `disk_id: u16` ascending,
+// values are 256-byte `DiskDescriptorOnDisk` byte images. `RootPointer.disks_overflow_root`
+// refers to this region.
+//
+// TODO(rewrite-phase-R1d): switch to the IMPL §1.5.6 packed-key codec once
+// R1c lands the prefix-template fix and variable-value-size support.
+
+/// Build a [`LoadedNode`] containing one sorted-run entry per overflow
+/// disk, sorted by `disk_id`. The node uses [`BtreeKind::DiskDescriptors`]
+/// and the spec's 18-bit (256 KiB) region size.
+pub fn disks_overflow_to_loaded_node(
+    overflow: &[DiskDescriptorOnDisk],
+) -> LoadedNode<u16, DiskDescriptorOnDisk> {
+    let mut entries: Vec<(u16, DiskDescriptorOnDisk)> = overflow
+        .iter()
+        .map(|d| ({ d.disk_id }, *d))
+        .collect();
+    entries.sort_by_key(|(k, _)| *k);
+
+    let mut node: LoadedNode<u16, DiskDescriptorOnDisk> = LoadedNode::new(
+        BtreeKind::DiskDescriptors,
+        0,
+        DISKS_OVERFLOW_REGION_SIZE_LOG2,
+    );
+    if !entries.is_empty() {
+        let run = SortedRun::from_sorted(0, 0, entries);
+        node.sorted_runs.push(run);
+        node.header.sorted_run_count = 1;
+    }
+    node
+}
+
+/// Restore the overflow descriptor list from a [`LoadedNode`] read via
+/// [`BtreeRegion::read`].
+pub fn disks_overflow_from_loaded_node(
+    node: &LoadedNode<u16, DiskDescriptorOnDisk>,
+) -> Vec<DiskDescriptorOnDisk> {
+    node.merge_iter().map(|(_, v)| *v).collect()
+}
+
+/// Write the overflow descriptor list as a fresh 256 KiB region at byte
+/// `offset` on `device`.
+pub fn flush_disks_overflow_to_region<D: BlockDevice>(
+    overflow: &[DiskDescriptorOnDisk],
+    device: &D,
+    offset: u64,
+) -> Result<(), PoolError> {
+    let mut node = disks_overflow_to_loaded_node(overflow);
+    BtreeRegion::write_full::<D, u16, DiskDescriptorOnDisk>(device, offset, &mut node)?;
+    Ok(())
+}
+
+/// Read the overflow descriptor list from the 256 KiB region at byte
+/// `offset` on `device`. An all-zero region returns `Vec::new()`.
+pub fn load_disks_overflow_from_region<D: BlockDevice>(
+    device: &D,
+    offset: u64,
+) -> Result<Vec<DiskDescriptorOnDisk>, PoolError> {
+    let mut probe = [0u8; 8];
+    device.read_at(offset, &mut probe)?;
+    if probe.iter().all(|&b| b == 0) {
+        return Ok(Vec::new());
+    }
+    let node = BtreeRegion::read::<D, u16, DiskDescriptorOnDisk>(
+        device,
+        offset,
+        BtreeKind::DiskDescriptors,
+    )?;
+    Ok(disks_overflow_from_loaded_node(&node))
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -278,5 +362,67 @@ mod tests {
             .collect();
         psr.set_inline_disks(&twelve).unwrap();
         assert_eq!(psr.inline_disk_count(), POOL_STATE_ROOT_INLINE_DISKS);
+    }
+
+    // ----- B+ tree region round-trip (R1b-11, disks_overflow) -----
+
+    use super::{
+        flush_disks_overflow_to_region, load_disks_overflow_from_region,
+    };
+    use tempfile::TempDir;
+
+    fn fresh_overflow_device() -> (TempDir, FileBlockDevice) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("disks_overflow.bin");
+        let dev = FileBlockDevice::open(&path, 1 << 20).unwrap();
+        (dir, dev)
+    }
+
+    #[test]
+    fn disks_overflow_region_round_trip_empty_returns_empty() {
+        let (_dir, dev) = fresh_overflow_device();
+        let descriptors = load_disks_overflow_from_region(&dev, 0).unwrap();
+        assert!(descriptors.is_empty());
+    }
+
+    #[test]
+    fn disks_overflow_region_round_trip_preserves_descriptors() {
+        let (_dir, dev) = fresh_overflow_device();
+        // Simulate a pool with 16 disks: 12 inline + 4 overflow.
+        let overflow: Vec<_> = (12u16..16)
+            .map(|i| make_disk(i, &format!("/disk{i}")))
+            .collect();
+        flush_disks_overflow_to_region(&overflow, &dev, 0).unwrap();
+        let back = load_disks_overflow_from_region(&dev, 0).unwrap();
+        assert_eq!(back.len(), 4);
+        for (i, d) in back.iter().enumerate() {
+            assert_eq!({ d.disk_id }, 12 + i as u16);
+            assert_eq!(d.path_str().unwrap(), format!("/disk{}", 12 + i));
+        }
+    }
+
+    #[test]
+    fn disks_overflow_region_round_trip_single_descriptor() {
+        let (_dir, dev) = fresh_overflow_device();
+        let one = vec![make_disk(13, "/disk13")];
+        flush_disks_overflow_to_region(&one, &dev, 0).unwrap();
+        let back = load_disks_overflow_from_region(&dev, 0).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!({ back[0].disk_id }, 13);
+        assert_eq!(back[0].path_str().unwrap(), "/disk13");
+    }
+
+    #[test]
+    fn disks_overflow_region_overwrite_replaces_state() {
+        let (_dir, dev) = fresh_overflow_device();
+        let first: Vec<_> = (12u16..16)
+            .map(|i| make_disk(i, &format!("/old{i}")))
+            .collect();
+        flush_disks_overflow_to_region(&first, &dev, 0).unwrap();
+        let second = vec![make_disk(99, "/new99")];
+        flush_disks_overflow_to_region(&second, &dev, 0).unwrap();
+        let back = load_disks_overflow_from_region(&dev, 0).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!({ back[0].disk_id }, 99);
     }
 }

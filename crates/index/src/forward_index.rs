@@ -8,20 +8,48 @@
 //! [`ForwardIndex`] derives `Serialize`/`Deserialize` directly; callers
 //! reach for `ciborium::ser::into_writer` / `ciborium::de::from_reader`.
 //!
-//! TODO(rewrite-phase-N): replace the CBOR-blob persistence with the §1.5
-//! B+ tree backing.
+//! ## Persistence (R1b-2)
+//!
+//! On disk the index occupies one 256 KiB §1.5 B+ tree region of
+//! [`BtreeKind::Forward`]. The in-memory mirror is materialised into a
+//! single CBOR-encoded sorted run via [`BtreeRegion::write_full`]; reload
+//! goes through [`BtreeRegion::read`]. Keys are raw `u64` oids (sorted
+//! ascending); values are the per-oid `Vec<(Assertion, TagOrigin)>`.
+//!
+//! Two reasons we use the CBOR sorted-run path here rather than the
+//! §1.5.6 packed-key codec:
+//!
+//! - **Variable-length values.** IMPL §7.1's [`LeafEntry`] is variable-
+//!   width (`header` bitfield + either an inline `[PackedAssertion;
+//!   total]` body or a 16-byte `BlockRef` spill_ref). The packed codec
+//!   currently assumes a fixed `value_size`, so the spec-mandated
+//!   §7.1 encoding can't ride on `BtreeRegion::write_full_packed` as-is.
+//! - **Snapshot threading.** IMPL §7.1's key is `(oid, snapshot)` with the
+//!   snapshot field part of the separator, but R6 hasn't shipped — every
+//!   snapshot is implicitly 0 today.
+//!
+//! TODO(rewrite-phase-R1d): once R1c lands the storage-side
+//! `force_prefix_zero` / variable-value-size knobs and R6 lands snapshots,
+//! switch to the native §7.1 encoding (`(oid, snapshot)` packed key,
+//! `LeafEntry` variable-length body, ForwardOverflow spill chain).
 
 use std::collections::HashMap;
 
 use {
     bytemuck::{Pod, Zeroable},
-    mimisbrunnr_storage::BlobRef,
+    mimisbrunnr_storage::{BlobRef, BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
     mimisbrunnr_types::{Assertion, ObjectId, TagId, TagOrigin, Value},
     serde::{Deserialize, Serialize},
     static_assertions::const_assert_eq,
 };
 
 use crate::error::IndexError;
+
+/// 256 KiB region size in bytes (matches the spec's 18-bit
+/// `region_size_log2`). Engine code sizes the on-disk slot from this.
+#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+pub const FORWARD_INDEX_REGION_SIZE: u64 = 256 * 1024;
+const REGION_SIZE_LOG2: u8 = 18;
 
 // ---------- PackedAssertion ----------
 
@@ -455,7 +483,120 @@ impl ForwardIndex {
             .iter()
             .map(|(raw, v)| (ObjectId::from_u64(*raw), v.as_slice()))
     }
+
+    // ----------------------------------------------------------------
+    // R1b-2: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // ----------------------------------------------------------------
+
+    /// Build a [`LoadedNode`] containing every entry as a single CBOR sorted
+    /// run sorted by `(oid, snapshot)`. The node uses [`BtreeKind::Forward`]
+    /// and the spec's 18-bit (256 KiB) region size.
+    ///
+    /// Per IMPL §11.2 the on-disk key is `(oid, snapshot)`; snapshots are
+    /// deferred to R6 so every key carries `snapshot = 0` today. The field
+    /// is preserved on disk so R6 won't need a layout break.
+    pub fn to_loaded_node(&self) -> LoadedNode<ForwardIndexKey, ForwardIndexValue> {
+        let mut entries: Vec<(ForwardIndexKey, ForwardIndexValue)> = self
+            .entries
+            .iter()
+            .map(|(oid, v)| {
+                (
+                    ForwardIndexKey {
+                        oid: *oid,
+                        snapshot: 0,
+                    },
+                    ForwardIndexValue(v.clone()),
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut node: LoadedNode<ForwardIndexKey, ForwardIndexValue> =
+            LoadedNode::new(BtreeKind::Forward, 0, REGION_SIZE_LOG2);
+        if !entries.is_empty() {
+            let run = SortedRun::from_sorted(0, 0, entries);
+            node.sorted_runs.push(run);
+            node.header.sorted_run_count = 1;
+        }
+        node
+    }
+
+    /// Restore the in-memory state from a [`LoadedNode`] read via
+    /// [`BtreeRegion::read`].
+    pub fn from_loaded_node(
+        node: &LoadedNode<ForwardIndexKey, ForwardIndexValue>,
+    ) -> Result<Self, IndexError> {
+        let mut entries: HashMap<u64, Vec<(Assertion, TagOrigin)>> = HashMap::new();
+        for (k, v) in node.merge_iter() {
+            // Snapshot != 0 won't appear until R6 lands snapshot-aware reads.
+            // Until then, collapse every entry onto the (snapshot=0) view by
+            // taking the last writer for each oid.
+            entries.insert(k.oid, v.0.clone());
+        }
+        Ok(Self { entries })
+    }
+
+    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
+    /// on `device`. Replaces the region wholesale via
+    /// [`BtreeRegion::write_full`].
+    pub fn flush_to_region<D: BlockDevice>(
+        &self,
+        device: &D,
+        offset: u64,
+    ) -> Result<(), IndexError> {
+        let mut node = self.to_loaded_node();
+        BtreeRegion::write_full::<D, ForwardIndexKey, ForwardIndexValue>(
+            device, offset, &mut node,
+        )?;
+        Ok(())
+    }
+
+    /// Read the in-memory state from the 256 KiB region at byte `offset` on
+    /// `device`. An all-zero region is treated as "empty index" and returns
+    /// [`Self::default`].
+    pub fn load_from_region<D: BlockDevice>(
+        device: &D,
+        offset: u64,
+    ) -> Result<Self, IndexError> {
+        // Probe the first 8 bytes — a fresh (all-zero) region has no magic.
+        let mut probe = [0u8; 8];
+        device.read_at(offset, &mut probe)?;
+        if probe.iter().all(|&b| b == 0) {
+            return Ok(Self::default());
+        }
+        let node = BtreeRegion::read::<D, ForwardIndexKey, ForwardIndexValue>(
+            device,
+            offset,
+            BtreeKind::Forward,
+        )?;
+        Self::from_loaded_node(&node)
+    }
 }
+
+// ---------- ForwardIndexKey / ForwardIndexValue (B+ tree wire types) ----------
+
+/// B+ tree key for the forward index: `(oid, snapshot)` per IMPL §11.2.
+///
+/// Snapshots are deferred to R6 so every key written today carries
+/// `snapshot = 0`; the field is on-disk now so the layout doesn't break
+/// when R6 lands.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct ForwardIndexKey {
+    pub oid: u64,
+    pub snapshot: u32,
+}
+
+/// B+ tree value for the forward index: the per-oid `(Assertion, TagOrigin)`
+/// list. Variable-shape — relies on the CBOR run codec.
+///
+/// **No `Eq` derive.** [`Assertion`] embeds [`Value::Float(f64)`], and `f64`
+/// cannot implement `Eq` (NaN ≠ NaN). `BtreeRegion::{write_full, read}` only
+/// require `Serialize` / `DeserializeOwned + Clone` on the value, so dropping
+/// `Eq` is safe.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ForwardIndexValue(pub Vec<(Assertion, TagOrigin)>);
 
 #[cfg(test)]
 mod tests {
@@ -681,5 +822,176 @@ mod tests {
         let removed = fi.remove_object(oid(1));
         assert_eq!(removed.len(), 1);
         assert_eq!(fi.object_count(), 0);
+    }
+
+    // ----- B+ tree region round-trip (R1b-2) -----
+
+    use mimisbrunnr_storage::FileBlockDevice;
+    use tempfile::TempDir;
+
+    fn fresh_device() -> (TempDir, FileBlockDevice) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("forward_index.bin");
+        let dev = FileBlockDevice::open(&path, 1 << 20).unwrap();
+        (dir, dev)
+    }
+
+    #[test]
+    fn forward_region_round_trip_empty_returns_default() {
+        let (_dir, dev) = fresh_device();
+        let idx = ForwardIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(idx.object_count(), 0);
+    }
+
+    #[test]
+    fn forward_region_round_trip_preserves_assertions() {
+        let (_dir, dev) = fresh_device();
+        let mut fi = ForwardIndex::new();
+        fi.add_assertion(oid(1), Assertion::Tag(tag(10)), TagOrigin::Direct);
+        fi.add_assertion(oid(1), Assertion::Tag(tag(11)), TagOrigin::Materialized);
+        fi.add_assertion(
+            oid(2),
+            Assertion::Attr {
+                key: tag(7),
+                value: Value::Text("Aphex".into()),
+            },
+            TagOrigin::Direct,
+        );
+        fi.add_assertion(
+            oid(3),
+            Assertion::Relation {
+                predicate: tag(99),
+                target: oid(42),
+            },
+            TagOrigin::Direct,
+        );
+
+        fi.flush_to_region(&dev, 0).unwrap();
+        let back = ForwardIndex::load_from_region(&dev, 0).unwrap();
+
+        assert_eq!(back.object_count(), 3);
+        let a1 = back.assertions_of(oid(1));
+        assert_eq!(a1.len(), 2);
+        assert_eq!(back.direct_tags(oid(1)), vec![tag(10)]);
+        assert_eq!(back.materialized_tags(oid(1)), vec![tag(11)]);
+        let a2 = back.assertions_of(oid(2));
+        assert_eq!(a2.len(), 1);
+        assert!(matches!(&a2[0].0, Assertion::Attr { .. }));
+        let a3 = back.assertions_of(oid(3));
+        assert_eq!(a3.len(), 1);
+        assert!(matches!(&a3[0].0, Assertion::Relation { .. }));
+    }
+
+    #[test]
+    fn forward_region_round_trip_single_object() {
+        // The CBOR sorted-run path is unaffected by the packed-codec
+        // single-entry trap (see chunk_index R1c TODO); a 1-object index
+        // must round-trip correctly.
+        let (_dir, dev) = fresh_device();
+        let mut fi = ForwardIndex::new();
+        fi.add_assertion(oid(7), Assertion::Tag(tag(700)), TagOrigin::Direct);
+        fi.flush_to_region(&dev, 0).unwrap();
+        let back = ForwardIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.object_count(), 1);
+        assert_eq!(back.direct_tags(oid(7)), vec![tag(700)]);
+    }
+
+    #[test]
+    fn forward_region_overwrite_replaces_state() {
+        let (_dir, dev) = fresh_device();
+        let mut first = ForwardIndex::new();
+        first.add_assertion(oid(1), Assertion::Tag(tag(10)), TagOrigin::Direct);
+        first.add_assertion(oid(2), Assertion::Tag(tag(20)), TagOrigin::Direct);
+        first.flush_to_region(&dev, 0).unwrap();
+
+        let mut second = ForwardIndex::new();
+        second.add_assertion(oid(9), Assertion::Tag(tag(900)), TagOrigin::Direct);
+        second.flush_to_region(&dev, 0).unwrap();
+
+        let back = ForwardIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.object_count(), 1);
+        assert_eq!(back.direct_tags(oid(9)), vec![tag(900)]);
+        assert!(back.assertions_of(oid(1)).is_empty());
+    }
+
+    #[test]
+    fn forward_loaded_node_round_trip_empty() {
+        let fi = ForwardIndex::new();
+        let node = fi.to_loaded_node();
+        assert_eq!(node.sorted_runs.len(), 0);
+        let back = ForwardIndex::from_loaded_node(&node).unwrap();
+        assert_eq!(back.object_count(), 0);
+    }
+
+    #[test]
+    fn forward_loaded_node_round_trip_preserves_all_entries() {
+        let mut fi = ForwardIndex::new();
+        for i in 1u64..=20 {
+            fi.add_assertion(oid(i), Assertion::Tag(tag(i as u32 * 10)), TagOrigin::Direct);
+            fi.add_assertion(
+                oid(i),
+                Assertion::Tag(tag(i as u32 * 10 + 1)),
+                TagOrigin::Materialized,
+            );
+        }
+        let node = fi.to_loaded_node();
+        assert_eq!(node.sorted_runs.len(), 1);
+        assert_eq!(node.sorted_runs[0].entries.len(), 20);
+        let back = ForwardIndex::from_loaded_node(&node).unwrap();
+        assert_eq!(back.object_count(), 20);
+        for i in 1u64..=20 {
+            let asserts = back.assertions_of(oid(i));
+            assert_eq!(asserts.len(), 2);
+        }
+    }
+
+    #[test]
+    fn forward_loaded_node_keys_carry_zero_snapshot() {
+        let mut fi = ForwardIndex::new();
+        fi.add_assertion(oid(1), Assertion::Tag(tag(10)), TagOrigin::Direct);
+        let node = fi.to_loaded_node();
+        assert_eq!(node.sorted_runs[0].entries[0].0.snapshot, 0);
+    }
+
+    #[test]
+    fn forward_region_kind_mismatch_detected() {
+        // Writing as Forward then trying to read as a different BtreeKind
+        // must fail. We invoke `BtreeRegion::read` directly with a wrong
+        // kind to confirm.
+        use mimisbrunnr_storage::BtreeRegion;
+        let (_dir, dev) = fresh_device();
+        let mut fi = ForwardIndex::new();
+        fi.add_assertion(oid(1), Assertion::Tag(tag(10)), TagOrigin::Direct);
+        fi.flush_to_region(&dev, 0).unwrap();
+        // Read with wrong kind.
+        let res = BtreeRegion::read::<_, ForwardIndexKey, ForwardIndexValue>(
+            &dev,
+            0,
+            BtreeKind::Range,
+        );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn forward_region_round_trip_50_objects() {
+        let (_dir, dev) = fresh_device();
+        let mut fi = ForwardIndex::new();
+        for i in 0u64..50 {
+            fi.add_assertion(oid(i), Assertion::Tag(tag(i as u32)), TagOrigin::Direct);
+            fi.add_assertion(
+                oid(i),
+                Assertion::Attr {
+                    key: tag(i as u32 + 1000),
+                    value: Value::Int(i as i64 * 7),
+                },
+                TagOrigin::Materialized,
+            );
+        }
+        fi.flush_to_region(&dev, 0).unwrap();
+        let back = ForwardIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.object_count(), 50);
+        for i in 0u64..50 {
+            assert_eq!(back.assertions_of(oid(i)).len(), 2);
+        }
     }
 }

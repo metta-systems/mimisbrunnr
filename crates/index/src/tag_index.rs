@@ -12,12 +12,34 @@
 //! In memory:
 //!
 //! - [`TagIndex`] = `HashMap<TagId, TagStore>` per IMPL §13.
+//!
+//! ## Persistence (R1b-3)
+//!
+//! On disk the tag-directory level occupies one 256 KiB §1.5 B+ tree
+//! region of [`BtreeKind::TagDirectory`]. The in-memory mirror is
+//! materialised into a single CBOR-encoded sorted run via
+//! [`BtreeRegion::write_full`]; reload goes through [`BtreeRegion::read`].
+//! Keys are raw `TagId` (`u32`) sorted ascending; values are the per-tag
+//! [`TagStore`] (variable-shape — Simple bitmap, Ordered = bitmap +
+//! sequence, Ranked = bitmap + scored entries; plus the embedded
+//! roaring bitmap is itself variable-length).
+//!
+//! Variable-shape values preclude the §1.5.6 packed-key codec: it
+//! requires every entry's value to share the same byte length. Until
+//! R1a-pack-2 grows variable-size value support, TagIndex flushes
+//! through the CBOR run codec.
+//!
+//! TODO(rewrite-phase-R1d): once R1c lands variable-value-size support
+//! and the storage layer offers the §8.1 `TagIndexLeafEntry` / §8.2
+//! `TagBitmapPage` / §8.3 `SequencePage`/`RankedPage` block-framing path,
+//! switch to native encoding so the per-tag bitmap pages live in their
+//! own 4 KiB blocks (rather than inline in the directory's CBOR payload).
 
 use std::collections::HashMap;
 
 use {
     bytemuck::{Pod, Zeroable},
-    mimisbrunnr_storage::BlockRef,
+    mimisbrunnr_storage::{BlockDevice, BlockRef, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
     mimisbrunnr_types::{ObjectId, TagId},
     roaring::RoaringBitmap,
     serde::{Deserialize, Serialize},
@@ -25,6 +47,12 @@ use {
 };
 
 use crate::{error::IndexError, tag_store::TagStore};
+
+/// 256 KiB region size in bytes (matches the spec's 18-bit
+/// `region_size_log2`). Engine code sizes the on-disk slot from this.
+#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+pub const TAG_INDEX_REGION_SIZE: u64 = 256 * 1024;
+const REGION_SIZE_LOG2: u8 = 18;
 
 // ---------- Store kind discriminants ----------
 
@@ -245,6 +273,103 @@ impl TagIndex {
     pub fn deserialise(bytes: &[u8]) -> Result<Self, IndexError> {
         ciborium::de::from_reader(bytes).map_err(|e| IndexError::CborDecode(e.to_string()))
     }
+
+    // ----------------------------------------------------------------
+    // R1b-2: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // ----------------------------------------------------------------
+
+    /// Build a [`LoadedNode`] containing every entry as a single CBOR
+    /// sorted run, sorted by `(tag_id, snapshot)`. The node uses
+    /// [`BtreeKind::TagDirectory`] and the spec's 18-bit (256 KiB) region
+    /// size.
+    ///
+    /// Per IMPL §11.2 the on-disk key is `(tag_id, snapshot)`; snapshots
+    /// are deferred to R6 so every key written today carries `snapshot = 0`.
+    /// The field is on-disk now so the layout doesn't break when R6 lands.
+    pub fn to_loaded_node(&self) -> LoadedNode<TagIndexKey, TagStore> {
+        let mut entries: Vec<(TagIndexKey, TagStore)> = self
+            .stores
+            .iter()
+            .map(|(k, v)| {
+                (
+                    TagIndexKey {
+                        tag_id: k.raw(),
+                        snapshot: 0,
+                    },
+                    v.clone(),
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut node: LoadedNode<TagIndexKey, TagStore> =
+            LoadedNode::new(BtreeKind::TagDirectory, 0, REGION_SIZE_LOG2);
+        if !entries.is_empty() {
+            let run = SortedRun::from_sorted(0, 0, entries);
+            node.sorted_runs.push(run);
+            node.header.sorted_run_count = 1;
+        }
+        node
+    }
+
+    /// Restore the in-memory state from a [`LoadedNode`] read via
+    /// [`BtreeRegion::read`].
+    pub fn from_loaded_node(node: &LoadedNode<TagIndexKey, TagStore>) -> Result<Self, IndexError> {
+        let mut stores: HashMap<TagId, TagStore> = HashMap::new();
+        for (k, v) in node.merge_iter() {
+            // Snapshot != 0 won't appear until R6 lands snapshot-aware reads.
+            stores.insert(TagId::new(k.tag_id), v.clone());
+        }
+        Ok(Self { stores })
+    }
+
+    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
+    /// on `device`. Replaces the region wholesale via
+    /// [`BtreeRegion::write_full`].
+    pub fn flush_to_region<D: BlockDevice>(
+        &self,
+        device: &D,
+        offset: u64,
+    ) -> Result<(), IndexError> {
+        let mut node = self.to_loaded_node();
+        BtreeRegion::write_full::<D, TagIndexKey, TagStore>(device, offset, &mut node)?;
+        Ok(())
+    }
+
+    /// Read the in-memory state from the 256 KiB region at byte `offset` on
+    /// `device`. An all-zero region is treated as "empty index" and returns
+    /// [`Self::default`].
+    pub fn load_from_region<D: BlockDevice>(
+        device: &D,
+        offset: u64,
+    ) -> Result<Self, IndexError> {
+        let mut probe = [0u8; 8];
+        device.read_at(offset, &mut probe)?;
+        if probe.iter().all(|&b| b == 0) {
+            return Ok(Self::default());
+        }
+        let node = BtreeRegion::read::<D, TagIndexKey, TagStore>(
+            device,
+            offset,
+            BtreeKind::TagDirectory,
+        )?;
+        Self::from_loaded_node(&node)
+    }
+}
+
+// ---------- TagIndexKey (B+ tree wire type) ----------
+
+/// B+ tree key for the tag inverted index: `(tag_id, snapshot)` per IMPL
+/// §11.2.
+///
+/// Snapshots are deferred to R6; every key written today carries
+/// `snapshot = 0`. The field is on-disk now so R6 won't need a layout break.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct TagIndexKey {
+    pub tag_id: u32,
+    pub snapshot: u32,
 }
 
 #[cfg(test)]
@@ -332,5 +457,147 @@ mod tests {
         assert_eq!(back.tag_count(), 2);
         assert!(back.contains(t(1), oid(10)));
         assert!(back.contains(t(2), oid(20)));
+    }
+
+    // ----- B+ tree region round-trip (R1b-3) -----
+
+    use mimisbrunnr_storage::FileBlockDevice;
+    use tempfile::TempDir;
+
+    fn fresh_device() -> (TempDir, FileBlockDevice) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tag_index.bin");
+        let dev = FileBlockDevice::open(&path, 1 << 20).unwrap();
+        (dir, dev)
+    }
+
+    #[test]
+    fn tag_region_round_trip_empty_returns_default() {
+        let (_dir, dev) = fresh_device();
+        let idx = TagIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(idx.tag_count(), 0);
+    }
+
+    #[test]
+    fn tag_region_round_trip_simple_stores() {
+        let (_dir, dev) = fresh_device();
+        let mut idx = TagIndex::new();
+        for tag_no in 1u32..=10 {
+            for member in 0u64..(tag_no as u64) {
+                idx.add_member(t(tag_no), oid(tag_no as u64 * 100 + member));
+            }
+        }
+        idx.flush_to_region(&dev, 0).unwrap();
+        let back = TagIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.tag_count(), 10);
+        for tag_no in 1u32..=10 {
+            for member in 0u64..(tag_no as u64) {
+                assert!(
+                    back.contains(t(tag_no), oid(tag_no as u64 * 100 + member)),
+                    "tag {tag_no} member {member}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tag_region_round_trip_single_tag() {
+        // CBOR sorted-run path is unaffected by the packed-codec
+        // single-entry trap (chunk_index R1c TODO).
+        let (_dir, dev) = fresh_device();
+        let mut idx = TagIndex::new();
+        idx.add_member(t(42), oid(100));
+        idx.add_member(t(42), oid(200));
+        idx.flush_to_region(&dev, 0).unwrap();
+        let back = TagIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.tag_count(), 1);
+        assert!(back.contains(t(42), oid(100)));
+        assert!(back.contains(t(42), oid(200)));
+    }
+
+    #[test]
+    fn tag_region_round_trip_preserves_ordered_and_ranked_kinds() {
+        let (_dir, dev) = fresh_device();
+        let mut idx = TagIndex::new();
+        idx.add_member(t(1), oid(10));
+        idx.add_member(t(1), oid(11));
+        idx.upgrade_to_ordered(t(1)).unwrap();
+
+        idx.add_member(t(2), oid(20));
+        idx.upgrade_to_ranked(t(2)).unwrap();
+
+        idx.add_member(t(3), oid(30)); // stays Simple
+
+        idx.flush_to_region(&dev, 0).unwrap();
+        let back = TagIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.tag_count(), 3);
+        assert!(back.get(t(1)).is_some());
+        assert!(back.contains(t(1), oid(10)));
+        assert!(back.contains(t(2), oid(20)));
+        assert!(back.contains(t(3), oid(30)));
+    }
+
+    #[test]
+    fn tag_region_overwrite_replaces_state() {
+        let (_dir, dev) = fresh_device();
+        let mut first = TagIndex::new();
+        first.add_member(t(1), oid(10));
+        first.add_member(t(2), oid(20));
+        first.flush_to_region(&dev, 0).unwrap();
+
+        let mut second = TagIndex::new();
+        second.add_member(t(99), oid(900));
+        second.flush_to_region(&dev, 0).unwrap();
+
+        let back = TagIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.tag_count(), 1);
+        assert!(back.contains(t(99), oid(900)));
+        assert!(back.get(t(1)).is_none());
+    }
+
+    #[test]
+    fn tag_loaded_node_round_trip_empty() {
+        let idx = TagIndex::new();
+        let node = idx.to_loaded_node();
+        assert_eq!(node.sorted_runs.len(), 0);
+        let back = TagIndex::from_loaded_node(&node).unwrap();
+        assert_eq!(back.tag_count(), 0);
+    }
+
+    #[test]
+    fn tag_loaded_node_keys_carry_zero_snapshot() {
+        let mut idx = TagIndex::new();
+        idx.add_member(t(7), oid(42));
+        let node = idx.to_loaded_node();
+        assert_eq!(node.sorted_runs[0].entries[0].0.snapshot, 0);
+        assert_eq!(node.sorted_runs[0].entries[0].0.tag_id, 7);
+    }
+
+    #[test]
+    fn tag_region_kind_mismatch_detected() {
+        use mimisbrunnr_storage::BtreeRegion;
+        let (_dir, dev) = fresh_device();
+        let mut idx = TagIndex::new();
+        idx.add_member(t(1), oid(10));
+        idx.flush_to_region(&dev, 0).unwrap();
+        let res = BtreeRegion::read::<_, TagIndexKey, TagStore>(&dev, 0, BtreeKind::Range);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn tag_region_round_trip_50_tags() {
+        let (_dir, dev) = fresh_device();
+        let mut idx = TagIndex::new();
+        for i in 0u32..50 {
+            for member in 0u64..3 {
+                idx.add_member(t(i), oid(i as u64 * 100 + member));
+            }
+        }
+        idx.flush_to_region(&dev, 0).unwrap();
+        let back = TagIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.tag_count(), 50);
+        for i in 0u32..50 {
+            assert!(back.contains(t(i), oid(i as u64 * 100)));
+        }
     }
 }

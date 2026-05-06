@@ -5,12 +5,31 @@
 //! id. Validation against the live ontology happens at `create_context` time;
 //! after that the manager is purely in-memory.
 //!
-//! ## Persistence
+//! ## Persistence (R1b-13)
 //!
-//! [`PathContextManager::serialise`] / [`PathContextManager::deserialise`]
-//! provide a CBOR-blob round-trip for now. The B+ tree shape from
-//! IMPLEMENTATION.md §10.3 will replace this in a later phase.
-// TODO(rewrite-phase-N): persist via the path-projection btree per IMPL §10.3.
+//! Per IMPL §10.3, **path projection has no dedicated on-disk B+ tree
+//! region** — paths are encoded as ordinary `Attr(unix-path, ...)`
+//! assertions on objects, with per-context overrides expressed via
+//! `Value::Scoped { context, inner }`. The path-projection data is
+//! therefore a *derived view* of the forward index (which got its own
+//! B+ tree region in R1b-2) plus the tag store (R1b-3).
+//!
+//! What this means for the manager:
+//! - `BtreeKind::PathProjections` does **not** exist in the spec
+//!   ([`storage::BlockKind`] enum) — there is intentionally no slot.
+//! - `RootPointer` carries no path-projection root: the `OntologyState`
+//!   (`unix-path-context:*` tag definitions) and the `ForwardIndex`
+//!   (`Attr(unix-path, ...)` assertions per object) carry the on-disk
+//!   truth.
+//! - The engine layer reconstructs `PathContextManager` at mount time
+//!   by scanning the forward index for `unix-path` Attr assertions
+//!   (DESIGN §12.2 algorithm). The transient
+//!   [`PathContextManager::serialise`] / [`PathContextManager::deserialise`]
+//!   helpers below are kept *only* for tooling / cli round-trips; the
+//!   engine's persistent path is the one above.
+//!
+//! No `flush_to_region` / `load_from_region` is provided because there
+//! is no spec-allocated region for it.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -93,16 +112,19 @@ impl PathContextManager {
         self.projections.is_empty()
     }
 
-    /// CBOR-encode for persistence.
-    // TODO(rewrite-phase-N): persist via path-projection btree per IMPL §10.3.
+    /// CBOR-encode for tooling / CLI snapshots.
+    ///
+    /// **Not the engine's persistent path** — see crate-level docs. The
+    /// engine reconstructs the manager from `Attr(unix-path, ...)`
+    /// assertions in the forward index at mount time per IMPL §10.3.
     pub fn serialise(&self) -> Result<Vec<u8>, UnixError> {
         let mut buf = Vec::new();
         ciborium::ser::into_writer(self, &mut buf).map_err(|e| UnixError::Cbor(e.to_string()))?;
         Ok(buf)
     }
 
-    /// Decode from CBOR.
-    // TODO(rewrite-phase-N): persist via path-projection btree per IMPL §10.3.
+    /// Decode from a CBOR snapshot. **Not the engine's persistent path**
+    /// — see [`Self::serialise`].
     pub fn deserialise(bytes: &[u8]) -> Result<Self, UnixError> {
         ciborium::de::from_reader(bytes).map_err(|e| UnixError::Cbor(e.to_string()))
     }

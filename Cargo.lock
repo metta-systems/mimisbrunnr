@@ -2230,9 +2230,12 @@ name = "mimisbrunnr-meta"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "ciborium",
  "mimisbrunnr-storage",
  "mimisbrunnr-types",
+ "serde",
  "static_assertions",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -2242,6 +2245,7 @@ version = "0.1.0"
 dependencies = [
  "ciborium",
  "log",
+ "mimisbrunnr-storage",
  "mimisbrunnr-types",
  "petgraph",
  "serde",
@@ -2371,9 +2375,11 @@ dependencies = [
  "log",
  "mimisbrunnr-index",
  "mimisbrunnr-ontology",
+ "mimisbrunnr-storage",
  "mimisbrunnr-types",
  "roaring",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 

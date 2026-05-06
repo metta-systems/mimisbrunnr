@@ -5,14 +5,25 @@
 //! (Phase 5) wires the executor and the WAL replay logic; this crate is
 //! purely the in-memory bookkeeping.
 //!
-// TODO(rewrite-phase-N): the §10.2 B+ tree shape replaces our CBOR-blob
-// persistence; WAL replay for offline catch-up (DESIGN §11.5) is the engine
-// layer's job and is intentionally out of scope here.
+//! ## Persistence (R1b-9)
+//!
+//! On disk the engine occupies one 256 KiB §1.5 B+ tree region of
+//! [`BtreeKind::Subscriptions`]. The whole [`PersistedEngine`]
+//! (`next_id` plus the sorted subscription list with their cached
+//! roaring-bitmap results) is materialised into a single CBOR-encoded
+//! sorted-run entry keyed by `u32 snapshot` (always `0` today; R6 will
+//! populate older snapshots).
+//!
+//! TODO(rewrite-phase-R1d): replace the single-entry blob with the IMPL
+//! §10.2 native per-subscription shape — a sorted run keyed by
+//! `(SubscriptionId, snapshot)` with one [`PersistedSub`] per entry, so
+//! mutating a single subscription doesn't rewrite the whole region.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use mimisbrunnr_index::RoaringBitmap;
 use mimisbrunnr_ontology::OntologyState;
+use mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun};
 use mimisbrunnr_types::{
     ChangeInterest, HybridTimestamp, NodeId, ObjectId, Query, SubscriptionId, SubscriptionState,
     TagId, WatchEvent,
@@ -24,6 +35,12 @@ use crate::{
     event::EventKind,
     subscription::{Retention, Subscription},
 };
+
+/// 256 KiB region size in bytes (matches the spec's 18-bit
+/// `region_size_log2`). Engine code sizes the on-disk slot from this.
+#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+pub const SUBSCRIPTIONS_REGION_SIZE: u64 = 256 * 1024;
+const REGION_SIZE_LOG2: u8 = 18;
 
 /// Truncate an [`ObjectId`] to a `u32` for storage in a roaring bitmap. The
 /// rest of the codebase uses the same convention (low 32 bits) — see
@@ -414,6 +431,76 @@ impl SubscriptionEngine {
         snap.into_engine()
     }
 
+    // ----------------------------------------------------------------
+    // R1b-9: §1.5 B+ tree persistence (single-entry CBOR run).
+    // ----------------------------------------------------------------
+
+    /// Build a [`LoadedNode`] containing a single sorted-run entry
+    /// `(snapshot=0, PersistedEngine)`. The node uses
+    /// [`BtreeKind::Subscriptions`] and the spec's 18-bit (256 KiB)
+    /// region size.
+    pub fn to_loaded_node(&self) -> Result<LoadedNode<u32, PersistedEngine>, WatchError> {
+        let snap = self.snapshot()?;
+        let entries = vec![(0u32, snap)];
+
+        let mut node: LoadedNode<u32, PersistedEngine> =
+            LoadedNode::new(BtreeKind::Subscriptions, 0, REGION_SIZE_LOG2);
+        let run = SortedRun::from_sorted(0, 0, entries);
+        node.sorted_runs.push(run);
+        node.header.sorted_run_count = 1;
+        Ok(node)
+    }
+
+    /// Restore the in-memory state from a [`LoadedNode`] read via
+    /// [`BtreeRegion::read`]. Picks the entry under `snapshot = 0`; an
+    /// empty node returns the default.
+    pub fn from_loaded_node(
+        node: &LoadedNode<u32, PersistedEngine>,
+    ) -> Result<Self, WatchError> {
+        for (k, v) in node.merge_iter() {
+            if *k == 0 {
+                return v.clone().into_engine();
+            }
+        }
+        Ok(Self::default())
+    }
+
+    /// Write the in-memory state as a fresh 256 KiB region at byte
+    /// `offset` on `device`.
+    pub fn flush_to_region<D: BlockDevice>(
+        &self,
+        device: &D,
+        offset: u64,
+    ) -> Result<(), WatchError> {
+        let mut node = self.to_loaded_node()?;
+        BtreeRegion::write_full::<D, u32, PersistedEngine>(device, offset, &mut node)
+            .map_err(|e| WatchError::CborEncode(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Read the in-memory state from the 256 KiB region at byte
+    /// `offset` on `device`. An all-zero region returns
+    /// [`Self::default`].
+    pub fn load_from_region<D: BlockDevice>(
+        device: &D,
+        offset: u64,
+    ) -> Result<Self, WatchError> {
+        let mut probe = [0u8; 8];
+        device
+            .read_at(offset, &mut probe)
+            .map_err(|e| WatchError::CborDecode(e.to_string()))?;
+        if probe.iter().all(|&b| b == 0) {
+            return Ok(Self::default());
+        }
+        let node = BtreeRegion::read::<D, u32, PersistedEngine>(
+            device,
+            offset,
+            BtreeKind::Subscriptions,
+        )
+        .map_err(|e| WatchError::CborDecode(e.to_string()))?;
+        Self::from_loaded_node(&node)
+    }
+
     fn snapshot(&self) -> Result<PersistedEngine, WatchError> {
         let mut subs: Vec<PersistedSub> = Vec::with_capacity(self.subscriptions.len());
         for sub in self.subscriptions.values() {
@@ -529,25 +616,42 @@ fn walk_with_ontology(query: &Query, ontology: &OntologyState, out: &mut BTreeSe
 // CBOR persistence shapes.
 // -------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedEngine {
-    next_id: SubscriptionId,
-    subscriptions: Vec<PersistedSub>,
+/// Serialised snapshot of the engine. Public because it appears in the
+/// R1b-9 [`SubscriptionEngine::to_loaded_node`] /
+/// [`SubscriptionEngine::from_loaded_node`] signatures; callers normally
+/// only use those indirectly via `flush_to_region` / `load_from_region`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedEngine {
+    /// Next subscription id to allocate.
+    pub next_id: SubscriptionId,
+    /// Subscriptions sorted by id.
+    pub subscriptions: Vec<PersistedSub>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PersistedSub {
-    id: SubscriptionId,
-    name: String,
-    query: Query,
-    interest: ChangeInterest,
-    cursor: u64,
-    state: SubscriptionState,
-    retention: Retention,
-    debounce_ms: Option<u32>,
+/// Serialised single subscription. Mirrors [`Subscription`] modulo the
+/// roaring-bitmap proxy (`cached_result` carries the
+/// `RoaringBitmap::serialize_into` byte image).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSub {
+    /// Subscription id.
+    pub id: SubscriptionId,
+    /// Human-readable name.
+    pub name: String,
+    /// Query AST.
+    pub query: Query,
+    /// Subscribed change kinds.
+    pub interest: ChangeInterest,
+    /// Last delivered LSN.
+    pub cursor: u64,
+    /// Subscription state.
+    pub state: SubscriptionState,
+    /// Retention policy.
+    pub retention: Retention,
+    /// Debounce window in milliseconds (`None` = no debounce).
+    pub debounce_ms: Option<u32>,
     /// Raw roaring-bitmap bytes (its built-in serializer handles run-length
     /// containers etc. — using CBOR's array-of-u32 would balloon the size).
-    cached_result: Vec<u8>,
+    pub cached_result: Vec<u8>,
 }
 
 impl PersistedEngine {
@@ -943,5 +1047,112 @@ mod tests {
         // Subscription is now indexed against both `car` and `vehicle`.
         assert!(e.tag_to_subs.get(&vehicle).unwrap().contains(&id));
         assert!(e.tag_to_subs.get(&car).unwrap().contains(&id));
+    }
+
+    // ----- B+ tree region round-trip (R1b-9) -----
+
+    use mimisbrunnr_storage::FileBlockDevice;
+    use tempfile::TempDir;
+
+    fn fresh_device() -> (TempDir, FileBlockDevice) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("subscriptions.bin");
+        let dev = FileBlockDevice::open(&path, 1 << 20).unwrap();
+        (dir, dev)
+    }
+
+    #[test]
+    fn watch_region_round_trip_empty_returns_default() {
+        let (_dir, dev) = fresh_device();
+        let e = SubscriptionEngine::load_from_region(&dev, 0).unwrap();
+        assert!(e.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn watch_region_round_trip_preserves_subscriptions() {
+        let (_dir, dev) = fresh_device();
+        let mut e = fresh();
+        let mut bm1 = RoaringBitmap::new();
+        bm1.insert(10);
+        bm1.insert(11);
+        let id1 = e.register(
+            "alpha".into(),
+            Query::And(vec![Query::HasTag(t(1)), Query::HasTag(t(2))]),
+            ChangeInterest::ALL,
+            Retention::Bounded { max_events: 8 },
+            bm1,
+            42,
+        );
+        let id2 = e.register(
+            "beta".into(),
+            Query::HasTag(t(3)),
+            ChangeInterest::TAG_ADDED,
+            Retention::AtMostOnce,
+            RoaringBitmap::new(),
+            7,
+        );
+        let next_before = e.next_id;
+
+        e.flush_to_region(&dev, 0).unwrap();
+        let back = SubscriptionEngine::load_from_region(&dev, 0).unwrap();
+
+        assert_eq!(back.subscriptions.len(), 2);
+        assert_eq!(back.next_id, next_before);
+        let s1 = &back.subscriptions[&id1];
+        assert_eq!(s1.cursor, 42);
+        assert_eq!(s1.cached_result.len(), 2);
+        let s2 = &back.subscriptions[&id2];
+        assert_eq!(s2.cursor, 7);
+        // Inverted tag index reconstructed.
+        assert!(back.tag_to_subs.get(&t(1)).unwrap().contains(&id1));
+        assert!(back.tag_to_subs.get(&t(3)).unwrap().contains(&id2));
+    }
+
+    #[test]
+    fn watch_region_round_trip_single_subscription() {
+        let (_dir, dev) = fresh_device();
+        let mut e = fresh();
+        let id = e.register(
+            "solo".into(),
+            Query::HasTag(t(99)),
+            ChangeInterest::ALL,
+            Retention::default(),
+            RoaringBitmap::new(),
+            0,
+        );
+        e.flush_to_region(&dev, 0).unwrap();
+        let back = SubscriptionEngine::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.subscriptions.len(), 1);
+        assert!(back.subscriptions.contains_key(&id));
+    }
+
+    #[test]
+    fn watch_region_overwrite_replaces_state() {
+        let (_dir, dev) = fresh_device();
+        let mut first = fresh();
+        first.register(
+            "old".into(),
+            Query::HasTag(t(1)),
+            ChangeInterest::ALL,
+            Retention::default(),
+            RoaringBitmap::new(),
+            0,
+        );
+        first.flush_to_region(&dev, 0).unwrap();
+
+        let mut second = fresh();
+        let id = second.register(
+            "fresh".into(),
+            Query::HasTag(t(99)),
+            ChangeInterest::ALL,
+            Retention::default(),
+            RoaringBitmap::new(),
+            0,
+        );
+        second.flush_to_region(&dev, 0).unwrap();
+
+        let back = SubscriptionEngine::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.subscriptions.len(), 1);
+        assert_eq!(back.subscriptions[&id].name, "fresh");
     }
 }

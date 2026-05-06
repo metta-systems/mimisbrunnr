@@ -293,6 +293,24 @@ The keystone. Implement IMPL §1.5 fully:
 - **R1b** (downstream): swap every Phase 3+ index `HashMap`/`BTreeMap`
   placeholder for the new B+ tree. One commit per index.
 
+**R1b-1 status (landed):** ChunkIndex and KvIndex now persist into
+dedicated 256 KiB §1.5 B+ tree regions inside the index zone (slot
+offsets `0` and `256 KiB` respectively); the legacy CBOR blob — still
+carrying the un-migrated indices — has shifted to slot offset `512 KiB`.
+**This is a one-way on-disk migration**: pools created by pre-R1b
+revisions (whose CBOR blob lives at zone offset 0) will fail to load
+under R1b+. There is no compatibility shim; recreate the pool.
+
+R1b-1 also surfaces a §1.5.6 packed-key-codec gap: when the sorted-run
+descriptor records a non-zero `common_value_prefix`, the on-disk run
+elides the leading bytes from every value but only persists the prefix
+*length* (not the bytes themselves). The reader has no source of truth
+for the elided bytes; with a single entry per run, every value byte ends
+up elided. ChunkIndex therefore takes the CBOR run codec for now —
+type scaffolding (`ChunkIndexKey`, `ChunkIndexValue`, the `PackableKey`
+impl) is in place to switch over once R1c lands either a pin-`prefix=0`
+storage knob or a per-run "first value bytes" sidecar.
+
 **Why second:** every "persistence" deferral below this line traces back here.
 
 **Effort:** XL — likely the largest single code drop in the project. The

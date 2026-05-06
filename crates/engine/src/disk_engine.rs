@@ -6,26 +6,57 @@
 //! - the primary disk's [`Superblock`] (atomic root commit at checkpoint),
 //! - a [`PoolManager`] (multi-disk lifecycle).
 //!
-//! ## Index persistence layout (post-R1b-1)
+//! ## Index persistence layout (post-R1b-3)
 //!
-//! Within the index zone, R1b-1 carves out two dedicated 256 KiB §1.5 B+
-//! tree regions for the migrated indices, with the remaining indices still
-//! living in a length-prefixed CBOR blob:
+//! Within the index zone, R1b carves out **ten** dedicated 256 KiB §1.5
+//! B+ tree regions for the migrated indices and tables, with the
+//! remaining state (oplog, path contexts, scalar bookkeeping) still
+//! living in a length-prefixed CBOR blob at the tail of the zone:
 //!
 //! ```text
-//! [zone.offset + 0]                 ChunkIndex region    (256 KiB)
-//! [zone.offset + 256 KiB]           KvIndex region       (256 KiB)
-//! [zone.offset + 512 KiB]           Legacy CBOR blob     (MIXI magic + u32 len + CBOR)
+//! [zone.offset + 0]                  ChunkIndex region        (256 KiB)   ← R1b-1
+//! [zone.offset + 256 KiB]            KvIndex region           (256 KiB)   ← R1b-1
+//! [zone.offset + 512 KiB]            ForwardIndex region      (256 KiB)   ← R1b-2
+//! [zone.offset + 768 KiB]            TagIndex region          (256 KiB)   ← R1b-2
+//! [zone.offset + 1024 KiB]           RangeIndex region        (256 KiB)   ← R1b-2
+//! [zone.offset + 1280 KiB]           ObjectTable region       (256 KiB)   ← R1b-3
+//! [zone.offset + 1536 KiB]           LocationTable region     (256 KiB)   ← R1b-3
+//! [zone.offset + 1792 KiB]           Ontology region          (256 KiB)   ← R1b-3*
+//! [zone.offset + 2048 KiB]           Subscriptions region     (256 KiB)   ← R1b-3*
+//! [zone.offset + 2304 KiB]           BackpointerTable region  (256 KiB)   ← R1b-3
+//! [zone.offset + 2560 KiB]           Legacy CBOR blob         (MIXI magic + u32 len + CBOR)
 //! ```
 //!
-//! Backwards compatibility with pre-R1b pools is **not** supported: the
-//! legacy blob has moved 512 KiB into the zone, so older pools whose CBOR
-//! blob sits at zone offset 0 will fail to load. This is a one-way
-//! migration; recreating the pool is the only path forward.
-//! TODO(rewrite-phase-R1b-2..N): migrate the remaining indices (forward,
-//! tag, range, ontology, subscriptions, path contexts, oplog, object
-//! table, location table) to per-index B+ tree regions and drop the CBOR
-//! blob entirely.
+//! \* Ontology and Subscriptions regions landed alongside R1b-3 since
+//! their `flush_to_region` / `load_from_region` APIs were already in
+//! place; they're documented here so the layout stays self-describing.
+//!
+//! Total dedicated region prefix after R1b-3: 2.5 MiB. With the
+//! default 3%-of-disk index zone, a 1 GiB pool (≈ 30 MiB index zone)
+//! leaves ~27.5 MiB for the legacy blob. The 4 MiB minimum index
+//! zone (`FMT_INDEX_ZONE_SIZE` in `mimisbrunnr-pool::tier`) leaves
+//! ~1.5 MiB for the legacy blob — still ample for the four scalars
+//! plus the path-contexts CBOR + transient blob `HashMap`.
+//!
+//! The legacy blob now carries only:
+//!
+//! - `oplog` (not yet migrated; tracked under R1b-N for a later phase),
+//! - `path_contexts` (per IMPL §10.3, no native region — derived from
+//!   forward-index `Attr(unix-path, ...)` at engine boot, see
+//!   `mimisbrunnr-unix::PathContextManager` docs),
+//! - scalar bookkeeping (`next_oid_local`, `next_tag_id`,
+//!   `last_applied_lsn`),
+//! - the transient `blobs: HashMap<u64, Vec<u8>>` (replaced by the real
+//!   blob zone once R4 lands).
+//!
+//! Backwards compatibility with pre-R1b-13 pools is **not** supported:
+//! every region offset and the legacy-blob offset have shifted. This is
+//! a one-way migration; recreating the pool is the only path forward.
+//!
+//! TODO(rewrite-phase-R1b-N): migrate `oplog` to its own region (or fold
+//! its content into a new `BtreeKind` slot once one is allocated). After
+//! that the legacy blob can be retired entirely modulo the few scalars,
+//! which can move to the superblock.
 
 use std::{
     collections::HashMap,
@@ -36,20 +67,36 @@ use std::{
 use ciborium::{de::from_reader, ser::into_writer};
 use log::trace;
 use mimisbrunnr_index::{ChunkIndex, ForwardIndex, KvIndex, RangeIndex, TagIndex};
-use mimisbrunnr_meta::{LocationTable, ObjectTable};
+use mimisbrunnr_meta::{BackpointerTable, LocationTable, ObjectTable};
 
-/// Per-index slot offsets within the index zone. R1b-1 places two
-/// 256 KiB §1.5 B+ tree regions at the start of the zone (one per
-/// migrated index) and pushes the legacy CBOR blob to immediately after
-/// them.
-const CHUNK_INDEX_REGION_OFFSET: u64 = 0;
+/// Per-index slot offsets within the index zone. R1b-3 wires ten
+/// dedicated 256 KiB §1.5 B+ tree regions, pushing the legacy CBOR blob
+/// to offset 2.5 MiB.
+pub(crate) const CHUNK_INDEX_REGION_OFFSET: u64 = 0;
 /// See [`CHUNK_INDEX_REGION_OFFSET`].
-const KV_INDEX_REGION_OFFSET: u64 = 256 * 1024;
+pub(crate) const KV_INDEX_REGION_OFFSET: u64 = 256 * 1024;
 /// See [`CHUNK_INDEX_REGION_OFFSET`].
-const LEGACY_CBOR_BLOB_OFFSET: u64 = 512 * 1024;
+pub(crate) const FORWARD_INDEX_REGION_OFFSET: u64 = 512 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`].
+pub(crate) const TAG_INDEX_REGION_OFFSET: u64 = 768 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`].
+pub(crate) const RANGE_INDEX_REGION_OFFSET: u64 = 1024 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added by R1b-3.
+pub(crate) const OBJECT_TABLE_REGION_OFFSET: u64 = 1280 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added by R1b-3.
+pub(crate) const LOCATION_TABLE_REGION_OFFSET: u64 = 1536 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added alongside R1b-3.
+pub(crate) const ONTOLOGY_REGION_OFFSET: u64 = 1792 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added alongside R1b-3.
+pub(crate) const SUBSCRIPTIONS_REGION_OFFSET: u64 = 2048 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added by R1b-3.
+pub(crate) const BACKPOINTER_TABLE_REGION_OFFSET: u64 = 2304 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`]. Shifted from 2.25 MiB to 2.5 MiB
+/// by R1b-3.
+pub(crate) const LEGACY_CBOR_BLOB_OFFSET: u64 = 2560 * 1024;
 /// 256 KiB region size — matches `Superblock.btree_node_size_log2 = 18`.
 #[allow(dead_code)] // referenced in size assertions / future dynamic layout work.
-const REGION_SIZE: u64 = 256 * 1024;
+pub(crate) const REGION_SIZE: u64 = 256 * 1024;
 use mimisbrunnr_ontology::{InstallResult, OntologyModule, OntologyState};
 use mimisbrunnr_pool::{DiskConfigEntry, PoolConfig, PoolManager, PoolStatus};
 use mimisbrunnr_storage::{BlockDevice, FileBlockDevice, Superblock};
@@ -109,38 +156,22 @@ pub struct DiskEngine {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexBlob {
-    forward_index_bytes: Vec<u8>,
-    tag_index_bytes: Vec<u8>,
-    range_index_bytes: Vec<u8>,
-    ontology_bytes: Vec<u8>,
-    subscriptions_bytes: Vec<u8>,
+    // R1b-13: forward / tag / range / chunk / kv indices, the
+    // object_table / location_table tables, and the ontology /
+    // subscriptions modules have all migrated to dedicated 256 KiB §1.5
+    // B+ tree regions; their bytes are no longer carried here.
     path_contexts_bytes: Vec<u8>,
     oplog_bytes: Vec<u8>,
-    /// Object table — serialised as a flat list of every record, since
-    /// `ObjectTable` itself doesn't derive Serialize.
-    objects: Vec<ObjectRecordCbor>,
-    /// Location table.
-    locations: Vec<LocationCbor>,
     next_oid_local: u64,
     next_tag_id: u32,
     last_applied_lsn: u64,
     blobs: HashMap<u64, Vec<u8>>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ObjectRecordCbor {
-    oid: u64,
-    /// Raw 128-byte ObjectRecord image.
-    bytes: Vec<u8>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct LocationCbor {
-    oid: u64,
-    /// Variable-length serialised ObjectLocation. `ObjectLocation::serialise`
-    /// gives bytes; we reuse the same parser on read.
-    bytes: Vec<u8>,
-}
+// R1b-13: removed `ObjectRecordCbor` and `LocationCbor` helpers — the
+// object_table and location_table now persist in their dedicated B+
+// tree regions, so the legacy blob no longer carries per-object /
+// per-location bytes.
 
 impl DiskEngine {
     // -------------------------------------------------------------------
@@ -218,18 +249,9 @@ impl DiskEngine {
 
         let zone_offset = { superblock.index_zone.offset };
 
-        // 1a. Migrated indices: ChunkIndex / KvIndex live in dedicated
-        // 256 KiB §1.5 B+ tree regions at fixed slot offsets.
-        engine.chunk_index = ChunkIndex::load_from_region(
-            primary_dev.as_ref(),
-            zone_offset + CHUNK_INDEX_REGION_OFFSET,
-        )
-        .map_err(EngineError::from)?;
-        engine.kv_index = KvIndex::load_from_region(
-            primary_dev.as_ref(),
-            zone_offset + KV_INDEX_REGION_OFFSET,
-        )
-        .map_err(EngineError::from)?;
+        // 1a. Migrated indices and tables: dedicated 256 KiB §1.5 B+
+        // tree regions at fixed slot offsets.
+        load_all_regions(&mut engine, primary_dev.as_ref(), zone_offset)?;
 
         // 1b. Restore everything else from the legacy CBOR blob (if any).
         let index_blob = read_index_blob(primary_dev.as_ref(), &superblock)?;
@@ -306,17 +328,9 @@ impl DiskEngine {
 
         let zone_offset = { superblock.index_zone.offset };
 
-        // Migrated indices live in dedicated regions at fixed slot offsets.
-        engine.chunk_index = ChunkIndex::load_from_region(
-            primary_dev.as_ref(),
-            zone_offset + CHUNK_INDEX_REGION_OFFSET,
-        )
-        .map_err(EngineError::from)?;
-        engine.kv_index = KvIndex::load_from_region(
-            primary_dev.as_ref(),
-            zone_offset + KV_INDEX_REGION_OFFSET,
-        )
-        .map_err(EngineError::from)?;
+        // Migrated indices and tables live in dedicated regions at
+        // fixed slot offsets.
+        load_all_regions(&mut engine, primary_dev.as_ref(), zone_offset)?;
 
         // Restore everything else from the legacy CBOR blob (if any).
         let index_blob = read_index_blob(primary_dev.as_ref(), &superblock)?;
@@ -355,7 +369,8 @@ impl DiskEngine {
 
     /// Save the engine's index state to the index zone:
     ///
-    /// 1. Flush the migrated indices ([`ChunkIndex`], [`KvIndex`]) to their
+    /// 1. Flush the migrated indices ([`ChunkIndex`], [`KvIndex`],
+    ///    [`ForwardIndex`], [`TagIndex`], [`RangeIndex`]) to their
     ///    dedicated 256 KiB §1.5 B+ tree regions at fixed slot offsets.
     /// 2. Write the remaining indices as a length-prefixed CBOR blob at
     ///    [`LEGACY_CBOR_BLOB_OFFSET`] within the zone.
@@ -370,7 +385,7 @@ impl DiskEngine {
         // Sanity-check zone is large enough for the new layout.
         if zone_length < LEGACY_CBOR_BLOB_OFFSET {
             return Err(EngineError::NotImplemented(
-                "index zone too small for R1b-1 layout (needs ≥ 512 KiB before the legacy blob)",
+                "index zone too small for R1b-3 layout (needs ≥ 2.5 MiB before the legacy blob)",
             ));
         }
 
@@ -382,6 +397,62 @@ impl DiskEngine {
         self.engine
             .kv_index
             .flush_to_region(self.primary_device.as_ref(), zone_offset + KV_INDEX_REGION_OFFSET)
+            .map_err(EngineError::from)?;
+        self.engine
+            .forward_index
+            .flush_to_region(
+                self.primary_device.as_ref(),
+                zone_offset + FORWARD_INDEX_REGION_OFFSET,
+            )
+            .map_err(EngineError::from)?;
+        self.engine
+            .tag_index
+            .flush_to_region(
+                self.primary_device.as_ref(),
+                zone_offset + TAG_INDEX_REGION_OFFSET,
+            )
+            .map_err(EngineError::from)?;
+        self.engine
+            .range_index
+            .flush_to_region(
+                self.primary_device.as_ref(),
+                zone_offset + RANGE_INDEX_REGION_OFFSET,
+            )
+            .map_err(EngineError::from)?;
+        self.engine
+            .object_table
+            .flush_to_region(
+                self.primary_device.as_ref(),
+                zone_offset + OBJECT_TABLE_REGION_OFFSET,
+            )
+            .map_err(EngineError::from)?;
+        self.engine
+            .location_table
+            .flush_to_region(
+                self.primary_device.as_ref(),
+                zone_offset + LOCATION_TABLE_REGION_OFFSET,
+            )
+            .map_err(EngineError::from)?;
+        self.engine
+            .ontology
+            .flush_to_region(
+                self.primary_device.as_ref(),
+                zone_offset + ONTOLOGY_REGION_OFFSET,
+            )
+            .map_err(EngineError::from)?;
+        self.engine
+            .subscriptions
+            .flush_to_region(
+                self.primary_device.as_ref(),
+                zone_offset + SUBSCRIPTIONS_REGION_OFFSET,
+            )
+            .map_err(EngineError::from)?;
+        self.engine
+            .backpointer_table
+            .flush_to_region(
+                self.primary_device.as_ref(),
+                zone_offset + BACKPOINTER_TABLE_REGION_OFFSET,
+            )
             .map_err(EngineError::from)?;
 
         // 2. Build + write the legacy CBOR blob (everything else).
@@ -412,19 +483,13 @@ impl DiskEngine {
     pub fn load_index_state(&mut self) -> Result<(), EngineError> {
         let zone_offset = { self.superblock.index_zone.offset };
 
-        // Migrated indices first.
-        self.engine.chunk_index = ChunkIndex::load_from_region(
-            self.primary_device.as_ref(),
-            zone_offset + CHUNK_INDEX_REGION_OFFSET,
-        )
-        .map_err(EngineError::from)?;
-        self.engine.kv_index = KvIndex::load_from_region(
-            self.primary_device.as_ref(),
-            zone_offset + KV_INDEX_REGION_OFFSET,
-        )
-        .map_err(EngineError::from)?;
+        // Migrated indices and tables first.
+        load_all_regions(&mut self.engine, self.primary_device.as_ref(), zone_offset)?;
 
-        // Legacy CBOR blob.
+        // Legacy CBOR blob (oplog + path_contexts + scalars + transient
+        // blob map). Object/location/ontology/subscriptions/backpointer
+        // fields already loaded from their dedicated regions; the
+        // legacy-blob applier no longer touches them.
         if let Some(blob) =
             read_index_blob(self.primary_device.as_ref(), &self.superblock)?
         {
@@ -763,38 +828,53 @@ impl DiskEngine {
 // Index-zone CBOR helpers (free functions to avoid borrow conflicts).
 // ----------------------------------------------------------------------
 
+/// Load every R1b-migrated index / table from its dedicated 256 KiB
+/// §1.5 B+ tree region. Used by [`DiskEngine::open`],
+/// [`DiskEngine::open_read_only`] and [`DiskEngine::load_index_state`].
+fn load_all_regions<D: BlockDevice>(
+    engine: &mut Engine,
+    device: &D,
+    zone_offset: u64,
+) -> Result<(), EngineError> {
+    engine.chunk_index =
+        ChunkIndex::load_from_region(device, zone_offset + CHUNK_INDEX_REGION_OFFSET)?;
+    engine.kv_index =
+        KvIndex::load_from_region(device, zone_offset + KV_INDEX_REGION_OFFSET)?;
+    engine.forward_index =
+        ForwardIndex::load_from_region(device, zone_offset + FORWARD_INDEX_REGION_OFFSET)?;
+    engine.tag_index =
+        TagIndex::load_from_region(device, zone_offset + TAG_INDEX_REGION_OFFSET)?;
+    engine.range_index =
+        RangeIndex::load_from_region(device, zone_offset + RANGE_INDEX_REGION_OFFSET)?;
+    engine.object_table =
+        ObjectTable::load_from_region(device, zone_offset + OBJECT_TABLE_REGION_OFFSET)?;
+    engine.location_table = LocationTable::load_from_region(
+        device,
+        zone_offset + LOCATION_TABLE_REGION_OFFSET,
+    )?;
+    engine.ontology =
+        OntologyState::load_from_region(device, zone_offset + ONTOLOGY_REGION_OFFSET)?;
+    engine.subscriptions = SubscriptionEngine::load_from_region(
+        device,
+        zone_offset + SUBSCRIPTIONS_REGION_OFFSET,
+    )?;
+    engine.backpointer_table = BackpointerTable::load_from_region(
+        device,
+        zone_offset + BACKPOINTER_TABLE_REGION_OFFSET,
+    )?;
+    Ok(())
+}
+
 fn build_index_blob(
     engine: &Engine,
     blobs: &HashMap<u64, Vec<u8>>,
 ) -> Result<IndexBlob, EngineError> {
-    let mut objects = Vec::with_capacity(engine.object_table.len());
-    for (oid, rec) in engine.object_table.iter() {
-        objects.push(ObjectRecordCbor {
-            oid: *oid,
-            bytes: rec.to_bytes().to_vec(),
-        });
-    }
-    let mut locations = Vec::with_capacity(engine.location_table.len());
-    for (oid, loc) in engine.location_table.iter() {
-        // ObjectLocation has its own framing; serialise via its own helper.
-        locations.push(LocationCbor {
-            oid: *oid,
-            bytes: loc.serialize(),
-        });
-    }
-    // Forward index now uses direct ciborium derive (no crate-local helper).
-    let mut forward_index_bytes = Vec::new();
-    into_writer(&engine.forward_index, &mut forward_index_bytes)?;
+    // R1b-13: object_table, location_table, ontology, subscriptions, and
+    // every R1b-1..R1b-4 index have moved to dedicated 256 KiB §1.5 B+
+    // tree regions; they are no longer carried in the legacy blob.
     Ok(IndexBlob {
-        forward_index_bytes,
-        tag_index_bytes: engine.tag_index.serialise()?,
-        range_index_bytes: engine.range_index.serialise()?,
-        ontology_bytes: engine.ontology.serialise()?,
-        subscriptions_bytes: engine.subscriptions.serialise()?,
         path_contexts_bytes: engine.path_contexts.serialise()?,
         oplog_bytes: engine.oplog.serialise()?,
-        objects,
-        locations,
         next_oid_local: engine.next_oid_local(),
         next_tag_id: index_blob_next_tag_id(engine),
         last_applied_lsn: engine.last_applied_lsn,
@@ -851,47 +931,18 @@ fn read_index_blob(
 }
 
 fn apply_index_blob(engine: &mut Engine, blob: IndexBlob) {
-    // Forward index uses direct ciborium derive (no helper).
-    if let Ok(fwd) = from_reader::<ForwardIndex, _>(blob.forward_index_bytes.as_slice()) {
-        engine.forward_index = fwd;
-    }
-    if let Ok(t) = TagIndex::deserialise(&blob.tag_index_bytes) {
-        engine.tag_index = t;
-    }
-    if let Ok(r) = RangeIndex::deserialise(&blob.range_index_bytes) {
-        engine.range_index = r;
-    }
-    if let Ok(ont) = OntologyState::deserialise(&blob.ontology_bytes) {
-        engine.ontology = ont;
-    }
-    if let Ok(s) = SubscriptionEngine::deserialise(&blob.subscriptions_bytes) {
-        engine.subscriptions = s;
-    }
+    // R1b-13: forward / tag / range / chunk / kv indices, plus
+    // object_table / location_table / ontology / subscriptions, all live
+    // in dedicated B+ tree regions; the engine fields are populated by
+    // the per-region loaders in `load_index_state` before this function
+    // runs. The legacy blob carries only path_contexts, oplog, and a
+    // few scalars.
     if let Ok(p) = PathContextManager::deserialise(&blob.path_contexts_bytes) {
         engine.path_contexts = p;
     }
     if let Ok(ol) = OpLog::deserialise(&blob.oplog_bytes) {
         engine.oplog = ol;
     }
-    // Object table.
-    let mut object_table = ObjectTable::new();
-    for o in blob.objects {
-        if o.bytes.len() == mimisbrunnr_meta::OBJECT_RECORD_SIZE {
-            let mut buf = [0u8; mimisbrunnr_meta::OBJECT_RECORD_SIZE];
-            buf.copy_from_slice(&o.bytes);
-            let rec = *mimisbrunnr_meta::ObjectRecord::ref_from_bytes(&buf);
-            object_table.insert(rec);
-        }
-    }
-    engine.object_table = object_table;
-    // Location table.
-    let mut location_table = LocationTable::new();
-    for l in blob.locations {
-        if let Ok((loc, _)) = mimisbrunnr_meta::ObjectLocation::parse(&l.bytes) {
-            location_table.insert(l.oid, loc);
-        }
-    }
-    engine.location_table = location_table;
     // Counters.
     {
         let mut next_local = blob.next_oid_local;
@@ -909,9 +960,9 @@ fn apply_index_blob(engine: &mut Engine, blob: IndexBlob) {
         }
     }
     engine.last_applied_lsn = engine.last_applied_lsn.max(blob.last_applied_lsn);
-    // next_tag_id: rolled forward via `register_tag` callers; persisted via
-    // ontology so we don't need to do anything else here. The blob's
-    // `next_tag_id` field exists for future use.
+    // next_tag_id: rolled forward via `register_tag` callers; persisted
+    // via the ontology region so we don't need to do anything else
+    // here. The blob's `next_tag_id` field exists for future use.
     let _ = blob.next_tag_id;
 }
 

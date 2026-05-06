@@ -6,11 +6,16 @@
 //! variants will be added in a later rewrite phase along with the live radix
 //! tree / B+ tree integration.
 
-use thiserror::Error;
+use {mimisbrunnr_storage::StorageError, thiserror::Error};
 
 /// Errors produced by `mimisbrunnr-meta`.
 #[derive(Debug, Error)]
 pub enum MetaError {
+    /// Underlying storage-layer failure (B+ tree region read/write, bucket
+    /// allocator, raw block device).
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
+
     /// An on-disk `u8` field carried a discriminant that does not map to a
     /// known [`mimisbrunnr_types::ObjectState`] variant.
     #[error("invalid ObjectState discriminant: {0}")]

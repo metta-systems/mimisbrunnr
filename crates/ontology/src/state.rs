@@ -1,15 +1,25 @@
 //! [`OntologyState`] — the live registry plus install / upgrade / scrub /
 //! policy-resolution machinery (DESIGN §3.5, §4.4–§4.6).
 //!
-//! The on-disk shape (B+ tree of `BtreeKind::Ontology` keyed by
-//! `(snapshot, tag_id)` per IMPL §10.1) is implemented in a later phase. This
-//! module provides a CBOR-blob placeholder and is marked accordingly.
+//! ## Persistence (R1b-8)
 //!
-// TODO(rewrite-phase-N): replace the CBOR-blob persistence with the
-// `BtreeKind::Ontology` B+ tree per IMPL §10.1.
+//! On disk the ontology occupies one 256 KiB §1.5 B+ tree region of
+//! [`BtreeKind::Ontology`]. The whole [`PersistedState`] (tags, DAG,
+//! module records) is materialised into a single CBOR-encoded sorted-run
+//! entry keyed by `u32 snapshot` (always `0` today; R6 will populate
+//! older snapshots) via [`BtreeRegion::write_full`]; reload goes through
+//! [`BtreeRegion::read`].
+//!
+//! TODO(rewrite-phase-R1d): replace the single-entry blob with the IMPL
+//! §10.1 native multi-tree shape — `OntologyRoot` 4 KiB block holding
+//! four sub-trees (`modules_root`, `tags_root`, `tag_names`, `dag_root`),
+//! each a `BtreeKind::Ontology` §1.5 large node. R6 ships the snapshot
+//! axis the spec requires; until then the single-entry encoding is
+//! enough to put `RootPointer.ontology_root` on a real B+ tree region.
 
 use std::collections::{BTreeSet, HashMap};
 
+use mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun};
 use mimisbrunnr_types::{ModuleId, StoragePolicy, TagDefinition, TagId};
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +29,12 @@ use crate::{
     materializer::Materializer,
     module::{IdAllocator, InstallResult, OntologyModule},
 };
+
+/// 256 KiB region size in bytes (matches the spec's 18-bit
+/// `region_size_log2`). Engine code sizes the on-disk slot from this.
+#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+pub const ONTOLOGY_REGION_SIZE: u64 = 256 * 1024;
+const REGION_SIZE_LOG2: u8 = 18;
 
 /// Bookkeeping per installed module: lets us scrub later by knowing which
 /// tags / implications this module added.
@@ -431,6 +447,76 @@ impl OntologyState {
         snap.into_state()
     }
 
+    // ----------------------------------------------------------------
+    // R1b-8: §1.5 B+ tree persistence (single-entry CBOR run).
+    // ----------------------------------------------------------------
+
+    /// Build a [`LoadedNode`] containing a single sorted-run entry
+    /// `(snapshot=0, PersistedState)`. The node uses
+    /// [`BtreeKind::Ontology`] and the spec's 18-bit (256 KiB) region
+    /// size.
+    pub fn to_loaded_node(&self) -> LoadedNode<u32, PersistedState> {
+        let snap = self.snapshot();
+        let entries = vec![(0u32, snap)];
+
+        let mut node: LoadedNode<u32, PersistedState> =
+            LoadedNode::new(BtreeKind::Ontology, 0, REGION_SIZE_LOG2);
+        let run = SortedRun::from_sorted(0, 0, entries);
+        node.sorted_runs.push(run);
+        node.header.sorted_run_count = 1;
+        node
+    }
+
+    /// Restore the in-memory state from a [`LoadedNode`] read via
+    /// [`BtreeRegion::read`]. Picks the entry under `snapshot = 0`; an
+    /// empty node returns the default.
+    pub fn from_loaded_node(
+        node: &LoadedNode<u32, PersistedState>,
+    ) -> Result<Self, OntologyError> {
+        for (k, v) in node.merge_iter() {
+            if *k == 0 {
+                return v.clone().into_state();
+            }
+        }
+        Ok(Self::default())
+    }
+
+    /// Write the in-memory state as a fresh 256 KiB region at byte
+    /// `offset` on `device`.
+    pub fn flush_to_region<D: BlockDevice>(
+        &self,
+        device: &D,
+        offset: u64,
+    ) -> Result<(), OntologyError> {
+        let mut node = self.to_loaded_node();
+        BtreeRegion::write_full::<D, u32, PersistedState>(device, offset, &mut node)
+            .map_err(|e| OntologyError::Cbor(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Read the in-memory state from the 256 KiB region at byte
+    /// `offset` on `device`. An all-zero region returns
+    /// [`Self::default`].
+    pub fn load_from_region<D: BlockDevice>(
+        device: &D,
+        offset: u64,
+    ) -> Result<Self, OntologyError> {
+        let mut probe = [0u8; 8];
+        device
+            .read_at(offset, &mut probe)
+            .map_err(|e| OntologyError::Cbor(e.to_string()))?;
+        if probe.iter().all(|&b| b == 0) {
+            return Ok(Self::default());
+        }
+        let node = BtreeRegion::read::<D, u32, PersistedState>(
+            device,
+            offset,
+            BtreeKind::Ontology,
+        )
+        .map_err(|e| OntologyError::Cbor(e.to_string()))?;
+        Self::from_loaded_node(&node)
+    }
+
     fn snapshot(&self) -> PersistedState {
         let mut tags: Vec<TagDefinition> = self.tags.values().cloned().collect();
         tags.sort_by_key(|t| t.id);
@@ -444,11 +530,17 @@ impl OntologyState {
     }
 }
 
+/// Snapshot of the on-disk ontology state. Serialised as the value of
+/// each entry in the [`BtreeKind::Ontology`] B+ tree region (R1b-8) and
+/// as the body of the legacy [`OntologyState::serialise`] CBOR blob.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedState {
-    tags: Vec<TagDefinition>,
-    dag: DagSnapshot,
-    modules: Vec<ModuleRecord>,
+pub struct PersistedState {
+    /// Tag definitions, sorted by id for deterministic encoding.
+    pub tags: Vec<TagDefinition>,
+    /// Implication DAG.
+    pub dag: DagSnapshot,
+    /// Installed module bookkeeping records, sorted by id.
+    pub modules: Vec<ModuleRecord>,
 }
 
 impl PersistedState {
@@ -785,5 +877,90 @@ mod tests {
         let bin = back.names["binary"];
         let resolved = back.resolve_policy(&[bin], &StoragePolicy::default());
         assert_eq!(resolved.compression, Some(CompressionAlgo::Zstd(9)));
+    }
+
+    // ----- B+ tree region round-trip (R1b-8) -----
+
+    use mimisbrunnr_storage::FileBlockDevice;
+    use tempfile::TempDir;
+
+    fn fresh_device() -> (TempDir, FileBlockDevice) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ontology.bin");
+        let dev = FileBlockDevice::open(&path, 1 << 20).unwrap();
+        (dir, dev)
+    }
+
+    #[test]
+    fn ontology_region_round_trip_empty_returns_default() {
+        let (_dir, dev) = fresh_device();
+        let state = OntologyState::load_from_region(&dev, 0).unwrap();
+        assert!(state.tags.is_empty());
+        assert!(state.installed_modules.is_empty());
+        assert_eq!(state.dag.edge_count(), 0);
+    }
+
+    #[test]
+    fn ontology_region_round_trip_preserves_state() {
+        let (_dir, dev) = fresh_device();
+        let mut state = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        state
+            .install(
+                module(
+                    "core",
+                    vec![
+                        label_with_storage("file", compress_only(9)),
+                        label("binary"),
+                        label("vehicle"),
+                    ],
+                    &[("binary", "file")],
+                ),
+                &mut alloc,
+            )
+            .unwrap();
+        state
+            .install(
+                module("ext", vec![label("media"), label("audio")], &[]),
+                &mut alloc,
+            )
+            .unwrap();
+
+        state.flush_to_region(&dev, 0).unwrap();
+        let back = OntologyState::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.tags.len(), state.tags.len());
+        assert_eq!(back.dag.edge_count(), state.dag.edge_count());
+        assert_eq!(back.installed_modules.len(), state.installed_modules.len());
+        // Policy resolution is preserved (validates DAG round-trip).
+        let bin = back.names["binary"];
+        let resolved = back.resolve_policy(&[bin], &StoragePolicy::default());
+        assert_eq!(resolved.compression, Some(CompressionAlgo::Zstd(9)));
+        // Module bookkeeping is preserved.
+        assert!(back.installed_modules.contains_key("core"));
+        assert!(back.installed_modules.contains_key("ext"));
+    }
+
+    #[test]
+    fn ontology_region_overwrite_replaces_state() {
+        let (_dir, dev) = fresh_device();
+        let mut first = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        first
+            .install(module("a", vec![label("x"), label("y")], &[]), &mut alloc)
+            .unwrap();
+        first.flush_to_region(&dev, 0).unwrap();
+
+        let mut second = OntologyState::new();
+        let mut alloc2 = IdAllocator::new();
+        second
+            .install(module("b", vec![label("z")], &[]), &mut alloc2)
+            .unwrap();
+        second.flush_to_region(&dev, 0).unwrap();
+
+        let back = OntologyState::load_from_region(&dev, 0).unwrap();
+        assert!(back.installed_modules.contains_key("b"));
+        assert!(!back.installed_modules.contains_key("a"));
+        assert!(back.names.contains_key("z"));
+        assert!(!back.names.contains_key("x"));
     }
 }

@@ -19,6 +19,7 @@
 
 use {
     bytemuck::{Pod, Zeroable},
+    serde::{Deserialize, Serialize},
     static_assertions::const_assert_eq,
 };
 
@@ -213,6 +214,34 @@ impl ObjectLocation {
         let bucket_no = (block_no >> shift) as u32;
         let sector_offset = (block_no & ((1u64 << shift) - 1)) as u16;
         (bucket_no, sector_offset)
+    }
+}
+
+// ---------- Serialize / Deserialize via bytemuck ----------
+//
+// `ObjectLocation` is `#[repr(C, align(8))] Pod` with a spec-pinned 48-byte
+// layout (IMPL §6.1). Round-trip the byte image directly so the CBOR wire
+// form mirrors the on-disk POD layout exactly. Used by the R1b sorted-run
+// CBOR path; the native §6.1 leaf encoder lands later.
+
+impl Serialize for ObjectLocation {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_bytes(bytemuck::bytes_of(self))
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectLocation {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let bytes: Vec<u8> = crate::serde_pod_bytes::deserialize_bytes(de)?;
+        if bytes.len() != OBJECT_LOCATION_SIZE {
+            return Err(serde::de::Error::custom(format!(
+                "expected {OBJECT_LOCATION_SIZE} bytes for ObjectLocation, got {}",
+                bytes.len()
+            )));
+        }
+        let mut buf = [0u8; OBJECT_LOCATION_SIZE];
+        buf.copy_from_slice(&bytes);
+        Ok(*bytemuck::from_bytes::<Self>(&buf))
     }
 }
 

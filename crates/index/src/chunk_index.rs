@@ -700,34 +700,7 @@ mod tests {
         }
     }
 
-    // TODO(rewrite-phase-R1c) — potential spec change required.
-    //
-    // The packed codec at `mimisbrunnr-storage::btree::pack` (IMPL §1.5.6)
-    // auto-detects `common_value_prefix` by scanning bytes shared across
-    // every value in a sorted run, capped at `MAX_VALUE_PREFIX = 24`. With a
-    // single-entry run, every byte is trivially "shared", so the entire
-    // value (here 20 bytes) gets elided. On read, the prefix template is
-    // reconstructed zero-filled — the original non-zero bytes are lost.
-    //
-    // The chunk-index-side `peek_common_value_prefix_len` helper recovers
-    // the *length* but cannot recover the *bytes*; nothing on disk records
-    // them. This is a real lossiness in the spec-as-implemented for any
-    // index that flushes a 1-entry sorted run (or a multi-disk pool whose
-    // entries happen to share non-zero leading bytes — see crate-level
-    // docs).
-    //
-    // Possible fixes (defer to phase R1c):
-    //   - storage: add a `force_prefix_zero` opt to `write_full_packed` /
-    //     `encode_packed_run` so callers without a recovery template pin
-    //     the descriptor's `common_value_prefix` to 0.
-    //   - storage: extend `SortedRunKeyFormat` to inline the elided prefix
-    //     bytes (spec amendment).
-    //
-    // For now: `#[ignore]` the case so `cargo test` is green; the regression
-    // is preserved as a live test body so re-enabling it once the spec gap
-    // is resolved is a one-line change.
     #[test]
-    #[ignore = "TODO(rewrite-phase-R1c): packed codec drops single-entry value bytes; needs spec fix"]
     fn region_overwrite_replaces_state() {
         let (_dir, dev) = fresh_device();
         let mut first = ChunkIndex::new();

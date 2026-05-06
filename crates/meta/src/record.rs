@@ -7,6 +7,7 @@
 use {
     bytemuck::{Pod, Zeroable},
     mimisbrunnr_types::{CompressionState, EncryptionState, ObjectId, ObjectState},
+    serde::{Deserialize, Serialize},
     static_assertions::const_assert_eq,
 };
 
@@ -187,6 +188,35 @@ impl ObjectRecord {
     /// useful for iterating a leaf node's record array.
     pub fn slice_from_bytes(buf: &[u8]) -> &[Self] {
         bytemuck::cast_slice(buf)
+    }
+}
+
+// ---------- Serialize / Deserialize via bytemuck ----------
+//
+// `ObjectRecord` is `#[repr(C)] Pod` with a spec-pinned 128 B layout
+// (IMPL §5.1). The natural CBOR encoding round-trips the byte image
+// rather than per-field tags — that keeps the serde wire form minimal
+// and matches the on-disk POD layout exactly. Used by the R1b sorted-run
+// CBOR path; the native §5 positional radix tree (R1d) will bypass this.
+
+impl Serialize for ObjectRecord {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_bytes(self.as_bytes())
+    }
+}
+
+impl<'de> Deserialize<'de> for ObjectRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let bytes: Vec<u8> = crate::serde_pod_bytes::deserialize_bytes(de)?;
+        if bytes.len() != OBJECT_RECORD_SIZE {
+            return Err(serde::de::Error::custom(format!(
+                "expected {OBJECT_RECORD_SIZE} bytes for ObjectRecord, got {}",
+                bytes.len()
+            )));
+        }
+        let mut buf = [0u8; OBJECT_RECORD_SIZE];
+        buf.copy_from_slice(&bytes);
+        Ok(*Self::ref_from_bytes(&buf))
     }
 }
 

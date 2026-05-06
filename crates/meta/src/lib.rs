@@ -33,16 +33,24 @@ mod object_table;
 mod overflow;
 mod radix;
 mod record;
+pub(crate) mod serde_pod_bytes;
 
 pub use {
-    backpointer::{BackpointerKey, BackpointerTable, BackpointerValue, OwnerKind},
+    backpointer::{
+        BACKPOINTER_TABLE_REGION_SIZE, BackpointerKey, BackpointerTable, BackpointerValue,
+        OwnerKind,
+    },
     error::MetaError,
     location::{
         LOCATION_FLAG_CHUNKED, LOCATION_FLAG_REMOTE_ONLY, LOCATION_HEADER_SIZE,
         LocationHeader, MAX_INLINE_REPLICAS, OBJECT_LOCATION_SIZE, ObjectLocation, ReplicaRef,
     },
-    location_table::LocationTable,
-    object_table::ObjectTable,
+    location_table::{
+        LOCATION_TABLE_REGION_SIZE, LocationTable, LocationTableKey, LocationTableValue,
+    },
+    object_table::{
+        OBJECT_TABLE_REGION_SIZE, ObjectTable, ObjectTableKey, ObjectTableValue,
+    },
     overflow::{
         OVERFLOW_ATTR_FLAG_SPILL, OVERFLOW_HEADER_SIZE, OVERFLOW_RECORD_SIZE, OverflowHeader,
     },

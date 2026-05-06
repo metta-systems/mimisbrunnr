@@ -8,6 +8,7 @@ use {
     bytemuck::{Pod, Zeroable},
     mimisbrunnr_storage::BlockRef,
     mimisbrunnr_types::{DiskId, DiskState, MediaType, StorageTier},
+    serde::{Deserialize, Serialize},
     static_assertions::const_assert_eq,
 };
 
@@ -130,6 +131,55 @@ const_assert_eq!(
     core::mem::size_of::<DiskDescriptorOnDisk>(),
     DISK_DESCRIPTOR_ON_DISK_SIZE
 );
+
+// ---------- Serialize / Deserialize via bytemuck ----------
+//
+// `DiskDescriptorOnDisk` is `#[repr(C, packed)] Pod` with a spec-pinned
+// 256 B layout (IMPL §10.4). Round-trip the byte image rather than
+// per-field tags so the CBOR wire form mirrors the on-disk POD layout
+// exactly. Used by the R1b-11 `disks_overflow_root` sorted-run path.
+
+impl Serialize for DiskDescriptorOnDisk {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_bytes(bytemuck::bytes_of(self))
+    }
+}
+
+impl<'de> Deserialize<'de> for DiskDescriptorOnDisk {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        use serde::de::{Error, SeqAccess, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+                f.write_str("byte string")
+            }
+            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                Ok(v.to_vec())
+            }
+            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(v)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+        let bytes: Vec<u8> = de.deserialize_bytes(V)?;
+        if bytes.len() != DISK_DESCRIPTOR_ON_DISK_SIZE {
+            return Err(serde::de::Error::custom(format!(
+                "expected {DISK_DESCRIPTOR_ON_DISK_SIZE} bytes for DiskDescriptorOnDisk, got {}",
+                bytes.len()
+            )));
+        }
+        let mut buf = [0u8; DISK_DESCRIPTOR_ON_DISK_SIZE];
+        buf.copy_from_slice(&bytes);
+        Ok(*bytemuck::from_bytes::<Self>(&buf))
+    }
+}
 
 impl Default for DiskDescriptorOnDisk {
     fn default() -> Self {

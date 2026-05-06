@@ -231,14 +231,20 @@ impl ImplicationDag {
 // dump the node and edge lists as flat vectors and rebuild on load.
 // -------------------------------------------------------------------------
 
+/// Serialisable snapshot of the implication DAG. Public because it
+/// appears in the [`crate::PersistedState`] (R1b-8) signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct DagSnapshot {
+pub struct DagSnapshot {
+    /// Tag node ids, sorted ascending.
     pub tags: Vec<TagId>,
+    /// Directed implication edges `(from, to)`.
     pub edges: Vec<(TagId, TagId)>,
 }
 
 impl ImplicationDag {
-    pub(crate) fn snapshot(&self) -> DagSnapshot {
+    /// Build a serialisable snapshot. R1b-8 persists this inside
+    /// [`crate::PersistedState`].
+    pub fn snapshot(&self) -> DagSnapshot {
         let mut tags: Vec<TagId> = self.graph.node_weights().copied().collect();
         tags.sort();
         let mut edges: Vec<(TagId, TagId)> = self.edges().collect();
@@ -246,7 +252,9 @@ impl ImplicationDag {
         DagSnapshot { tags, edges }
     }
 
-    pub(crate) fn from_snapshot(snap: DagSnapshot) -> Result<Self, OntologyError> {
+    /// Rebuild the DAG from a [`DagSnapshot`]. Errors if the encoded
+    /// edges form a cycle (no longer satisfies the DAG invariant).
+    pub fn from_snapshot(snap: DagSnapshot) -> Result<Self, OntologyError> {
         let mut dag = ImplicationDag::new();
         for t in snap.tags {
             dag.add_tag(t);

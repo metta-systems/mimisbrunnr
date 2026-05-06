@@ -700,6 +700,124 @@ fn fresh_pool_open_before_first_commit_sees_empty_migrated_indices() {
     assert_eq!(de.engine.kv_index.entry_count(), 0);
 }
 
+// ----------------------------------------------------------------------
+// R1b-2: per-region index persistence (Forward / Tag / Range)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fresh_pool_open_before_first_commit_sees_empty_r1b2_indices() {
+    // All five migrated regions are zero-filled at format time, so an
+    // `open` against a freshly-created pool must succeed and see empty
+    // forward / tag / range states alongside the R1b-1 indices.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    {
+        let _de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+        // Drop without committing.
+    }
+    let de = DiskEngine::open(&cfg_path).unwrap();
+    assert_eq!(de.engine.forward_index.object_count(), 0);
+    assert_eq!(de.engine.tag_index.tag_count(), 0);
+    assert_eq!(de.engine.range_index.entry_count(), 0);
+}
+
+#[test]
+fn r1b2_forward_tag_range_persist_across_commit_drop_open() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+
+    // Tag mutations exercise tag_index + forward_index; set_attr exercises
+    // kv_index + range_index + forward_index.
+    let watched = de.engine.register_tag("watched");
+    let year = de.engine.register_tag("year");
+    let oid1 = de.create_object().unwrap();
+    let oid2 = de.create_object().unwrap();
+    de.add_tag(oid1, watched).unwrap();
+    de.add_tag(oid2, watched).unwrap();
+    de.set_attr(oid1, year, Value::Int(2024)).unwrap();
+    de.set_attr(oid2, year, Value::Int(2025)).unwrap();
+
+    let pre_forward = de.engine.forward_index.object_count();
+    let pre_tags = de.engine.tag_index.tag_count();
+    let pre_range = de.engine.range_index.entry_count();
+    de.commit().unwrap();
+    drop(de);
+
+    let de2 = DiskEngine::open(&cfg_path).unwrap();
+    // Forward index round-trip.
+    assert_eq!(de2.engine.forward_index.object_count(), pre_forward);
+    assert_eq!(de2.engine.forward_index.assertions_of(oid1).len(), 2);
+    assert_eq!(de2.engine.forward_index.assertions_of(oid2).len(), 2);
+
+    // Tag index round-trip.
+    assert_eq!(de2.engine.tag_index.tag_count(), pre_tags);
+    let watched2 = de2.engine.resolve_tag_name("watched").unwrap();
+    assert!(de2.engine.tag_index.contains(watched2, oid1));
+    assert!(de2.engine.tag_index.contains(watched2, oid2));
+
+    // Range index round-trip — equality + half-open scan.
+    assert_eq!(de2.engine.range_index.entry_count(), pre_range);
+    let year2 = de2.engine.resolve_tag_name("year").unwrap();
+    let scan = de2
+        .engine
+        .range_index
+        .range_scan(year2, &Value::Int(2024), &Value::Int(2026));
+    assert_eq!(scan.len(), 2);
+}
+
+#[test]
+fn all_five_migrated_indices_round_trip_together() {
+    // ChunkIndex + KvIndex + ForwardIndex + TagIndex + RangeIndex —
+    // commit, drop, re-open; every one of them must survive.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+
+    // ChunkIndex (private mutation surface).
+    let blob_ref = mimisbrunnr_storage::BlobRef {
+        disk_id: 0,
+        _pad: 0,
+        block_no: 4242,
+        length: 4096,
+    };
+    de.engine.chunk_index.insert_or_bump([0xc1u8; 32], blob_ref);
+
+    // ForwardIndex / TagIndex / KvIndex / RangeIndex via the public surface.
+    let red = de.engine.register_tag("red");
+    let year = de.engine.register_tag("year");
+    let oid = de.create_object().unwrap();
+    de.add_tag(oid, red).unwrap();
+    de.set_attr(oid, year, Value::Int(2026)).unwrap();
+    de.commit().unwrap();
+    drop(de);
+
+    let de2 = DiskEngine::open(&cfg_path).unwrap();
+    // Chunk.
+    assert_eq!(de2.engine.chunk_index.chunk_count(), 1);
+    // Forward.
+    let asserts = de2.engine.forward_index.assertions_of(oid);
+    assert!(asserts.iter().any(|(a, _)| matches!(a, Assertion::Tag(_))));
+    assert!(
+        asserts
+            .iter()
+            .any(|(a, _)| matches!(a, Assertion::Attr { .. }))
+    );
+    // Tag.
+    let red2 = de2.engine.resolve_tag_name("red").unwrap();
+    assert!(de2.engine.tag_index.contains(red2, oid));
+    // KV (via kv_index).
+    let year2 = de2.engine.resolve_tag_name("year").unwrap();
+    assert_eq!(de2.engine.kv_index.lookup(year2, &Value::Int(2026)).len(), 1);
+    // Range.
+    let bm = de2
+        .engine
+        .range_index
+        .range_scan(year2, &Value::Int(2025), &Value::Int(2027));
+    assert_eq!(bm.len(), 1);
+}
+
 #[test]
 fn migrated_indices_persist_across_commit_drop_open() {
     let tmp = TempDir::new().unwrap();
@@ -736,4 +854,220 @@ fn migrated_indices_persist_across_commit_drop_open() {
     let key2 = de2.engine.resolve_tag_name("yr").unwrap();
     let bm = de2.engine.kv_index.lookup(key2, &Value::Int(2026));
     assert_eq!(bm.len(), 1);
+}
+
+// ----------------------------------------------------------------------
+// R1b-3: per-region object table / location table / backpointer table
+// ----------------------------------------------------------------------
+
+#[test]
+fn fresh_pool_open_before_first_commit_sees_empty_r1b3_tables() {
+    // Every region (including the three R1b-3 ones) is zero-filled at
+    // format time, so an `open` against a freshly-created pool must
+    // succeed and see empty object/location/backpointer states.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    {
+        let _de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+        // Drop without committing.
+    }
+    let de = DiskEngine::open(&cfg_path).unwrap();
+    assert_eq!(de.engine.object_table.len(), 0);
+    assert_eq!(de.engine.location_table.len(), 0);
+    assert_eq!(de.engine.backpointer_table.len(), 0);
+}
+
+#[test]
+fn r1b3_object_table_persists_across_commit_drop_open() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+    let watched = de.engine.register_tag("watched");
+    let oid1 = de.create_object().unwrap();
+    let oid2 = de.create_object().unwrap();
+    de.add_tag(oid1, watched).unwrap();
+    de.add_tag(oid2, watched).unwrap();
+
+    let pre_objects = de.engine.object_table.len();
+    assert_eq!(pre_objects, 2);
+    de.commit().unwrap();
+    drop(de);
+
+    let de2 = DiskEngine::open(&cfg_path).unwrap();
+    assert_eq!(de2.engine.object_table.len(), pre_objects);
+    let r1 = de2.engine.object_table.get(oid1.to_u64()).expect("oid1 missing");
+    assert_eq!({ r1.id }, oid1.to_u64());
+    let r2 = de2.engine.object_table.get(oid2.to_u64()).expect("oid2 missing");
+    assert_eq!({ r2.id }, oid2.to_u64());
+}
+
+#[test]
+fn r1b3_location_table_persists_across_commit_drop_open() {
+    use mimisbrunnr_meta::{ObjectLocation, ReplicaRef};
+
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+    let oid = de.create_object().unwrap();
+
+    // Inject a location directly (engine doesn't drive blob-zone allocation
+    // yet — that's R4). The persistence round-trip is what we care about.
+    let r = ReplicaRef {
+        disk_id: 0,
+        sector_offset: 5,
+        bucket_no: 42,
+    };
+    let loc = ObjectLocation::new(0x4000, &[r]).unwrap();
+    de.engine.location_table.insert(oid.to_u64(), loc);
+    de.commit().unwrap();
+    drop(de);
+
+    let de2 = DiskEngine::open(&cfg_path).unwrap();
+    assert_eq!(de2.engine.location_table.len(), 1);
+    let got = de2
+        .engine
+        .location_table
+        .get(oid.to_u64())
+        .expect("location missing after round-trip");
+    assert_eq!(got.header.replica_count, 1);
+    assert_eq!({ got.header.extent_length }, 0x4000);
+    assert_eq!(got.active_replicas()[0].bucket_no, 42);
+}
+
+#[test]
+fn r1b3_backpointer_table_persists_across_commit_drop_open() {
+    use mimisbrunnr_meta::{BackpointerKey, BackpointerValue, OwnerKind};
+
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+
+    // Engine doesn't drive backpointer mutations yet (R4); insert a few
+    // manually so we can prove the round-trip works end-to-end.
+    let entries: Vec<(BackpointerKey, BackpointerValue)> = (0u32..5)
+        .map(|i| {
+            let k = BackpointerKey::new(0, 100 + i, (i as u16) * 2);
+            let v = BackpointerValue {
+                owner_kind: OwnerKind::BlobExtent as u8,
+                length_sectors: 4,
+                bucket_gen: 100 + i,
+                owner_key: [(i as u8); 16],
+                ..BackpointerValue::default()
+            };
+            (k, v)
+        })
+        .collect();
+    for (k, v) in &entries {
+        de.engine.backpointer_table.insert(*k, *v);
+    }
+    assert_eq!(de.engine.backpointer_table.len(), 5);
+
+    de.commit().unwrap();
+    drop(de);
+
+    let de2 = DiskEngine::open(&cfg_path).unwrap();
+    assert_eq!(de2.engine.backpointer_table.len(), 5);
+    for (k, v) in &entries {
+        let got = de2
+            .engine
+            .backpointer_table
+            .get(k)
+            .expect("backpointer missing after round-trip");
+        assert_eq!(got.owner_kind, v.owner_kind);
+        assert_eq!({ got.bucket_gen }, { v.bucket_gen });
+        assert_eq!(got.owner_key, v.owner_key);
+    }
+    // Bucket-prefix scan still works.
+    let scan: Vec<_> = de2.engine.backpointer_table.range_in_bucket(0, 102).collect();
+    assert_eq!(scan.len(), 1);
+}
+
+#[test]
+fn all_ten_migrated_structures_round_trip_together() {
+    use mimisbrunnr_meta::{BackpointerKey, BackpointerValue, OwnerKind};
+
+    // ChunkIndex + KvIndex + ForwardIndex + TagIndex + RangeIndex +
+    // ObjectTable + LocationTable + Ontology + Subscriptions +
+    // BackpointerTable — commit, drop, re-open; each must survive.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+
+    // ChunkIndex.
+    let blob_ref = mimisbrunnr_storage::BlobRef {
+        disk_id: 0,
+        _pad: 0,
+        block_no: 5050,
+        length: 4096,
+    };
+    de.engine.chunk_index.insert_or_bump([0xc7u8; 32], blob_ref);
+
+    // ObjectTable + ForwardIndex + TagIndex + KvIndex + RangeIndex via
+    // the public surface (create_object inserts into object_table; add_tag
+    // touches forward + tag; set_attr touches forward + kv + range).
+    let red = de.engine.register_tag("red");
+    let year = de.engine.register_tag("year");
+    let oid = de.create_object().unwrap();
+    de.add_tag(oid, red).unwrap();
+    de.set_attr(oid, year, Value::Int(2026)).unwrap();
+
+    // BackpointerTable (manual insert — engine doesn't drive yet).
+    let bk = BackpointerKey::new(0, 7, 0);
+    let bv = BackpointerValue {
+        owner_kind: OwnerKind::BlobExtent as u8,
+        length_sectors: 1,
+        bucket_gen: 7,
+        owner_key: [9u8; 16],
+        ..BackpointerValue::default()
+    };
+    de.engine.backpointer_table.insert(bk, bv);
+
+    // Subscriptions: register one so the subscriptions region is non-empty.
+    let _sub = de
+        .subscribe(
+            "watch-red".into(),
+            Query::HasTag(red),
+            ChangeInterest::ALL,
+            Retention::default(),
+        )
+        .unwrap();
+
+    de.commit().unwrap();
+    drop(de);
+
+    let de2 = DiskEngine::open(&cfg_path).unwrap();
+    // ChunkIndex.
+    assert_eq!(de2.engine.chunk_index.chunk_count(), 1);
+    // ObjectTable.
+    assert!(de2.engine.object_table.get(oid.to_u64()).is_some());
+    // ForwardIndex.
+    let asserts = de2.engine.forward_index.assertions_of(oid);
+    assert!(asserts.iter().any(|(a, _)| matches!(a, Assertion::Tag(_))));
+    assert!(
+        asserts
+            .iter()
+            .any(|(a, _)| matches!(a, Assertion::Attr { .. }))
+    );
+    // TagIndex.
+    let red2 = de2.engine.resolve_tag_name("red").unwrap();
+    assert!(de2.engine.tag_index.contains(red2, oid));
+    // KvIndex.
+    let year2 = de2.engine.resolve_tag_name("year").unwrap();
+    assert_eq!(de2.engine.kv_index.lookup(year2, &Value::Int(2026)).len(), 1);
+    // RangeIndex.
+    let bm = de2
+        .engine
+        .range_index
+        .range_scan(year2, &Value::Int(2025), &Value::Int(2027));
+    assert_eq!(bm.len(), 1);
+    // BackpointerTable.
+    assert_eq!(de2.engine.backpointer_table.len(), 1);
+    assert!(de2.engine.backpointer_table.get(&bk).is_some());
+    // Ontology + Subscriptions: both seeded above; resolve_tag_name above
+    // already confirmed ontology, and the subscription count must be 1.
+    assert_eq!(de2.engine.subscriptions.subscriptions.len(), 1);
+    // LocationTable: empty in this test (no manual insert) — confirms
+    // that an empty dedicated region round-trips correctly.
+    assert_eq!(de2.engine.location_table.len(), 0);
 }

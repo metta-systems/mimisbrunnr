@@ -48,9 +48,9 @@ pub use {
     error::IndexError,
     faceted::{FacetCount, FacetedExplorer},
     forward_index::{
-        ForwardIndex, LEAF_ENTRY_INLINE_SPILL_THRESHOLD, LEAF_ENTRY_SPILL_FLAG,
-        LEAF_ENTRY_TOTAL_MASK, LeafEntry, LeafEntryBody, PACKED_ASSERTION_SIZE,
-        PACKED_ASSERTION_KIND_ATTR, PACKED_ASSERTION_KIND_RELATION,
+        ForwardIndex, ForwardIndexKey, ForwardIndexValue, LEAF_ENTRY_INLINE_SPILL_THRESHOLD,
+        LEAF_ENTRY_SPILL_FLAG, LEAF_ENTRY_TOTAL_MASK, LeafEntry, LeafEntryBody,
+        PACKED_ASSERTION_SIZE, PACKED_ASSERTION_KIND_ATTR, PACKED_ASSERTION_KIND_RELATION,
         PACKED_ASSERTION_KIND_TAG, PACKED_ASSERTION_ORIGIN_DIRECT,
         PACKED_ASSERTION_ORIGIN_MATERIALIZED, PackedAssertion,
     },
@@ -59,8 +59,8 @@ pub use {
         KvHashDirectoryHeader, KvIndex, KvIndexKey, KvIndexValue,
     },
     normalised_key::{NORMALISED_KEY_LEN, NormalisedKey},
-    range_index::RangeIndex,
-    tag_index::{TAG_INDEX_LEAF_ENTRY_SIZE, TagIndex, TagIndexLeafEntry, TagStoreKind},
+    range_index::{RangeIndex, RangeIndexKey, RangeIndexValue},
+    tag_index::{TAG_INDEX_LEAF_ENTRY_SIZE, TagIndex, TagIndexKey, TagIndexLeafEntry, TagStoreKind},
     tag_store::TagStore,
 };
 

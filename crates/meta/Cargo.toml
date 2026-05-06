@@ -8,5 +8,10 @@ license.workspace = true
 mimisbrunnr-storage = { workspace = true }
 mimisbrunnr-types = { workspace = true }
 bytemuck = { workspace = true }
+ciborium = { workspace = true }
+serde = { workspace = true }
 static_assertions = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
