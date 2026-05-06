@@ -3,6 +3,8 @@
 //! Only the data shapes — the engine, oplog cursor management, and inverted
 //! tag→subscription index live in `mimisbrunnr-watch`.
 
+use core::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{ObjectId, ids::TagId, timestamp::HybridTimestamp};
@@ -64,6 +66,33 @@ impl std::ops::BitOrAssign for ChangeInterest {
     }
 }
 
+impl fmt::Display for ChangeInterest {
+    /// Pipe-separated mnemonic spelling, e.g. `"TAG_ADDED|DELETED"`. Empty
+    /// interest sets render as `""`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const FLAGS: &[(u32, &str)] = &[
+            (1 << 0, "TAG_ADDED"),
+            (1 << 1, "TAG_REMOVED"),
+            (1 << 2, "CONTENT_CHANGED"),
+            (1 << 3, "CREATED"),
+            (1 << 4, "DELETED"),
+            (1 << 5, "ENTERED"),
+            (1 << 6, "EXITED"),
+        ];
+        let mut first = true;
+        for (bit, name) in FLAGS {
+            if (self.0 & bit) != 0 {
+                if !first {
+                    f.write_str("|")?;
+                }
+                first = false;
+                f.write_str(name)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Lifecycle of a subscription. A `Dormant` subscription keeps its cursor
 /// but generates no events until reactivated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -110,6 +139,49 @@ pub enum WatchEvent {
     },
 }
 
+impl WatchEvent {
+    /// Discriminant name as a stable string. Used by [`Self::fmt`].
+    pub const fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Entered { .. } => "Entered",
+            Self::Exited { .. } => "Exited",
+            Self::TagAdded { .. } => "TagAdded",
+            Self::TagRemoved { .. } => "TagRemoved",
+            Self::ContentChanged { .. } => "ContentChanged",
+            Self::Deleted { .. } => "Deleted",
+            Self::Created { .. } => "Created",
+        }
+    }
+}
+
+impl fmt::Display for WatchEvent {
+    /// Stable JSON representation of a watch event. Hand-formatted (no
+    /// `serde_json` dep). Field order is fixed:
+    /// `kind, oid, [tag,] timestamp{physical_ns, logical, node_id}`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (oid, tag, ts): (ObjectId, Option<TagId>, &HybridTimestamp) = match self {
+            Self::Entered { oid, timestamp }
+            | Self::Exited { oid, timestamp }
+            | Self::ContentChanged { oid, timestamp }
+            | Self::Deleted { oid, timestamp }
+            | Self::Created { oid, timestamp } => (*oid, None, timestamp),
+            Self::TagAdded { oid, tag, timestamp } | Self::TagRemoved { oid, tag, timestamp } => {
+                (*oid, Some(*tag), timestamp)
+            }
+        };
+        write!(f, "{{\"kind\":\"{}\"", self.kind_str())?;
+        write!(f, ",\"oid\":{}", oid.to_u64())?;
+        if let Some(t) = tag {
+            write!(f, ",\"tag\":{}", t.raw())?;
+        }
+        write!(
+            f,
+            ",\"timestamp\":{{\"physical_ns\":{},\"logical\":{},\"node_id\":{}}}}}",
+            ts.physical_ns, ts.logical, ts.node_id
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +194,44 @@ mod tests {
         assert!(!m.contains(ChangeInterest::ENTERED));
         assert!(ChangeInterest::ALL.contains(m));
         assert_eq!(ChangeInterest::empty().0, 0);
+    }
+
+    #[test]
+    fn change_interest_display_pipes_flags() {
+        let m = ChangeInterest::TAG_ADDED | ChangeInterest::DELETED;
+        assert_eq!(m.to_string(), "TAG_ADDED|DELETED");
+        let all = ChangeInterest::ALL;
+        assert_eq!(
+            all.to_string(),
+            "TAG_ADDED|TAG_REMOVED|CONTENT_CHANGED|CREATED|DELETED|ENTERED|EXITED"
+        );
+        assert_eq!(ChangeInterest::empty().to_string(), "");
+    }
+
+    #[test]
+    fn watch_event_display_is_stable_json() {
+        let oid = ObjectId::from_parts(0, 42);
+        let ts = HybridTimestamp::new(1_700_000_000_000, 7, 3);
+        let entered = WatchEvent::Entered { oid, timestamp: ts };
+        assert_eq!(
+            entered.to_string(),
+            "{\"kind\":\"Entered\",\"oid\":42,\"timestamp\":\
+             {\"physical_ns\":1700000000000,\"logical\":7,\"node_id\":3}}"
+        );
+
+        let tag_added = WatchEvent::TagAdded {
+            oid,
+            tag: TagId::new(99),
+            timestamp: ts,
+        };
+        assert_eq!(
+            tag_added.to_string(),
+            "{\"kind\":\"TagAdded\",\"oid\":42,\"tag\":99,\"timestamp\":\
+             {\"physical_ns\":1700000000000,\"logical\":7,\"node_id\":3}}"
+        );
+
+        let deleted = WatchEvent::Deleted { oid, timestamp: ts };
+        assert!(deleted.to_string().starts_with("{\"kind\":\"Deleted\""));
     }
 
     #[test]

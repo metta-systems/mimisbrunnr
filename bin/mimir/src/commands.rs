@@ -18,9 +18,9 @@ use mimisbrunnr::{
     sql::{SqlEngine, SqlError, SqlOutput, explain as explain_sql},
     types::{
         Assertion, ChangeInterest, ObjectId, Query, TagDefinition, TagId, TagSemantics, Value,
-        WatchEvent, value_hash,
+        value_hash,
     },
-    unix::{Importer, build_path_attr},
+    unix::{Exporter, Importer, build_path_attr},
     watch::Retention,
 };
 
@@ -502,7 +502,7 @@ pub fn run_watch_drain<W: Write>(
     let events = engine.engine.subscriptions.drain(id);
     writeln!(out, "drained={}", events.len())?;
     for ev in &events {
-        writeln!(out, "{}", format_event(ev))?;
+        writeln!(out, "{ev}")?;
     }
     Ok(())
 }
@@ -761,16 +761,102 @@ pub fn run_project_import<W: Write>(
     Ok(())
 }
 
-/// Stub for `mimir project export`. Phase 7a returns a TODO.
+/// `mimir project export` — single-object or directory-tree form.
+///
+/// With `oid_arg = Some(_)`, writes the in-memory blob bytes for that oid to
+/// `output`. With `oid_arg = None`, plans an [`Exporter::execute`] over every
+/// oid registered in the context's projection and writes the resulting
+/// directory tree under `output`.
 pub fn run_project_export<W: Write>(
-    _engine: &mut DiskEngine,
-    _out: &mut W,
-    _context: &str,
-    _output: &Path,
+    engine: &mut DiskEngine,
+    out: &mut W,
+    context: &str,
+    output: &Path,
+    oid_arg: Option<&str>,
 ) -> CommandResult {
-    Err(CommandError::Unimplemented(
-        "project export: needs blob fetching plumbing (Phase 7+)",
-    ))
+    // Validate the context exists, even for the per-oid form — keeps
+    // `mimir project export` semantically scoped.
+    let canonical = context_tag_name(context);
+    let context_id = match engine.engine.ontology.names.get(&canonical) {
+        Some(id) => *id,
+        None => {
+            return Err(CommandError::NotFound(format!(
+                "context '{context}' (use `mimir project create-context` first)"
+            )));
+        }
+    };
+    if engine.engine.path_contexts.get(context_id).is_none() {
+        return Err(CommandError::NotFound(format!(
+            "context '{context}' has no projection registered"
+        )));
+    }
+
+    if let Some(oid_arg) = oid_arg {
+        let oid = parse_oid(oid_arg).map_err(CommandError::BadArg)?;
+        ensure_object(engine, oid)?;
+
+        let bytes = engine
+            .read_blob(oid)?
+            .ok_or_else(|| CommandError::NotFound(format!("no blob for object {oid}")))?;
+
+        if let Some(parent) = output.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(output, &bytes)?;
+        writeln!(
+            out,
+            "wrote {} bytes for {oid} to {}",
+            bytes.len(),
+            output.display()
+        )?;
+        return Ok(());
+    }
+
+    // Directory-tree form: plan against every oid in the projection, then
+    // execute via Exporter.
+    let plan = {
+        let projection = engine
+            .engine
+            .path_contexts
+            .get(context_id)
+            .expect("checked above");
+        let oids: Vec<ObjectId> = projection.iter().map(|(o, _)| o).collect();
+        Exporter::plan(projection, &oids)
+    };
+
+    if plan.is_empty() {
+        std::fs::create_dir_all(output)?;
+        writeln!(
+            out,
+            "exported 0 objects from context {context} to {} (projection is empty)",
+            output.display()
+        )?;
+        return Ok(());
+    }
+
+    // Pre-fetch blobs into a map so the content provider closure doesn't
+    // borrow `engine` mutably.
+    let mut content: std::collections::HashMap<ObjectId, Vec<u8>> =
+        std::collections::HashMap::with_capacity(plan.len());
+    for entry in &plan {
+        if let mimisbrunnr::unix::ExportAction::CreateFile = entry.action
+            && let Some(bytes) = engine.read_blob(entry.oid)?
+        {
+            content.insert(entry.oid, bytes);
+        }
+    }
+    let provider = |oid: ObjectId| -> Option<Vec<u8>> { content.get(&oid).cloned() };
+    Exporter::execute(&plan, output, &provider).map_err(CommandError::Unix)?;
+
+    writeln!(
+        out,
+        "exported {} objects from context {context} to {}",
+        plan.len(),
+        output.display()
+    )?;
+    Ok(())
 }
 
 // =========================================================================
@@ -832,44 +918,6 @@ fn next_tag_id(engine: &DiskEngine) -> u32 {
         .max()
         .map(|m| m + 1)
         .unwrap_or(1)
-}
-
-/// Render a [`WatchEvent`] as a single line of `key=value` pairs. Trivial
-/// JSON-ish output that's easy to grep / parse downstream without pulling in
-/// `serde_json` (not in the workspace deps).
-fn format_event(ev: &WatchEvent) -> String {
-    match ev {
-        WatchEvent::Entered { oid, timestamp } => format!(
-            r#"{{"kind":"Entered","oid":"{oid}","ts_ns":{}}}"#,
-            timestamp.physical_ns
-        ),
-        WatchEvent::Exited { oid, timestamp } => format!(
-            r#"{{"kind":"Exited","oid":"{oid}","ts_ns":{}}}"#,
-            timestamp.physical_ns
-        ),
-        WatchEvent::TagAdded { oid, tag, timestamp } => format!(
-            r#"{{"kind":"TagAdded","oid":"{oid}","tag":{},"ts_ns":{}}}"#,
-            tag.raw(),
-            timestamp.physical_ns
-        ),
-        WatchEvent::TagRemoved { oid, tag, timestamp } => format!(
-            r#"{{"kind":"TagRemoved","oid":"{oid}","tag":{},"ts_ns":{}}}"#,
-            tag.raw(),
-            timestamp.physical_ns
-        ),
-        WatchEvent::ContentChanged { oid, timestamp } => format!(
-            r#"{{"kind":"ContentChanged","oid":"{oid}","ts_ns":{}}}"#,
-            timestamp.physical_ns
-        ),
-        WatchEvent::Created { oid, timestamp } => format!(
-            r#"{{"kind":"Created","oid":"{oid}","ts_ns":{}}}"#,
-            timestamp.physical_ns
-        ),
-        WatchEvent::Deleted { oid, timestamp } => format!(
-            r#"{{"kind":"Deleted","oid":"{oid}","ts_ns":{}}}"#,
-            timestamp.physical_ns
-        ),
-    }
 }
 
 // `value_hash` is re-exported in `mimisbrunnr::types`, but not used yet —

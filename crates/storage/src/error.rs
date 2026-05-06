@@ -46,4 +46,7 @@ pub enum StorageError {
 
     #[error("no valid superblock copy found")]
     NoValidSuperblock,
+
+    #[error("device opened read-only; writes are not permitted")]
+    ReadOnly,
 }

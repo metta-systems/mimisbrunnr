@@ -198,7 +198,7 @@ impl<'a> QueryExecutor<'a> {
             _ => return RoaringBitmap::new(),
         };
         let mut acc = RoaringBitmap::new();
-        for (oid_raw, assertions) in self.forward_index_iter() {
+        for (oid, assertions) in self.forward_index.iter() {
             for (assertion, _origin) in assertions {
                 if let Assertion::Attr {
                     key: k,
@@ -206,7 +206,7 @@ impl<'a> QueryExecutor<'a> {
                 } = &assertion
                     && *k == key
                     && haystack.starts_with(needle)
-                    && let Some(local32) = oid_low32(oid_raw)
+                    && let Some(local32) = oid_low32(oid.to_u64())
                 {
                     acc.insert(local32);
                 }
@@ -223,7 +223,7 @@ impl<'a> QueryExecutor<'a> {
     /// reverse relation index.
     fn eval_related(&self, predicate: TagId, target: ObjectId) -> RoaringBitmap {
         let mut acc = RoaringBitmap::new();
-        for (oid_raw, assertions) in self.forward_index_iter() {
+        for (oid, assertions) in self.forward_index.iter() {
             for (assertion, _origin) in assertions {
                 if let Assertion::Relation {
                     predicate: p,
@@ -231,7 +231,7 @@ impl<'a> QueryExecutor<'a> {
                 } = &assertion
                     && *p == predicate
                     && *t == target
-                    && let Some(local32) = oid_low32(oid_raw)
+                    && let Some(local32) = oid_low32(oid.to_u64())
                 {
                     acc.insert(local32);
                 }
@@ -329,46 +329,17 @@ impl<'a> QueryExecutor<'a> {
     /// `key = key`. Walks the forward index; cost is O(forward index size).
     fn objects_with_attr_key(&self, key: TagId) -> RoaringBitmap {
         let mut acc = RoaringBitmap::new();
-        for (oid_raw, assertions) in self.forward_index_iter() {
+        for (oid, assertions) in self.forward_index.iter() {
             for (assertion, _origin) in assertions {
                 if let Assertion::Attr { key: k, .. } = &assertion
                     && *k == key
-                    && let Some(local32) = oid_low32(oid_raw)
+                    && let Some(local32) = oid_low32(oid.to_u64())
                 {
                     acc.insert(local32);
                 }
             }
         }
         acc
-    }
-
-    /// Iterate every `(oid, &assertions)` pair in the forward index. The
-    /// forward index does not currently expose an iterator, so we read its
-    /// CBOR snapshot — this is acceptable for the in-memory mirror but is
-    /// **slow** for repeated calls. The Phase-N B+ tree will replace this
-    /// with a streaming scan.
-    fn forward_index_iter(&self) -> Vec<(u64, Vec<(Assertion, mimisbrunnr_types::TagOrigin)>)> {
-        // The forward index doesn't currently expose its `entries` map
-        // directly; we round-trip via CBOR. This is intentional — keeps the
-        // in-memory mirror's invariants firmly inside the index crate.
-        //
-        // TODO(rewrite-phase-N): expose a public `iter()` on `ForwardIndex`
-        // and remove the round-trip.
-        match self.forward_index.serialise() {
-            Ok(bytes) => {
-                #[derive(serde::Deserialize)]
-                struct Snapshot {
-                    entries: std::collections::HashMap<
-                        u64,
-                        Vec<(Assertion, mimisbrunnr_types::TagOrigin)>,
-                    >,
-                }
-                ciborium::de::from_reader::<Snapshot, _>(bytes.as_slice())
-                    .map(|s| s.entries.into_iter().collect())
-                    .unwrap_or_default()
-            }
-            Err(_) => Vec::new(),
-        }
     }
 }
 

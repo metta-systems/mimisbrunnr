@@ -15,5 +15,3 @@ roaring = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 
-[dev-dependencies]
-arbitrary-int = { workspace = true }

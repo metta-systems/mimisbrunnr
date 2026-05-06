@@ -173,11 +173,15 @@ enum ProjectAction {
         #[arg(long)]
         context: String,
     },
-    /// Export a context to a directory. (Phase 7a: TODO)
+    /// Export blob bytes from a context. With `--oid`, writes a single
+    /// object's blob to `--output`; without, the full directory-tree export
+    /// is still deferred.
     Export {
         ctx: String,
         #[arg(short, long)]
         output: PathBuf,
+        #[arg(long)]
+        oid: Option<String>,
     },
 }
 
@@ -355,8 +359,8 @@ fn run<W: Write>(
                 commands::run_project_import(engine, out, &dir, &context)?;
                 Ok(true)
             }
-            ProjectAction::Export { ctx, output } => {
-                commands::run_project_export(engine, out, &ctx, &output)?;
+            ProjectAction::Export { ctx, output, oid } => {
+                commands::run_project_export(engine, out, &ctx, &output, oid.as_deref())?;
                 Ok(false)
             }
         },

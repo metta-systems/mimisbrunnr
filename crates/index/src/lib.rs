@@ -38,7 +38,7 @@ mod tag_store;
 
 pub use {
     chunk_index::{
-        CHUNK_INDEX_LEAF_ENTRY_SIZE, ChunkIndex, ChunkIndexLeafEntry,
+        CHUNK_INDEX_LEAF_ENTRY_SIZE, ChunkHashKey, ChunkIndex, ChunkIndexLeafEntry,
     },
     chunk_list::{
         CHUNK_LIST_ENTRY_SIZE, CHUNK_PARAMS_RECORD_SIZE, ChunkListEntry,

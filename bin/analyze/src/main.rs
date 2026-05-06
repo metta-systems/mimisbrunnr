@@ -1,7 +1,7 @@
 //! `analyze` — read-only visual inspector for a Mímisbrunnr pool.
 //!
 //! Phase 7d rewrite. Opens a pool via [`DiskEngine::open`] (read-write today —
-//! see `OPEN_READ_ONLY_TODO`), builds a [`PoolSnapshot`] of the in-memory state
+//! see `open_pool_read_only`), builds a [`PoolSnapshot`] of the in-memory state
 //! plus on-disk header metadata, and renders it via either:
 //!
 //! - an `egui` GUI with tabs (Pool / Disk / WAL / Objects / Tags / Ontology),
@@ -270,9 +270,12 @@ fn collect_disks(engine: &DiskEngine, cfg: &PoolConfig) -> Vec<DiskSummary> {
                 Some(superblock_view(&engine.superblock)),
                 Some(root_pointer_view(engine.superblock.active_root_pointer())),
             )
+        } else if let Some(disk_sb) = engine.pool.disk_superblock(entry.id) {
+            (
+                Some(superblock_view(disk_sb)),
+                Some(root_pointer_view(disk_sb.active_root_pointer())),
+            )
         } else {
-            // TODO(rewrite-phase-N): walk other disks' superblocks via their
-            // own `BlockDevice` runtime view. Phase 7d: primary only.
             (None, None)
         };
         out.push(DiskSummary {
@@ -623,7 +626,7 @@ pub fn render_dump(snap: &PoolSnapshot) -> String {
             d.disk_id,
             d.path.display(),
             d.media_type,
-            tier_name(d.tier),
+            d.tier.name(),
             format_bytes(d.capacity_bytes),
             format_bytes(d.used_bytes),
             d.state,
@@ -634,7 +637,7 @@ pub fn render_dump(snap: &PoolSnapshot) -> String {
     for (tier, b) in &snap.pool_status.by_tier {
         out.push_str(&format!(
             "  {}: {} disks, {} capacity, {} used\n",
-            tier_name(*tier),
+            tier.name(),
             b.disk_count,
             format_bytes(b.capacity_bytes),
             format_bytes(b.used_bytes),
@@ -694,7 +697,7 @@ pub fn render_json(snap: &PoolSnapshot) -> String {
         out.push_str(&format!(
             "    {{ \"id\": {}, \"tier\": \"{}\", \"capacity\": {}, \"used\": {}, \"state\": \"{}\" }}{}\n",
             d.disk_id,
-            tier_name(d.tier),
+            d.tier.name(),
             d.capacity_bytes,
             d.used_bytes,
             d.state,
@@ -727,16 +730,6 @@ fn wal_used_percent(h: &WalHeaderView) -> u64 {
         0
     } else {
         h.used_bytes.saturating_mul(100) / h.data_capacity
-    }
-}
-
-/// Display name for a storage tier (logical types don't expose `name()`).
-fn tier_name(t: StorageTier) -> &'static str {
-    match t {
-        StorageTier::Hot => "Hot",
-        StorageTier::Warm => "Warm",
-        StorageTier::Cold => "Cold",
-        StorageTier::Glacier => "Glacier",
     }
 }
 
@@ -877,7 +870,7 @@ impl AnalyzerApp {
                     "  disk{} {:?} ({}, {}) — {} of {} used [{}]",
                     d.disk_id,
                     d.media_type,
-                    tier_name(d.tier),
+                    d.tier.name(),
                     d.path.display(),
                     format_bytes(d.used_bytes),
                     format_bytes(d.capacity_bytes),
@@ -890,7 +883,7 @@ impl AnalyzerApp {
             for (tier, b) in &self.snap.pool_status.by_tier {
                 ui.label(format!(
                     "  {}: {} disks, capacity {}, used {}",
-                    tier_name(*tier),
+                    tier.name(),
                     b.disk_count,
                     format_bytes(b.capacity_bytes),
                     format_bytes(b.used_bytes),
@@ -928,7 +921,7 @@ impl AnalyzerApp {
             ui.label(format!(
                 "media={:?} tier={} capacity={} used={} state={}",
                 d.media_type,
-                tier_name(d.tier),
+                d.tier.name(),
                 format_bytes(d.capacity_bytes),
                 format_bytes(d.used_bytes),
                 d.state,
@@ -941,7 +934,7 @@ impl AnalyzerApp {
                 draw_kv(ui, "node_id", sb.node_id.to_string());
                 draw_kv(ui, "disk_id", sb.disk_id.to_string());
                 draw_kv(ui, "media_type", format!("{:?}", sb.media_type));
-                draw_kv(ui, "tier", tier_name(sb.tier));
+                draw_kv(ui, "tier", sb.tier.name());
                 draw_kv(ui, "device_capacity", format_bytes(sb.device_capacity));
                 draw_kv(ui, "creation_ns", sb.creation_timestamp_ns.to_string());
                 draw_kv(ui, "last_mount_ns", sb.last_mount_timestamp_ns.to_string());
@@ -986,7 +979,7 @@ impl AnalyzerApp {
                 );
                 draw_kv(ui, "fs_format_version", sb.fs_format_version.to_string());
             } else {
-                ui.weak("Superblock view not available for non-primary disks (TODO).");
+                ui.weak("Superblock view not available for this disk.");
             }
 
             ui.add_space(8.0);
@@ -1292,16 +1285,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Open a pool, read-only as far as the analyze tool is concerned.
-///
-/// `OPEN_READ_ONLY_TODO`: The storage `FileBlockDevice::open` does not yet
-/// expose a read-only flag, and the only constructor that opens the WAL +
-/// superblock + replays state is [`DiskEngine::open`] (read-write). For now
-/// we use it; the analyze tool refrains from issuing any mutation calls.
-/// TODO(rewrite-phase-N): add `FileBlockDevice::open_read_only` and a
-/// `DiskEngine::open_read_only` that skips WAL replay's checkpoint flush.
+/// Open a pool read-only via [`DiskEngine::open_read_only`]. The primary
+/// device, the WAL ring, and every mutation method on `DiskEngine` all reject
+/// writes — the analyze tool itself never tries.
 fn open_pool_read_only(config_path: &Path) -> Result<DiskEngine, Box<dyn std::error::Error>> {
-    Ok(DiskEngine::open(config_path)?)
+    Ok(DiskEngine::open_read_only(config_path)?)
 }
 
 // Silence unused-import warning when `OBJECT_RECORD_SIZE` constant is added

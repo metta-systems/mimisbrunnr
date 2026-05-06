@@ -2348,7 +2348,6 @@ dependencies = [
 name = "mimisbrunnr-watch"
 version = "0.1.0"
 dependencies = [
- "arbitrary-int",
  "ciborium",
  "log",
  "mimisbrunnr-index",

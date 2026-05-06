@@ -14,11 +14,11 @@ use fuser::{
     ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, WriteFlags,
 };
 use log::trace;
-use mimisbrunnr_types::ObjectId;
+use mimisbrunnr_types::{ObjectId, TagId};
 
 use crate::attr::{VfsAttr, VfsAttrKind};
 use crate::entry::VfsEntryKind;
-use crate::inode::InodeId;
+use crate::inode::{INODE_CTX_ROOT, INODE_ROOT, INODE_TAGS_ROOT, InodeId};
 use crate::tag_vfs::TagVfs;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -27,6 +27,26 @@ const BLOCK_SIZE: u32 = 4096;
 /// Function type that resolves an object's bytes for `read`. Returns
 /// `Some(bytes)` if the engine has the content available, `None` otherwise.
 pub type ContentProvider<'a> = Box<dyn Fn(ObjectId) -> Option<Vec<u8>> + Send + Sync + 'a>;
+
+/// What the FUSE mount root (`/`) maps to in the underlying [`TagVfs`].
+///
+/// - [`MountRoot::Full`] — `/` shows both `/tags` and `/ctx` children
+///   (the original mount layout).
+/// - [`MountRoot::TagsOnly`] — `/` is the `tags`-root listing.
+/// - [`MountRoot::CtxOnly`] — `/` is the `ctx`-root listing.
+/// - [`MountRoot::SingleContext`] — `/` is the directory of one named
+///   context, i.e. what `<full-mount>/ctx/<context>/` would show.
+#[derive(Debug, Clone, Copy)]
+pub enum MountRoot {
+    /// Full layout: `/tags` and `/ctx` directories.
+    Full,
+    /// Re-root at the tags-root.
+    TagsOnly,
+    /// Re-root at the ctx-root.
+    CtxOnly,
+    /// Re-root at `/ctx/<context-tag>`.
+    SingleContext(TagId),
+}
 
 /// FUSE adapter — a [`TagVfs`] plus a content-provider callback.
 ///
@@ -39,12 +59,49 @@ pub struct MimisbrunnrFs<'a> {
     pub vfs: TagVfs<'a>,
     /// Pluggable content provider — the engine-side blob fetcher.
     pub content: ContentProvider<'a>,
+    /// The session-local inode that the FUSE mount root (`INODE_ROOT`)
+    /// transparently aliases. Defaults to `INODE_ROOT` itself for
+    /// [`MountRoot::Full`].
+    root_inode: InodeId,
 }
 
 impl<'a> MimisbrunnrFs<'a> {
-    /// Construct from a `TagVfs` and a content provider.
+    /// Construct from a `TagVfs` and a content provider with the default
+    /// full-layout root. Equivalent to
+    /// [`Self::new_with_root`] with [`MountRoot::Full`].
     pub fn new(vfs: TagVfs<'a>, content: ContentProvider<'a>) -> Self {
-        Self { vfs, content }
+        Self::new_with_root(vfs, content, MountRoot::Full)
+    }
+
+    /// Construct with an explicit [`MountRoot`]. For
+    /// [`MountRoot::SingleContext`], the requested context must already
+    /// have a registered projection in the underlying [`PathContextManager`];
+    /// otherwise the mount falls back to the full layout (the alternative
+    /// would be returning `Result`, but mounts are configured at the CLI
+    /// boundary where the existence check happens upstream).
+    pub fn new_with_root(vfs: TagVfs<'a>, content: ContentProvider<'a>, root: MountRoot) -> Self {
+        let root_inode = match root {
+            MountRoot::Full => INODE_ROOT,
+            MountRoot::TagsOnly => INODE_TAGS_ROOT,
+            MountRoot::CtxOnly => INODE_CTX_ROOT,
+            MountRoot::SingleContext(tag) => vfs.ctx_root_inode(tag).unwrap_or(INODE_ROOT),
+        };
+        Self {
+            vfs,
+            content,
+            root_inode,
+        }
+    }
+
+    /// Translate the FUSE-facing root inode (`INODE_ROOT`) to the
+    /// configured underlying inode. All other inodes pass through
+    /// unchanged.
+    fn translate(&self, ino: InodeId) -> InodeId {
+        if ino == INODE_ROOT && self.root_inode != INODE_ROOT {
+            self.root_inode
+        } else {
+            ino
+        }
     }
 
     /// Build the FUSE-side `FileAttr` for an `(inode, vfs_attr, optional
@@ -112,7 +169,7 @@ impl Filesystem for MimisbrunnrFs<'static> {
             }
         };
         trace!("fuse::lookup parent={} name={name_str:?}", parent.0);
-        let parent = InodeId(parent.0);
+        let parent = self.translate(InodeId(parent.0));
         match self.vfs.lookup(parent, name_str) {
             Some(entry) => {
                 let attr = match self.vfs.getattr(entry.inode) {
@@ -131,11 +188,14 @@ impl Filesystem for MimisbrunnrFs<'static> {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        let inode = InodeId(ino.0);
-        match self.vfs.getattr(inode) {
+        let logical = self.translate(InodeId(ino.0));
+        match self.vfs.getattr(logical) {
             Some(attr) => {
-                let oid = self.object_for_inode(inode);
-                reply.attr(&TTL, &self.make_file_attr(inode, attr, oid));
+                let oid = self.object_for_inode(logical);
+                // Always report the FUSE-facing inode the kernel asked
+                // about; the size/kind comes from the translated logical
+                // inode.
+                reply.attr(&TTL, &self.make_file_attr(InodeId(ino.0), attr, oid));
             }
             None => reply.error(Errno::ENOENT),
         }
@@ -149,7 +209,7 @@ impl Filesystem for MimisbrunnrFs<'static> {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let inode = InodeId(ino.0);
+        let inode = self.translate(InodeId(ino.0));
         let listing = self.vfs.readdir(inode);
 
         for (i, (name, entry)) in listing.iter().enumerate().skip(offset as usize) {
@@ -179,7 +239,7 @@ impl Filesystem for MimisbrunnrFs<'static> {
         _lock: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let inode = InodeId(ino.0);
+        let inode = self.translate(InodeId(ino.0));
         let oid = match self.object_for_inode(inode) {
             Some(o) => o,
             None => {
@@ -248,5 +308,73 @@ impl Filesystem for MimisbrunnrFs<'static> {
 
     fn rmdir(&self, _req: &Request, _parent: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
         reply.error(Errno::EROFS);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
+    use mimisbrunnr_ontology::OntologyState;
+    use mimisbrunnr_unix::PathContextManager;
+
+    fn empty_vfs() -> (
+        TagIndex,
+        KvIndex,
+        ForwardIndex,
+        OntologyState,
+        PathContextManager,
+    ) {
+        (
+            TagIndex::new(),
+            KvIndex::new(),
+            ForwardIndex::new(),
+            OntologyState::default(),
+            PathContextManager::new(),
+        )
+    }
+
+    #[test]
+    fn new_root_inode_defaults_to_inode_root() {
+        let (ti, kv, fi, ont, pcm) = empty_vfs();
+        let vfs = TagVfs::new(&ti, &kv, &fi, &ont, &pcm);
+        let provider: ContentProvider<'_> = Box::new(|_| None);
+        let fs = MimisbrunnrFs::new(vfs, provider);
+        assert_eq!(fs.root_inode, INODE_ROOT);
+    }
+
+    #[test]
+    fn new_with_root_tags_only_redirects_root_to_tags() {
+        let (ti, kv, fi, ont, pcm) = empty_vfs();
+        let vfs = TagVfs::new(&ti, &kv, &fi, &ont, &pcm);
+        let provider: ContentProvider<'_> = Box::new(|_| None);
+        let fs = MimisbrunnrFs::new_with_root(vfs, provider, MountRoot::TagsOnly);
+        assert_eq!(fs.root_inode, INODE_TAGS_ROOT);
+        assert_eq!(fs.translate(InodeId(1)), INODE_TAGS_ROOT);
+        // Non-root inodes pass through unchanged.
+        assert_eq!(fs.translate(InodeId(42)), InodeId(42));
+    }
+
+    #[test]
+    fn new_with_root_ctx_only_redirects_root_to_ctx() {
+        let (ti, kv, fi, ont, pcm) = empty_vfs();
+        let vfs = TagVfs::new(&ti, &kv, &fi, &ont, &pcm);
+        let provider: ContentProvider<'_> = Box::new(|_| None);
+        let fs = MimisbrunnrFs::new_with_root(vfs, provider, MountRoot::CtxOnly);
+        assert_eq!(fs.root_inode, INODE_CTX_ROOT);
+    }
+
+    #[test]
+    fn new_with_root_unknown_context_falls_back_to_full() {
+        let (ti, kv, fi, ont, pcm) = empty_vfs();
+        let vfs = TagVfs::new(&ti, &kv, &fi, &ont, &pcm);
+        let provider: ContentProvider<'_> = Box::new(|_| None);
+        let fs = MimisbrunnrFs::new_with_root(
+            vfs,
+            provider,
+            MountRoot::SingleContext(TagId::new(99)),
+        );
+        // Unknown context → fall back to INODE_ROOT.
+        assert_eq!(fs.root_inode, INODE_ROOT);
     }
 }

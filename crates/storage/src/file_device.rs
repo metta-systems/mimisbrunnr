@@ -16,6 +16,7 @@ use {
 pub struct FileBlockDevice {
     file: Mutex<File>,
     capacity: u64,
+    read_only: bool,
 }
 
 impl FileBlockDevice {
@@ -49,7 +50,28 @@ impl FileBlockDevice {
         Ok(Self {
             file: Mutex::new(file),
             capacity: actual_capacity,
+            read_only: false,
         })
+    }
+
+    /// Open an existing file-backed block device read-only. Any subsequent
+    /// `write_at` / `sync` call returns [`StorageError::ReadOnly`]; reads
+    /// proceed normally.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self, StorageError> {
+        let path = path.as_ref();
+        trace!("FileBlockDevice::open_read_only path={}", path.display());
+        let file = OpenOptions::new().read(true).open(path)?;
+        let meta = file.metadata()?;
+        Ok(Self {
+            file: Mutex::new(file),
+            capacity: meta.len(),
+            read_only: true,
+        })
+    }
+
+    /// `true` if the device was opened read-only.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Build a [`FileBlockDevice`] from an already-open file.
@@ -61,6 +83,7 @@ impl FileBlockDevice {
         Ok(Self {
             file: Mutex::new(file),
             capacity,
+            read_only: false,
         })
     }
 }
@@ -82,6 +105,9 @@ impl BlockDevice for FileBlockDevice {
     }
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::ReadOnly);
+        }
         let end = offset + buf.len() as u64;
         if end > self.capacity {
             return Err(StorageError::OutOfBounds {
@@ -101,6 +127,9 @@ impl BlockDevice for FileBlockDevice {
     }
 
     fn sync(&self) -> Result<(), StorageError> {
+        if self.read_only {
+            return Err(StorageError::ReadOnly);
+        }
         let file = self.file.lock().unwrap();
         file.sync_all()?;
         Ok(())
@@ -144,5 +173,31 @@ mod tests {
     fn sync_succeeds() {
         let (_tmp, dev) = test_device(4096);
         dev.sync().unwrap();
+    }
+
+    #[test]
+    fn open_read_only_rejects_writes_and_syncs() {
+        let tmp = NamedTempFile::new().unwrap();
+        // First open RW, write a marker, drop.
+        {
+            let dev = FileBlockDevice::open(tmp.path(), 4096).unwrap();
+            dev.write_at(0, b"hello").unwrap();
+            dev.sync().unwrap();
+        }
+        // Now reopen read-only.
+        let ro = FileBlockDevice::open_read_only(tmp.path()).unwrap();
+        assert!(ro.is_read_only());
+        assert_eq!(ro.capacity(), 4096);
+
+        // Read still works.
+        let mut buf = [0u8; 5];
+        ro.read_at(0, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello");
+
+        // Writes are rejected with ReadOnly.
+        let err = ro.write_at(0, b"nope").unwrap_err();
+        assert!(matches!(err, StorageError::ReadOnly));
+        let err = ro.sync().unwrap_err();
+        assert!(matches!(err, StorageError::ReadOnly));
     }
 }

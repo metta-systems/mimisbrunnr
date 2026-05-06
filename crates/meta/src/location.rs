@@ -196,6 +196,15 @@ impl ObjectLocation {
         LOCATION_HEADER_SIZE + n * core::mem::size_of::<ReplicaRef>()
     }
 
+    /// Convenience wrapper around [`Self::serialize_into`] that returns a
+    /// freshly-allocated `Vec<u8>` containing the encoded bytes.
+    pub fn serialize(&self) -> Vec<u8> {
+        let n = self.header.replica_count.min(MAX_INLINE_REPLICAS as u8) as usize;
+        let mut out = Vec::with_capacity(LOCATION_HEADER_SIZE + n * core::mem::size_of::<ReplicaRef>());
+        self.serialize_into(&mut out);
+        out
+    }
+
     /// Convert a `(bucket_no, sector_offset)` pair derived from an absolute
     /// `block_no` per IMPL §6.1's helper formulas. `bucket_size_log2` is the
     /// log2 of the bucket size in bytes (e.g. 20 for 1 MiB buckets).

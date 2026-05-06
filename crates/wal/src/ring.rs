@@ -57,6 +57,9 @@ pub struct Wal {
     /// `0` or `1` — which slot held the active header on the last
     /// `read_or_format`. The next `flush_header` writes to the *other* slot.
     active_slot: u8,
+    /// `true` if this ring was opened read-only — every mutating method
+    /// short-circuits with [`WalError::ReadOnly`].
+    read_only: bool,
 }
 
 /// Per IMPL §3.5 / §2.2: WAL header A/B alternation flips on every commit. We
@@ -121,6 +124,7 @@ impl Wal {
             size,
             header,
             active_slot: HEADER_SLOT_B, // so the first flush will write A
+            read_only: false,
         };
 
         // Initial flush — pick slot A explicitly.
@@ -181,7 +185,32 @@ impl Wal {
             size,
             header,
             active_slot: slot,
+            read_only: false,
         })
+    }
+
+    /// Open a WAL ring for **read-only** inspection. Identical to [`Wal::open`]
+    /// for header parsing, but every mutating method
+    /// ([`Wal::append`], [`Wal::append_raw`], [`Wal::checkpoint`])
+    /// short-circuits with [`WalError::ReadOnly`].
+    ///
+    /// The supplied `device` does not itself need to be read-only — this is
+    /// purely an in-memory flag. The intended caller pairs it with
+    /// [`mimisbrunnr_storage::FileBlockDevice::open_read_only`] so any stray
+    /// write would also fail at the device layer.
+    pub fn open_read_only(
+        device: &dyn BlockDevice,
+        offset: u64,
+        size: u64,
+    ) -> Result<Self, WalError> {
+        let mut wal = Self::open(device, offset, size)?;
+        wal.read_only = true;
+        Ok(wal)
+    }
+
+    /// Whether this WAL was opened read-only.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Flush the current header to the inactive slot (alternating writes —
@@ -270,6 +299,9 @@ impl Wal {
         ts: LogicalHybridTimestamp,
         flags: u16,
     ) -> Result<u64, WalError> {
+        if self.read_only {
+            return Err(WalError::ReadOnly);
+        }
         if flags & WAL_ENTRY_FLAG_ENCRYPTED != 0 {
             return Err(WalError::EncryptionUnsupported);
         }
@@ -367,6 +399,9 @@ impl Wal {
         device: &dyn BlockDevice,
         last_checkpoint_lsn: u64,
     ) -> Result<u64, WalError> {
+        if self.read_only {
+            return Err(WalError::ReadOnly);
+        }
         let mut reclaimed: u64 = 0;
         let data_cap = self.data_capacity();
         let sector_cap = BLOCK_SIZE as u64;
@@ -745,6 +780,21 @@ mod tests {
             WalOp::WriteBlob(p) => assert_eq!(p, payload),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn open_read_only_rejects_mutations() {
+        let size = 16 * BLOCK_SIZE as u64;
+        let (_tmp, dev) = open_test_dev(size);
+        Wal::format(&*dev, 0, size).unwrap();
+        let mut wal = Wal::open_read_only(&*dev, 0, size).unwrap();
+        assert!(wal.is_read_only());
+        let err = wal
+            .append_raw(&*dev, WalOpKind::CreateObject, &[0u8], ts(), 0)
+            .unwrap_err();
+        assert!(matches!(err, WalError::ReadOnly));
+        let err = wal.checkpoint(&*dev, 1).unwrap_err();
+        assert!(matches!(err, WalError::ReadOnly));
     }
 
     #[test]

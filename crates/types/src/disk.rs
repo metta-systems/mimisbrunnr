@@ -4,6 +4,8 @@
 //! crate; this struct is what the rest of the system carries in memory and
 //! shows in CLI / API output.
 
+use core::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ids::DiskId;
@@ -17,6 +19,32 @@ pub enum MediaType {
     SmrHdd,
     /// Network-attached / object-store backend (S3, IPFS, …).
     Remote,
+}
+
+impl MediaType {
+    /// Stable, human-friendly name for this media class. Matches the
+    /// `Debug`-style spelling and is what `analyze` / `brunnr` show in
+    /// status tables.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NVMe => "NVMe",
+            Self::Ssd => "Ssd",
+            Self::Hdd => "Hdd",
+            Self::SmrHdd => "SmrHdd",
+            Self::Remote => "Remote",
+        }
+    }
+
+    /// Alias of [`Self::name`], idiomatic for `as_str()`-style use sites.
+    pub const fn as_str(self) -> &'static str {
+        self.name()
+    }
+}
+
+impl fmt::Display for MediaType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// Storage tier. Discriminants are pinned by DESIGN §8.1 and used as array
@@ -40,6 +68,27 @@ impl StorageTier {
             _ => None,
         }
     }
+
+    /// Stable, human-friendly tier name. Used by CLI output and analyze.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Hot => "Hot",
+            Self::Warm => "Warm",
+            Self::Cold => "Cold",
+            Self::Glacier => "Glacier",
+        }
+    }
+
+    /// Alias of [`Self::name`].
+    pub const fn as_str(self) -> &'static str {
+        self.name()
+    }
+}
+
+impl fmt::Display for StorageTier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// Operational state of a disk (DESIGN §8.1).
@@ -53,6 +102,29 @@ pub enum DiskState {
     Removed,
     /// Failed; awaits resilver.
     Faulted,
+}
+
+impl DiskState {
+    /// Stable, human-friendly state name. Used by CLI output and analyze.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Online => "Online",
+            Self::Draining => "Draining",
+            Self::Removed => "Removed",
+            Self::Faulted => "Faulted",
+        }
+    }
+
+    /// Alias of [`Self::name`].
+    pub const fn as_str(self) -> &'static str {
+        self.name()
+    }
+}
+
+impl fmt::Display for DiskState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
 }
 
 /// Logical descriptor of a single disk in a pool. Mirrors the user-visible
@@ -91,6 +163,31 @@ mod tests {
         assert!(StorageTier::Hot < StorageTier::Warm);
         assert!(StorageTier::Warm < StorageTier::Cold);
         assert!(StorageTier::Cold < StorageTier::Glacier);
+    }
+
+    #[test]
+    fn storage_tier_name_and_display() {
+        assert_eq!(StorageTier::Hot.name(), "Hot");
+        assert_eq!(StorageTier::Warm.as_str(), "Warm");
+        assert_eq!(StorageTier::Cold.name(), "Cold");
+        assert_eq!(StorageTier::Glacier.to_string(), "Glacier");
+    }
+
+    #[test]
+    fn media_type_name_and_display() {
+        assert_eq!(MediaType::NVMe.name(), "NVMe");
+        assert_eq!(MediaType::Ssd.as_str(), "Ssd");
+        assert_eq!(MediaType::Hdd.to_string(), "Hdd");
+        assert_eq!(MediaType::SmrHdd.name(), "SmrHdd");
+        assert_eq!(MediaType::Remote.name(), "Remote");
+    }
+
+    #[test]
+    fn disk_state_name_and_display() {
+        assert_eq!(DiskState::Online.name(), "Online");
+        assert_eq!(DiskState::Draining.as_str(), "Draining");
+        assert_eq!(DiskState::Removed.to_string(), "Removed");
+        assert_eq!(DiskState::Faulted.name(), "Faulted");
     }
 
     #[test]

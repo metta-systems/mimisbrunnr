@@ -64,6 +64,10 @@ pub enum WalError {
     /// Compressed entry support is not yet implemented in this phase.
     #[error("compressed wal entries not yet supported")]
     CompressionUnsupported,
+
+    /// Mutating call attempted on a WAL opened read-only.
+    #[error("wal is read-only")]
+    ReadOnly,
 }
 
 impl<T> From<ciborium::ser::Error<T>> for WalError

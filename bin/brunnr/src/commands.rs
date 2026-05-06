@@ -266,9 +266,9 @@ fn print_status(s: &EngineStatus) {
         println!(
             "  {:>4} {:<10} {:<10} {:<6} {:>14} {:>14}",
             id,
-            format!("{state:?}"),
-            format!("{media:?}"),
-            format!("{tier:?}"),
+            state.name(),
+            media.name(),
+            tier.name(),
             cap,
             used
         );
@@ -279,7 +279,7 @@ fn print_status(s: &EngineStatus) {
     for (tier, tb) in &s.pool.by_tier {
         println!(
             "  {:<8} disks={:<3} capacity={:>14}  used={:>14}",
-            format!("{tier:?}"),
+            tier.name(),
             tb.disk_count,
             tb.capacity_bytes,
             tb.used_bytes,
@@ -381,7 +381,7 @@ pub fn cmd_mount(
     mountpoint: &Path,
     context: Option<&str>,
 ) -> Result<(), BrunnrError> {
-    use mimisbrunnr_fuse::{MimisbrunnrFs, TagVfs};
+    use mimisbrunnr_fuse::{ContentProvider, MimisbrunnrFs, MountRoot, TagVfs};
 
     if !mountpoint.exists() {
         std::fs::create_dir_all(mountpoint)?;
@@ -406,41 +406,36 @@ pub fn cmd_mount(
         &leaked.engine.path_contexts,
     );
 
-    if let Some(ctx) = context {
-        // The 5b `MimisbrunnrFs` always exposes both `/tags/` and `/ctx/`.
-        // For `mount-unix` we still mount the full tree; the requested
-        // context shows up under `<mountpoint>/ctx/<context>`.
-        // TODO(rewrite-phase-N): implement subtree-only mount that re-roots
-        // at the named path-context.
-        if leaked
+    let mount_root = if let Some(ctx) = context {
+        let tag_id = leaked
             .engine
             .ontology
             .names
             .get(ctx)
-            .and_then(|tid| leaked.engine.path_contexts.projections.get(tid))
-            .is_none()
-        {
-            return Err(BrunnrError::Mount(format!(
-                "context '{ctx}' is not registered in this pool"
-            )));
-        }
+            .copied()
+            .filter(|tid| leaked.engine.path_contexts.projections.contains_key(tid))
+            .ok_or_else(|| {
+                BrunnrError::Mount(format!(
+                    "context '{ctx}' is not registered in this pool"
+                ))
+            })?;
         println!(
-            "Mounting full filesystem at {} — your context is at {}/ctx/{ctx}",
-            mountpoint.display(),
+            "Mounting context '{ctx}' as the root at {}",
             mountpoint.display()
         );
+        MountRoot::SingleContext(tag_id)
     } else {
         println!("Mounting filesystem at {}", mountpoint.display());
-    }
+        MountRoot::Full
+    };
 
     // The Phase 6 `DiskEngine` keeps blobs in an in-memory HashMap keyed by
     // `oid_local`. Wrap that lookup in a closure the FUSE adapter can call.
-    let content: Box<
-        dyn Fn(mimisbrunnr_types::ObjectId) -> Option<Vec<u8>> + Send + Sync + 'static,
-    > = Box::new(move |oid: mimisbrunnr_types::ObjectId| {
-        leaked.blobs.get(&oid.local_seq()).cloned()
-    });
-    let fs: MimisbrunnrFs<'static> = MimisbrunnrFs::new(tag_vfs, content);
+    let content: ContentProvider<'static> =
+        Box::new(move |oid: mimisbrunnr_types::ObjectId| {
+            leaked.read_blob(oid).ok().flatten()
+        });
+    let fs: MimisbrunnrFs<'static> = MimisbrunnrFs::new_with_root(tag_vfs, content, mount_root);
 
     let mount_config = fuser::Config::default();
     fuser::mount2(fs, mountpoint, &mount_config)
@@ -746,7 +741,7 @@ mod tests {
     #[cfg(feature = "fuse")]
     #[test]
     fn fuse_filesystem_constructible_from_disk_engine() {
-        use mimisbrunnr_fuse::{MimisbrunnrFs, TagVfs};
+        use mimisbrunnr_fuse::{ContentProvider, MimisbrunnrFs, TagVfs};
 
         let tmp = TempDir::new().unwrap();
         let cfg = tmp.path().join("pool.toml");
@@ -771,9 +766,7 @@ mod tests {
             &de.engine.ontology,
             &de.engine.path_contexts,
         );
-        let provider: Box<
-            dyn Fn(mimisbrunnr_types::ObjectId) -> Option<Vec<u8>> + Send + Sync,
-        > = Box::new(|_| None);
+        let provider: ContentProvider<'_> = Box::new(|_| None);
         let _fs = MimisbrunnrFs::new(tag_vfs, provider);
     }
 

@@ -174,8 +174,16 @@ impl KvIndex {
         self.entries.len()
     }
 
-    /// Serialise to CBOR. TODO(rewrite-phase-N): replace with the
-    /// extendible-hash on-disk backing.
+    /// Serialise to CBOR.
+    ///
+    /// `KvIndex` derives `Serialize`/`Deserialize` directly. The
+    /// `RoaringBitmap` framing lives in [`RoaringBitmapSerde`]'s custom serde
+    /// impls. This helper is kept for symmetry with the other indices and to
+    /// map ciborium errors to [`IndexError`]; callers may equally reach for
+    /// `ciborium::ser::into_writer` directly.
+    ///
+    /// TODO(rewrite-phase-N): replace with the extendible-hash on-disk
+    /// backing.
     pub fn serialise(&self) -> Result<Vec<u8>, IndexError> {
         let mut buf = Vec::new();
         ciborium::ser::into_writer(self, &mut buf)
@@ -183,7 +191,8 @@ impl KvIndex {
         Ok(buf)
     }
 
-    /// Deserialise from CBOR.
+    /// Deserialise from CBOR. See the doc on [`Self::serialise`] for why
+    /// this helper is retained.
     pub fn deserialise(bytes: &[u8]) -> Result<Self, IndexError> {
         ciborium::de::from_reader(bytes).map_err(|e| IndexError::CborDecode(e.to_string()))
     }

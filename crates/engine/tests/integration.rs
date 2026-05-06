@@ -1,9 +1,7 @@
 //! Phase 6 integration tests for `mimisbrunnr-engine`.
 //!
-//! Cross-crate API gap noted: `ForwardIndex` does not expose a public
-//! iterator (the query crate works around it via the CBOR snapshot). Where
-//! we need to inspect forward-index contents from a test, we go through
-//! `assertions_of(oid)` per object — same workaround.
+//! Forward-index inspection in tests goes through `assertions_of(oid)` per
+//! object or the public `ForwardIndex::iter()` (added in phase R0).
 
 use std::path::PathBuf;
 
@@ -67,6 +65,22 @@ fn install_car_vehicle(engine: &mut Engine) -> (TagId, TagId) {
 // ----------------------------------------------------------------------
 // In-memory Engine
 // ----------------------------------------------------------------------
+
+#[test]
+fn ensure_oid_exists_is_idempotent_and_advances_counter() {
+    let mut e = Engine::new(1);
+    let pinned = ObjectId::from_parts(1, 100);
+    e.ensure_oid_exists(pinned).unwrap();
+    assert!(e.object_table.get(pinned.to_u64()).is_some());
+
+    // Repeat call: still ok, no duplicate insert.
+    e.ensure_oid_exists(pinned).unwrap();
+    assert_eq!(e.object_count(), 1);
+
+    // The next freshly-created oid must skip past the pinned local seq.
+    let fresh = e.create_object();
+    assert!(fresh.local_seq() > pinned.local_seq());
+}
 
 #[test]
 fn create_object_increments_local_seq_and_yields_unique_oids() {
@@ -424,6 +438,25 @@ fn disk_engine_create_open_round_trip_preserves_tag() {
 }
 
 #[test]
+fn disk_engine_read_blob_round_trips_in_memory() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path).unwrap();
+
+    let oid = de.create_object().unwrap();
+    let res = de.write_blob(oid, b"phase-r0 payload").unwrap();
+    assert_eq!(res.original_size, 16);
+
+    let got = de.read_blob(oid).unwrap();
+    assert!(got.is_some(), "expected blob present after write_blob");
+    assert_eq!(got.unwrap().len(), res.stored_size as usize);
+
+    // Unknown oid → None.
+    let ghost = ObjectId::from_parts(1, 9999);
+    assert!(de.read_blob(ghost).unwrap().is_none());
+}
+
+#[test]
 fn disk_engine_replays_wal_past_last_checkpoint() {
     let tmp = TempDir::new().unwrap();
     let (cfg, cfg_path) = small_pool(&tmp);
@@ -544,4 +577,105 @@ fn register_tag_is_idempotent_by_name() {
     let a = e.register_tag("dup");
     let b = e.register_tag("dup");
     assert_eq!(a, b);
+}
+
+// ----------------------------------------------------------------------
+// DiskEngine::open_read_only
+// ----------------------------------------------------------------------
+
+#[test]
+fn open_read_only_round_trip_preserves_state() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+    let tag = de.engine.register_tag("ro_tag");
+    let oid = de.create_object().unwrap();
+    de.add_tag(oid, tag).unwrap();
+    de.commit().unwrap();
+    drop(de);
+
+    let de_ro = DiskEngine::open_read_only(&cfg_path).unwrap();
+    assert!(de_ro.is_read_only());
+    let tag2 = de_ro.engine.resolve_tag_name("ro_tag").unwrap();
+    assert_eq!(tag2, tag);
+    let bm = de_ro.engine.query(&Query::HasTag(tag2)).unwrap();
+    assert_eq!(bm.len(), 1);
+}
+
+#[test]
+fn open_read_only_rejects_add_tag() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+
+    {
+        let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+        de.commit().unwrap();
+    }
+
+    let mut de_ro = DiskEngine::open_read_only(&cfg_path).unwrap();
+    let tag = de_ro.engine.register_tag("ghost");
+    let ghost = ObjectId::from_parts(1, 0);
+    let err = de_ro.add_tag(ghost, tag).unwrap_err();
+    assert!(matches!(err, EngineError::ReadOnly));
+}
+
+#[test]
+fn open_read_only_rejects_commit() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+
+    {
+        let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+        de.commit().unwrap();
+    }
+
+    let mut de_ro = DiskEngine::open_read_only(&cfg_path).unwrap();
+    let err = de_ro.commit().unwrap_err();
+    assert!(matches!(err, EngineError::ReadOnly));
+}
+
+#[test]
+fn open_read_only_twice_in_succession_succeeds() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+
+    {
+        let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+        de.commit().unwrap();
+    }
+
+    let de1 = DiskEngine::open_read_only(&cfg_path).unwrap();
+    drop(de1);
+    let de2 = DiskEngine::open_read_only(&cfg_path).unwrap();
+    assert!(de2.is_read_only());
+}
+
+#[test]
+fn read_only_then_mutating_open_sees_subsequent_changes() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+
+    {
+        let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+        de.commit().unwrap();
+    }
+
+    // Read-only open observes the empty post-commit state.
+    let de_ro1 = DiskEngine::open_read_only(&cfg_path).unwrap();
+    assert!(de_ro1.engine.resolve_tag_name("fresh").is_none());
+    drop(de_ro1);
+
+    // Sequential RW open adds a tag and commits.
+    {
+        let mut de = DiskEngine::open(&cfg_path).unwrap();
+        let tag = de.engine.register_tag("fresh");
+        let oid = de.create_object().unwrap();
+        de.add_tag(oid, tag).unwrap();
+        de.commit().unwrap();
+    }
+
+    // Re-RO-open sees the new tag.
+    let de_ro2 = DiskEngine::open_read_only(&cfg_path).unwrap();
+    assert!(de_ro2.engine.resolve_tag_name("fresh").is_some());
 }

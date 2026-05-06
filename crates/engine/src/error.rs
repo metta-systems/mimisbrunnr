@@ -61,6 +61,9 @@ pub enum EngineError {
     #[error("LSN {0} already applied")]
     LsnAlreadyApplied(u64),
 
+    #[error("engine is read-only")]
+    ReadOnly,
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }

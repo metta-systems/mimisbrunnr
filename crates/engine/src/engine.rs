@@ -601,6 +601,22 @@ impl Engine {
         Ok(())
     }
 
+    /// Idempotently materialise an object record for `oid` if it isn't
+    /// already present. Used by tests, debugging tools, and CLI affordances
+    /// (`mimir create`) to mint an `ObjectId` without going through
+    /// [`Engine::create_object`] (which generates a fresh local sequence).
+    ///
+    /// This call **does not** allocate a new LSN, **does not** emit a WAL
+    /// op, and is safe to call repeatedly — if `oid` already exists, it is
+    /// a no-op (the existing `created_ns` is preserved). The internal
+    /// `next_oid_local` watermark advances if `oid.local_seq()` exceeds it,
+    /// so subsequent `create_object()` calls don't collide.
+    pub fn ensure_oid_exists(&mut self, oid: ObjectId) -> Result<(), EngineError> {
+        // Use 0 as the placeholder timestamp — no real "creation" happened
+        // here, this is just a materialisation of a known oid.
+        self.replay_create_object(oid, 0, 0)
+    }
+
     pub(crate) fn replay_delete_object(
         &mut self,
         oid: ObjectId,

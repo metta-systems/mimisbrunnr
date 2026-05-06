@@ -13,7 +13,7 @@
 //! DESIGN §8.4 are tagged as TODO for later phases — this module gives the
 //! **disk-level** lifecycle (create / open / add / remove / status / pick).
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 use {
     log::{trace, warn},
@@ -62,6 +62,10 @@ pub struct DiskRuntime {
     pub state: DiskState,
     pub used_bytes: u64,
     pub device: Arc<FileBlockDevice>,
+    /// Cached active superblock copy, populated when the runtime is opened
+    /// or freshly formatted. Used by inspectors (e.g. `analyze`) to render
+    /// per-disk header info without re-reading the device.
+    pub superblock: Superblock,
 }
 
 impl std::fmt::Debug for DiskRuntime {
@@ -139,7 +143,7 @@ impl PoolManager {
 
         let mut disks: BTreeMap<DiskId, DiskRuntime> = BTreeMap::new();
         for entry in &config.disks {
-            let dev = Self::open_or_format_disk(entry, config.node_id, true)?;
+            let (dev, sb) = Self::open_or_format_disk(entry, config.node_id, true)?;
             disks.insert(
                 entry.id,
                 DiskRuntime {
@@ -147,6 +151,7 @@ impl PoolManager {
                     state: DiskState::Online,
                     used_bytes: 0,
                     device: dev,
+                    superblock: sb,
                 },
             );
         }
@@ -170,7 +175,7 @@ impl PoolManager {
 
         let mut disks: BTreeMap<DiskId, DiskRuntime> = BTreeMap::new();
         for entry in &config.disks {
-            let dev = Self::open_or_format_disk(entry, config.node_id, false)?;
+            let (dev, sb) = Self::open_or_format_disk(entry, config.node_id, false)?;
             disks.insert(
                 entry.id,
                 DiskRuntime {
@@ -178,6 +183,7 @@ impl PoolManager {
                     state: DiskState::Online,
                     used_bytes: 0,
                     device: dev,
+                    superblock: sb,
                 },
             );
         }
@@ -206,7 +212,7 @@ impl PoolManager {
         entry: &DiskConfigEntry,
         node_id: NodeId,
         format: bool,
-    ) -> Result<Arc<FileBlockDevice>, PoolError> {
+    ) -> Result<(Arc<FileBlockDevice>, Superblock), PoolError> {
         trace!(
             "open_or_format_disk id={} path={} format={}",
             entry.id,
@@ -251,8 +257,11 @@ impl PoolManager {
                 },
                 FMT_FORMAT_VERSION,
             )?;
-        } else {
-            let sb = Superblock::open(&dev)?;
+        }
+        // Read the active superblock copy back (whether we just formatted or
+        // are re-opening). On the re-open path also validate node/disk IDs.
+        let sb = Superblock::open(&dev)?;
+        if !format {
             let sb_node = sb.node_id();
             if sb_node != node_id {
                 return Err(PoolError::NodeIdMismatch {
@@ -269,7 +278,7 @@ impl PoolManager {
                 });
             }
         }
-        Ok(Arc::new(dev))
+        Ok((Arc::new(dev), sb))
     }
 
     // --------------------------------------------------------------
@@ -288,7 +297,7 @@ impl PoolManager {
                 max: POOL_STATE_ROOT_INLINE_DISKS as u32,
             });
         }
-        let dev = Self::open_or_format_disk(&entry, self.config.node_id, true)?;
+        let (dev, sb) = Self::open_or_format_disk(&entry, self.config.node_id, true)?;
         let id = entry.id;
         self.config.disks.push(entry.clone());
         self.disks.insert(
@@ -298,6 +307,7 @@ impl PoolManager {
                 state: DiskState::Online,
                 used_bytes: 0,
                 device: dev,
+                superblock: sb,
             },
         );
         self.write_pool_state_root()?;
@@ -388,6 +398,13 @@ impl PoolManager {
         self.disks.get(&disk_id)
     }
 
+    /// Borrow the cached superblock for `disk_id`. Returns `None` for an
+    /// unknown disk. The cached copy reflects the active superblock as of
+    /// pool open / disk add.
+    pub fn disk_superblock(&self, disk_id: DiskId) -> Option<&Superblock> {
+        self.disks.get(&disk_id).map(|rt| &rt.superblock)
+    }
+
     /// Pick a disk for new data of `data_type` in tier `tier_pref`.
     ///
     /// Phase 3c strategy: simple capacity-weighted choice among Online
@@ -426,6 +443,16 @@ impl PoolManager {
     /// it on the primary disk.
     pub fn commit(&mut self) -> Result<(), PoolError> {
         self.write_pool_state_root()
+    }
+
+    /// Persist the manager's authoritative [`PoolConfig`] to `path` as TOML.
+    ///
+    /// `add_disk` and `remove_disk` already update the manager's internal
+    /// `PoolConfig`; this is the single helper callers (binaries, the engine
+    /// `DiskEngine`) reach for after a mutation. Replaces the older
+    /// re-read-then-save dance.
+    pub fn save_config(&self, path: &Path) -> Result<(), PoolError> {
+        self.config.save_toml(path)
     }
 
     fn write_pool_state_root(&mut self) -> Result<(), PoolError> {
@@ -675,6 +702,58 @@ mod tests {
         bad.node_id = 99;
         let err = PoolManager::open(bad).unwrap_err();
         assert!(matches!(err, PoolError::NodeIdMismatch { .. }));
+    }
+
+    #[test]
+    fn save_config_persists_post_add_disk() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = small_pool(&tmp);
+        let mut mgr = PoolManager::create(cfg).unwrap();
+        let new_path = tmp.path().join("dynamic.img");
+        let new_entry = entry(2, new_path, StorageTier::Warm, MediaType::Ssd, 16 * 1024 * 1024);
+        mgr.add_disk(new_entry).unwrap();
+
+        let toml_path = tmp.path().join("pool.toml");
+        mgr.save_config(&toml_path).unwrap();
+
+        // Reload via PoolConfig::load_toml — verifies the manager-owned
+        // save path produces a re-readable file with the new disk.
+        let reloaded = PoolConfig::load_toml(&toml_path).unwrap();
+        assert_eq!(reloaded.disks.len(), 3);
+        assert!(reloaded.disks.iter().any(|d| d.id == 2));
+    }
+
+    #[test]
+    fn disk_superblock_returns_some_for_each_disk() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = small_pool(&tmp);
+        let mgr = PoolManager::create(cfg).unwrap();
+        let sb0 = mgr.disk_superblock(0).expect("primary disk superblock");
+        assert_eq!(sb0.node_id(), 1);
+        assert_eq!(sb0.disk_id(), 0);
+        let sb1 = mgr.disk_superblock(1).expect("secondary disk superblock");
+        assert_eq!(sb1.node_id(), 1);
+        assert_eq!(sb1.disk_id(), 1);
+    }
+
+    #[test]
+    fn disk_superblock_unknown_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = small_pool(&tmp);
+        let mgr = PoolManager::create(cfg).unwrap();
+        assert!(mgr.disk_superblock(99).is_none());
+    }
+
+    #[test]
+    fn disk_superblock_after_add_disk_is_present() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = small_pool(&tmp);
+        let mut mgr = PoolManager::create(cfg).unwrap();
+        let new_path = tmp.path().join("disk2.img");
+        let new_entry = entry(2, new_path, StorageTier::Warm, MediaType::Ssd, 16 * 1024 * 1024);
+        mgr.add_disk(new_entry).unwrap();
+        let sb2 = mgr.disk_superblock(2).expect("freshly added disk superblock");
+        assert_eq!(sb2.disk_id(), 2);
     }
 
     #[test]

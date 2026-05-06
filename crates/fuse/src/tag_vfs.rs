@@ -214,6 +214,22 @@ impl<'a> TagVfs<'a> {
         self.context_trees.get(context)
     }
 
+    /// Allocate (or fetch the cached) inode for the context-directory of
+    /// `context` rooted under `/ctx/`. Returns `None` if there is no
+    /// projection registered for that tag. Used by [`crate::MountRoot`] to
+    /// re-root a FUSE mount at a single context.
+    pub fn ctx_root_inode(&self, context: TagId) -> Option<InodeId> {
+        if !self.context_trees.projections.contains_key(&context) {
+            return None;
+        }
+        let name = self.ontology.tags.get(&context)?.name.clone();
+        let kind = VfsEntryKind::CtxDir {
+            context,
+            sub_path: String::new(),
+        };
+        Some(self.allocate_inode(kind, INODE_CTX_ROOT, &name))
+    }
+
     // ----------------------------------------------------------------------
     // lookup helpers
     // ----------------------------------------------------------------------

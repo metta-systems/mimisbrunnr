@@ -62,4 +62,4 @@ pub use inode::{INODE_CTX_ROOT, INODE_ROOT, INODE_TAGS_ROOT, InodeId};
 pub use tag_vfs::TagVfs;
 
 #[cfg(feature = "fuse")]
-pub use mimisbrunnr_fs::MimisbrunnrFs;
+pub use mimisbrunnr_fs::{ContentProvider, MimisbrunnrFs, MountRoot};

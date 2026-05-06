@@ -5,8 +5,11 @@
 //! - In-memory mirror: [`ForwardIndex`] (per IMPL §13:
 //!   `HashMap<u64, Vec<(Assertion, TagOrigin)>>`).
 //!
-//! TODO(rewrite-phase-N): replace [`ForwardIndex::serialise`] /
-//! [`ForwardIndex::deserialise`] with the §1.5 B+ tree backing.
+//! [`ForwardIndex`] derives `Serialize`/`Deserialize` directly; callers
+//! reach for `ciborium::ser::into_writer` / `ciborium::de::from_reader`.
+//!
+//! TODO(rewrite-phase-N): replace the CBOR-blob persistence with the §1.5
+//! B+ tree backing.
 
 use std::collections::HashMap;
 
@@ -356,8 +359,8 @@ impl LeafEntry {
 /// In-memory mirror of the forward index (IMPL §13).
 ///
 /// Public surface mirrors DESIGN §5.5 (`direct_tags`, `materialized_tags`,
-/// `assertions_of`, …). Persistence in this phase is the
-/// [`ForwardIndex::serialise`] / [`ForwardIndex::deserialise`] pair below.
+/// `assertions_of`, …). The struct derives `Serialize`/`Deserialize` directly
+/// — callers reach for `ciborium::ser::into_writer` / `ciborium::de::from_reader`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ForwardIndex {
     /// Keyed by raw `ObjectId` (`oid.to_u64()`); per IMPL §13 the in-memory
@@ -444,19 +447,13 @@ impl ForwardIndex {
         self.entries.len()
     }
 
-    /// Serialise to CBOR. TODO(rewrite-phase-N): replace with §1.5 B+ tree
-    /// backing.
-    pub fn serialise(&self) -> Result<Vec<u8>, IndexError> {
-        let mut buf = Vec::new();
-        ciborium::ser::into_writer(self, &mut buf)
-            .map_err(|e| IndexError::CborEncode(e.to_string()))?;
-        Ok(buf)
-    }
-
-    /// Deserialise from CBOR. TODO(rewrite-phase-N): replace with §1.5 B+
-    /// tree backing.
-    pub fn deserialise(bytes: &[u8]) -> Result<Self, IndexError> {
-        ciborium::de::from_reader(bytes).map_err(|e| IndexError::CborDecode(e.to_string()))
+    /// Iterate every (oid, assertions) pair currently in the index. The
+    /// iteration order matches the underlying `HashMap` (i.e. unspecified)
+    /// but every present object is yielded exactly once.
+    pub fn iter(&self) -> impl Iterator<Item = (ObjectId, &[(Assertion, TagOrigin)])> {
+        self.entries
+            .iter()
+            .map(|(raw, v)| (ObjectId::from_u64(*raw), v.as_slice()))
     }
 }
 
@@ -643,10 +640,35 @@ mod tests {
             },
             TagOrigin::Materialized,
         );
-        let bytes = fi.serialise().unwrap();
-        let back = ForwardIndex::deserialise(&bytes).unwrap();
+        // Direct ciborium round-trip — the helper layer was removed in R0.5.
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&fi, &mut bytes).unwrap();
+        let back: ForwardIndex = ciborium::de::from_reader(bytes.as_slice()).unwrap();
         assert_eq!(back.assertions_of(oid(1)).len(), 1);
         assert_eq!(back.assertions_of(oid(2)).len(), 1);
+    }
+
+    #[test]
+    fn forward_index_iter_yields_all_pairs() {
+        let mut fi = ForwardIndex::new();
+        fi.add_assertion(oid(1), Assertion::Tag(tag(10)), TagOrigin::Direct);
+        fi.add_assertion(oid(1), Assertion::Tag(tag(11)), TagOrigin::Direct);
+        fi.add_assertion(oid(2), Assertion::Tag(tag(20)), TagOrigin::Direct);
+        fi.add_assertion(oid(2), Assertion::Tag(tag(21)), TagOrigin::Materialized);
+        fi.add_assertion(oid(3), Assertion::Tag(tag(30)), TagOrigin::Direct);
+        fi.add_assertion(oid(3), Assertion::Tag(tag(31)), TagOrigin::Materialized);
+
+        let mut total_pairs = 0usize;
+        let mut seen_oids = std::collections::HashSet::new();
+        for (o, asserts) in fi.iter() {
+            seen_oids.insert(o.to_u64());
+            total_pairs += asserts.len();
+        }
+        assert_eq!(total_pairs, 6);
+        assert_eq!(seen_oids.len(), 3);
+        assert!(seen_oids.contains(&oid(1).to_u64()));
+        assert!(seen_oids.contains(&oid(2).to_u64()));
+        assert!(seen_oids.contains(&oid(3).to_u64()));
     }
 
     #[test]

@@ -49,6 +49,77 @@ const_assert_eq!(
 
 // ---------- ChunkIndex (in-memory mirror) ----------
 
+/// Newtype around a 32-byte chunk hash so the `ChunkIndex` can derive
+/// `Serialize`/`Deserialize` directly. Serde's default `[u8; 32]` map-key
+/// representation depends on the format (CBOR encodes the byte array, but
+/// JSON-style formats reject byte-array keys); using a base-16 string here
+/// is unambiguous, format-agnostic, and stable across crate versions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChunkHashKey(pub [u8; 32]);
+
+impl ChunkHashKey {
+    /// Borrow the raw bytes.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl From<[u8; 32]> for ChunkHashKey {
+    fn from(b: [u8; 32]) -> Self {
+        Self(b)
+    }
+}
+
+impl From<ChunkHashKey> for [u8; 32] {
+    fn from(k: ChunkHashKey) -> Self {
+        k.0
+    }
+}
+
+impl Serialize for ChunkHashKey {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        // Lowercase base-16; 64 chars total, no separators.
+        let mut buf = [0u8; 64];
+        for (i, byte) in self.0.iter().enumerate() {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            buf[2 * i] = HEX[(byte >> 4) as usize];
+            buf[2 * i + 1] = HEX[(byte & 0xf) as usize];
+        }
+        // SAFETY: HEX bytes are all ASCII, so the buffer is valid UTF-8.
+        let s = core::str::from_utf8(&buf).map_err(serde::ser::Error::custom)?;
+        ser.serialize_str(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for ChunkHashKey {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        if s.len() != 64 {
+            return Err(serde::de::Error::custom(format!(
+                "expected 64 hex chars, got {}",
+                s.len()
+            )));
+        }
+        let mut out = [0u8; 32];
+        let bytes = s.as_bytes();
+        for (i, slot) in out.iter_mut().enumerate() {
+            let hi = hex_nibble(bytes[2 * i]).map_err(serde::de::Error::custom)?;
+            let lo = hex_nibble(bytes[2 * i + 1]).map_err(serde::de::Error::custom)?;
+            *slot = (hi << 4) | lo;
+        }
+        Ok(Self(out))
+    }
+}
+
+fn hex_nibble(c: u8) -> Result<u8, &'static str> {
+    match c {
+        b'0'..=b'9' => Ok(c - b'0'),
+        b'a'..=b'f' => Ok(c - b'a' + 10),
+        b'A'..=b'F' => Ok(c - b'A' + 10),
+        _ => Err("non-hex character in ChunkHashKey"),
+    }
+}
+
 /// Serialisable proxy for `BlobRef` (the upstream type derives neither
 /// `Serialize` nor `Deserialize`).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -81,12 +152,24 @@ impl From<BlobRefSerde> for BlobRef {
     }
 }
 
+/// Internal serde-friendly value: the proxy `BlobRef` plus the refcount.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct ChunkEntrySerde {
+    blob: BlobRefSerde,
+    ref_count: u32,
+}
+
 /// In-memory `ChunkIndex`. Keyed by BLAKE3 chunk hash, value is the physical
 /// extent and a reference count tracking how many `ChunkList` chains point
 /// at this chunk (DESIGN §5 / IMPL §9.3).
-#[derive(Debug, Clone, Default)]
+///
+/// `Serialize` / `Deserialize` are derived via the [`ChunkHashKey`] newtype
+/// (base-16 string keys) and a per-entry serde proxy for [`BlobRef`]. That
+/// makes the type usable directly with `ciborium::ser::into_writer` /
+/// `ciborium::de::from_reader` — no crate-local helpers needed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChunkIndex {
-    entries: HashMap<[u8; 32], (BlobRef, u32)>,
+    entries: HashMap<ChunkHashKey, ChunkEntrySerde>,
 }
 
 impl ChunkIndex {
@@ -97,32 +180,40 @@ impl ChunkIndex {
 
     /// Look up a chunk by hash. Returns `None` if absent.
     pub fn lookup(&self, hash: &[u8; 32]) -> Option<BlobRef> {
-        self.entries.get(hash).map(|(b, _)| *b)
+        self.entries
+            .get(&ChunkHashKey(*hash))
+            .map(|e| e.blob.into())
     }
 
     /// Borrow `(blob, ref_count)` for a given hash.
     pub fn entry(&self, hash: &[u8; 32]) -> Option<(BlobRef, u32)> {
-        self.entries.get(hash).copied()
+        self.entries
+            .get(&ChunkHashKey(*hash))
+            .map(|e| (e.blob.into(), e.ref_count))
     }
 
     /// Insert a new chunk if missing, otherwise increment its `ref_count`.
     /// Returns the resulting `BlobRef` (the freshly inserted one, or the
     /// existing one — content-addressed dedup makes them identical).
     pub fn insert_or_bump(&mut self, hash: [u8; 32], blob: BlobRef) -> BlobRef {
-        let entry = self.entries.entry(hash).or_insert((blob, 0));
-        entry.1 = entry.1.saturating_add(1);
-        entry.0
+        let entry = self.entries.entry(ChunkHashKey(hash)).or_insert(ChunkEntrySerde {
+            blob: blob.into(),
+            ref_count: 0,
+        });
+        entry.ref_count = entry.ref_count.saturating_add(1);
+        entry.blob.into()
     }
 
     /// Decrement the refcount; remove if it reaches zero. Returns `true` if
     /// the entry was removed (caller should reclaim the blob).
     pub fn decrement(&mut self, hash: &[u8; 32]) -> bool {
-        if let Some(entry) = self.entries.get_mut(hash) {
-            if entry.1 <= 1 {
-                self.entries.remove(hash);
+        let key = ChunkHashKey(*hash);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if entry.ref_count <= 1 {
+                self.entries.remove(&key);
                 true
             } else {
-                entry.1 -= 1;
+                entry.ref_count -= 1;
                 false
             }
         } else {
@@ -137,33 +228,24 @@ impl ChunkIndex {
 
     /// Reference count for a hash, or 0 if absent.
     pub fn ref_count(&self, hash: &[u8; 32]) -> u32 {
-        self.entries.get(hash).map(|(_, c)| *c).unwrap_or(0)
+        self.entries
+            .get(&ChunkHashKey(*hash))
+            .map(|e| e.ref_count)
+            .unwrap_or(0)
     }
 
-    /// Serialise to CBOR. TODO(rewrite-phase-N): replace with §1.5 B+ tree
-    /// backing.
+    /// Serialise to CBOR. The type derives `Serialize` directly; this
+    /// helper is retained for symmetry with the other indices.
     pub fn serialise(&self) -> Result<Vec<u8>, IndexError> {
-        let proxy: HashMap<[u8; 32], (BlobRefSerde, u32)> = self
-            .entries
-            .iter()
-            .map(|(h, (b, c))| (*h, ((*b).into(), *c)))
-            .collect();
         let mut buf = Vec::new();
-        ciborium::ser::into_writer(&proxy, &mut buf)
+        ciborium::ser::into_writer(self, &mut buf)
             .map_err(|e| IndexError::CborEncode(e.to_string()))?;
         Ok(buf)
     }
 
     /// Deserialise from CBOR.
     pub fn deserialise(bytes: &[u8]) -> Result<Self, IndexError> {
-        let proxy: HashMap<[u8; 32], (BlobRefSerde, u32)> =
-            ciborium::de::from_reader(bytes).map_err(|e| IndexError::CborDecode(e.to_string()))?;
-        Ok(Self {
-            entries: proxy
-                .into_iter()
-                .map(|(h, (b, c))| (h, (b.into(), c)))
-                .collect(),
-        })
+        ciborium::de::from_reader(bytes).map_err(|e| IndexError::CborDecode(e.to_string()))
     }
 }
 
@@ -217,6 +299,22 @@ mod tests {
         let mut idx = ChunkIndex::new();
         assert!(idx.lookup(&h(99)).is_none());
         assert!(!idx.decrement(&h(99)));
+    }
+
+    #[test]
+    fn chunk_hash_key_serde_round_trip_via_ciborium_directly() {
+        // Verify the ChunkIndex derives Serialize/Deserialize and round-trips
+        // through `ciborium::{ser,de}` without crate-local helpers.
+        let mut idx = ChunkIndex::new();
+        idx.insert_or_bump(h(7), b(700));
+        idx.insert_or_bump(h(8), b(800));
+        idx.insert_or_bump(h(8), b(800));
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&idx, &mut buf).unwrap();
+        let back: ChunkIndex = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(back.chunk_count(), 2);
+        assert_eq!(back.ref_count(&h(7)), 1);
+        assert_eq!(back.ref_count(&h(8)), 2);
     }
 
     #[test]

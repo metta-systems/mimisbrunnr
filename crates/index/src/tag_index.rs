@@ -223,8 +223,16 @@ impl TagIndex {
         self.stores.keys().copied().collect()
     }
 
-    /// Serialise to CBOR. TODO(rewrite-phase-N): replace with §1.5 B+ tree
-    /// backing.
+    /// Serialise to CBOR.
+    ///
+    /// `TagIndex` derives `Serialize`/`Deserialize` directly — the
+    /// `RoaringBitmap` framing lives in [`crate::TagStore`]'s custom serde
+    /// impls (`bitmap_bytes` field, IMPL §13.1). This helper exists for
+    /// symmetry with the other indices and to map ciborium errors to
+    /// [`IndexError`]; callers may equally reach for `ciborium::ser::into_writer`
+    /// directly.
+    ///
+    /// TODO(rewrite-phase-N): replace with §1.5 B+ tree backing.
     pub fn serialise(&self) -> Result<Vec<u8>, IndexError> {
         let mut buf = Vec::new();
         ciborium::ser::into_writer(self, &mut buf)
@@ -232,7 +240,8 @@ impl TagIndex {
         Ok(buf)
     }
 
-    /// Deserialise from CBOR.
+    /// Deserialise from CBOR. See the doc on [`Self::serialise`] for why this
+    /// helper is retained.
     pub fn deserialise(bytes: &[u8]) -> Result<Self, IndexError> {
         ciborium::de::from_reader(bytes).map_err(|e| IndexError::CborDecode(e.to_string()))
     }
