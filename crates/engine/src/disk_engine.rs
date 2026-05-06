@@ -6,10 +6,26 @@
 //! - the primary disk's [`Superblock`] (atomic root commit at checkpoint),
 //! - a [`PoolManager`] (multi-disk lifecycle).
 //!
-//! Index persistence in this phase is a **single CBOR blob** in the index
-//! zone, length-prefixed by a 4-byte little-endian header. The B+ tree
-//! machinery lands in a later phase.
-// TODO(rewrite-phase-N): replace CBOR blob with B+ trees per IMPL §1.5/§7/§8/§9.
+//! ## Index persistence layout (post-R1b-1)
+//!
+//! Within the index zone, R1b-1 carves out two dedicated 256 KiB §1.5 B+
+//! tree regions for the migrated indices, with the remaining indices still
+//! living in a length-prefixed CBOR blob:
+//!
+//! ```text
+//! [zone.offset + 0]                 ChunkIndex region    (256 KiB)
+//! [zone.offset + 256 KiB]           KvIndex region       (256 KiB)
+//! [zone.offset + 512 KiB]           Legacy CBOR blob     (MIXI magic + u32 len + CBOR)
+//! ```
+//!
+//! Backwards compatibility with pre-R1b pools is **not** supported: the
+//! legacy blob has moved 512 KiB into the zone, so older pools whose CBOR
+//! blob sits at zone offset 0 will fail to load. This is a one-way
+//! migration; recreating the pool is the only path forward.
+//! TODO(rewrite-phase-R1b-2..N): migrate the remaining indices (forward,
+//! tag, range, ontology, subscriptions, path contexts, oplog, object
+//! table, location table) to per-index B+ tree regions and drop the CBOR
+//! blob entirely.
 
 use std::{
     collections::HashMap,
@@ -21,6 +37,19 @@ use ciborium::{de::from_reader, ser::into_writer};
 use log::trace;
 use mimisbrunnr_index::{ChunkIndex, ForwardIndex, KvIndex, RangeIndex, TagIndex};
 use mimisbrunnr_meta::{LocationTable, ObjectTable};
+
+/// Per-index slot offsets within the index zone. R1b-1 places two
+/// 256 KiB §1.5 B+ tree regions at the start of the zone (one per
+/// migrated index) and pushes the legacy CBOR blob to immediately after
+/// them.
+const CHUNK_INDEX_REGION_OFFSET: u64 = 0;
+/// See [`CHUNK_INDEX_REGION_OFFSET`].
+const KV_INDEX_REGION_OFFSET: u64 = 256 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`].
+const LEGACY_CBOR_BLOB_OFFSET: u64 = 512 * 1024;
+/// 256 KiB region size — matches `Superblock.btree_node_size_log2 = 18`.
+#[allow(dead_code)] // referenced in size assertions / future dynamic layout work.
+const REGION_SIZE: u64 = 256 * 1024;
 use mimisbrunnr_ontology::{InstallResult, OntologyModule, OntologyState};
 use mimisbrunnr_pool::{DiskConfigEntry, PoolConfig, PoolManager, PoolStatus};
 use mimisbrunnr_storage::{BlockDevice, FileBlockDevice, Superblock};
@@ -82,9 +111,7 @@ pub struct DiskEngine {
 struct IndexBlob {
     forward_index_bytes: Vec<u8>,
     tag_index_bytes: Vec<u8>,
-    kv_index_bytes: Vec<u8>,
     range_index_bytes: Vec<u8>,
-    chunk_index_bytes: Vec<u8>,
     ontology_bytes: Vec<u8>,
     subscriptions_bytes: Vec<u8>,
     path_contexts_bytes: Vec<u8>,
@@ -189,15 +216,32 @@ impl DiskEngine {
 
         let mut engine = Engine::new(config.node_id);
 
-        // 1. Restore index state from the index-zone CBOR blob (if any).
+        let zone_offset = { superblock.index_zone.offset };
+
+        // 1a. Migrated indices: ChunkIndex / KvIndex live in dedicated
+        // 256 KiB §1.5 B+ tree regions at fixed slot offsets.
+        engine.chunk_index = ChunkIndex::load_from_region(
+            primary_dev.as_ref(),
+            zone_offset + CHUNK_INDEX_REGION_OFFSET,
+        )
+        .map_err(EngineError::from)?;
+        engine.kv_index = KvIndex::load_from_region(
+            primary_dev.as_ref(),
+            zone_offset + KV_INDEX_REGION_OFFSET,
+        )
+        .map_err(EngineError::from)?;
+
+        // 1b. Restore everything else from the legacy CBOR blob (if any).
         let index_blob = read_index_blob(primary_dev.as_ref(), &superblock)?;
+        let mut blobs: HashMap<u64, Vec<u8>> = HashMap::new();
         if let Some(blob) = index_blob {
+            blobs = blob.blobs.clone();
             apply_index_blob(&mut engine, blob);
         }
 
         let mut de = Self {
             engine,
-            blobs: HashMap::new(),
+            blobs,
             pool,
             primary_device: primary_dev,
             superblock,
@@ -207,12 +251,7 @@ impl DiskEngine {
             read_only: false,
         };
 
-        // 2. Re-load the blob map (we stuffed it into the index blob too).
-        if let Some(blob) = read_index_blob(de.primary_device.as_ref(), &de.superblock)? {
-            de.blobs = blob.blobs.clone();
-        }
-
-        // 3. Replay WAL entries past the last applied LSN.
+        // 2. Replay WAL entries past the last applied LSN.
         de.replay_wal()?;
         Ok(de)
     }
@@ -265,7 +304,21 @@ impl DiskEngine {
 
         let mut engine = Engine::new(config.node_id);
 
-        // Restore index state from the index-zone CBOR blob (if any).
+        let zone_offset = { superblock.index_zone.offset };
+
+        // Migrated indices live in dedicated regions at fixed slot offsets.
+        engine.chunk_index = ChunkIndex::load_from_region(
+            primary_dev.as_ref(),
+            zone_offset + CHUNK_INDEX_REGION_OFFSET,
+        )
+        .map_err(EngineError::from)?;
+        engine.kv_index = KvIndex::load_from_region(
+            primary_dev.as_ref(),
+            zone_offset + KV_INDEX_REGION_OFFSET,
+        )
+        .map_err(EngineError::from)?;
+
+        // Restore everything else from the legacy CBOR blob (if any).
         let index_blob = read_index_blob(primary_dev.as_ref(), &superblock)?;
         let mut blobs: HashMap<u64, Vec<u8>> = HashMap::new();
         if let Some(blob) = index_blob {
@@ -300,37 +353,78 @@ impl DiskEngine {
     // Persistence: index zone (CBOR blob) and atomic root commit.
     // -------------------------------------------------------------------
 
-    /// Save the engine's index state to the index zone as a length-prefixed
-    /// CBOR blob.
+    /// Save the engine's index state to the index zone:
+    ///
+    /// 1. Flush the migrated indices ([`ChunkIndex`], [`KvIndex`]) to their
+    ///    dedicated 256 KiB §1.5 B+ tree regions at fixed slot offsets.
+    /// 2. Write the remaining indices as a length-prefixed CBOR blob at
+    ///    [`LEGACY_CBOR_BLOB_OFFSET`] within the zone.
     pub fn save_index_state(&mut self) -> Result<(), EngineError> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let blob = build_index_blob(&self.engine, &self.blobs)?;
-        let mut payload = Vec::new();
-        into_writer(&blob, &mut payload)?;
 
         let zone_offset = { self.superblock.index_zone.offset };
         let zone_length = { self.superblock.index_zone.length };
 
+        // Sanity-check zone is large enough for the new layout.
+        if zone_length < LEGACY_CBOR_BLOB_OFFSET {
+            return Err(EngineError::NotImplemented(
+                "index zone too small for R1b-1 layout (needs ≥ 512 KiB before the legacy blob)",
+            ));
+        }
+
+        // 1. Flush migrated indices to their fixed-offset regions.
+        self.engine
+            .chunk_index
+            .flush_to_region(self.primary_device.as_ref(), zone_offset + CHUNK_INDEX_REGION_OFFSET)
+            .map_err(EngineError::from)?;
+        self.engine
+            .kv_index
+            .flush_to_region(self.primary_device.as_ref(), zone_offset + KV_INDEX_REGION_OFFSET)
+            .map_err(EngineError::from)?;
+
+        // 2. Build + write the legacy CBOR blob (everything else).
+        let blob = build_index_blob(&self.engine, &self.blobs)?;
+        let mut payload = Vec::new();
+        into_writer(&blob, &mut payload)?;
+
         // Frame: [magic u32 le | length u32 le | cbor bytes ...]
         let total = 4 + 4 + payload.len() as u64;
-        if total > zone_length {
+        let blob_room = zone_length - LEGACY_CBOR_BLOB_OFFSET;
+        if total > blob_room {
             return Err(EngineError::NotImplemented(
-                "index zone too small for CBOR blob — TODO(rewrite-phase-N): spill via §1.5 B+ trees",
+                "legacy index blob too large for the index zone — TODO(rewrite-phase-R1b-N): \
+                 migrate the remaining indices off the CBOR blob",
             ));
         }
         let mut framed = Vec::with_capacity(total as usize);
         framed.extend_from_slice(&INDEX_BLOB_MAGIC.to_le_bytes());
         framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         framed.extend_from_slice(&payload);
-        self.primary_device.write_at(zone_offset, &framed)?;
+        self.primary_device
+            .write_at(zone_offset + LEGACY_CBOR_BLOB_OFFSET, &framed)?;
         self.primary_device.sync()?;
         Ok(())
     }
 
     /// Reload the index state from disk (overwrites in-memory state).
     pub fn load_index_state(&mut self) -> Result<(), EngineError> {
+        let zone_offset = { self.superblock.index_zone.offset };
+
+        // Migrated indices first.
+        self.engine.chunk_index = ChunkIndex::load_from_region(
+            self.primary_device.as_ref(),
+            zone_offset + CHUNK_INDEX_REGION_OFFSET,
+        )
+        .map_err(EngineError::from)?;
+        self.engine.kv_index = KvIndex::load_from_region(
+            self.primary_device.as_ref(),
+            zone_offset + KV_INDEX_REGION_OFFSET,
+        )
+        .map_err(EngineError::from)?;
+
+        // Legacy CBOR blob.
         if let Some(blob) =
             read_index_blob(self.primary_device.as_ref(), &self.superblock)?
         {
@@ -694,9 +788,7 @@ fn build_index_blob(
     Ok(IndexBlob {
         forward_index_bytes,
         tag_index_bytes: engine.tag_index.serialise()?,
-        kv_index_bytes: engine.kv_index.serialise()?,
         range_index_bytes: engine.range_index.serialise()?,
-        chunk_index_bytes: engine.chunk_index.serialise()?,
         ontology_bytes: engine.ontology.serialise()?,
         subscriptions_bytes: engine.subscriptions.serialise()?,
         path_contexts_bytes: engine.path_contexts.serialise()?,
@@ -730,11 +822,13 @@ fn read_index_blob(
 ) -> Result<Option<IndexBlob>, EngineError> {
     let zone_offset = { superblock.index_zone.offset };
     let zone_length = { superblock.index_zone.length };
-    if zone_length < 8 {
+    if zone_length < LEGACY_CBOR_BLOB_OFFSET + 8 {
         return Ok(None);
     }
+    let blob_offset = zone_offset + LEGACY_CBOR_BLOB_OFFSET;
+    let blob_room = zone_length - LEGACY_CBOR_BLOB_OFFSET;
     let mut header = [0u8; 8];
-    device.read_at(zone_offset, &mut header)?;
+    device.read_at(blob_offset, &mut header)?;
     let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
     if magic == 0 {
         // Fresh zone — no payload yet.
@@ -747,11 +841,11 @@ fn read_index_blob(
         return Ok(None);
     }
     let payload_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
-    if payload_len + 8 > zone_length {
+    if payload_len + 8 > blob_room {
         return Ok(None);
     }
     let mut payload = vec![0u8; payload_len as usize];
-    device.read_at(zone_offset + 8, &mut payload)?;
+    device.read_at(blob_offset + 8, &mut payload)?;
     let blob: IndexBlob = from_reader(payload.as_slice())?;
     Ok(Some(blob))
 }
@@ -764,14 +858,8 @@ fn apply_index_blob(engine: &mut Engine, blob: IndexBlob) {
     if let Ok(t) = TagIndex::deserialise(&blob.tag_index_bytes) {
         engine.tag_index = t;
     }
-    if let Ok(kv) = KvIndex::deserialise(&blob.kv_index_bytes) {
-        engine.kv_index = kv;
-    }
     if let Ok(r) = RangeIndex::deserialise(&blob.range_index_bytes) {
         engine.range_index = r;
-    }
-    if let Ok(c) = ChunkIndex::deserialise(&blob.chunk_index_bytes) {
-        engine.chunk_index = c;
     }
     if let Ok(ont) = OntologyState::deserialise(&blob.ontology_bytes) {
         engine.ontology = ont;

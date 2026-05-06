@@ -1,5 +1,6 @@
 //! Errors emitted by `mimisbrunnr-index`.
 
+use mimisbrunnr_storage::StorageError;
 use thiserror::Error;
 
 /// Errors returned by the index crate.
@@ -41,4 +42,8 @@ pub enum IndexError {
     /// Roaring bitmap (de)serialisation failure.
     #[error("roaring bitmap error: {0}")]
     Roaring(String),
+
+    /// Underlying storage error (B+ tree region read/write).
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
 }

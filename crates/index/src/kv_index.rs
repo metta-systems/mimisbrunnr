@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use {
     bytemuck::{Pod, Zeroable},
+    mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
     mimisbrunnr_types::{TagId, Value, value_hash},
     roaring::RoaringBitmap,
     serde::{Deserialize, Serialize},
@@ -20,6 +21,12 @@ use {
 };
 
 use crate::error::IndexError;
+
+/// 256 KiB region size in bytes (matches the spec's 18-bit
+/// `region_size_log2`). Engine code sizes the on-disk slot from this.
+#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+pub const KV_INDEX_REGION_SIZE: u64 = 256 * 1024;
+const REGION_SIZE_LOG2: u8 = 18;
 
 // ---------- KvHashDirectoryHeader ----------
 
@@ -196,7 +203,126 @@ impl KvIndex {
     pub fn deserialise(bytes: &[u8]) -> Result<Self, IndexError> {
         ciborium::de::from_reader(bytes).map_err(|e| IndexError::CborDecode(e.to_string()))
     }
+
+    // ----------------------------------------------------------------
+    // R1b-1: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // ----------------------------------------------------------------
+    //
+    // Variable-shape values (roaring bitmaps, serialised to bytes) preclude
+    // the §1.5.6 packed-key codec: it requires every entry's value to share
+    // the same byte length. Until R1a-pack-2 grows variable-size value
+    // support, KvIndex flushes through the CBOR run codec.
+
+    /// Build a [`LoadedNode`] containing every entry as a single CBOR sorted
+    /// run, sorted by `(tag_id, value_hash)`. Each value is the per-key
+    /// [`RoaringBitmap`] serialised via `RoaringBitmap::serialize_into`.
+    ///
+    /// The node uses [`BtreeKind::KvDirectory`] (the spec doesn't yet
+    /// allocate a dedicated `BtreeKind::KvIndex` — see TODO below) and the
+    /// spec's 18-bit (256 KiB) region size.
+    /// TODO(rewrite-phase-R1c): once `BtreeKind::KvIndex` exists in the
+    /// storage spec, switch to it.
+    pub fn to_loaded_node(&self) -> LoadedNode<KvIndexKey, KvIndexValue> {
+        let mut entries: Vec<(KvIndexKey, KvIndexValue)> = self
+            .entries
+            .iter()
+            .map(|(k, bm)| {
+                let mut bytes = Vec::with_capacity(bm.0.serialized_size());
+                // serialize_into errors only on I/O; Vec write is infallible.
+                bm.0.serialize_into(&mut bytes)
+                    .expect("RoaringBitmap::serialize_into into Vec must not fail");
+                (
+                    KvIndexKey {
+                        tag_id: k.0.raw(),
+                        value_hash: k.1,
+                    },
+                    KvIndexValue(bytes),
+                )
+            })
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut node: LoadedNode<KvIndexKey, KvIndexValue> =
+            LoadedNode::new(BtreeKind::KvDirectory, 0, REGION_SIZE_LOG2);
+        if !entries.is_empty() {
+            let run = SortedRun::from_sorted(0, 0, entries);
+            node.sorted_runs.push(run);
+            node.header.sorted_run_count = 1;
+        }
+        node
+    }
+
+    /// Restore the in-memory state from a [`LoadedNode`] read via
+    /// [`BtreeRegion::read`]. Re-deserialises each per-entry roaring bitmap
+    /// from its byte image.
+    pub fn from_loaded_node(
+        node: &LoadedNode<KvIndexKey, KvIndexValue>,
+    ) -> Result<Self, IndexError> {
+        let mut entries: HashMap<(TagId, u64), RoaringBitmapSerde> = HashMap::new();
+        for (k, v) in node.merge_iter() {
+            let bm = RoaringBitmap::deserialize_from(v.0.as_slice())
+                .map_err(|e| IndexError::Roaring(e.to_string()))?;
+            entries.insert((TagId::new(k.tag_id), k.value_hash), RoaringBitmapSerde(bm));
+        }
+        Ok(Self {
+            entries,
+            secret: [0u8; 16],
+        })
+    }
+
+    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
+    /// on `device`. Replaces the region wholesale via
+    /// [`BtreeRegion::write_full`].
+    pub fn flush_to_region<D: BlockDevice>(
+        &self,
+        device: &D,
+        offset: u64,
+    ) -> Result<(), IndexError> {
+        let mut node = self.to_loaded_node();
+        BtreeRegion::write_full::<D, KvIndexKey, KvIndexValue>(device, offset, &mut node)?;
+        Ok(())
+    }
+
+    /// Read the in-memory state from the 256 KiB region at byte `offset` on
+    /// `device`. An all-zero region is treated as "empty index" and returns
+    /// [`Self::default`].
+    pub fn load_from_region<D: BlockDevice>(
+        device: &D,
+        offset: u64,
+    ) -> Result<Self, IndexError> {
+        let mut probe = [0u8; 8];
+        device.read_at(offset, &mut probe)?;
+        if probe.iter().all(|&b| b == 0) {
+            return Ok(Self::default());
+        }
+        let node = BtreeRegion::read::<D, KvIndexKey, KvIndexValue>(
+            device,
+            offset,
+            BtreeKind::KvDirectory,
+        )?;
+        Self::from_loaded_node(&node)
+    }
 }
+
+// ---------- KvIndexKey / KvIndexValue (B+ tree wire types) ----------
+
+/// B+ tree key for the KV index: `(tag_id, value_hash)` per IMPL §9.1.
+///
+/// Order is `tag_id` then `value_hash`, lexicographically — matches the
+/// derived `Ord` impl below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct KvIndexKey {
+    pub tag_id: u32,
+    pub value_hash: u64,
+}
+
+/// B+ tree value for the KV index: the roaring bitmap of object-locals,
+/// serialised via `RoaringBitmap::serialize_into`. Wrapping in a newtype
+/// gives us `Serialize` / `Deserialize` via serde's blanket
+/// `Vec<u8>` impls without conflicting with the
+/// [`RoaringBitmapSerde`] proxy used by the CBOR-blob persistence path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvIndexValue(pub Vec<u8>);
 
 // ---------- RoaringBitmapSerde (serde wrapper) ----------
 
@@ -293,5 +419,96 @@ mod tests {
         assert_eq!(back.entry_count(), 2);
         assert!(back.lookup(t(1), &Value::Int(42)).contains(100));
         assert!(back.lookup(t(2), &Value::Text("foo".into())).contains(200));
+    }
+
+    // ----- B+ tree region round-trip (R1b-1) -----
+
+    use mimisbrunnr_storage::FileBlockDevice;
+    use tempfile::TempDir;
+
+    fn fresh_device() -> (TempDir, FileBlockDevice) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("kv_index.bin");
+        // 1 MiB is plenty for one 256 KiB region.
+        let dev = FileBlockDevice::open(&path, 1 << 20).unwrap();
+        (dir, dev)
+    }
+
+    #[test]
+    fn empty_loaded_node_round_trip() {
+        let idx = KvIndex::new();
+        let node = idx.to_loaded_node();
+        assert_eq!(node.sorted_runs.len(), 0);
+        let back = KvIndex::from_loaded_node(&node).unwrap();
+        assert_eq!(back.entry_count(), 0);
+    }
+
+    #[test]
+    fn loaded_node_round_trip_preserves_entries() {
+        let mut idx = KvIndex::new();
+        idx.insert(t(1), &Value::Int(42), 100);
+        idx.insert(t(1), &Value::Int(42), 101);
+        idx.insert(t(1), &Value::Int(7), 200);
+        idx.insert(t(2), &Value::Text("foo".into()), 300);
+        let node = idx.to_loaded_node();
+        assert_eq!(node.sorted_runs.len(), 1);
+        let back = KvIndex::from_loaded_node(&node).unwrap();
+        assert_eq!(back.entry_count(), 3);
+        let bm = back.lookup(t(1), &Value::Int(42));
+        assert!(bm.contains(100));
+        assert!(bm.contains(101));
+        assert_eq!(bm.len(), 2);
+        assert!(back.lookup(t(2), &Value::Text("foo".into())).contains(300));
+    }
+
+    #[test]
+    fn region_round_trip_empty_returns_default() {
+        let (_dir, dev) = fresh_device();
+        let idx = KvIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(idx.entry_count(), 0);
+    }
+
+    #[test]
+    fn region_round_trip_50_entries_with_100_oid_bitmaps() {
+        let (_dir, dev) = fresh_device();
+        let mut idx = KvIndex::new();
+        // 50 distinct (tag, value) entries; each carrying 100 random-ish u32s.
+        let oid_for = |i: u32, j: u32| i.wrapping_mul(31).wrapping_add(j).wrapping_add(1);
+        for i in 0u32..50 {
+            let v = Value::Int(i as i64 * 13 + 1);
+            for j in 0u32..100 {
+                idx.insert(t(i), &v, oid_for(i, j));
+            }
+        }
+        assert_eq!(idx.entry_count(), 50);
+        idx.flush_to_region(&dev, 0).unwrap();
+        let back = KvIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.entry_count(), 50);
+        for i in 0u32..50 {
+            let v = Value::Int(i as i64 * 13 + 1);
+            let bm = back.lookup(t(i), &v);
+            assert_eq!(bm.len(), 100, "entry {i} should still have 100 ids");
+            for j in 0u32..100 {
+                assert!(bm.contains(oid_for(i, j)));
+            }
+        }
+    }
+
+    #[test]
+    fn region_overwrite_replaces_state() {
+        let (_dir, dev) = fresh_device();
+        let mut first = KvIndex::new();
+        first.insert(t(1), &Value::Int(1), 11);
+        first.insert(t(1), &Value::Int(2), 22);
+        first.flush_to_region(&dev, 0).unwrap();
+
+        let mut second = KvIndex::new();
+        second.insert(t(9), &Value::Int(99), 999);
+        second.flush_to_region(&dev, 0).unwrap();
+
+        let back = KvIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.entry_count(), 1);
+        assert!(back.lookup(t(9), &Value::Int(99)).contains(999));
+        assert!(back.lookup(t(1), &Value::Int(1)).is_empty());
     }
 }

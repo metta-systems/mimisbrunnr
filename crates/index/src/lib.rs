@@ -38,7 +38,8 @@ mod tag_store;
 
 pub use {
     chunk_index::{
-        CHUNK_INDEX_LEAF_ENTRY_SIZE, ChunkHashKey, ChunkIndex, ChunkIndexLeafEntry,
+        BlobRefSerde, CHUNK_INDEX_LEAF_ENTRY_SIZE, CHUNK_INDEX_VALUE_SIZE, ChunkEntrySerde,
+        ChunkHashKey, ChunkIndex, ChunkIndexKey, ChunkIndexLeafEntry, ChunkIndexValue,
     },
     chunk_list::{
         CHUNK_LIST_ENTRY_SIZE, CHUNK_PARAMS_RECORD_SIZE, ChunkListEntry,
@@ -55,7 +56,7 @@ pub use {
     },
     kv_index::{
         KV_HASH_BUCKET_HEADER_SIZE, KV_HASH_DIRECTORY_HEADER_SIZE, KvHashBucketHeader,
-        KvHashDirectoryHeader, KvIndex,
+        KvHashDirectoryHeader, KvIndex, KvIndexKey, KvIndexValue,
     },
     normalised_key::{NORMALISED_KEY_LEN, NormalisedKey},
     range_index::RangeIndex,

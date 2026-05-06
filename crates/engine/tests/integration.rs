@@ -679,3 +679,61 @@ fn read_only_then_mutating_open_sees_subsequent_changes() {
     let de_ro2 = DiskEngine::open_read_only(&cfg_path).unwrap();
     assert!(de_ro2.engine.resolve_tag_name("fresh").is_some());
 }
+
+// ----------------------------------------------------------------------
+// R1b-1: per-region index persistence (ChunkIndex / KvIndex)
+// ----------------------------------------------------------------------
+
+#[test]
+fn fresh_pool_open_before_first_commit_sees_empty_migrated_indices() {
+    // Sanity: the migrated-index regions are zero-filled at format time, so
+    // an `open` against a freshly-created pool that hasn't been committed
+    // must succeed and see empty ChunkIndex / KvIndex states.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    {
+        let _de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+        // Drop without committing.
+    }
+    let de = DiskEngine::open(&cfg_path).unwrap();
+    assert_eq!(de.engine.chunk_index.chunk_count(), 0);
+    assert_eq!(de.engine.kv_index.entry_count(), 0);
+}
+
+#[test]
+fn migrated_indices_persist_across_commit_drop_open() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+    // ChunkIndex inserts go through the in-memory engine directly — no
+    // public DiskEngine surface for them in R1b-1, but the persistence
+    // round-trip must still cover them.
+    let blob_ref = mimisbrunnr_storage::BlobRef {
+        disk_id: 0,
+        _pad: 0,
+        block_no: 1234,
+        length: 4096,
+    };
+    de.engine.chunk_index.insert_or_bump([0xa1u8; 32], blob_ref);
+    de.engine.chunk_index.insert_or_bump([0xa1u8; 32], blob_ref); // ref_count = 2
+    de.engine.chunk_index.insert_or_bump([0xb2u8; 32], blob_ref);
+
+    // KvIndex inserts go through the public set_attr path.
+    let key = de.engine.register_tag("yr");
+    let oid = de.create_object().unwrap();
+    de.set_attr(oid, key, Value::Int(2026)).unwrap();
+    de.commit().unwrap();
+    drop(de);
+
+    let de2 = DiskEngine::open(&cfg_path).unwrap();
+    // ChunkIndex round-trip.
+    assert_eq!(de2.engine.chunk_index.chunk_count(), 2);
+    assert_eq!(de2.engine.chunk_index.ref_count(&[0xa1u8; 32]), 2);
+    assert_eq!(de2.engine.chunk_index.ref_count(&[0xb2u8; 32]), 1);
+
+    // KvIndex round-trip via set_attr.
+    let key2 = de2.engine.resolve_tag_name("yr").unwrap();
+    let bm = de2.engine.kv_index.lookup(key2, &Value::Int(2026));
+    assert_eq!(bm.len(), 1);
+}
