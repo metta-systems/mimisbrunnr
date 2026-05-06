@@ -40,6 +40,11 @@ pub use {
     block_device::BlockDevice,
     btree::{
         BtreeRegion, JournalEntry, JournalOp, LoadedNode, MergeIter, SortedRun, compact,
+        pack::{
+            FieldHints, FormatFit, FormatPromoteEvent, PackError, PackableKey, check_fit,
+            compare_packed_keys, decode_packed_run, decode_packed_run_with_prefix,
+            encode_packed_run, select_format,
+        },
         should_compact,
     },
     btree_node::{

@@ -61,4 +61,7 @@ pub enum StorageError {
 
     #[error("region payload exhausted: payload_used={used} would exceed region_size={size}")]
     RegionFull { used: u64, size: u64 },
+
+    #[error("packed-key codec error: {0}")]
+    Pack(#[from] crate::btree::pack::PackError),
 }

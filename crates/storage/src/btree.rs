@@ -51,10 +51,14 @@
 //! granularity. See [`BtreeRegion::append_sorted_run`].
 //!
 //! Sorted-run payload encoding (R1a-core): **`ciborium` CBOR** of
-//! `Vec<(K, V)>`, with `K, V: Serialize + DeserializeOwned`. The packed-key
-//! codec replaces this in R1a-pack; the on-disk flag
-//! [`SORTED_RUN_FLAG_PACKED_KEYS`] stays clear for R1a-core writes and is
-//! rejected on read.
+//! `Vec<(K, V)>`, with `K, V: Serialize + DeserializeOwned`. R1a-pack adds a
+//! parallel **packed-key codec** path (see the `pack` submodule and
+//! [`BtreeRegion::write_full_packed`] / [`BtreeRegion::read_packed`]) that
+//! sets the on-disk flag [`SORTED_RUN_FLAG_PACKED_KEYS`] on the per-run
+//! header. The CBOR path remains the default for variable-shape values and
+//! key types that don't implement [`PackableKey`].
+
+pub mod pack;
 
 use std::cell::RefCell;
 
@@ -740,6 +744,250 @@ impl BtreeRegion {
             .copy_from_slice(existing_header.as_bytes());
         device.write_at(offset, &header_sector)?;
         Ok(())
+    }
+}
+
+// ---------- Packed-key path (R1a-pack) ----------
+
+impl BtreeRegion {
+    /// Encode a sorted run using the packed-key codec (IMPL §1.5.6). Returns
+    /// the per-run header (with `SORTED_RUN_FLAG_PACKED_KEYS` set, CRC
+    /// computed) and the payload bytes.
+    fn encode_run_packed<K, V>(
+        run: &SortedRun<K, V>,
+        value_size: usize,
+    ) -> Result<(SortedRunHeader, Vec<u8>), StorageError>
+    where
+        K: pack::PackableKey,
+        V: AsRef<[u8]>,
+    {
+        let (head, fields) = pack::select_format(&run.entries)?;
+        let payload = pack::encode_packed_run(&run.entries, &head, &fields)?;
+        let _ = value_size; // value_size is encoded in the entries' length; recorded for symmetry.
+        let mut header = SortedRunHeader {
+            magic: SORTED_RUN_MAGIC,
+            seq: run.seq,
+            journal_seq: run.journal_seq,
+            entry_count: run.entries.len() as u32,
+            payload_length: payload.len() as u32,
+            flags: run.flags | SORTED_RUN_FLAG_PACKED_KEYS,
+            crc: 0,
+        };
+        let crc = SortedRunHeader::compute_crc(bytemuck::bytes_of(&header), &payload);
+        header.crc = crc;
+        Ok((header, payload))
+    }
+
+    /// Write a freshly built region using the packed-key codec for every
+    /// sorted run. Sets [`SORTED_RUN_FLAG_PACKED_KEYS`] on each per-run
+    /// header. The CBOR fallback is the existing [`Self::write_full`].
+    pub fn write_full_packed<D: BlockDevice, K, V>(
+        device: &D,
+        offset: u64,
+        node: &mut LoadedNode<K, V>,
+        value_size: usize,
+    ) -> Result<(), StorageError>
+    where
+        K: pack::PackableKey,
+        V: AsRef<[u8]>,
+    {
+        let region_size = Self::region_size(&node.header);
+        let mut cursor: u64 = BLOCK_SIZE as u64;
+
+        for run in &node.sorted_runs {
+            let (run_header, payload) = Self::encode_run_packed(run, value_size)?;
+            let run_total = std::mem::size_of::<SortedRunHeader>() as u64 + payload.len() as u64;
+            if cursor + run_total > region_size {
+                return Err(StorageError::RegionFull {
+                    used: cursor + run_total,
+                    size: region_size,
+                });
+            }
+            device.write_at(offset + cursor, bytemuck::bytes_of(&run_header))?;
+            device.write_at(
+                offset + cursor + std::mem::size_of::<SortedRunHeader>() as u64,
+                &payload,
+            )?;
+            cursor = Self::align_up_to_sector(cursor + run_total);
+        }
+        let payload_used = cursor - BLOCK_SIZE as u64;
+        if payload_used > u32::MAX as u64 {
+            return Err(StorageError::RegionFull {
+                used: payload_used,
+                size: region_size,
+            });
+        }
+        node.header.payload_used = payload_used as u32;
+        node.header.sorted_run_count = node.sorted_runs.len() as u8;
+        node.header.seq = { node.header.seq } + 1;
+
+        let mut header_sector = vec![0u8; BLOCK_SIZE];
+        header_sector[..std::mem::size_of::<BtreeNodeHeader>()]
+            .copy_from_slice(node.header.as_bytes());
+        device.write_at(offset, &header_sector)?;
+        node.dirty = false;
+        Ok(())
+    }
+
+    /// Append a packed sorted run, mirroring [`Self::append_sorted_run`] for
+    /// the CBOR path. Sets [`SORTED_RUN_FLAG_PACKED_KEYS`] on the new run.
+    pub fn append_sorted_run_packed<D: BlockDevice, K, V>(
+        device: &D,
+        offset: u64,
+        existing_header: &mut BtreeNodeHeader,
+        new_run: &SortedRun<K, V>,
+        value_size: usize,
+    ) -> Result<(), StorageError>
+    where
+        K: pack::PackableKey,
+        V: AsRef<[u8]>,
+    {
+        let region_size = Self::region_size(existing_header);
+        let payload_used = { existing_header.payload_used } as u64;
+        let cursor = BLOCK_SIZE as u64 + payload_used;
+        debug_assert_eq!(cursor % BLOCK_SIZE as u64, 0);
+
+        let (run_header, payload) = Self::encode_run_packed(new_run, value_size)?;
+        let run_total = std::mem::size_of::<SortedRunHeader>() as u64 + payload.len() as u64;
+        if cursor + run_total > region_size {
+            return Err(StorageError::RegionFull {
+                used: cursor + run_total,
+                size: region_size,
+            });
+        }
+
+        device.write_at(offset + cursor, bytemuck::bytes_of(&run_header))?;
+        device.write_at(
+            offset + cursor + std::mem::size_of::<SortedRunHeader>() as u64,
+            &payload,
+        )?;
+        let new_cursor = Self::align_up_to_sector(cursor + run_total);
+        let new_payload_used = new_cursor - BLOCK_SIZE as u64;
+        if new_payload_used > u32::MAX as u64 {
+            return Err(StorageError::RegionFull {
+                used: new_payload_used,
+                size: region_size,
+            });
+        }
+        existing_header.payload_used = new_payload_used as u32;
+        existing_header.sorted_run_count = { existing_header.sorted_run_count } + 1;
+        existing_header.seq = { existing_header.seq } + 1;
+        if new_run.journal_seq > { existing_header.last_persisted_lsn } {
+            existing_header.last_persisted_lsn = new_run.journal_seq;
+        }
+
+        let mut header_sector = vec![0u8; BLOCK_SIZE];
+        header_sector[..std::mem::size_of::<BtreeNodeHeader>()]
+            .copy_from_slice(existing_header.as_bytes());
+        device.write_at(offset, &header_sector)?;
+        Ok(())
+    }
+
+    /// Read a region whose sorted runs may be a mix of packed-key and CBOR
+    /// encodings. The caller supplies the fixed `value_size` (in bytes) and
+    /// the expected `prefix_template` for packed runs (passed to the
+    /// decoder so full values can be reconstructed). CBOR runs ignore both
+    /// arguments.
+    ///
+    /// Use this rather than [`Self::read`] when the tree was written with
+    /// the packed codec for any of its runs.
+    pub fn read_packed<D: BlockDevice, K, V>(
+        device: &D,
+        offset: u64,
+        kind: BtreeKind,
+        value_size: usize,
+        prefix_template: &[u8],
+    ) -> Result<LoadedNode<K, V>, StorageError>
+    where
+        K: pack::PackableKey + DeserializeOwned + Ord + Clone,
+        V: From<Vec<u8>> + DeserializeOwned + Clone,
+    {
+        let mut header_sector = vec![0u8; BLOCK_SIZE];
+        device.read_at(offset, &mut header_sector)?;
+        let header = BtreeNodeHeader::parse(&header_sector)?;
+        let header_kind = { header.pre.kind };
+        if header_kind != kind as u16 {
+            return Err(StorageError::InvalidBtreeKind(header_kind));
+        }
+
+        let region_size = Self::region_size(&header);
+        let payload_used = { header.payload_used } as u64;
+        if payload_used > region_size {
+            return Err(StorageError::RegionFull {
+                used: payload_used,
+                size: region_size,
+            });
+        }
+
+        let mut sorted_runs: SmallVec<[SortedRun<K, V>; 4]> = SmallVec::new();
+        let mut cursor: u64 = BLOCK_SIZE as u64;
+        let header_payload_end = BLOCK_SIZE as u64 + payload_used;
+        let expected_count = { header.sorted_run_count } as usize;
+        let mut runs_read = 0usize;
+        while cursor < header_payload_end && runs_read < expected_count {
+            let mut run_header_buf = [0u8; std::mem::size_of::<SortedRunHeader>()];
+            device.read_at(offset + cursor, &mut run_header_buf)?;
+            let run_header: SortedRunHeader = *bytemuck::from_bytes(&run_header_buf);
+            let magic = { run_header.magic };
+            if magic != SORTED_RUN_MAGIC {
+                log::warn!(
+                    "btree region at offset {offset:#x}: torn sorted-run magic at \
+                     cursor {cursor:#x} (expected {SORTED_RUN_MAGIC:#x}, got {magic:#x}); \
+                     dropping this and trailing runs",
+                );
+                break;
+            }
+            let payload_length = { run_header.payload_length } as usize;
+            let flags = { run_header.flags };
+            let mut payload = vec![0u8; payload_length];
+            let payload_offset =
+                offset + cursor + std::mem::size_of::<SortedRunHeader>() as u64;
+            device.read_at(payload_offset, &mut payload)?;
+            if let Err(e) = run_header.verify(&payload) {
+                log::warn!(
+                    "btree region at offset {offset:#x}: torn sorted-run CRC at \
+                     cursor {cursor:#x}: {e}; dropping this and trailing runs",
+                );
+                break;
+            }
+
+            let entries: Vec<(K, V)> = if flags & SORTED_RUN_FLAG_PACKED_KEYS != 0 {
+                // Packed path.
+                let entry_count = { run_header.entry_count };
+                let decoded = pack::decode_packed_run_with_prefix::<K>(
+                    &payload,
+                    value_size,
+                    entry_count,
+                    prefix_template,
+                )?;
+                decoded
+                    .into_iter()
+                    .map(|(k, v)| (k, V::from(v)))
+                    .collect()
+            } else {
+                // CBOR fallback.
+                ciborium::de::from_reader(payload.as_slice())
+                    .map_err(|e| StorageError::CborDecode(e.to_string()))?
+            };
+
+            sorted_runs.push(SortedRun {
+                seq: { run_header.seq },
+                journal_seq: { run_header.journal_seq },
+                flags,
+                entries,
+            });
+            runs_read += 1;
+            let run_total = std::mem::size_of::<SortedRunHeader>() as u64 + payload_length as u64;
+            cursor = Self::align_up_to_sector(cursor + run_total);
+        }
+
+        Ok(LoadedNode {
+            header,
+            sorted_runs,
+            merged_view: RefCell::new(None),
+            pending_journal: Vec::new(),
+            dirty: false,
+        })
     }
 }
 
