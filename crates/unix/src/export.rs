@@ -1,202 +1,211 @@
-use std::{collections::HashMap, path::Path};
+//! [`Exporter`] — turn a [`PathProjection`] + a list of object ids into a
+//! materialisation plan, then optionally execute it against a host directory
+//! (DESIGN §12.4).
+//!
+//! Planning is pure: it only reads the projection and returns a `Vec<ExportEntry>`.
+//! Execution is the only place this crate writes to disk; the engine layer
+//! supplies a `content_provider` callback so we don't depend on any specific
+//! blob source.
 
-use mimisbrunnr_types::{PathProjection, ProjectedEntryType};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use mimisbrunnr_types::ObjectId;
 
 use crate::error::UnixError;
+use crate::projection::PathProjection;
 
-/// Exports a path projection to a directory on disk.
-pub struct Exporter;
-
-/// Result of exporting a projection.
-#[derive(Debug)]
-pub struct ExportResult {
-    /// Number of files written.
-    pub files_written: usize,
-    /// Number of symlinks created.
-    pub symlinks_created: usize,
-    /// Number of directories created.
-    pub dirs_created: usize,
-    /// Total bytes written.
-    pub total_bytes: u64,
+/// What execution should do at this entry's host_path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportAction {
+    /// Materialise a regular file with content fetched via the
+    /// `content_provider`.
+    CreateFile,
+    /// Create a symbolic link whose target is the given path (literal).
+    CreateSymlink(PathBuf),
+    /// Create a directory (mkdir -p).
+    CreateDirectory,
 }
 
+/// One entry in an export plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportEntry {
+    /// The Mímisbrunnr object whose content we'll write (or whose presence we
+    /// reflect with a directory / symlink).
+    pub oid: ObjectId,
+    /// Relative path inside the eventual `target_root` passed to
+    /// [`Exporter::execute`].
+    pub host_path: PathBuf,
+    /// What execution should do here.
+    pub action: ExportAction,
+}
+
+/// Planning- and execution-side entry-point.
+pub struct Exporter;
+
 impl Exporter {
-    /// Export a projection to `output_dir`, creating files from blob data.
+    /// Produce a plan for exporting `oids` under `projection`. Objects that
+    /// don't appear in the projection are skipped silently — the engine is
+    /// expected to filter beforehand if it cares.
+    pub fn plan(projection: &PathProjection, oids: &[ObjectId]) -> Vec<ExportEntry> {
+        let mut out = Vec::new();
+        for &oid in oids {
+            if let Some(rel) = projection.lookup(oid) {
+                out.push(ExportEntry {
+                    oid,
+                    host_path: PathBuf::from(rel),
+                    action: ExportAction::CreateFile,
+                });
+            }
+        }
+        out
+    }
+
+    /// Execute a plan against `target_root`. Calls `content_provider` for
+    /// each [`ExportAction::CreateFile`] entry to fetch the bytes to write.
     ///
-    /// Synthesizes directories from paths automatically. Writes files using
-    /// blob data looked up by `(node << 48) | local`. Creates symlinks where
-    /// the projection specifies them.
-    pub fn export_directory(
-        projection: &PathProjection,
-        blobs: &HashMap<u64, Vec<u8>>,
-        output_dir: &Path,
-    ) -> Result<ExportResult, UnixError> {
-        let proj = projection.with_synthesized_dirs();
-        let mut result = ExportResult {
-            files_written: 0,
-            symlinks_created: 0,
-            dirs_created: 0,
-            total_bytes: 0,
-        };
+    /// `target_root` does not need to exist; missing parent directories are
+    /// created as needed.
+    pub fn execute(
+        plan: &[ExportEntry],
+        target_root: &Path,
+        content_provider: &dyn Fn(ObjectId) -> Option<Vec<u8>>,
+    ) -> Result<(), UnixError> {
+        // Sort so that directories come before their contents. Lexicographic
+        // ordering of host_path is enough since "a" < "a/b".
+        let mut sorted: Vec<&ExportEntry> = plan.iter().collect();
+        sorted.sort_by(|a, b| a.host_path.cmp(&b.host_path));
 
-        // Sort entries so directories come before their contents
-        let mut entries: Vec<_> = proj.entries.iter().collect();
-        entries.sort_by_key(|e| &e.path);
-
-        for entry in &entries {
-            let target_path = output_dir.join(&entry.path);
-
-            match &entry.entry_type {
-                ProjectedEntryType::Directory { .. } => {
-                    std::fs::create_dir_all(&target_path)?;
-                    result.dirs_created += 1;
+        for entry in sorted {
+            let dst = target_root.join(&entry.host_path);
+            match &entry.action {
+                ExportAction::CreateDirectory => {
+                    fs::create_dir_all(&dst)?;
                 }
-                ProjectedEntryType::File { mode, .. } => {
-                    // Ensure parent exists
-                    if let Some(parent) = target_path.parent() {
-                        std::fs::create_dir_all(parent)?;
+                ExportAction::CreateFile => {
+                    if let Some(parent) = dst.parent() {
+                        fs::create_dir_all(parent)?;
                     }
-                    if let Some(oid) = entry.object
-                        && let Some(data) = blobs.get(&((oid.node() << 48) | oid.local()))
-                    {
-                        std::fs::write(&target_path, data)?;
-                        result.total_bytes += data.len() as u64;
-                        result.files_written += 1;
-
-                        // Set permissions on unix
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            let perms = std::fs::Permissions::from_mode(*mode);
-                            let _ = std::fs::set_permissions(&target_path, perms);
-                        }
-                    }
+                    let raw = content_provider(entry.oid)
+                        .ok_or_else(|| UnixError::MissingContent(entry.oid.to_u64()))?;
+                    fs::write(&dst, raw)?;
                 }
-                ProjectedEntryType::Symlink { target } => {
-                    if let Some(parent) = target_path.parent() {
-                        std::fs::create_dir_all(parent)?;
+                ExportAction::CreateSymlink(target) => {
+                    if let Some(parent) = dst.parent() {
+                        fs::create_dir_all(parent)?;
                     }
                     #[cfg(unix)]
                     {
-                        std::os::unix::fs::symlink(target, &target_path)?;
-                        result.symlinks_created += 1;
+                        std::os::unix::fs::symlink(target, &dst)?;
                     }
                     #[cfg(not(unix))]
                     {
                         let _ = target;
+                        log::warn!(
+                            "export: symlink {} skipped (not supported on this platform)",
+                            dst.display()
+                        );
                     }
                 }
             }
         }
-
-        Ok(result)
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use {
-        super::*,
-        mimisbrunnr_types::{ObjectId, ProjectedEntry},
-    };
+    use mimisbrunnr_types::TagId;
+    use tempfile::TempDir;
 
-    fn oid(n: u64) -> ObjectId {
-        ObjectId::new(0, n)
+    use super::*;
+
+    fn oid(local: u64) -> ObjectId {
+        ObjectId::from_parts(0, local)
     }
 
     #[test]
-    fn export_simple_tree() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut proj = PathProjection::new("test");
+    fn plan_yields_correct_host_paths() {
+        let mut p = PathProjection::new(TagId::new(1), PathBuf::from("/r"));
+        p.add(oid(1), "src/main.rs".into()).unwrap();
+        p.add(oid(2), "README.md".into()).unwrap();
+        let plan = Exporter::plan(&p, &[oid(1), oid(2), oid(3)]);
+        // oid(3) is missing from the projection — skipped.
+        assert_eq!(plan.len(), 2);
+        let by_oid: std::collections::HashMap<_, _> =
+            plan.iter().map(|e| (e.oid, e.host_path.clone())).collect();
+        assert_eq!(by_oid[&oid(1)], PathBuf::from("src/main.rs"));
+        assert_eq!(by_oid[&oid(2)], PathBuf::from("README.md"));
+        for e in &plan {
+            assert_eq!(e.action, ExportAction::CreateFile);
+        }
+    }
 
-        let o1 = oid(1);
-        let o2 = oid(2);
-        proj.add(ProjectedEntry::file(o1, "readme.txt"));
-        proj.add(ProjectedEntry::file(o2, "src/main.rs"));
+    #[test]
+    fn execute_creates_files_with_content() {
+        let mut p = PathProjection::new(TagId::new(1), PathBuf::from("/r"));
+        p.add(oid(1), "deep/path/main.rs".into()).unwrap();
+        p.add(oid(2), "top.txt".into()).unwrap();
 
-        let mut blobs = HashMap::new();
-        blobs.insert((o1.node() << 48) | o1.local(), b"# Hello".to_vec());
-        blobs.insert((o2.node() << 48) | o2.local(), b"fn main() {}".to_vec());
+        let plan = Exporter::plan(&p, &[oid(1), oid(2)]);
+        let tmp = TempDir::new().unwrap();
+        let provider = |o: ObjectId| -> Option<Vec<u8>> {
+            match o.local_seq() {
+                1 => Some(b"fn main() {}".to_vec()),
+                2 => Some(b"hello".to_vec()),
+                _ => None,
+            }
+        };
 
-        let result = Exporter::export_directory(&proj, &blobs, tmp.path()).unwrap();
-        assert_eq!(result.files_written, 2);
-        assert!(result.total_bytes > 0);
+        Exporter::execute(&plan, tmp.path(), &provider).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(tmp.path().join("readme.txt")).unwrap(),
-            "# Hello"
-        );
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("src/main.rs")).unwrap(),
+            fs::read_to_string(tmp.path().join("deep/path/main.rs")).unwrap(),
             "fn main() {}"
         );
+        assert_eq!(
+            fs::read_to_string(tmp.path().join("top.txt")).unwrap(),
+            "hello"
+        );
     }
 
     #[test]
-    fn export_creates_directories() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut proj = PathProjection::new("test");
-
-        let o1 = oid(1);
-        proj.add(ProjectedEntry::file(o1, "a/b/c/deep.txt"));
-
-        let mut blobs = HashMap::new();
-        blobs.insert((o1.node() << 48) | o1.local(), b"deep".to_vec());
-
-        let result = Exporter::export_directory(&proj, &blobs, tmp.path()).unwrap();
-        assert_eq!(result.files_written, 1);
-        assert!(tmp.path().join("a/b/c/deep.txt").exists());
-    }
-
-    #[test]
-    fn export_empty_projection() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let proj = PathProjection::new("empty");
-        let blobs = HashMap::new();
-
-        let result = Exporter::export_directory(&proj, &blobs, tmp.path()).unwrap();
-        assert_eq!(result.files_written, 0);
-        assert_eq!(result.total_bytes, 0);
+    fn execute_errors_when_provider_returns_none() {
+        let mut p = PathProjection::new(TagId::new(1), PathBuf::from("/r"));
+        p.add(oid(1), "missing.txt".into()).unwrap();
+        let plan = Exporter::plan(&p, &[oid(1)]);
+        let tmp = TempDir::new().unwrap();
+        let provider = |_o: ObjectId| -> Option<Vec<u8>> { None };
+        let err = Exporter::execute(&plan, tmp.path(), &provider).unwrap_err();
+        assert!(matches!(err, UnixError::MissingContent(_)));
     }
 
     #[cfg(unix)]
     #[test]
-    fn export_symlink() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut proj = PathProjection::new("test");
-
-        let o1 = oid(1);
-        proj.add(ProjectedEntry::file(o1, "bin/bash"));
-        proj.add(ProjectedEntry::symlink("usr/bin/bash", "../../bin/bash"));
-
-        let mut blobs = HashMap::new();
-        blobs.insert((o1.node() << 48) | o1.local(), b"#!/bin/bash".to_vec());
-
-        let result = Exporter::export_directory(&proj, &blobs, tmp.path()).unwrap();
-        assert_eq!(result.files_written, 1);
-        assert_eq!(result.symlinks_created, 1);
-
-        let link = tmp.path().join("usr/bin/bash");
+    fn execute_creates_symlink() {
+        let tmp = TempDir::new().unwrap();
+        let plan = vec![ExportEntry {
+            oid: oid(1),
+            host_path: PathBuf::from("link"),
+            action: ExportAction::CreateSymlink(PathBuf::from("../target")),
+        }];
+        let provider = |_o: ObjectId| -> Option<Vec<u8>> { None };
+        Exporter::execute(&plan, tmp.path(), &provider).unwrap();
+        let link = tmp.path().join("link");
         assert!(link.is_symlink());
-        assert_eq!(
-            std::fs::read_link(&link).unwrap().to_str().unwrap(),
-            "../../bin/bash"
-        );
+        assert_eq!(fs::read_link(&link).unwrap(), PathBuf::from("../target"));
     }
 
     #[test]
-    fn export_unscoped_projection() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mut proj = PathProjection::unscoped();
-
-        let o1 = oid(1);
-        proj.add(ProjectedEntry::file(o1, "file.txt"));
-
-        let mut blobs = HashMap::new();
-        blobs.insert((o1.node() << 48) | o1.local(), b"content".to_vec());
-
-        let result = Exporter::export_directory(&proj, &blobs, tmp.path()).unwrap();
-        assert_eq!(result.files_written, 1);
-        assert!(proj.context.is_none());
+    fn execute_creates_directory() {
+        let tmp = TempDir::new().unwrap();
+        let plan = vec![ExportEntry {
+            oid: oid(1),
+            host_path: PathBuf::from("a/b/c"),
+            action: ExportAction::CreateDirectory,
+        }];
+        let provider = |_o: ObjectId| -> Option<Vec<u8>> { None };
+        Exporter::execute(&plan, tmp.path(), &provider).unwrap();
+        assert!(tmp.path().join("a/b/c").is_dir());
     }
 }

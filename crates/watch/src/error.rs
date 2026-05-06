@@ -1,11 +1,19 @@
-#[derive(Debug, thiserror::Error)]
+//! Errors raised by the watch / subscription engine.
+
+use mimisbrunnr_types::SubscriptionId;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
 pub enum WatchError {
-    #[error("subscription not found: {0}")]
-    NotFound(u64),
+    #[error("subscription {0} not found")]
+    UnknownSubscription(SubscriptionId),
 
-    #[error("subscription already exists: {0}")]
-    AlreadyExists(String),
+    #[error("CBOR encode error: {0}")]
+    CborEncode(String),
 
-    #[error("query error: {0}")]
-    Query(#[from] mimisbrunnr_query::QueryError),
+    #[error("CBOR decode error: {0}")]
+    CborDecode(String),
+
+    #[error("roaring bitmap codec error: {0}")]
+    Bitmap(String),
 }

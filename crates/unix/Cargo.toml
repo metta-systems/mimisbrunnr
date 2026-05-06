@@ -6,12 +6,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-mimisbrunnr-engine = { workspace = true }
 mimisbrunnr-ontology = { workspace = true }
-mimisbrunnr-transform = { workspace = true }
 mimisbrunnr-types = { workspace = true }
+ciborium = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-arbitrary-int = { workspace = true }
 tempfile = { workspace = true }

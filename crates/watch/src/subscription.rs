@@ -1,68 +1,70 @@
-use {
-    mimisbrunnr_types::{Query, SubscriptionId},
-    roaring::RoaringBitmap,
-};
+//! Runtime [`Subscription`] record. DESIGN §11.2.
+//!
+//! The on-disk B+ tree shape (IMPL §10.2) is implemented in a later phase;
+//! we serialise via CBOR for now.
+//!
+// TODO(rewrite-phase-N): replace the CBOR-blob persistence with the
+// `BtreeKind::Subscriptions` B+ tree per IMPL §10.2.
 
-use std::time::Duration;
+use mimisbrunnr_types::{ChangeInterest, Query, SubscriptionId, SubscriptionState};
+use roaring::RoaringBitmap;
+use serde::{Deserialize, Serialize};
 
-/// What kinds of changes a subscription is interested in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChangeInterest(u32);
+/// Retention policy for an offline (or slow) consumer's pending events.
+///
+/// DESIGN §11.6 mentions "max events" / "coalescing"; we expose the storage
+/// shape here. The consumer-facing `debounce_ms` lives on [`Subscription`]
+/// directly to mirror the spec's per-subscription batching knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Retention {
+    /// Drop events when the consumer can't keep up.
+    AtMostOnce,
+    /// Bounded ring buffer of `max_events`. Oldest events are dropped first.
+    Bounded { max_events: u32 },
+    /// Grow without bound — caller must drain.
+    Unlimited,
+}
 
-impl ChangeInterest {
-    pub const TAG_ADDED: Self = Self(1 << 0);
-    pub const TAG_REMOVED: Self = Self(1 << 1);
-    pub const CONTENT_CHANGED: Self = Self(1 << 2);
-    pub const CREATED: Self = Self(1 << 3);
-    pub const DELETED: Self = Self(1 << 4);
-    pub const ENTERED: Self = Self(1 << 5);
-    pub const EXITED: Self = Self(1 << 6);
-    pub const ALL: Self = Self(0x7F);
-
-    pub fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
+impl Default for Retention {
+    fn default() -> Self {
+        Self::Bounded { max_events: 1024 }
     }
 }
 
-impl std::ops::BitOr for ChangeInterest {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
-
-/// Lifecycle state of a subscription.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubscriptionState {
-    /// Actively delivering events.
-    Active,
-    /// Agent is offline, cursor frozen.
-    Dormant,
-}
-
-/// A persistent, named query watch.
+/// Live subscription record (DESIGN §11.2).
 #[derive(Debug, Clone)]
 pub struct Subscription {
     pub id: SubscriptionId,
     pub name: String,
     pub query: Query,
     pub interest: ChangeInterest,
-    /// Where we've read up to in the oplog.
+    /// LSN of the last event delivered to the consumer.
     pub cursor: u64,
     pub state: SubscriptionState,
-    pub retention: Duration,
-    /// Cached result set — the current matching objects.
+    pub retention: Retention,
+    /// Optional debounce window (milliseconds). If `Some(ms)`, repeated
+    /// events for the same `oid` within `ms` are coalesced into a single
+    /// event of the latest kind. Phase 4b: field is honoured by `tick()`
+    /// but a full per-tick flush is left as a TODO.
+    // TODO(rewrite-phase-N): wire full debounce flush in `tick()`.
+    pub debounce_ms: Option<u32>,
+    /// Current member set. Maintained by the engine on every mutation hook.
     pub cached_result: RoaringBitmap,
 }
 
 impl Subscription {
+    /// Construct a fresh `Active` subscription.
+    ///
+    /// The engine layer is responsible for computing `cached_result` (the
+    /// initial query evaluation) — DESIGN §11.4 atomic subscribe + snapshot.
     pub fn new(
         id: SubscriptionId,
         name: String,
         query: Query,
         interest: ChangeInterest,
+        retention: Retention,
         cursor: u64,
-        initial_result: RoaringBitmap,
+        cached_result: RoaringBitmap,
     ) -> Self {
         Self {
             id,
@@ -71,40 +73,13 @@ impl Subscription {
             interest,
             cursor,
             state: SubscriptionState::Active,
-            retention: Duration::from_secs(7 * 24 * 3600), // 7 days default
-            cached_result: initial_result,
+            retention,
+            debounce_ms: None,
+            cached_result,
         }
     }
 
     pub fn is_active(&self) -> bool {
-        self.state == SubscriptionState::Active
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use {super::*, mimisbrunnr_types::TagId};
-
-    #[test]
-    fn change_interest_flags() {
-        let interest = ChangeInterest::TAG_ADDED | ChangeInterest::CONTENT_CHANGED;
-        assert!(interest.contains(ChangeInterest::TAG_ADDED));
-        assert!(interest.contains(ChangeInterest::CONTENT_CHANGED));
-        assert!(!interest.contains(ChangeInterest::DELETED));
-    }
-
-    #[test]
-    fn subscription_creation() {
-        let sub = Subscription::new(
-            1,
-            "test-watch".into(),
-            Query::HasTag(TagId::new(1)),
-            ChangeInterest::ALL,
-            0,
-            RoaringBitmap::new(),
-        );
-        assert!(sub.is_active());
-        assert_eq!(sub.id, 1);
-        assert_eq!(sub.name, "test-watch");
+        matches!(self.state, SubscriptionState::Active)
     }
 }

@@ -2248,11 +2248,13 @@ dependencies = [
 name = "mimisbrunnr-query"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "log",
  "mimisbrunnr-index",
  "mimisbrunnr-ontology",
  "mimisbrunnr-types",
  "roaring",
+ "serde",
  "thiserror 2.0.18",
 ]
 
@@ -2311,11 +2313,11 @@ dependencies = [
 name = "mimisbrunnr-unix"
 version = "0.1.0"
 dependencies = [
- "arbitrary-int",
- "mimisbrunnr-engine",
+ "ciborium",
+ "log",
  "mimisbrunnr-ontology",
- "mimisbrunnr-transform",
  "mimisbrunnr-types",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
 ]
@@ -2341,11 +2343,13 @@ name = "mimisbrunnr-watch"
 version = "0.1.0"
 dependencies = [
  "arbitrary-int",
+ "ciborium",
+ "log",
  "mimisbrunnr-index",
  "mimisbrunnr-ontology",
- "mimisbrunnr-query",
  "mimisbrunnr-types",
  "roaring",
+ "serde",
  "thiserror 2.0.18",
 ]
 

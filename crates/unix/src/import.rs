@@ -1,352 +1,353 @@
-use std::{collections::HashMap, path::Path};
+//! [`Importer`] — walk a host filesystem subtree and produce a stream of
+//! [`ImportEntry`]s ready for the engine layer to ingest (DESIGN §12.5).
+//!
+//! Side-effect-only operations (filesystem reads); does **not** create
+//! Mímisbrunnr objects, hash blobs, or assert tags. Those concerns live in
+//! the engine. This crate's contribution is shape: deciding which host paths
+//! become which kinds of entry, with what relative path under the chosen
+//! context, and producing the path attribute (via [`build_path_attr`]) for
+//! the engine to attach.
+//!
+//! Symlinks are recorded as [`ImportKind::Symlink`] by default and are *not*
+//! followed; pass [`Importer::with_follow_symlinks`] if you want to chase
+//! them.
 
-use {
-    mimisbrunnr_engine::Engine,
-    mimisbrunnr_types::{ObjectId, PathContextManager, ProjectedEntry, TagId},
-};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use mimisbrunnr_types::{Assertion, TagId};
 
 use crate::error::UnixError;
+use crate::storage::build_path_attr;
 
-/// Imports a Unix directory tree into the engine, optionally into a named context.
-pub struct Importer;
+/// What kind of host-side filesystem entity an [`ImportEntry`] represents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportKind {
+    /// Regular file.
+    File,
+    /// Symbolic link with its raw target. The target is the literal contents
+    /// of the link, not a resolved path.
+    Symlink(PathBuf),
+    /// Directory. Mímisbrunnr does not store directory objects (DESIGN
+    /// §12.2), but the entry is emitted so callers that want to mirror an
+    /// empty tree can still see them.
+    Directory,
+}
 
-/// Result of importing a directory tree.
-pub struct ImportResult {
-    /// Number of objects created.
-    pub objects_created: usize,
-    /// Number of objects deduplicated (same content hash).
-    pub objects_deduped: usize,
-    /// Total bytes imported.
-    pub total_bytes: u64,
-    /// The context name, if any.
-    pub context: Option<String>,
-    /// Transformed blob data for each imported object, ready for blob zone storage.
-    /// Each entry is (ObjectId, transformed_bytes).
-    pub transformed_blobs: Vec<(ObjectId, Vec<u8>)>,
-    /// Original plaintext blob data (for in-memory / FUSE serving).
-    /// Key is `(node << 48) | local`.
-    pub original_blobs: HashMap<u64, Vec<u8>>,
+/// One entry produced by [`Importer::scan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportEntry {
+    /// Absolute host path.
+    pub host_path: PathBuf,
+    /// Path relative to the importer's root, in Unix forward-slash form.
+    pub relative_path: String,
+    /// File / Symlink / Directory.
+    pub kind: ImportKind,
+    /// Reported size in bytes (0 for symlinks and directories).
+    pub size_bytes: u64,
+    /// Modification time in nanoseconds since the Unix epoch. `0` if the
+    /// platform doesn't expose it.
+    pub modified_ns: i64,
+}
+
+/// Recursive host-tree walker.
+pub struct Importer {
+    root: PathBuf,
+    context: TagId,
+    include_hidden: bool,
+    follow_symlinks: bool,
 }
 
 impl Importer {
-    /// Import a directory tree, creating objects and populating path entries.
-    ///
-    /// Walks the directory recursively, creating an object for each regular file.
-    /// Deduplicates by content hash. Auto-tags based on file extension if
-    /// tag IDs are provided in `extension_tags`.
-    ///
-    /// If `context_name` is `Some`, entries are added to a named context.
-    /// If `None`, entries are added to the unscoped projection.
-    pub fn import_directory(
-        engine: &mut Engine,
-        context_mgr: &mut PathContextManager,
-        root: &Path,
-        context_name: Option<&str>,
-        extension_tags: &HashMap<String, TagId>,
-        now_ms: u64,
-    ) -> Result<ImportResult, UnixError> {
-        // Create context if needed
-        if let Some(name) = context_name
-            && context_mgr.get_context(name).is_err()
-        {
-            context_mgr.create_context(name)?;
+    /// New importer rooted at `root`, tagging entries with `context` (passed
+    /// through unchanged when the engine eventually constructs path
+    /// assertions via [`build_path_attr`]).
+    pub fn new(root: &Path, context: TagId) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            context,
+            include_hidden: false,
+            follow_symlinks: false,
         }
-
-        let mut result = ImportResult {
-            objects_created: 0,
-            objects_deduped: 0,
-            total_bytes: 0,
-            context: context_name.map(String::from),
-            transformed_blobs: Vec::new(),
-            original_blobs: HashMap::new(),
-        };
-
-        // Track content hashes for dedup
-        let mut hash_to_oid: HashMap<[u8; 32], ObjectId> = HashMap::new();
-
-        Self::walk_dir(
-            engine,
-            context_mgr,
-            root,
-            root,
-            context_name,
-            extension_tags,
-            &mut hash_to_oid,
-            &mut result,
-            now_ms,
-        )?;
-
-        Ok(result)
     }
 
-    #[expect(clippy::too_many_arguments)]
-    fn walk_dir(
-        engine: &mut Engine,
-        context_mgr: &mut PathContextManager,
-        root: &Path,
-        dir: &Path,
-        context_name: Option<&str>,
-        extension_tags: &HashMap<String, TagId>,
-        hash_to_oid: &mut HashMap<[u8; 32], ObjectId>,
-        result: &mut ImportResult,
-        now_ms: u64,
-    ) -> Result<(), UnixError> {
-        let entries = std::fs::read_dir(dir)?;
+    /// Include or exclude dotfiles / dot-directories. Default: false.
+    pub fn with_hidden(mut self, include: bool) -> Self {
+        self.include_hidden = include;
+        self
+    }
 
-        for entry in entries {
+    /// Follow symlinks (treat them as files / directories) instead of
+    /// recording them as `Symlink`. Default: false.
+    pub fn with_follow_symlinks(mut self, follow: bool) -> Self {
+        self.follow_symlinks = follow;
+        self
+    }
+
+    /// The context tag this importer is scoped to.
+    pub fn context(&self) -> TagId {
+        self.context
+    }
+
+    /// Walk the host tree and return every entry found.
+    pub fn scan(self) -> Result<Vec<ImportEntry>, UnixError> {
+        let mut out = Vec::new();
+        let root = self.root.clone();
+        self.walk(&root, &mut out)?;
+        Ok(out)
+    }
+
+    /// Inner recursive walker.
+    fn walk(&self, dir: &Path, out: &mut Vec<ImportEntry>) -> Result<(), UnixError> {
+        let read = fs::read_dir(dir)?;
+        for entry in read {
             let entry = entry?;
-            let path = entry.path();
-            let metadata = entry.metadata()?;
+            let host_path = entry.path();
 
-            if metadata.is_dir() {
-                Self::walk_dir(
-                    engine,
-                    context_mgr,
-                    root,
-                    &path,
-                    context_name,
-                    extension_tags,
-                    hash_to_oid,
-                    result,
-                    now_ms,
-                )?;
-            } else if metadata.is_file() {
-                let relative = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .to_string();
-
-                let content = std::fs::read(&path)?;
-                let hash = mimisbrunnr_transform::ContentHasher::hash(&content);
-                result.total_bytes += content.len() as u64;
-
-                let oid = if let Some(&existing) = hash_to_oid.get(&hash) {
-                    result.objects_deduped += 1;
-                    existing
-                } else {
-                    let oid = engine.create_object(now_ms).map_err(UnixError::Engine)?;
-                    let blob_result = engine
-                        .write_blob(oid, &content, now_ms)
-                        .map_err(UnixError::Engine)?;
-                    hash_to_oid.insert(hash, oid);
-                    result.transformed_blobs.push((oid, blob_result.data));
-                    result
-                        .original_blobs
-                        .insert((oid.node() << 48) | oid.local(), content);
-                    result.objects_created += 1;
-
-                    // Auto-tag by extension
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                        && let Some(&tag_id) = extension_tags.get(ext)
-                    {
-                        let _ = engine.add_tag(oid, tag_id, now_ms);
-                    }
-
-                    oid
-                };
-
-                // Add to path context or unscoped
-                #[cfg(unix)]
-                let mode = {
-                    use std::os::unix::fs::PermissionsExt;
-                    metadata.permissions().mode()
-                };
-                #[cfg(not(unix))]
-                let mode = 0o644u32;
-
-                let proj_entry = ProjectedEntry::file_with_mode(oid, &relative, mode);
-                match context_name {
-                    Some(name) => context_mgr.set_path(name, oid, &relative, proj_entry)?,
-                    None => context_mgr.set_unscoped_path(oid, &relative, proj_entry),
-                }
+            // Hidden filtering: any component whose final segment starts with
+            // a dot. Skip `.` / `..` since read_dir doesn't yield them anyway.
+            if !self.include_hidden
+                && let Some(name) = host_path.file_name().and_then(|n| n.to_str())
+                && name.starts_with('.')
+            {
+                continue;
             }
-            // Skip symlinks and other special files for now
-        }
 
+            // symlink_metadata so we see the link itself, not its target.
+            let lmeta = match fs::symlink_metadata(&host_path) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::warn!("import: stat failed for {}: {e}", host_path.display());
+                    continue;
+                }
+            };
+
+            let relative_path = match host_path.strip_prefix(&self.root) {
+                Ok(rel) => match rel.to_str() {
+                    Some(s) => s.replace('\\', "/"),
+                    None => {
+                        return Err(UnixError::NonUtf8Path(host_path.clone()));
+                    }
+                },
+                Err(_) => {
+                    // Shouldn't happen — host_path was built from `dir` which
+                    // descends from `self.root`. Defensive fallback.
+                    host_path.to_string_lossy().into_owned()
+                }
+            };
+
+            let modified_ns = lmeta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+
+            if lmeta.file_type().is_symlink() {
+                if self.follow_symlinks {
+                    // Resolve once via metadata() (follows links). If that
+                    // fails, log and skip rather than aborting the whole
+                    // scan.
+                    match fs::metadata(&host_path) {
+                        Ok(meta) => {
+                            if meta.is_dir() {
+                                out.push(ImportEntry {
+                                    host_path: host_path.clone(),
+                                    relative_path,
+                                    kind: ImportKind::Directory,
+                                    size_bytes: 0,
+                                    modified_ns,
+                                });
+                                self.walk(&host_path, out)?;
+                            } else if meta.is_file() {
+                                out.push(ImportEntry {
+                                    host_path,
+                                    relative_path,
+                                    kind: ImportKind::File,
+                                    size_bytes: meta.len(),
+                                    modified_ns,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "import: dangling symlink at {}: {e}",
+                                host_path.display()
+                            );
+                        }
+                    }
+                } else {
+                    let target = fs::read_link(&host_path).unwrap_or_default();
+                    out.push(ImportEntry {
+                        host_path,
+                        relative_path,
+                        kind: ImportKind::Symlink(target),
+                        size_bytes: 0,
+                        modified_ns,
+                    });
+                }
+            } else if lmeta.is_dir() {
+                out.push(ImportEntry {
+                    host_path: host_path.clone(),
+                    relative_path,
+                    kind: ImportKind::Directory,
+                    size_bytes: 0,
+                    modified_ns,
+                });
+                self.walk(&host_path, out)?;
+            } else if lmeta.is_file() {
+                out.push(ImportEntry {
+                    host_path,
+                    relative_path,
+                    kind: ImportKind::File,
+                    size_bytes: lmeta.len(),
+                    modified_ns,
+                });
+            }
+        }
         Ok(())
+    }
+
+    /// Derive the assertions to attach to the object created from `entry`.
+    ///
+    /// At this layer we only emit the path attribute. Type tags (`file`,
+    /// `directory`, `symlink`), content-derived tags (mime sniff, hashes),
+    /// and ownership / mode attributes are wired by the engine + ontology
+    /// layer that has the resolved tag ids in hand.
+    pub fn derive_assertions(
+        &self,
+        unix_path_tag: TagId,
+        entry: &ImportEntry,
+    ) -> Result<Vec<Assertion>, UnixError> {
+        let attr = build_path_attr(unix_path_tag, self.context, &entry.relative_path)?;
+        Ok(vec![attr])
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use {super::*, std::fs, tempfile::TempDir};
+    use std::fs;
 
-    fn setup() -> (Engine, PathContextManager) {
-        (Engine::new(0), PathContextManager::new())
+    use mimisbrunnr_types::Value;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn ctx() -> TagId {
+        TagId::new(7)
     }
 
-    fn create_test_tree(dir: &Path) {
-        fs::create_dir_all(dir.join("src")).unwrap();
-        fs::write(dir.join("README.md"), "# Hello").unwrap();
-        fs::write(dir.join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
-        fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
-        fs::write(dir.join("src/lib.rs"), "pub fn hello() {}").unwrap();
-    }
-
+    #[cfg(unix)]
     #[test]
-    fn import_directory() {
+    fn scan_walks_tree_with_dirs_files_and_symlink() {
         let tmp = TempDir::new().unwrap();
-        create_test_tree(tmp.path());
+        let root = tmp.path();
 
-        let (mut engine, mut ctx_mgr) = setup();
-        let ext_tags = HashMap::new();
+        // 2 dirs
+        fs::create_dir_all(root.join("src/inner")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        // 3 files
+        fs::write(root.join("README.md"), "# hi").unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("docs/intro.md"), "intro").unwrap();
+        // 1 symlink (to README.md)
+        std::os::unix::fs::symlink("README.md", root.join("link-to-readme")).unwrap();
 
-        let result = Importer::import_directory(
-            &mut engine,
-            &mut ctx_mgr,
-            tmp.path(),
-            Some("test-project"),
-            &ext_tags,
-            1000,
-        )
-        .unwrap();
+        let entries = Importer::new(root, ctx()).scan().unwrap();
 
-        assert_eq!(result.objects_created, 4);
-        assert_eq!(result.objects_deduped, 0);
-        assert!(result.total_bytes > 0);
+        let mut files = 0;
+        let mut dirs = 0;
+        let mut symlinks = 0;
+        for e in &entries {
+            match &e.kind {
+                ImportKind::File => files += 1,
+                ImportKind::Directory => dirs += 1,
+                ImportKind::Symlink(target) => {
+                    symlinks += 1;
+                    assert_eq!(target, &PathBuf::from("README.md"));
+                }
+            }
+        }
+        assert_eq!(files, 3);
+        // src, src/inner, docs
+        assert_eq!(dirs, 3);
+        assert_eq!(symlinks, 1);
 
-        // Verify context was created with entries
-        let proj = ctx_mgr.get_context("test-project").unwrap();
-        assert_eq!(proj.len(), 4);
-        assert!(proj.get("README.md").is_some());
-        assert!(proj.get("src/main.rs").is_some());
-    }
+        // Relative paths use forward slashes and are not absolute.
+        for e in &entries {
+            assert!(!e.relative_path.starts_with('/'));
+        }
 
-    #[test]
-    fn import_with_dedup() {
-        let tmp = TempDir::new().unwrap();
-        // Two files with identical content
-        fs::write(tmp.path().join("a.txt"), "same content").unwrap();
-        fs::write(tmp.path().join("b.txt"), "same content").unwrap();
-        fs::write(tmp.path().join("c.txt"), "different").unwrap();
-
-        let (mut engine, mut ctx_mgr) = setup();
-        let ext_tags = HashMap::new();
-
-        let result = Importer::import_directory(
-            &mut engine,
-            &mut ctx_mgr,
-            tmp.path(),
-            Some("ctx"),
-            &ext_tags,
-            1000,
-        )
-        .unwrap();
-
-        assert_eq!(result.objects_created, 2); // a.txt + c.txt
-        assert_eq!(result.objects_deduped, 1); // b.txt is same as a.txt
-    }
-
-    #[test]
-    fn import_with_auto_tag() {
-        let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("code.rs"), "fn main() {}").unwrap();
-        fs::write(tmp.path().join("data.json"), "{}").unwrap();
-
-        let (mut engine, mut ctx_mgr) = setup();
-
-        // Register tags first
-        use mimisbrunnr_ontology::{TagDefinition, TagSemantics};
-        let rs_tag = TagId::new(100);
-        engine
-            .register_tag(TagDefinition::new(rs_tag, "rust", TagSemantics::Label))
+        // README.md size and a non-empty modified_ns for the file.
+        let readme = entries
+            .iter()
+            .find(|e| e.relative_path == "README.md")
             .unwrap();
-
-        let mut ext_tags = HashMap::new();
-        ext_tags.insert("rs".to_string(), rs_tag);
-
-        let result = Importer::import_directory(
-            &mut engine,
-            &mut ctx_mgr,
-            tmp.path(),
-            Some("ctx"),
-            &ext_tags,
-            1000,
-        )
-        .unwrap();
-
-        assert_eq!(result.objects_created, 2);
-
-        // The .rs file should have been tagged
-        let proj = ctx_mgr.get_context("ctx").unwrap();
-        let rs_entry = proj.get("code.rs").unwrap();
-        let oid = rs_entry.object.unwrap();
-        let tags = engine.tags(oid).unwrap();
-        assert!(tags.contains(&rs_tag));
+        assert!(matches!(readme.kind, ImportKind::File));
+        assert_eq!(readme.size_bytes, "# hi".len() as u64);
     }
 
     #[test]
-    fn import_empty_directory() {
+    fn with_hidden_false_skips_dotfiles() {
         let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("visible.txt"), "v").unwrap();
+        fs::write(root.join(".hidden"), "h").unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref").unwrap();
 
-        let (mut engine, mut ctx_mgr) = setup();
-        let ext_tags = HashMap::new();
-
-        let result = Importer::import_directory(
-            &mut engine,
-            &mut ctx_mgr,
-            tmp.path(),
-            Some("empty"),
-            &ext_tags,
-            1000,
-        )
-        .unwrap();
-
-        assert_eq!(result.objects_created, 0);
-        assert_eq!(result.total_bytes, 0);
+        let entries = Importer::new(root, ctx()).scan().unwrap();
+        assert!(entries.iter().any(|e| e.relative_path == "visible.txt"));
+        assert!(entries.iter().all(|e| !e.relative_path.starts_with('.')));
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.relative_path.contains(".git"))
+        );
     }
 
     #[test]
-    fn import_nested_directories() {
+    fn with_hidden_true_includes_dotfiles() {
         let tmp = TempDir::new().unwrap();
-        fs::create_dir_all(tmp.path().join("a/b/c")).unwrap();
-        fs::write(tmp.path().join("a/b/c/deep.txt"), "deep file").unwrap();
-        fs::write(tmp.path().join("a/top.txt"), "top file").unwrap();
+        let root = tmp.path();
+        fs::write(root.join("visible.txt"), "v").unwrap();
+        fs::write(root.join(".hidden"), "h").unwrap();
 
-        let (mut engine, mut ctx_mgr) = setup();
-        let ext_tags = HashMap::new();
-
-        let result = Importer::import_directory(
-            &mut engine,
-            &mut ctx_mgr,
-            tmp.path(),
-            Some("nested"),
-            &ext_tags,
-            1000,
-        )
-        .unwrap();
-
-        assert_eq!(result.objects_created, 2);
-
-        let proj = ctx_mgr.get_context("nested").unwrap();
-        assert!(proj.get("a/b/c/deep.txt").is_some());
-        assert!(proj.get("a/top.txt").is_some());
+        let entries = Importer::new(root, ctx())
+            .with_hidden(true)
+            .scan()
+            .unwrap();
+        assert!(entries.iter().any(|e| e.relative_path == "visible.txt"));
+        assert!(entries.iter().any(|e| e.relative_path == ".hidden"));
     }
 
     #[test]
-    fn import_unscoped() {
+    fn derive_assertions_returns_path_attr() {
         let tmp = TempDir::new().unwrap();
-        fs::write(tmp.path().join("file.txt"), "hello").unwrap();
-
-        let (mut engine, mut ctx_mgr) = setup();
-        let ext_tags = HashMap::new();
-
-        let result = Importer::import_directory(
-            &mut engine,
-            &mut ctx_mgr,
-            tmp.path(),
-            None,
-            &ext_tags,
-            1000,
-        )
-        .unwrap();
-
-        assert_eq!(result.objects_created, 1);
-        assert!(result.context.is_none());
-
-        // Should be in unscoped projection
-        assert!(ctx_mgr.unscoped().get("file.txt").is_some());
-        assert_eq!(ctx_mgr.context_count(), 0); // no named context created
+        let root = tmp.path();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        let entries = Importer::new(root, ctx()).scan().unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.relative_path == "a.txt")
+            .unwrap();
+        let unix_path = TagId::new(11);
+        // Build a fresh importer (scan consumes self) to call derive_assertions.
+        let importer = Importer::new(root, ctx());
+        let assertions = importer.derive_assertions(unix_path, entry).unwrap();
+        assert_eq!(assertions.len(), 1);
+        match &assertions[0] {
+            Assertion::Attr { key, value } => {
+                assert_eq!(*key, unix_path);
+                match value {
+                    Value::Scoped { context, inner } => {
+                        assert_eq!(*context, ctx());
+                        assert!(matches!(inner.as_ref(), Value::Text(s) if s == "a.txt"));
+                    }
+                    other => panic!("expected Scoped, got {other:?}"),
+                }
+            }
+            other => panic!("expected Attr, got {other:?}"),
+        }
     }
 }

@@ -1,190 +1,140 @@
-use {mimisbrunnr_index::TagIndex, mimisbrunnr_types::TagId, roaring::RoaringBitmap};
+//! Faceted exploration on top of [`crate::QueryExecutor`].
+//!
+//! Wraps the index crate's `FacetedExplorer` so callers can drive facets
+//! from a [`Query`] (rather than a pre-built bitmap). Evaluates the base
+//! query, then ranks every tag by `|selection ∩ tag.bitmap|` and returns
+//! the top `max_facets`.
 
-/// Faceted exploration: "Given my current result set, what tags exist on
-/// the matching objects?"
-///
-/// Intersects the result bitmap with each candidate tag bitmap.
-/// At ~μs per AND, 5000 tags complete in <10ms.
-pub struct FacetedExplorer<'a> {
-    tag_index: &'a TagIndex,
-}
+use {
+    mimisbrunnr_index::FacetedExplorer as IndexFacetedExplorer,
+    mimisbrunnr_types::{Query, TagId},
+};
 
-/// A facet: a tag and how many objects in the result set have it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Facet {
+use crate::{error::QueryError, executor::QueryExecutor};
+
+/// One facet row: the tag and the cardinality of its intersection with the
+/// base selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FacetGroup {
+    /// The tag id.
     pub tag: TagId,
+    /// `|selection ∩ tag.bitmap|`.
     pub count: u64,
 }
 
+/// Faceted-exploration helper. Wraps [`QueryExecutor`] with the
+/// "evaluate-then-facet" idiom.
+pub struct FacetedExplorer<'a> {
+    executor: &'a QueryExecutor<'a>,
+}
+
 impl<'a> FacetedExplorer<'a> {
-    pub fn new(tag_index: &'a TagIndex) -> Self {
-        Self { tag_index }
+    /// New explorer bound to `executor`.
+    pub fn new(executor: &'a QueryExecutor<'a>) -> Self {
+        Self { executor }
     }
 
-    /// Compute facets for a result set. Returns tags sorted by count descending.
-    pub fn facets(&self, result_set: &RoaringBitmap) -> Vec<Facet> {
-        if result_set.is_empty() {
-            return Vec::new();
-        }
-
-        let mut facets: Vec<Facet> = self
-            .tag_index
-            .all_tags()
+    /// Evaluate `base`, then return the top `max_facets` tag rows by
+    /// `|selection ∩ tag.bitmap|`, descending. Tags with no overlap are
+    /// omitted. Ties break by ascending tag id (matches the index crate's
+    /// helper).
+    pub fn explore(
+        &self,
+        base: &Query,
+        max_facets: usize,
+    ) -> Result<Vec<FacetGroup>, QueryError> {
+        let selection = self.executor.evaluate(base)?;
+        let rows = IndexFacetedExplorer::facets_for(self.executor.tag_index, &selection);
+        Ok(rows
             .into_iter()
-            .filter_map(|tag| {
-                let bm = self.tag_index.bitmap(tag)?;
-                let count = (result_set & bm).len();
-                if count > 0 {
-                    Some(Facet { tag, count })
-                } else {
-                    None
-                }
+            .take(max_facets)
+            .map(|f| FacetGroup {
+                tag: f.tag,
+                count: f.count,
             })
-            .collect();
-
-        facets.sort_by(|a, b| b.count.cmp(&a.count));
-        facets
-    }
-
-    /// Compute facets only for the given candidate tags (more efficient when
-    /// you already know which tags to check).
-    pub fn facets_for(&self, result_set: &RoaringBitmap, candidates: &[TagId]) -> Vec<Facet> {
-        if result_set.is_empty() {
-            return Vec::new();
-        }
-
-        let mut facets: Vec<Facet> = candidates
-            .iter()
-            .filter_map(|&tag| {
-                let bm = self.tag_index.bitmap(tag)?;
-                let count = (result_set & bm).len();
-                if count > 0 {
-                    Some(Facet { tag, count })
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        facets.sort_by(|a, b| b.count.cmp(&a.count));
-        facets
+            .collect())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        mimisbrunnr_index::{ForwardIndex, KvIndex, RangeIndex, TagIndex},
+        mimisbrunnr_ontology::OntologyState,
+        mimisbrunnr_types::{ObjectId, Query, TagId},
+    };
 
-    fn tag(id: u32) -> TagId {
+    fn t(id: u32) -> TagId {
         TagId::new(id)
     }
+    fn oid(local: u64) -> ObjectId {
+        ObjectId::from_parts(0, local)
+    }
 
     #[test]
-    fn basic_facets() {
-        let mut idx = TagIndex::new();
-        // electronic: 1,2,3,4,5
-        for i in 1..=5 {
-            idx.tag_object(tag(1), i);
+    fn explore_orders_by_count_desc() {
+        let mut tag = TagIndex::new();
+        // electronics: 1..=5
+        for i in 1..=5u64 {
+            tag.add_member(t(1), oid(i));
         }
         // portable: 2,3
-        idx.tag_object(tag(2), 2);
-        idx.tag_object(tag(2), 3);
-        // favorite: 3
-        idx.tag_object(tag(3), 3);
+        tag.add_member(t(2), oid(2));
+        tag.add_member(t(2), oid(3));
+        // favourite: 3
+        tag.add_member(t(3), oid(3));
 
-        let explorer = FacetedExplorer::new(&idx);
+        let kv = KvIndex::new();
+        let range = RangeIndex::new();
+        let fwd = ForwardIndex::new();
+        let ont = OntologyState::new();
+        let exec = QueryExecutor::new(&tag, &kv, &range, &fwd, &ont);
 
-        // Result set: {2, 3}
-        let mut result = RoaringBitmap::new();
-        result.insert(2);
-        result.insert(3);
+        let explorer = FacetedExplorer::new(&exec);
+        let groups = explorer.explore(&Query::HasTag(t(1)), 10).unwrap();
 
-        let facets = explorer.facets(&result);
-
-        // electronic: 2 (both 2 and 3 have it)
-        // portable: 2 (both 2 and 3 have it)
-        // favorite: 1 (only 3 has it)
-        assert!(facets.len() >= 2);
-
-        let electronic_facet = facets.iter().find(|f| f.tag == tag(1)).unwrap();
-        assert_eq!(electronic_facet.count, 2);
-
-        let portable_facet = facets.iter().find(|f| f.tag == tag(2)).unwrap();
-        assert_eq!(portable_facet.count, 2);
-
-        let fav_facet = facets.iter().find(|f| f.tag == tag(3)).unwrap();
-        assert_eq!(fav_facet.count, 1);
+        // Selection = {1,2,3,4,5}.
+        // electronics ∩ sel = 5; portable ∩ sel = 2; favourite ∩ sel = 1.
+        assert_eq!(groups[0].tag, t(1));
+        assert_eq!(groups[0].count, 5);
+        assert_eq!(groups[1].tag, t(2));
+        assert_eq!(groups[1].count, 2);
+        assert_eq!(groups[2].tag, t(3));
+        assert_eq!(groups[2].count, 1);
     }
 
     #[test]
-    fn facets_sorted_by_count() {
-        let mut idx = TagIndex::new();
-        // tag1: 1,2,3 (count=3 in result)
-        for i in 1..=3 {
-            idx.tag_object(tag(1), i);
+    fn explore_respects_max_facets() {
+        let mut tag = TagIndex::new();
+        for i in 1..=10u64 {
+            tag.add_member(t(1), oid(i));
         }
-        // tag2: 1 (count=1 in result)
-        idx.tag_object(tag(2), 1);
-        // tag3: 1,2 (count=2 in result)
-        idx.tag_object(tag(3), 1);
-        idx.tag_object(tag(3), 2);
+        tag.add_member(t(2), oid(1));
+        tag.add_member(t(3), oid(1));
+        tag.add_member(t(4), oid(1));
 
-        let explorer = FacetedExplorer::new(&idx);
-        let mut result = RoaringBitmap::new();
-        for i in 1..=3 {
-            result.insert(i);
-        }
+        let kv = KvIndex::new();
+        let range = RangeIndex::new();
+        let fwd = ForwardIndex::new();
+        let ont = OntologyState::new();
+        let exec = QueryExecutor::new(&tag, &kv, &range, &fwd, &ont);
+        let explorer = FacetedExplorer::new(&exec);
 
-        let facets = explorer.facets(&result);
-        assert_eq!(facets[0].count, 3);
-        assert_eq!(facets[1].count, 2);
-        assert_eq!(facets[2].count, 1);
+        let groups = explorer.explore(&Query::HasTag(t(1)), 2).unwrap();
+        assert_eq!(groups.len(), 2);
     }
 
     #[test]
-    fn facets_empty_result() {
-        let idx = TagIndex::new();
-        let explorer = FacetedExplorer::new(&idx);
-        let result = RoaringBitmap::new();
-        assert!(explorer.facets(&result).is_empty());
-    }
-
-    #[test]
-    fn facets_for_candidates() {
-        let mut idx = TagIndex::new();
-        for i in 1..=5 {
-            idx.tag_object(tag(1), i);
-        }
-        for i in 1..=3 {
-            idx.tag_object(tag(2), i);
-        }
-        idx.tag_object(tag(3), 1);
-
-        let explorer = FacetedExplorer::new(&idx);
-        let mut result = RoaringBitmap::new();
-        for i in 1..=5 {
-            result.insert(i);
-        }
-
-        // Only ask about tag(2) and tag(3)
-        let facets = explorer.facets_for(&result, &[tag(2), tag(3)]);
-        assert_eq!(facets.len(), 2);
-        assert!(!facets.iter().any(|f| f.tag == tag(1))); // not asked for
-    }
-
-    #[test]
-    fn facets_excludes_zero_count() {
-        let mut idx = TagIndex::new();
-        idx.tag_object(tag(1), 10);
-        idx.tag_object(tag(2), 20);
-
-        let explorer = FacetedExplorer::new(&idx);
-        let mut result = RoaringBitmap::new();
-        result.insert(10);
-
-        let facets = explorer.facets(&result);
-        // Only tag(1) should appear — tag(2) has no overlap with result
-        assert_eq!(facets.len(), 1);
-        assert_eq!(facets[0].tag, tag(1));
+    fn explore_empty_selection() {
+        let tag = TagIndex::new();
+        let kv = KvIndex::new();
+        let range = RangeIndex::new();
+        let fwd = ForwardIndex::new();
+        let ont = OntologyState::new();
+        let exec = QueryExecutor::new(&tag, &kv, &range, &fwd, &ont);
+        let explorer = FacetedExplorer::new(&exec);
+        let groups = explorer.explore(&Query::HasTag(t(99)), 5).unwrap();
+        assert!(groups.is_empty());
     }
 }

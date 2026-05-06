@@ -1,83 +1,57 @@
-use mimisbrunnr_types::{HybridTimestamp, ObjectId, TagId};
+//! Helpers around [`WatchEvent`] (the logical type lives in
+//! `mimisbrunnr-types`).
 
-/// A watch event delivered to a subscription.
-#[derive(Debug, Clone, PartialEq)]
-pub enum WatchEvent {
-    /// An object entered the subscription's result set (gained a matching tag).
-    Entered {
-        oid: ObjectId,
-        timestamp: HybridTimestamp,
-    },
-    /// An object exited the subscription's result set (lost a matching tag).
-    Exited {
-        oid: ObjectId,
-        timestamp: HybridTimestamp,
-    },
-    /// A tag was added to an object already in the result set.
-    TagAdded {
-        oid: ObjectId,
-        tag: TagId,
-        timestamp: HybridTimestamp,
-    },
-    /// A tag was removed from an object in the result set.
-    TagRemoved {
-        oid: ObjectId,
-        tag: TagId,
-        timestamp: HybridTimestamp,
-    },
-    /// An object in the result set had its content changed.
-    ContentChanged {
-        oid: ObjectId,
-        timestamp: HybridTimestamp,
-    },
-    /// An object in the result set was deleted.
-    Deleted {
-        oid: ObjectId,
-        timestamp: HybridTimestamp,
-    },
-    /// An object was created that matches the subscription query.
-    Created {
-        oid: ObjectId,
-        timestamp: HybridTimestamp,
-    },
-}
+use mimisbrunnr_types::{HybridTimestamp, ObjectId, WatchEvent};
 
-impl WatchEvent {
-    pub fn object_id(&self) -> ObjectId {
-        match self {
-            Self::Entered { oid, .. }
-            | Self::Exited { oid, .. }
-            | Self::TagAdded { oid, .. }
-            | Self::TagRemoved { oid, .. }
-            | Self::ContentChanged { oid, .. }
-            | Self::Deleted { oid, .. }
-            | Self::Created { oid, .. } => *oid,
-        }
-    }
-
-    pub fn timestamp(&self) -> HybridTimestamp {
-        match self {
-            Self::Entered { timestamp, .. }
-            | Self::Exited { timestamp, .. }
-            | Self::TagAdded { timestamp, .. }
-            | Self::TagRemoved { timestamp, .. }
-            | Self::ContentChanged { timestamp, .. }
-            | Self::Deleted { timestamp, .. }
-            | Self::Created { timestamp, .. } => *timestamp,
-        }
+/// Extract the object id from any [`WatchEvent`] variant.
+pub fn event_object_id(ev: &WatchEvent) -> ObjectId {
+    match ev {
+        WatchEvent::Entered { oid, .. }
+        | WatchEvent::Exited { oid, .. }
+        | WatchEvent::TagAdded { oid, .. }
+        | WatchEvent::TagRemoved { oid, .. }
+        | WatchEvent::ContentChanged { oid, .. }
+        | WatchEvent::Deleted { oid, .. }
+        | WatchEvent::Created { oid, .. } => *oid,
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Extract the timestamp from any [`WatchEvent`] variant.
+pub fn event_timestamp(ev: &WatchEvent) -> HybridTimestamp {
+    match ev {
+        WatchEvent::Entered { timestamp, .. }
+        | WatchEvent::Exited { timestamp, .. }
+        | WatchEvent::TagAdded { timestamp, .. }
+        | WatchEvent::TagRemoved { timestamp, .. }
+        | WatchEvent::ContentChanged { timestamp, .. }
+        | WatchEvent::Deleted { timestamp, .. }
+        | WatchEvent::Created { timestamp, .. } => *timestamp,
+    }
+}
 
-    #[test]
-    fn event_accessors() {
-        let ts = HybridTimestamp::new(1000, 0, 0);
-        let oid = ObjectId::new(0, 42);
-        let event = WatchEvent::Entered { oid, timestamp: ts };
-        assert_eq!(event.object_id(), oid);
-        assert_eq!(event.timestamp(), ts);
+/// Discriminant tag used by debounce coalescing — compares only "what kind
+/// of event" rather than payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EventKind {
+    Entered,
+    Exited,
+    TagAdded,
+    TagRemoved,
+    ContentChanged,
+    Deleted,
+    Created,
+}
+
+impl From<&WatchEvent> for EventKind {
+    fn from(ev: &WatchEvent) -> Self {
+        match ev {
+            WatchEvent::Entered { .. } => Self::Entered,
+            WatchEvent::Exited { .. } => Self::Exited,
+            WatchEvent::TagAdded { .. } => Self::TagAdded,
+            WatchEvent::TagRemoved { .. } => Self::TagRemoved,
+            WatchEvent::ContentChanged { .. } => Self::ContentChanged,
+            WatchEvent::Deleted { .. } => Self::Deleted,
+            WatchEvent::Created { .. } => Self::Created,
+        }
     }
 }
