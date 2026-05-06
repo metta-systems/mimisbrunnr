@@ -2194,11 +2194,10 @@ dependencies = [
 name = "mimisbrunnr-meta"
 version = "0.1.0"
 dependencies = [
- "arbitrary-int",
  "bytemuck",
  "mimisbrunnr-storage",
  "mimisbrunnr-types",
- "tempfile",
+ "static_assertions",
  "thiserror 2.0.18",
 ]
 
@@ -2263,6 +2262,7 @@ dependencies = [
  "bytemuck",
  "crc32c",
  "log",
+ "mimisbrunnr-types",
  "static_assertions",
  "tempfile",
  "thiserror 2.0.18",
@@ -2309,10 +2309,14 @@ dependencies = [
 name = "mimisbrunnr-wal"
 version = "0.1.0"
 dependencies = [
- "crc32fast",
+ "bytemuck",
+ "ciborium",
+ "crc32c",
  "log",
  "mimisbrunnr-storage",
  "mimisbrunnr-types",
+ "serde",
+ "static_assertions",
  "tempfile",
  "thiserror 2.0.18",
 ]

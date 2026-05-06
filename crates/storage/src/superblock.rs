@@ -7,6 +7,7 @@
 use {
     bytemuck::{Pod, Zeroable},
     log::trace,
+    mimisbrunnr_types::{DiskId, MediaType, NodeId, StorageTier},
     static_assertions::const_assert_eq,
 };
 
@@ -17,6 +18,41 @@ use crate::{
     root_pointer::{BlockRef, RootPointer},
     zone_map::ZoneExtent,
 };
+
+/// Stable on-disk byte encoding for [`MediaType`].
+///
+/// The spec (IMPL §2.1) reserves the `media_type` byte for a `MediaType`
+/// discriminator but does not pin the values. We choose a stable mapping
+/// here and use it everywhere; later phases can extend this enum but must
+/// never renumber it.
+const MEDIA_TYPE_NVME: u8 = 0;
+const MEDIA_TYPE_SSD: u8 = 1;
+const MEDIA_TYPE_HDD: u8 = 2;
+const MEDIA_TYPE_SMR_HDD: u8 = 3;
+const MEDIA_TYPE_REMOTE: u8 = 4;
+
+#[inline]
+fn media_type_to_u8(m: MediaType) -> u8 {
+    match m {
+        MediaType::NVMe => MEDIA_TYPE_NVME,
+        MediaType::Ssd => MEDIA_TYPE_SSD,
+        MediaType::Hdd => MEDIA_TYPE_HDD,
+        MediaType::SmrHdd => MEDIA_TYPE_SMR_HDD,
+        MediaType::Remote => MEDIA_TYPE_REMOTE,
+    }
+}
+
+#[inline]
+fn media_type_from_u8(v: u8) -> Result<MediaType, StorageError> {
+    match v {
+        MEDIA_TYPE_NVME => Ok(MediaType::NVMe),
+        MEDIA_TYPE_SSD => Ok(MediaType::Ssd),
+        MEDIA_TYPE_HDD => Ok(MediaType::Hdd),
+        MEDIA_TYPE_SMR_HDD => Ok(MediaType::SmrHdd),
+        MEDIA_TYPE_REMOTE => Ok(MediaType::Remote),
+        _ => Err(StorageError::InvalidMediaType(v)),
+    }
+}
 
 /// `"MIMISBRUNNR\0\0\0\0\0"` full magic. IMPL §1.4 / §2.1.
 pub const SUPERBLOCK_MAGIC_FULL: [u8; 16] = *b"MIMISBRUNNR\0\0\0\0\0";
@@ -100,10 +136,10 @@ impl Superblock {
     #[allow(clippy::too_many_arguments)]
     pub fn new_blank(
         fs_uuid: [u8; 16],
-        node_id: u16,
-        disk_id: u16,
-        media_type: u8,
-        tier: u8,
+        node_id: NodeId,
+        disk_id: DiskId,
+        media_type: MediaType,
+        tier: StorageTier,
         device_capacity: u64,
         bucket_size_log2: u8,
         btree_node_size_log2: u8,
@@ -125,8 +161,8 @@ impl Superblock {
         sb.fs_uuid = fs_uuid;
         sb.node_id = node_id;
         sb.disk_id = disk_id;
-        sb.media_type = media_type;
-        sb.tier = tier;
+        sb.media_type = media_type_to_u8(media_type);
+        sb.tier = tier as u8;
         sb.device_capacity = device_capacity;
         sb.block_size_log2 = 12;
         sb.bucket_size_log2 = bucket_size_log2;
@@ -145,6 +181,46 @@ impl Superblock {
         sb.root_b.recompute_crc();
         sb.recompute_crc();
         sb
+    }
+
+    /// Decode the raw `media_type` byte into a logical [`MediaType`].
+    ///
+    /// Returns [`StorageError::InvalidMediaType`] if the on-disk byte does not
+    /// match any known variant.
+    pub fn media_type(&self) -> Result<MediaType, StorageError> {
+        let raw = { self.media_type };
+        media_type_from_u8(raw)
+    }
+
+    /// Decode the raw `tier` byte into a logical [`StorageTier`].
+    pub fn tier(&self) -> Result<StorageTier, StorageError> {
+        let raw = { self.tier };
+        StorageTier::from_u8(raw).ok_or(StorageError::InvalidStorageTier(raw))
+    }
+
+    /// Strongly-typed accessor for the `node_id` field. Just a typed alias
+    /// for the underlying `u16`, but keeps read-side call sites self-documenting.
+    pub fn node_id(&self) -> NodeId {
+        let raw = { self.node_id };
+        raw as NodeId
+    }
+
+    /// Strongly-typed accessor for the `disk_id` field.
+    pub fn disk_id(&self) -> DiskId {
+        let raw = { self.disk_id };
+        raw as DiskId
+    }
+
+    /// Set the `media_type` byte from a logical [`MediaType`]. Caller is
+    /// responsible for invoking [`Self::recompute_crc`] before persisting.
+    pub fn set_media_type(&mut self, m: MediaType) {
+        self.media_type = media_type_to_u8(m);
+    }
+
+    /// Set the `tier` byte from a logical [`StorageTier`]. Caller is
+    /// responsible for invoking [`Self::recompute_crc`] before persisting.
+    pub fn set_tier(&mut self, t: StorageTier) {
+        self.tier = t as u8;
     }
 
     /// Recompute and store the trailing CRC (`bytes[0..4092]` with the CRC
@@ -189,10 +265,10 @@ impl Superblock {
     pub fn format(
         device: &dyn BlockDevice,
         fs_uuid: [u8; 16],
-        node_id: u16,
-        disk_id: u16,
-        media_type: u8,
-        tier: u8,
+        node_id: NodeId,
+        disk_id: DiskId,
+        media_type: MediaType,
+        tier: StorageTier,
         bucket_size_log2: u8,
         btree_node_size_log2: u8,
         bootstrap_buckets: u32,
@@ -354,8 +430,8 @@ mod tests {
             [0xAB; 16],
             1,
             2,
-            0,
-            0,
+            MediaType::NVMe,
+            StorageTier::Hot,
             20,
             18,
             64,
@@ -486,5 +562,78 @@ mod tests {
         let healed = Superblock::open(&dev).unwrap();
         let s = { healed.active_root_pointer().seq };
         assert_eq!(s, 3);
+    }
+
+    #[test]
+    fn typed_accessors_round_trip() {
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+        // Format with a non-default media type / tier pair so a stuck-zero
+        // bug would be visible.
+        Superblock::format(
+            &dev,
+            [0xCD; 16],
+            7,
+            9,
+            MediaType::Hdd,
+            StorageTier::Warm,
+            20,
+            18,
+            64,
+            0x1_0000,
+            0x10_0000,
+            dummy_extent(0x100_0000, 0x10_0000),
+            dummy_extent(0x110_0000, 0x10_0000),
+            dummy_extent(0x120_0000, 0x10_0000),
+            1,
+        )
+        .unwrap();
+        let sb = Superblock::open(&dev).unwrap();
+        assert_eq!(sb.media_type().unwrap(), MediaType::Hdd);
+        assert_eq!(sb.tier().unwrap(), StorageTier::Warm);
+        assert_eq!(sb.node_id(), 7);
+        assert_eq!(sb.disk_id(), 9);
+
+        // Round-trip via setters: flip to a different combination, recompute
+        // the CRC, and confirm verification still passes.
+        let mut sb2 = sb;
+        sb2.set_media_type(MediaType::Remote);
+        sb2.set_tier(StorageTier::Glacier);
+        sb2.recompute_crc();
+        sb2.verify_crc().unwrap();
+        assert_eq!(sb2.media_type().unwrap(), MediaType::Remote);
+        assert_eq!(sb2.tier().unwrap(), StorageTier::Glacier);
+    }
+
+    #[test]
+    fn invalid_discriminant_decoding() {
+        // Format normally, then read the raw bytes, splice in an invalid
+        // media_type byte, fix up the CRC, and verify the typed accessor
+        // returns the expected error.
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+        let _ = fmt_default(&dev);
+
+        let mut buf = vec![0u8; BLOCK_SIZE];
+        dev.read_at(0, &mut buf).unwrap();
+        // media_type lives at offset 68; tier at 69.
+        buf[68] = 99;
+        buf[69] = 200;
+        // Recompute the trailing CRC so the block-level checks pass.
+        buf[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4].copy_from_slice(&[0; 4]);
+        let new_crc = crc32c::crc32c(&buf[..SUPERBLOCK_CRC_OFFSET]);
+        buf[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4]
+            .copy_from_slice(&new_crc.to_le_bytes());
+
+        let sb: Superblock = *bytemuck::from_bytes::<Superblock>(&buf);
+        sb.verify_crc().unwrap();
+        match sb.media_type() {
+            Err(StorageError::InvalidMediaType(99)) => {}
+            other => panic!("expected InvalidMediaType(99), got {other:?}"),
+        }
+        match sb.tier() {
+            Err(StorageError::InvalidStorageTier(200)) => {}
+            other => panic!("expected InvalidStorageTier(200), got {other:?}"),
+        }
     }
 }

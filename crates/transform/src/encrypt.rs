@@ -1,119 +1,89 @@
-use crate::TransformError;
+//! Encryption stage of the transform pipeline (DESIGN §9.3, IMPL §14).
+//!
+//! Phase 2c **placeholder**: the real cipher integrations require workspace
+//! dependencies that are not yet pulled in (`aes`, `aes-gcm`, `xts-mode`,
+//! `hctr2`, `chacha20poly1305`). Until then this module wires the API
+//! surface — the caller may pass any `EncryptionMode` — but every non-`None`
+//! mode short-circuits to `TransformError::EncryptionDisabled`. `None` is a
+//! transparent passthrough so the rest of the pipeline can be exercised
+//! end-to-end.
+//!
+//! TODO(rewrite-phase-N): wire actual ciphers — needs aes-gcm, xts-mode,
+//! hctr2, chacha20poly1305 workspace deps.
 
-/// Encryption mode selection.
+use mimisbrunnr_types::EncryptionMode;
+
+use crate::error::TransformError;
+
+/// Opaque key handle. Will be replaced by the proper key hierarchy
+/// (Master KEK → DiskKey → per-zone keys, DESIGN §9.4) in a later phase.
 ///
-/// The design specifies different modes for different zones:
-/// - HCTR2-AES-128 for blob zone (wide-block, hides internal structure)
-/// - XTS-AES-256 for metadata/index zones (fast random access)
-/// - AES-256-GCM for WAL (authenticated, append-only with monotonic nonce)
-/// - ChaCha20-Poly1305 for sync traffic
-///
-/// Currently implemented as XOR-based placeholder. Real crypto implementations
-/// will be added when the `aes`, `hctr2`, and `chacha20poly1305` crates are integrated.
+/// TODO(rewrite-phase-N): replace with the full key hierarchy (DESIGN §9.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncryptionMode {
-    /// No encryption.
-    None,
-    /// HCTR2-AES-128 for blob zone. Tweak = object_id + sector_offset.
-    Hctr2 { object_id: u64 },
-    /// XTS-AES-256 for metadata/index zone.
-    Xts,
-    /// AES-256-GCM for WAL.
-    AesGcm { nonce: u64 },
-    /// ChaCha20-Poly1305 for network sync.
-    ChaCha20Poly1305,
+pub struct TransformKey(pub [u8; 32]);
+
+impl TransformKey {
+    /// All-zero placeholder key. Used for `EncryptionMode::None` and tests.
+    pub const ZERO: Self = Self([0u8; 32]);
+
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
 }
 
-/// Encryptor/decryptor.
-///
-/// Currently uses a reversible XOR cipher as a structural placeholder.
-/// The API and data flow are correct — only the cipher primitives need
-/// replacement with real implementations.
+impl Default for TransformKey {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
+/// Stateless encryptor placeholder.
+#[derive(Debug, Default, Clone, Copy)]
 pub struct Encryptor;
 
 impl Encryptor {
-    /// Encrypt data in-place with the given mode and key.
-    ///
-    /// For length-preserving modes (HCTR2, XTS), output is same size as input.
-    /// For AEAD modes (GCM, ChaCha20), output includes authentication tag.
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Encrypt `data` under `mode`. In Phase 2c only `EncryptionMode::None`
+    /// is wired; every other variant returns
+    /// `TransformError::EncryptionDisabled`.
     pub fn encrypt(
+        &self,
         data: &[u8],
-        key: &[u8; 32],
         mode: EncryptionMode,
+        _key: &TransformKey,
     ) -> Result<Vec<u8>, TransformError> {
         match mode {
             EncryptionMode::None => Ok(data.to_vec()),
-            EncryptionMode::Hctr2 { object_id } => {
-                // Placeholder: XOR with key-derived stream seeded by object_id
-                Ok(xor_cipher(data, key, object_id))
-            }
-            EncryptionMode::Xts => {
-                // Placeholder: XOR with key
-                Ok(xor_cipher(data, key, 0))
-            }
-            EncryptionMode::AesGcm { nonce } => {
-                // Placeholder: XOR + append 16-byte fake tag
-                let mut out = xor_cipher(data, key, nonce);
-                // Fake authentication tag (16 bytes)
-                let tag = compute_fake_tag(data, key, nonce);
-                out.extend_from_slice(&tag);
-                Ok(out)
-            }
-            EncryptionMode::ChaCha20Poly1305 => {
-                // Placeholder: XOR + append 16-byte fake tag
-                let mut out = xor_cipher(data, key, 0x5050);
-                let tag = compute_fake_tag(data, key, 0x5050);
-                out.extend_from_slice(&tag);
-                Ok(out)
-            }
+            EncryptionMode::Hctr2 { .. }
+            | EncryptionMode::Xts
+            | EncryptionMode::AesGcm
+            | EncryptionMode::ChaCha20Poly1305 => Err(TransformError::EncryptionDisabled),
         }
     }
 
-    /// Decrypt data.
+    /// Inverse of `encrypt` with the same Phase 2c restrictions.
     pub fn decrypt(
+        &self,
         data: &[u8],
-        key: &[u8; 32],
         mode: EncryptionMode,
+        _key: &TransformKey,
     ) -> Result<Vec<u8>, TransformError> {
         match mode {
             EncryptionMode::None => Ok(data.to_vec()),
-            EncryptionMode::Hctr2 { object_id } => {
-                // XOR is its own inverse
-                Ok(xor_cipher(data, key, object_id))
-            }
-            EncryptionMode::Xts => Ok(xor_cipher(data, key, 0)),
-            EncryptionMode::AesGcm { nonce } => {
-                if data.len() < 16 {
-                    return Err(TransformError::Decryption(
-                        "data too short for auth tag".into(),
-                    ));
-                }
-                let (ciphertext, tag) = data.split_at(data.len() - 16);
-                let plaintext = xor_cipher(ciphertext, key, nonce);
-                let expected_tag = compute_fake_tag(&plaintext, key, nonce);
-                if tag != expected_tag {
-                    return Err(TransformError::Decryption("authentication failed".into()));
-                }
-                Ok(plaintext)
-            }
-            EncryptionMode::ChaCha20Poly1305 => {
-                if data.len() < 16 {
-                    return Err(TransformError::Decryption(
-                        "data too short for auth tag".into(),
-                    ));
-                }
-                let (ciphertext, tag) = data.split_at(data.len() - 16);
-                let plaintext = xor_cipher(ciphertext, key, 0x5050);
-                let expected_tag = compute_fake_tag(&plaintext, key, 0x5050);
-                if tag != expected_tag {
-                    return Err(TransformError::Decryption("authentication failed".into()));
-                }
-                Ok(plaintext)
-            }
+            EncryptionMode::Hctr2 { .. }
+            | EncryptionMode::Xts
+            | EncryptionMode::AesGcm
+            | EncryptionMode::ChaCha20Poly1305 => Err(TransformError::EncryptionDisabled),
         }
     }
 
-    /// Check if a mode is length-preserving (no authentication tag).
+    /// Whether `mode` is length-preserving (no AEAD tag).
+    ///
+    /// Per DESIGN §9.3: `Hctr2` and `Xts` are length-preserving; `AesGcm`
+    /// and `ChaCha20Poly1305` append a 16-byte authentication tag.
     pub fn is_length_preserving(mode: EncryptionMode) -> bool {
         matches!(
             mode,
@@ -121,167 +91,89 @@ impl Encryptor {
         )
     }
 
-    /// Overhead in bytes for AEAD modes.
-    pub fn overhead(mode: EncryptionMode) -> usize {
-        if Self::is_length_preserving(mode) {
-            0
-        } else {
-            16
-        }
+    /// Whether `mode` requires sector-aligned input.
+    ///
+    /// Block-cipher modes (XTS, HCTR2 in our blob-extent shape) operate on
+    /// 4 KiB-aligned data; the AEAD modes are byte-streamed.
+    pub fn requires_sector_alignment(mode: EncryptionMode) -> bool {
+        matches!(
+            mode,
+            EncryptionMode::Xts | EncryptionMode::Hctr2 { .. }
+        )
     }
-}
-
-/// Placeholder XOR cipher — deterministic and reversible.
-fn xor_cipher(data: &[u8], key: &[u8; 32], tweak: u64) -> Vec<u8> {
-    let tweak_bytes = tweak.to_le_bytes();
-    data.iter()
-        .enumerate()
-        .map(|(i, &b)| b ^ key[i % 32] ^ tweak_bytes[i % 8])
-        .collect()
-}
-
-/// Fake authentication tag for AEAD placeholder.
-fn compute_fake_tag(plaintext: &[u8], key: &[u8; 32], nonce: u64) -> [u8; 16] {
-    let mut tag = [0u8; 16];
-    // Simple hash-like construction for the fake tag
-    let mut acc = nonce;
-    for (i, &b) in plaintext.iter().enumerate() {
-        acc = acc
-            .wrapping_mul(31)
-            .wrapping_add(b as u64)
-            .wrapping_add(key[i % 32] as u64);
-    }
-    tag[..8].copy_from_slice(&acc.to_le_bytes());
-    tag[8..16].copy_from_slice(&acc.wrapping_mul(0x517cc1b727220a95).to_le_bytes());
-    tag
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const TEST_KEY: [u8; 32] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
-        0x1F, 0x20,
-    ];
-
     #[test]
     fn none_passthrough() {
-        let data = b"hello world";
-        let enc = Encryptor::encrypt(data, &TEST_KEY, EncryptionMode::None).unwrap();
+        let e = Encryptor::new();
+        let data = b"hello mimisbrunnr";
+        let enc = e.encrypt(data, EncryptionMode::None, &TransformKey::ZERO).unwrap();
         assert_eq!(enc, data);
-        let dec = Encryptor::decrypt(&enc, &TEST_KEY, EncryptionMode::None).unwrap();
+        let dec = e.decrypt(&enc, EncryptionMode::None, &TransformKey::ZERO).unwrap();
         assert_eq!(dec, data);
     }
 
     #[test]
-    fn hctr2_round_trip() {
-        let data = b"secret blob data for object 42";
-        let mode = EncryptionMode::Hctr2 { object_id: 42 };
-
-        let enc = Encryptor::encrypt(data, &TEST_KEY, mode).unwrap();
-        assert_ne!(enc, data.to_vec()); // Should differ
-        assert_eq!(enc.len(), data.len()); // Length-preserving
-
-        let dec = Encryptor::decrypt(&enc, &TEST_KEY, mode).unwrap();
-        assert_eq!(dec, data);
+    fn xts_disabled_in_phase_2c() {
+        let e = Encryptor::new();
+        let err = e
+            .encrypt(b"x", EncryptionMode::Xts, &TransformKey::ZERO)
+            .unwrap_err();
+        assert!(matches!(err, TransformError::EncryptionDisabled));
+        let err = e
+            .decrypt(b"x", EncryptionMode::Xts, &TransformKey::ZERO)
+            .unwrap_err();
+        assert!(matches!(err, TransformError::EncryptionDisabled));
     }
 
     #[test]
-    fn hctr2_different_objects_differ() {
-        let data = b"same content";
-        let enc1 =
-            Encryptor::encrypt(data, &TEST_KEY, EncryptionMode::Hctr2 { object_id: 1 }).unwrap();
-        let enc2 =
-            Encryptor::encrypt(data, &TEST_KEY, EncryptionMode::Hctr2 { object_id: 2 }).unwrap();
-        assert_ne!(enc1, enc2); // Different tweaks → different ciphertext
+    fn hctr2_disabled_in_phase_2c() {
+        let e = Encryptor::new();
+        let err = e
+            .encrypt(
+                b"x",
+                EncryptionMode::Hctr2 { object_id: 1 },
+                &TransformKey::ZERO,
+            )
+            .unwrap_err();
+        assert!(matches!(err, TransformError::EncryptionDisabled));
     }
 
     #[test]
-    fn xts_round_trip() {
-        let data = b"metadata record content";
-        let enc = Encryptor::encrypt(data, &TEST_KEY, EncryptionMode::Xts).unwrap();
-        assert_eq!(enc.len(), data.len());
-        let dec = Encryptor::decrypt(&enc, &TEST_KEY, EncryptionMode::Xts).unwrap();
-        assert_eq!(dec, data);
+    fn aead_modes_disabled_in_phase_2c() {
+        let e = Encryptor::new();
+        for mode in [EncryptionMode::AesGcm, EncryptionMode::ChaCha20Poly1305] {
+            let err = e.encrypt(b"x", mode, &TransformKey::ZERO).unwrap_err();
+            assert!(matches!(err, TransformError::EncryptionDisabled));
+        }
     }
 
     #[test]
-    fn aes_gcm_round_trip() {
-        let data = b"WAL entry payload";
-        let mode = EncryptionMode::AesGcm { nonce: 12345 };
-
-        let enc = Encryptor::encrypt(data, &TEST_KEY, mode).unwrap();
-        assert_eq!(enc.len(), data.len() + 16); // 16-byte auth tag
-
-        let dec = Encryptor::decrypt(&enc, &TEST_KEY, mode).unwrap();
-        assert_eq!(dec, data);
-    }
-
-    #[test]
-    fn aes_gcm_tamper_detection() {
-        let data = b"authenticated data";
-        let mode = EncryptionMode::AesGcm { nonce: 1 };
-
-        let mut enc = Encryptor::encrypt(data, &TEST_KEY, mode).unwrap();
-        enc[0] ^= 0xFF; // Tamper with ciphertext
-
-        let result = Encryptor::decrypt(&enc, &TEST_KEY, mode);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn chacha_round_trip() {
-        let data = b"sync message";
-        let mode = EncryptionMode::ChaCha20Poly1305;
-
-        let enc = Encryptor::encrypt(data, &TEST_KEY, mode).unwrap();
-        assert_eq!(enc.len(), data.len() + 16);
-
-        let dec = Encryptor::decrypt(&enc, &TEST_KEY, mode).unwrap();
-        assert_eq!(dec, data);
-    }
-
-    #[test]
-    fn length_preserving_check() {
+    fn length_preserving_classification() {
         assert!(Encryptor::is_length_preserving(EncryptionMode::None));
+        assert!(Encryptor::is_length_preserving(EncryptionMode::Xts));
         assert!(Encryptor::is_length_preserving(EncryptionMode::Hctr2 {
             object_id: 0
         }));
-        assert!(Encryptor::is_length_preserving(EncryptionMode::Xts));
-        assert!(!Encryptor::is_length_preserving(EncryptionMode::AesGcm {
-            nonce: 0
-        }));
+        assert!(!Encryptor::is_length_preserving(EncryptionMode::AesGcm));
         assert!(!Encryptor::is_length_preserving(
             EncryptionMode::ChaCha20Poly1305
         ));
     }
 
     #[test]
-    fn overhead_bytes() {
-        assert_eq!(Encryptor::overhead(EncryptionMode::None), 0);
-        assert_eq!(
-            Encryptor::overhead(EncryptionMode::Hctr2 { object_id: 0 }),
-            0
-        );
-        assert_eq!(Encryptor::overhead(EncryptionMode::AesGcm { nonce: 0 }), 16);
-    }
-
-    #[test]
-    fn empty_data() {
-        let enc = Encryptor::encrypt(b"", &TEST_KEY, EncryptionMode::Xts).unwrap();
-        assert!(enc.is_empty());
-        let dec = Encryptor::decrypt(&enc, &TEST_KEY, EncryptionMode::Xts).unwrap();
-        assert!(dec.is_empty());
-    }
-
-    #[test]
-    fn large_data() {
-        let data = vec![0x42u8; 64 * 1024];
-        let mode = EncryptionMode::Hctr2 { object_id: 999 };
-        let enc = Encryptor::encrypt(&data, &TEST_KEY, mode).unwrap();
-        let dec = Encryptor::decrypt(&enc, &TEST_KEY, mode).unwrap();
-        assert_eq!(dec, data);
+    fn sector_alignment_classification() {
+        assert!(!Encryptor::requires_sector_alignment(EncryptionMode::None));
+        assert!(Encryptor::requires_sector_alignment(EncryptionMode::Xts));
+        assert!(Encryptor::requires_sector_alignment(
+            EncryptionMode::Hctr2 { object_id: 0 }
+        ));
+        assert!(!Encryptor::requires_sector_alignment(
+            EncryptionMode::AesGcm
+        ));
     }
 }

@@ -7,9 +7,6 @@ license.workspace = true
 [dependencies]
 mimisbrunnr-storage = { workspace = true }
 mimisbrunnr-types = { workspace = true }
-arbitrary-int = { workspace = true }
 bytemuck = { workspace = true }
+static_assertions = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }

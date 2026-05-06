@@ -1,41 +1,41 @@
-/// Sector alignment: pad data to 4KB boundary.
-///
-/// Required before encryption since XTS and HCTR2 are length-preserving
-/// and operate on sector-aligned data.
-pub struct SectorPadder;
+//! Sector-alignment padding (DESIGN §9.1, step 3).
+//!
+//! Block-cipher modes used for on-disk encryption — XTS in particular —
+//! operate on fixed-size sectors. The padder zero-extends a buffer in
+//! place to the next multiple of `sector_size`. Tracking the *original*
+//! length so the buffer can be restored later is the caller's job: it
+//! belongs in metadata (e.g. `ObjectRecord::content_size`), not in the
+//! padded bytes themselves.
 
-/// Sector size (4 KiB).
+/// Default sector size used by Mímisbrunnr (4 KiB).
 pub const SECTOR_SIZE: usize = 4096;
 
+/// Stateless sector padder.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SectorPadder;
+
 impl SectorPadder {
-    /// Pad data to the next 4KB boundary. Returns (padded_data, original_length).
-    pub fn pad(data: &[u8]) -> (Vec<u8>, usize) {
-        let original_len = data.len();
-        let padded_len = Self::padded_size(original_len);
-
-        let mut padded = Vec::with_capacity(padded_len);
-        padded.extend_from_slice(data);
-        padded.resize(padded_len, 0);
-
-        (padded, original_len)
+    pub const fn new() -> Self {
+        Self
     }
 
-    /// Remove padding given the original length.
-    pub fn unpad(data: &[u8], original_len: usize) -> &[u8] {
-        &data[..original_len.min(data.len())]
-    }
-
-    /// Compute the padded size for a given original size.
-    pub fn padded_size(original_len: usize) -> usize {
-        if original_len == 0 {
-            return 0;
+    /// Zero-extend `data` in place so its length is a multiple of
+    /// `sector_size`. A zero-length buffer is left untouched. Panics if
+    /// `sector_size == 0`.
+    pub fn pad_to(&self, data: &mut Vec<u8>, sector_size: usize) {
+        assert!(sector_size > 0, "sector_size must be > 0");
+        if data.is_empty() {
+            return;
         }
-        original_len.div_ceil(SECTOR_SIZE) * SECTOR_SIZE
+        let aligned = data.len().div_ceil(sector_size) * sector_size;
+        data.resize(aligned, 0);
     }
 
-    /// Check if data is already sector-aligned.
-    pub fn is_aligned(data: &[u8]) -> bool {
-        data.is_empty() || data.len().is_multiple_of(SECTOR_SIZE)
+    /// Returns true if `data.len()` is already a multiple of `sector_size`
+    /// (or empty). Panics if `sector_size == 0`.
+    pub fn is_aligned(&self, data: &[u8], sector_size: usize) -> bool {
+        assert!(sector_size > 0, "sector_size must be > 0");
+        data.is_empty() || data.len().is_multiple_of(sector_size)
     }
 }
 
@@ -44,70 +44,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pad_small_data() {
-        let data = b"hello";
-        let (padded, orig_len) = SectorPadder::pad(data);
-        assert_eq!(orig_len, 5);
-        assert_eq!(padded.len(), SECTOR_SIZE);
-        assert_eq!(&padded[..5], b"hello");
-        assert!(padded[5..].iter().all(|&b| b == 0));
+    fn pad_small_to_4k() {
+        let p = SectorPadder::new();
+        let mut data = b"hello".to_vec();
+        p.pad_to(&mut data, SECTOR_SIZE);
+        assert_eq!(data.len(), SECTOR_SIZE);
+        assert_eq!(&data[..5], b"hello");
+        assert!(data[5..].iter().all(|&b| b == 0));
     }
 
     #[test]
-    fn pad_exact_sector() {
-        let data = vec![0xAB; SECTOR_SIZE];
-        let (padded, orig_len) = SectorPadder::pad(&data);
-        assert_eq!(orig_len, SECTOR_SIZE);
-        assert_eq!(padded.len(), SECTOR_SIZE);
-        assert_eq!(padded, data);
+    fn pad_exact_multiple_unchanged() {
+        let p = SectorPadder::new();
+        let mut data = vec![0xABu8; SECTOR_SIZE];
+        let snapshot = data.clone();
+        p.pad_to(&mut data, SECTOR_SIZE);
+        assert_eq!(data, snapshot);
     }
 
     #[test]
-    fn pad_just_over_sector() {
-        let data = vec![0xCD; SECTOR_SIZE + 1];
-        let (padded, orig_len) = SectorPadder::pad(&data);
-        assert_eq!(orig_len, SECTOR_SIZE + 1);
-        assert_eq!(padded.len(), SECTOR_SIZE * 2);
+    fn pad_just_over_one_sector() {
+        let p = SectorPadder::new();
+        let mut data = vec![0xCDu8; SECTOR_SIZE + 1];
+        p.pad_to(&mut data, SECTOR_SIZE);
+        assert_eq!(data.len(), 2 * SECTOR_SIZE);
     }
 
     #[test]
-    fn pad_empty() {
-        let (padded, orig_len) = SectorPadder::pad(b"");
-        assert_eq!(orig_len, 0);
-        assert_eq!(padded.len(), 0);
+    fn pad_empty_is_noop() {
+        let p = SectorPadder::new();
+        let mut data: Vec<u8> = Vec::new();
+        p.pad_to(&mut data, SECTOR_SIZE);
+        assert!(data.is_empty());
     }
 
     #[test]
-    fn unpad_restores_original() {
-        let data = b"original content here!";
-        let (padded, orig_len) = SectorPadder::pad(data);
-        let restored = SectorPadder::unpad(&padded, orig_len);
-        assert_eq!(restored, data);
+    fn round_trip_with_caller_tracked_length() {
+        // The padder doesn't track original length — caller does.
+        let p = SectorPadder::new();
+        let original = b"the quick brown fox".to_vec();
+        let original_len = original.len();
+        let mut padded = original.clone();
+        p.pad_to(&mut padded, SECTOR_SIZE);
+        assert!(p.is_aligned(&padded, SECTOR_SIZE));
+        // Caller restores by truncating to the recorded length.
+        padded.truncate(original_len);
+        assert_eq!(padded, original);
     }
 
     #[test]
-    fn padded_size() {
-        assert_eq!(SectorPadder::padded_size(0), 0);
-        assert_eq!(SectorPadder::padded_size(1), SECTOR_SIZE);
-        assert_eq!(SectorPadder::padded_size(SECTOR_SIZE), SECTOR_SIZE);
-        assert_eq!(SectorPadder::padded_size(SECTOR_SIZE + 1), SECTOR_SIZE * 2);
-        assert_eq!(SectorPadder::padded_size(SECTOR_SIZE * 3), SECTOR_SIZE * 3);
-    }
-
-    #[test]
-    fn is_aligned() {
-        assert!(SectorPadder::is_aligned(b""));
-        assert!(!SectorPadder::is_aligned(b"x"));
-        assert!(SectorPadder::is_aligned(&vec![0; SECTOR_SIZE]));
-        assert!(!SectorPadder::is_aligned(&vec![0; SECTOR_SIZE + 1]));
-    }
-
-    #[test]
-    fn large_data_round_trip() {
-        let data = vec![0xFF; 100_000];
-        let (padded, orig_len) = SectorPadder::pad(&data);
-        assert!(SectorPadder::is_aligned(&padded));
-        let restored = SectorPadder::unpad(&padded, orig_len);
-        assert_eq!(restored, &data[..]);
+    fn is_aligned_cases() {
+        let p = SectorPadder::new();
+        assert!(p.is_aligned(b"", SECTOR_SIZE));
+        assert!(!p.is_aligned(b"x", SECTOR_SIZE));
+        assert!(p.is_aligned(&vec![0; SECTOR_SIZE], SECTOR_SIZE));
+        assert!(!p.is_aligned(&vec![0; SECTOR_SIZE + 1], SECTOR_SIZE));
     }
 }

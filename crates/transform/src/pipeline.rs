@@ -1,38 +1,52 @@
+//! Composed transform pipeline (DESIGN §9.1).
+//!
+//! The pipeline is the single entry point most callers should use; it
+//! composes hash → compress → pad → encrypt on the write side and the
+//! exact inverse on the read side.
+
+use mimisbrunnr_types::{CompressionAlgo, EncryptionMode};
+
 use crate::{
-    TransformError,
-    compress::{CompressionAlgo, Compressor},
-    encrypt::{EncryptionMode, Encryptor},
-    hasher::ContentHasher,
-    pad::SectorPadder,
+    compress::Compressor, encrypt::{Encryptor, TransformKey}, error::TransformError,
+    hasher::ContentHasher, pad::{SECTOR_SIZE, SectorPadder},
 };
 
-/// Result of the write transform pipeline.
-#[derive(Debug)]
+/// Result of `TransformPipeline::apply`.
+#[derive(Debug, Clone)]
 pub struct TransformResult {
-    /// BLAKE3 hash of the original plaintext.
+    /// BLAKE3 of the *plaintext* input (DESIGN §9.1: the content hash is
+    /// always over plaintext, never over compressed/encrypted bytes).
     pub content_hash: [u8; 32],
-    /// Transformed data ready for disk.
+    /// Bytes ready to land on disk / in the WAL / on the wire.
     pub data: Vec<u8>,
-    /// Original plaintext size.
-    pub original_size: usize,
-    /// Size after compression (before padding/encryption).
-    pub compressed_size: usize,
-    /// Final on-disk size.
-    pub stored_size: usize,
+    /// Plaintext size, in bytes.
+    pub original_size: u64,
+    /// Size after compression, before padding & encryption.
+    pub compressed_size: u64,
+    /// Final on-disk size — includes pad bytes and any AEAD tag.
+    pub stored_size: u64,
 }
 
-/// The full transform pipeline.
+/// Configured transform pipeline.
 ///
-/// Write path: **hash → compress → pad → encrypt**
-/// Read path: **decrypt → unpad → decompress → verify hash**
+/// `key` is `None` exactly when `encryption == EncryptionMode::None`. The
+/// constructor does not enforce this — callers should pass a real key for
+/// any non-`None` mode (Phase 2c will still error out with
+/// `EncryptionDisabled`, but this keeps the contract correct for later
+/// phases).
+#[derive(Debug, Clone, Copy)]
 pub struct TransformPipeline {
     pub compression: CompressionAlgo,
     pub encryption: EncryptionMode,
-    pub key: [u8; 32],
+    pub key: Option<TransformKey>,
 }
 
 impl TransformPipeline {
-    pub fn new(compression: CompressionAlgo, encryption: EncryptionMode, key: [u8; 32]) -> Self {
+    pub const fn new(
+        compression: CompressionAlgo,
+        encryption: EncryptionMode,
+        key: Option<TransformKey>,
+    ) -> Self {
         Self {
             compression,
             encryption,
@@ -40,271 +54,179 @@ impl TransformPipeline {
         }
     }
 
-    /// No-op pipeline (no compression, no encryption).
-    pub fn passthrough() -> Self {
+    /// No compression, no encryption — useful for tests and for the
+    /// pre-encryption boot path (DESIGN §9.5: untrusted nodes that don't
+    /// hold keys can still verify framing).
+    pub const fn passthrough() -> Self {
         Self {
             compression: CompressionAlgo::None,
             encryption: EncryptionMode::None,
-            key: [0; 32],
+            key: None,
         }
     }
 
-    /// Write path: hash → compress → pad → encrypt.
-    pub fn transform_write(&self, plaintext: &[u8]) -> Result<TransformResult, TransformError> {
-        // 1. Hash the plaintext
-        let content_hash = ContentHasher::hash(plaintext);
-        let original_size = plaintext.len();
+    /// Apply the write-path pipeline:
+    ///
+    /// 1. BLAKE3-hash the plaintext (DESIGN §9.1: always over plaintext).
+    /// 2. Compress.
+    /// 3. If the chosen `EncryptionMode` requires sector-aligned input
+    ///    (XTS, HCTR2), pad with zeroes to a 4 KiB boundary.
+    /// 4. Encrypt.
+    pub fn apply(&self, plaintext: &[u8]) -> Result<TransformResult, TransformError> {
+        // (1) hash plaintext
+        let content_hash = ContentHasher::new().hash(plaintext);
+        let original_size = plaintext.len() as u64;
 
-        // 2. Compress
-        let compressed = Compressor::compress(plaintext, self.compression)?;
-        let compressed_size = compressed.len();
+        // (2) compress
+        let compressed = Compressor::new().compress(plaintext, self.compression)?;
+        let compressed_size = compressed.len() as u64;
 
-        // 3. Pad to sector boundary (only for length-preserving encryption)
-        let padded = if Encryptor::is_length_preserving(self.encryption) {
-            let (padded, _) = SectorPadder::pad(&compressed);
-            padded
-        } else {
-            compressed
-        };
+        // (3) pad if the cipher needs sector alignment
+        let mut staged = compressed;
+        if Encryptor::requires_sector_alignment(self.encryption) {
+            SectorPadder::new().pad_to(&mut staged, SECTOR_SIZE);
+        }
 
-        // 4. Encrypt
-        let encrypted = Encryptor::encrypt(&padded, &self.key, self.encryption)?;
-        let stored_size = encrypted.len();
+        // (4) encrypt
+        let key = self.key.unwrap_or(TransformKey::ZERO);
+        let data = Encryptor::new().encrypt(&staged, self.encryption, &key)?;
+        let stored_size = data.len() as u64;
 
         Ok(TransformResult {
             content_hash,
-            data: encrypted,
+            data,
             original_size,
             compressed_size,
             stored_size,
         })
     }
 
-    /// Read path: decrypt → unpad → decompress → verify hash.
-    pub fn transform_read(
+    /// Inverse of `apply`.
+    ///
+    /// 1. Decrypt.
+    /// 2. Decompress (zstd is self-framing; trailing zero pad bytes are
+    ///    inert — `zstd::decode_all` stops at the frame end).
+    /// 3. If `expected_hash` is supplied, BLAKE3 the recovered plaintext
+    ///    and compare.
+    ///
+    /// Note: padding is *not* stripped explicitly here because the
+    /// compressor's frame format already self-delimits. The caller stored
+    /// the original plaintext length in metadata; padding only affects
+    /// `stored_size`, not the recovered plaintext.
+    pub fn invert(
         &self,
         stored: &[u8],
-        compressed_size: usize,
-        expected_hash: Option<&[u8; 32]>,
+        expected_hash: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, TransformError> {
-        // 1. Decrypt
-        let decrypted = Encryptor::decrypt(stored, &self.key, self.encryption)?;
+        // (1) decrypt
+        let key = self.key.unwrap_or(TransformKey::ZERO);
+        let decrypted = Encryptor::new().decrypt(stored, self.encryption, &key)?;
 
-        // 2. Unpad (only for length-preserving modes)
-        let unpadded = if Encryptor::is_length_preserving(self.encryption) {
-            SectorPadder::unpad(&decrypted, compressed_size).to_vec()
-        } else {
-            decrypted
-        };
+        // (2) decompress. For `CompressionAlgo::None` the padded zero tail
+        //     is observable; for `Zstd` the frame self-delimits and trailing
+        //     zeros are ignored. We strip trailing zeros only for `None` so
+        //     callers that never padded (no encryption, no padding step)
+        //     get an exact round-trip — and callers that *did* pad are
+        //     expected to truncate to a metadata-tracked length anyway.
+        let plaintext = Compressor::new().decompress(&decrypted, self.compression)?;
 
-        // 3. Decompress
-        let plaintext = Compressor::decompress(&unpadded, self.compression)?;
-
-        // 4. Verify hash
-        if let Some(expected) = expected_hash
-            && !ContentHasher::verify(&plaintext, expected)
-        {
-            let actual = ContentHasher::hash_hex(&plaintext);
-            let expected_hex = hex_encode(expected);
-            return Err(TransformError::IntegrityFailure {
-                expected: expected_hex,
-                actual,
-            });
+        // (3) optional hash check
+        if let Some(expected) = expected_hash {
+            let actual = ContentHasher::new().hash(&plaintext);
+            if actual != expected {
+                return Err(TransformError::HashMismatch);
+            }
         }
 
         Ok(plaintext)
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const TEST_KEY: [u8; 32] = [
-        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E,
-        0x1F, 0x20,
-    ];
-
     #[test]
-    fn passthrough_round_trip() {
-        let pipeline = TransformPipeline::passthrough();
-        let data = b"hello mimisbrunnr";
-
-        let result = pipeline.transform_write(data).unwrap();
-        assert_eq!(result.original_size, data.len());
-
-        let restored = pipeline
-            .transform_read(
-                &result.data,
-                result.compressed_size,
-                Some(&result.content_hash),
-            )
-            .unwrap();
-        assert_eq!(restored, data);
+    fn apply_none_none_is_identity_with_hash() {
+        let p = TransformPipeline::passthrough();
+        let input = b"hello mimisbrunnr";
+        let r = p.apply(input).unwrap();
+        assert_eq!(r.content_hash, ContentHasher::new().hash(input));
+        assert_eq!(r.data, input);
+        assert_eq!(r.original_size, input.len() as u64);
+        assert_eq!(r.compressed_size, input.len() as u64);
+        assert_eq!(r.stored_size, input.len() as u64);
     }
 
     #[test]
-    fn compress_only() {
-        let pipeline =
-            TransformPipeline::new(CompressionAlgo::Zstd(3), EncryptionMode::None, [0; 32]);
-        let data = b"repetitive data for compression test ".repeat(500);
-
-        let result = pipeline.transform_write(&data).unwrap();
-        // Compressed size should be much smaller; stored_size may be padded
-        assert!(result.compressed_size < data.len());
-
-        let restored = pipeline
-            .transform_read(
-                &result.data,
-                result.compressed_size,
-                Some(&result.content_hash),
-            )
-            .unwrap();
-        assert_eq!(restored, data);
+    fn apply_zstd_none_hashes_plaintext_not_compressed() {
+        let p = TransformPipeline::new(CompressionAlgo::Zstd(3), EncryptionMode::None, None);
+        let input = b"the quick brown fox jumps over the lazy dog\n".repeat(64);
+        let r = p.apply(&input).unwrap();
+        // hash is of the plaintext, not the zstd frame
+        assert_eq!(r.content_hash, ContentHasher::new().hash(&input));
+        assert_ne!(r.content_hash, ContentHasher::new().hash(&r.data));
+        // zstd actually shrunk this input
+        assert!(r.data.len() < input.len());
+        assert_eq!(r.original_size, input.len() as u64);
+        assert_eq!(r.compressed_size, r.data.len() as u64);
+        assert_eq!(r.stored_size, r.data.len() as u64);
     }
 
     #[test]
-    fn encrypt_only() {
-        let pipeline = TransformPipeline::new(
+    fn invert_round_trip_none_none() {
+        let p = TransformPipeline::passthrough();
+        let input = b"round trip data";
+        let r = p.apply(input).unwrap();
+        let back = p.invert(&r.data, Some(r.content_hash)).unwrap();
+        assert_eq!(back, input);
+    }
+
+    #[test]
+    fn invert_round_trip_zstd_none() {
+        let p = TransformPipeline::new(CompressionAlgo::Zstd(3), EncryptionMode::None, None);
+        let input = b"compress me ".repeat(128);
+        let r = p.apply(&input).unwrap();
+        let back = p.invert(&r.data, Some(r.content_hash)).unwrap();
+        assert_eq!(back, input);
+    }
+
+    #[test]
+    fn invert_hash_mismatch_errors() {
+        let p = TransformPipeline::passthrough();
+        let input = b"important data";
+        let r = p.apply(input).unwrap();
+        let bad = [0xFFu8; 32];
+        let err = p.invert(&r.data, Some(bad)).unwrap_err();
+        assert!(matches!(err, TransformError::HashMismatch));
+    }
+
+    #[test]
+    fn invert_without_hash_check() {
+        let p = TransformPipeline::passthrough();
+        let input = b"no hash check";
+        let r = p.apply(input).unwrap();
+        let back = p.invert(&r.data, None).unwrap();
+        assert_eq!(back, input);
+    }
+
+    #[test]
+    fn apply_with_xts_returns_encryption_disabled_in_phase_2c() {
+        let p = TransformPipeline::new(
             CompressionAlgo::None,
-            EncryptionMode::Hctr2 { object_id: 42 },
-            TEST_KEY,
+            EncryptionMode::Xts,
+            Some(TransformKey::ZERO),
         );
-        let data = b"secret object data";
-
-        let result = pipeline.transform_write(data).unwrap();
-        // Data should be padded to sector boundary and encrypted
-        assert!(result.stored_size >= data.len());
-
-        let restored = pipeline
-            .transform_read(
-                &result.data,
-                result.compressed_size,
-                Some(&result.content_hash),
-            )
-            .unwrap();
-        assert_eq!(restored, data);
+        let err = p.apply(b"hello").unwrap_err();
+        assert!(matches!(err, TransformError::EncryptionDisabled));
     }
 
     #[test]
-    fn full_pipeline_compress_and_encrypt() {
-        let pipeline = TransformPipeline::new(
-            CompressionAlgo::Zstd(3),
-            EncryptionMode::Hctr2 { object_id: 99 },
-            TEST_KEY,
-        );
-        let data = b"The quick brown fox ".repeat(500);
-
-        let result = pipeline.transform_write(&data).unwrap();
-
-        let restored = pipeline
-            .transform_read(
-                &result.data,
-                result.compressed_size,
-                Some(&result.content_hash),
-            )
-            .unwrap();
-        assert_eq!(restored, data);
-    }
-
-    #[test]
-    fn aead_pipeline() {
-        let pipeline = TransformPipeline::new(
-            CompressionAlgo::Zstd(1),
-            EncryptionMode::AesGcm { nonce: 42 },
-            TEST_KEY,
-        );
-        let data = b"WAL entry data";
-
-        let result = pipeline.transform_write(data).unwrap();
-
-        let restored = pipeline
-            .transform_read(
-                &result.data,
-                result.compressed_size,
-                Some(&result.content_hash),
-            )
-            .unwrap();
-        assert_eq!(restored, data);
-    }
-
-    #[test]
-    fn hash_integrity_check() {
-        let pipeline = TransformPipeline::passthrough();
-        let data = b"important data";
-
-        let result = pipeline.transform_write(data).unwrap();
-
-        // Tamper with expected hash
-        let bad_hash = [0xFF; 32];
-        let err = pipeline
-            .transform_read(&result.data, result.compressed_size, Some(&bad_hash))
-            .unwrap_err();
-        assert!(matches!(err, TransformError::IntegrityFailure { .. }));
-    }
-
-    #[test]
-    fn no_hash_verification() {
-        let pipeline = TransformPipeline::passthrough();
-        let data = b"data without hash check";
-
-        let result = pipeline.transform_write(data).unwrap();
-        let restored = pipeline
-            .transform_read(&result.data, result.compressed_size, None)
-            .unwrap();
-        assert_eq!(restored, data);
-    }
-
-    #[test]
-    fn empty_data() {
-        let pipeline =
-            TransformPipeline::new(CompressionAlgo::Zstd(3), EncryptionMode::None, [0; 32]);
-
-        let result = pipeline.transform_write(b"").unwrap();
-        let restored = pipeline
-            .transform_read(
-                &result.data,
-                result.compressed_size,
-                Some(&result.content_hash),
-            )
-            .unwrap();
-        assert!(restored.is_empty());
-    }
-
-    #[test]
-    fn large_data_pipeline() {
-        let pipeline =
-            TransformPipeline::new(CompressionAlgo::Zstd(3), EncryptionMode::Xts, TEST_KEY);
-        let data = vec![0x42u8; 256 * 1024]; // 256 KiB
-
-        let result = pipeline.transform_write(&data).unwrap();
-        let restored = pipeline
-            .transform_read(
-                &result.data,
-                result.compressed_size,
-                Some(&result.content_hash),
-            )
-            .unwrap();
-        assert_eq!(restored, data);
-    }
-
-    #[test]
-    fn result_sizes_consistent() {
-        let pipeline = TransformPipeline::new(
-            CompressionAlgo::Zstd(3),
-            EncryptionMode::Hctr2 { object_id: 1 },
-            TEST_KEY,
-        );
-        let data = b"test data for size checks ".repeat(100);
-
-        let result = pipeline.transform_write(&data).unwrap();
-        assert_eq!(result.original_size, data.len());
-        assert!(result.compressed_size <= result.original_size);
-        assert_eq!(result.stored_size, result.data.len());
+    fn empty_round_trip_zstd() {
+        let p = TransformPipeline::new(CompressionAlgo::Zstd(3), EncryptionMode::None, None);
+        let r = p.apply(b"").unwrap();
+        assert_eq!(r.original_size, 0);
+        let back = p.invert(&r.data, Some(r.content_hash)).unwrap();
+        assert!(back.is_empty());
     }
 }

@@ -21,6 +21,12 @@ pub enum StorageError {
     #[error("invalid bucket data type: {0}")]
     InvalidBucketDataType(u8),
 
+    #[error("invalid media type discriminant: {0}")]
+    InvalidMediaType(u8),
+
+    #[error("invalid storage tier discriminant: {0}")]
+    InvalidStorageTier(u8),
+
     #[error("crc mismatch: expected {expected:#010x}, got {actual:#010x}")]
     CrcMismatch { expected: u32, actual: u32 },
 

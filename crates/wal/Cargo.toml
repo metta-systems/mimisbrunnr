@@ -8,8 +8,12 @@ license.workspace = true
 [dependencies]
 mimisbrunnr-storage = { workspace = true }
 mimisbrunnr-types = { workspace = true }
-crc32fast = { workspace = true }
+bytemuck = { workspace = true }
+ciborium = { workspace = true }
+crc32c = { workspace = true }
 log = { workspace = true }
+serde = { workspace = true }
+static_assertions = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
