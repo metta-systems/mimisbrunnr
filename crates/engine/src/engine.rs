@@ -12,6 +12,7 @@ use mimisbrunnr_meta::{
 };
 use mimisbrunnr_ontology::{IdAllocator, InstallResult, OntologyModule, OntologyState};
 use mimisbrunnr_query::QueryExecutor;
+use mimisbrunnr_storage::{BucketAllocTable, FreespaceLru};
 use mimisbrunnr_transform::{TransformPipeline, TransformResult};
 use mimisbrunnr_types::{
     Assertion, ChangeInterest, NodeId, ObjectId, ObjectState, Query, SubscriptionId, TagDefinition,
@@ -46,6 +47,23 @@ pub struct Engine {
     /// commit / load against its dedicated B+ tree region.
     /// TODO(rewrite-phase-R4): populate on every blob / chunk write.
     pub backpointer_table: BackpointerTable,
+    /// Bucket allocation table — IMPL §12.2. Pool-scoped (R1b-4); the
+    /// per-disk split is R1d. The engine doesn't drive bucket
+    /// allocation today (Theme F / H), but having the field lets the
+    /// empty table round-trip through commit / load against its
+    /// dedicated B+ tree region.
+    /// TODO(rewrite-phase-Theme-H): populate via the foreground
+    /// allocator + copygc producer.
+    pub bucket_alloc: BucketAllocTable,
+    /// Freespace LRU — IMPL §12.4. Pool-scoped (R1b-4); the per-disk
+    /// split is R1d. The engine doesn't drive LRU mutations today
+    /// (Theme H), but having the field lets the empty table
+    /// round-trip through commit / load against its dedicated B+ tree
+    /// region.
+    /// TODO(rewrite-phase-Theme-H): live allocator integration —
+    /// "scan band 0" foreground fast path, lazy reband on 8-sector
+    /// boundary, copygc producer.
+    pub freespace_lru: FreespaceLru,
     pub forward_index: ForwardIndex,
     pub tag_index: TagIndex,
     pub kv_index: KvIndex,
@@ -88,6 +106,8 @@ impl Engine {
             object_table: ObjectTable::new(),
             location_table: LocationTable::new(),
             backpointer_table: BackpointerTable::new(),
+            bucket_alloc: BucketAllocTable::new(),
+            freespace_lru: FreespaceLru::new(),
             forward_index: ForwardIndex::new(),
             tag_index: TagIndex::new(),
             kv_index: KvIndex::new(),

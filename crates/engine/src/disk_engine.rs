@@ -6,10 +6,10 @@
 //! - the primary disk's [`Superblock`] (atomic root commit at checkpoint),
 //! - a [`PoolManager`] (multi-disk lifecycle).
 //!
-//! ## Index persistence layout (post-R1b-3)
+//! ## Index persistence layout (post-R1b-4)
 //!
-//! Within the index zone, R1b carves out **ten** dedicated 256 KiB §1.5
-//! B+ tree regions for the migrated indices and tables, with the
+//! Within the index zone, R1b carves out **twelve** dedicated 256 KiB
+//! §1.5 B+ tree regions for the migrated indices and tables, with the
 //! remaining state (oplog, path contexts, scalar bookkeeping) still
 //! living in a length-prefixed CBOR blob at the tail of the zone:
 //!
@@ -24,19 +24,33 @@
 //! [zone.offset + 1792 KiB]           Ontology region          (256 KiB)   ← R1b-3*
 //! [zone.offset + 2048 KiB]           Subscriptions region     (256 KiB)   ← R1b-3*
 //! [zone.offset + 2304 KiB]           BackpointerTable region  (256 KiB)   ← R1b-3
-//! [zone.offset + 2560 KiB]           Legacy CBOR blob         (MIXI magic + u32 len + CBOR)
+//! [zone.offset + 2560 KiB]           BucketAllocTable region  (256 KiB)   ← R1b-4
+//! [zone.offset + 2816 KiB]           FreespaceLru region      (256 KiB)   ← R1b-4
+//! [zone.offset + 3072 KiB]           Legacy CBOR blob         (MIXI magic + u32 len + CBOR)
 //! ```
 //!
 //! \* Ontology and Subscriptions regions landed alongside R1b-3 since
 //! their `flush_to_region` / `load_from_region` APIs were already in
 //! place; they're documented here so the layout stays self-describing.
 //!
-//! Total dedicated region prefix after R1b-3: 2.5 MiB. With the
+//! Total dedicated region prefix after R1b-4: **3.0 MiB**. With the
 //! default 3%-of-disk index zone, a 1 GiB pool (≈ 30 MiB index zone)
-//! leaves ~27.5 MiB for the legacy blob. The 4 MiB minimum index
+//! leaves ~27 MiB for the legacy blob. The 4 MiB minimum index
 //! zone (`FMT_INDEX_ZONE_SIZE` in `mimisbrunnr-pool::tier`) leaves
-//! ~1.5 MiB for the legacy blob — still ample for the four scalars
-//! plus the path-contexts CBOR + transient blob `HashMap`.
+//! exactly **1 MiB** for the legacy blob — tight but workable for the
+//! few scalars plus the path-contexts CBOR + oplog + transient blob
+//! `HashMap`. If a workload outgrows that, bump
+//! `FMT_INDEX_ZONE_SIZE` to 8 MiB.
+//!
+//! Per IMPL §12.2 / §12.4 the bucket alloc table and freespace LRU
+//! are actually **per-disk** B+ trees rooted at
+//! `DiskDescriptorOnDisk.{buckets_root, freespace_root}`. R1b-4
+//! simplifies to one pool-scoped region in the index zone; the wire
+//! keys already carry `disk_id` so the per-disk split (R1d) is a
+//! layout-only change with no on-disk format break. The
+//! `RootPointer` does **not** gain `bucket_alloc_root` /
+//! `freespace_lru_root` slots — per spec those fields live on the
+//! per-disk descriptor, not on the pool-wide root pointer.
 //!
 //! The legacy blob now carries only:
 //!
@@ -69,9 +83,9 @@ use log::trace;
 use mimisbrunnr_index::{ChunkIndex, ForwardIndex, KvIndex, RangeIndex, TagIndex};
 use mimisbrunnr_meta::{BackpointerTable, LocationTable, ObjectTable};
 
-/// Per-index slot offsets within the index zone. R1b-3 wires ten
+/// Per-index slot offsets within the index zone. R1b-4 wires twelve
 /// dedicated 256 KiB §1.5 B+ tree regions, pushing the legacy CBOR blob
-/// to offset 2.5 MiB.
+/// to offset 3.0 MiB.
 pub(crate) const CHUNK_INDEX_REGION_OFFSET: u64 = 0;
 /// See [`CHUNK_INDEX_REGION_OFFSET`].
 pub(crate) const KV_INDEX_REGION_OFFSET: u64 = 256 * 1024;
@@ -91,15 +105,21 @@ pub(crate) const ONTOLOGY_REGION_OFFSET: u64 = 1792 * 1024;
 pub(crate) const SUBSCRIPTIONS_REGION_OFFSET: u64 = 2048 * 1024;
 /// See [`CHUNK_INDEX_REGION_OFFSET`]. Added by R1b-3.
 pub(crate) const BACKPOINTER_TABLE_REGION_OFFSET: u64 = 2304 * 1024;
-/// See [`CHUNK_INDEX_REGION_OFFSET`]. Shifted from 2.25 MiB to 2.5 MiB
-/// by R1b-3.
-pub(crate) const LEGACY_CBOR_BLOB_OFFSET: u64 = 2560 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added by R1b-4.
+pub(crate) const BUCKET_ALLOC_REGION_OFFSET: u64 = 2560 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added by R1b-4.
+pub(crate) const FREESPACE_LRU_REGION_OFFSET: u64 = 2816 * 1024;
+/// See [`CHUNK_INDEX_REGION_OFFSET`]. Shifted from 2.5 MiB to 3.0 MiB
+/// by R1b-4.
+pub(crate) const LEGACY_CBOR_BLOB_OFFSET: u64 = 3072 * 1024;
 /// 256 KiB region size — matches `Superblock.btree_node_size_log2 = 18`.
 #[allow(dead_code)] // referenced in size assertions / future dynamic layout work.
 pub(crate) const REGION_SIZE: u64 = 256 * 1024;
 use mimisbrunnr_ontology::{InstallResult, OntologyModule, OntologyState};
 use mimisbrunnr_pool::{DiskConfigEntry, PoolConfig, PoolManager, PoolStatus};
-use mimisbrunnr_storage::{BlockDevice, FileBlockDevice, Superblock};
+use mimisbrunnr_storage::{
+    BlockDevice, BucketAllocTable, FileBlockDevice, FreespaceLru, Superblock,
+};
 use mimisbrunnr_types::{
     ChangeInterest, DiskId, ObjectId, Query, SubscriptionId, TagId, Value,
 };
@@ -385,7 +405,7 @@ impl DiskEngine {
         // Sanity-check zone is large enough for the new layout.
         if zone_length < LEGACY_CBOR_BLOB_OFFSET {
             return Err(EngineError::NotImplemented(
-                "index zone too small for R1b-3 layout (needs ≥ 2.5 MiB before the legacy blob)",
+                "index zone too small for R1b-4 layout (needs ≥ 3.0 MiB before the legacy blob)",
             ));
         }
 
@@ -452,6 +472,23 @@ impl DiskEngine {
             .flush_to_region(
                 self.primary_device.as_ref(),
                 zone_offset + BACKPOINTER_TABLE_REGION_OFFSET,
+            )
+            .map_err(EngineError::from)?;
+        // R1b-4: bucket alloc + freespace LRU. Pool-scoped for now;
+        // wire `disk_id = 0` until R1d splits per-disk per IMPL §12.2.
+        self.engine
+            .bucket_alloc
+            .flush_to_region(
+                self.primary_device.as_ref(),
+                zone_offset + BUCKET_ALLOC_REGION_OFFSET,
+                0,
+            )
+            .map_err(EngineError::from)?;
+        self.engine
+            .freespace_lru
+            .flush_to_region(
+                self.primary_device.as_ref(),
+                zone_offset + FREESPACE_LRU_REGION_OFFSET,
             )
             .map_err(EngineError::from)?;
 
@@ -545,6 +582,14 @@ impl DiskEngine {
         // TODO(rewrite-phase-N): populate every B+ tree root in RootPointer
         // (object_table_root, location_table_root, …). For now they are
         // BlockRef::ZERO sentinels.
+        //
+        // Note (R1b-4): `bucket_alloc_root` / `freespace_lru_root` are
+        // **not** RootPointer fields — per IMPL §12.2 / §12.4 those
+        // roots live on `DiskDescriptorOnDisk.{buckets_root,
+        // freespace_root}`, not on the pool-wide root pointer. The
+        // R1b-4 pool-scoped simplification keeps both regions in the
+        // index zone instead, so the per-disk root fields stay
+        // zeroed until R1d splits the trees per-disk.
         let next_lsn = self.wal.next_lsn();
         let mut new_root = *self.superblock.active_root_pointer();
         new_root.seq = { new_root.seq }.saturating_add(1);
@@ -862,6 +907,12 @@ fn load_all_regions<D: BlockDevice>(
         device,
         zone_offset + BACKPOINTER_TABLE_REGION_OFFSET,
     )?;
+    engine.bucket_alloc =
+        BucketAllocTable::load_from_region(device, zone_offset + BUCKET_ALLOC_REGION_OFFSET)
+            .map_err(EngineError::from)?;
+    engine.freespace_lru =
+        FreespaceLru::load_from_region(device, zone_offset + FREESPACE_LRU_REGION_OFFSET)
+            .map_err(EngineError::from)?;
     Ok(())
 }
 

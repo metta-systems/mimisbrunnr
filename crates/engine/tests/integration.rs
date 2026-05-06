@@ -862,9 +862,10 @@ fn migrated_indices_persist_across_commit_drop_open() {
 
 #[test]
 fn fresh_pool_open_before_first_commit_sees_empty_r1b3_tables() {
-    // Every region (including the three R1b-3 ones) is zero-filled at
-    // format time, so an `open` against a freshly-created pool must
-    // succeed and see empty object/location/backpointer states.
+    // Every region (including the three R1b-3 ones plus the two new
+    // R1b-4 ones) is zero-filled at format time, so an `open` against
+    // a freshly-created pool must succeed and see empty
+    // object/location/backpointer/bucket-alloc/freespace-LRU states.
     let tmp = TempDir::new().unwrap();
     let (cfg, cfg_path) = small_pool(&tmp);
     {
@@ -875,6 +876,8 @@ fn fresh_pool_open_before_first_commit_sees_empty_r1b3_tables() {
     assert_eq!(de.engine.object_table.len(), 0);
     assert_eq!(de.engine.location_table.len(), 0);
     assert_eq!(de.engine.backpointer_table.len(), 0);
+    assert_eq!(de.engine.bucket_alloc.len(), 0);
+    assert_eq!(de.engine.freespace_lru.len(), 0);
 }
 
 #[test]
@@ -1070,4 +1073,217 @@ fn all_ten_migrated_structures_round_trip_together() {
     // LocationTable: empty in this test (no manual insert) — confirms
     // that an empty dedicated region round-trips correctly.
     assert_eq!(de2.engine.location_table.len(), 0);
+}
+
+// ----------------------------------------------------------------------
+// R1b-4: bucket alloc table + freespace LRU
+// ----------------------------------------------------------------------
+
+#[test]
+fn r1b4_bucket_alloc_table_persists_across_commit_drop_open() {
+    use mimisbrunnr_storage::{
+        BUCKET_FLAG_NEEDS_DISCARD, BUCKET_FLAG_PINNED_BY_SNAPSHOT, BucketAllocEntry,
+        BucketDataType,
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+
+    // Engine doesn't drive bucket allocation yet (Theme F / H);
+    // inject directly so we can prove the round-trip works.
+    let entries: Vec<(u32, BucketAllocEntry)> = (0u32..16)
+        .map(|i| {
+            (
+                i,
+                BucketAllocEntry {
+                    generation: i + 1,
+                    data_type: BucketDataType::Blob as u8,
+                    flags: if i % 4 == 0 {
+                        BUCKET_FLAG_NEEDS_DISCARD
+                    } else {
+                        0
+                    },
+                    dirty_sectors: (i & 0xff) as u16,
+                    last_modify_lsn: i as u64 * 100,
+                },
+            )
+        })
+        .collect();
+    for (k, v) in &entries {
+        de.engine.bucket_alloc.insert(*k, *v);
+    }
+    de.engine.bucket_alloc.insert(
+        9999,
+        BucketAllocEntry {
+            generation: 42,
+            data_type: BucketDataType::Metadata as u8,
+            flags: BUCKET_FLAG_PINNED_BY_SNAPSHOT,
+            dirty_sectors: 17,
+            last_modify_lsn: 999_999,
+        },
+    );
+    let pre_len = de.engine.bucket_alloc.len();
+    assert_eq!(pre_len, 17);
+
+    de.commit().unwrap();
+    drop(de);
+
+    let de2 = DiskEngine::open(&cfg_path).unwrap();
+    assert_eq!(de2.engine.bucket_alloc.len(), pre_len);
+    for (k, v) in &entries {
+        let got = de2
+            .engine
+            .bucket_alloc
+            .get(*k)
+            .expect("bucket missing after round-trip");
+        assert_eq!({ got.generation }, { v.generation });
+        assert_eq!(got.data_type, v.data_type);
+        assert_eq!(got.flags, v.flags);
+        assert_eq!({ got.last_modify_lsn }, { v.last_modify_lsn });
+    }
+    let pinned = de2.engine.bucket_alloc.get(9999).expect("pinned missing");
+    assert_eq!(pinned.flags, BUCKET_FLAG_PINNED_BY_SNAPSHOT);
+}
+
+#[test]
+fn r1b4_freespace_lru_persists_across_commit_drop_open() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+
+    // Inject entries spread across bands 0 (allocator fast path), 100
+    // (mid-fragmented), and 255 (saturated).
+    for bucket in 0u32..10 {
+        de.engine.freespace_lru.insert(0, 0, bucket);
+    }
+    for bucket in 100u32..105 {
+        de.engine.freespace_lru.insert(100, 0, bucket);
+    }
+    for bucket in 200u32..203 {
+        de.engine.freespace_lru.insert(255, 0, bucket);
+    }
+    // Cross-disk entry — proves the disk_id field round-trips through
+    // the wire even though the in-memory mirror is pool-scoped.
+    de.engine.freespace_lru.insert(50, 7, 42);
+    let pre_len = de.engine.freespace_lru.len();
+    assert_eq!(pre_len, 19);
+
+    de.commit().unwrap();
+    drop(de);
+
+    let de2 = DiskEngine::open(&cfg_path).unwrap();
+    assert_eq!(de2.engine.freespace_lru.len(), pre_len);
+    for bucket in 0u32..10 {
+        assert!(de2.engine.freespace_lru.contains(0, 0, bucket));
+    }
+    for bucket in 100u32..105 {
+        assert!(de2.engine.freespace_lru.contains(100, 0, bucket));
+    }
+    for bucket in 200u32..203 {
+        assert!(de2.engine.freespace_lru.contains(255, 0, bucket));
+    }
+    assert!(de2.engine.freespace_lru.contains(50, 7, 42));
+
+    // Banded scan still works after round-trip — allocator fast path.
+    let band0_count = de2.engine.freespace_lru.iter_band(0).count();
+    assert_eq!(band0_count, 10);
+    let band255_count = de2.engine.freespace_lru.iter_band(255).count();
+    assert_eq!(band255_count, 3);
+}
+
+#[test]
+fn all_twelve_migrated_structures_round_trip_together() {
+    use mimisbrunnr_meta::{BackpointerKey, BackpointerValue, OwnerKind};
+    use mimisbrunnr_storage::{BucketAllocEntry, BucketDataType};
+
+    // ChunkIndex + KvIndex + ForwardIndex + TagIndex + RangeIndex +
+    // ObjectTable + LocationTable + Ontology + Subscriptions +
+    // BackpointerTable + BucketAllocTable + FreespaceLru — commit,
+    // drop, re-open; each must survive.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+
+    // ChunkIndex.
+    let blob_ref = mimisbrunnr_storage::BlobRef {
+        disk_id: 0,
+        _pad: 0,
+        block_no: 5050,
+        length: 4096,
+    };
+    de.engine.chunk_index.insert_or_bump([0xc7u8; 32], blob_ref);
+
+    // ObjectTable + ForwardIndex + TagIndex + KvIndex + RangeIndex via
+    // the public surface.
+    let red = de.engine.register_tag("red");
+    let year = de.engine.register_tag("year");
+    let oid = de.create_object().unwrap();
+    de.add_tag(oid, red).unwrap();
+    de.set_attr(oid, year, Value::Int(2026)).unwrap();
+
+    // BackpointerTable.
+    let bk = BackpointerKey::new(0, 7, 0);
+    let bv = BackpointerValue {
+        owner_kind: OwnerKind::BlobExtent as u8,
+        length_sectors: 1,
+        bucket_gen: 7,
+        owner_key: [9u8; 16],
+        ..BackpointerValue::default()
+    };
+    de.engine.backpointer_table.insert(bk, bv);
+
+    // BucketAllocTable (R1b-4).
+    de.engine.bucket_alloc.insert(
+        13,
+        BucketAllocEntry {
+            generation: 13,
+            data_type: BucketDataType::Blob as u8,
+            flags: 0,
+            dirty_sectors: 1,
+            last_modify_lsn: 13,
+        },
+    );
+
+    // FreespaceLru (R1b-4).
+    de.engine.freespace_lru.insert(0, 0, 13);
+    de.engine.freespace_lru.insert(255, 0, 99);
+
+    // Subscriptions.
+    let _sub = de
+        .subscribe(
+            "watch-red".into(),
+            Query::HasTag(red),
+            ChangeInterest::ALL,
+            Retention::default(),
+        )
+        .unwrap();
+
+    de.commit().unwrap();
+    drop(de);
+
+    let de2 = DiskEngine::open(&cfg_path).unwrap();
+    assert_eq!(de2.engine.chunk_index.chunk_count(), 1);
+    assert!(de2.engine.object_table.get(oid.to_u64()).is_some());
+    let asserts = de2.engine.forward_index.assertions_of(oid);
+    assert!(asserts.iter().any(|(a, _)| matches!(a, Assertion::Tag(_))));
+    let red2 = de2.engine.resolve_tag_name("red").unwrap();
+    assert!(de2.engine.tag_index.contains(red2, oid));
+    let year2 = de2.engine.resolve_tag_name("year").unwrap();
+    assert_eq!(de2.engine.kv_index.lookup(year2, &Value::Int(2026)).len(), 1);
+    let bm = de2
+        .engine
+        .range_index
+        .range_scan(year2, &Value::Int(2025), &Value::Int(2027));
+    assert_eq!(bm.len(), 1);
+    assert_eq!(de2.engine.backpointer_table.len(), 1);
+    assert!(de2.engine.backpointer_table.get(&bk).is_some());
+    // R1b-4: bucket alloc + freespace LRU.
+    assert_eq!(de2.engine.bucket_alloc.len(), 1);
+    let ba = de2.engine.bucket_alloc.get(13).unwrap();
+    assert_eq!({ ba.generation }, 13);
+    assert_eq!(de2.engine.freespace_lru.len(), 2);
+    assert!(de2.engine.freespace_lru.contains(0, 0, 13));
+    assert!(de2.engine.freespace_lru.contains(255, 0, 99));
+    assert_eq!(de2.engine.subscriptions.subscriptions.len(), 1);
 }

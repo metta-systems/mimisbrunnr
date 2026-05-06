@@ -22,6 +22,7 @@ mod btree;
 mod btree_node;
 mod error;
 mod file_device;
+mod freespace;
 mod root_pointer;
 mod superblock;
 mod zone_map;
@@ -29,8 +30,9 @@ mod zone_map;
 pub use {
     addressing::block_no_to_bucket,
     alloc::{
+        BUCKET_ALLOC_ENTRY_SIZE, BUCKET_ALLOC_KEY_SIZE, BUCKET_ALLOC_REGION_SIZE,
         BUCKET_FLAG_NEEDS_DISCARD, BUCKET_FLAG_PINNED_BY_SNAPSHOT, BucketAllocEntry,
-        BucketAllocTable, BucketDataType,
+        BucketAllocKey, BucketAllocTable, BucketDataType,
     },
     block::{
         BLOCK_FLAG_CONTINUATION, BLOCK_FLAG_ENCRYPTED, BLOCK_PREAMBLE_MAGIC_BLOCK,
@@ -55,6 +57,9 @@ pub use {
     },
     error::StorageError,
     file_device::FileBlockDevice,
+    freespace::{
+        Empty, FREESPACE_LRU_KEY_SIZE, FREESPACE_LRU_REGION_SIZE, FreespaceLru, FreespaceLruKey,
+    },
     root_pointer::{BlobRef, BlockRef, RootPointer},
     superblock::{ChunkParamsRecord, SUPERBLOCK_MAGIC_FULL, Superblock},
     zone_map::{ZoneExtent, ZoneMap, ZoneMapEntry},
