@@ -18,6 +18,7 @@ mod addressing;
 mod alloc;
 mod block;
 mod block_device;
+mod btree;
 mod btree_node;
 mod error;
 mod file_device;
@@ -37,6 +38,10 @@ pub use {
         BlockPreamble, BtreeKind, block_crc,
     },
     block_device::BlockDevice,
+    btree::{
+        BtreeRegion, JournalEntry, JournalOp, LoadedNode, MergeIter, SortedRun, compact,
+        should_compact,
+    },
     btree_node::{
         BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS, BTREE_NODE_FLAG_HEAD_OF_CHAIN, BtreeNodeHeader,
         FIELD_FORMAT_FLAG_MSB_FIRST, FIELD_FORMAT_FLAG_SIGNED, FieldFormat,

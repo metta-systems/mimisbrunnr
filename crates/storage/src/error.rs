@@ -49,4 +49,16 @@ pub enum StorageError {
 
     #[error("device opened read-only; writes are not permitted")]
     ReadOnly,
+
+    #[error("CBOR encode error: {0}")]
+    CborEncode(String),
+
+    #[error("CBOR decode error: {0}")]
+    CborDecode(String),
+
+    #[error("invalid sorted-run magic: expected {expected:#010x}, got {actual:#010x}")]
+    InvalidSortedRunMagic { expected: u32, actual: u32 },
+
+    #[error("region payload exhausted: payload_used={used} would exceed region_size={size}")]
+    RegionFull { used: u64, size: u64 },
 }
