@@ -1287,3 +1287,88 @@ fn all_twelve_migrated_structures_round_trip_together() {
     assert!(de2.engine.freespace_lru.contains(255, 0, 99));
     assert_eq!(de2.engine.subscriptions.subscriptions.len(), 1);
 }
+
+// ----- R1c-D1: RootPointer.*_root slots populated -----
+
+#[test]
+fn rootpointer_slots_populated_post_create() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+
+    // The 10 R1b-migrated trees must all have non-zero BlockRefs.
+    let r = de.superblock.active_root_pointer();
+    assert!({ r.chunk_index_root.block_no } != 0, "chunk_index_root");
+    assert!({ r.kv_index_root.block_no } != 0, "kv_index_root");
+    assert!({ r.forward_index_root.block_no } != 0, "forward_index_root");
+    assert!({ r.tag_index_root.block_no } != 0, "tag_index_root");
+    assert!({ r.range_index_root.block_no } != 0, "range_index_root");
+    assert!({ r.object_table_root.block_no } != 0, "object_table_root");
+    assert!({ r.location_table_root.block_no } != 0, "location_table_root");
+    assert!({ r.ontology_root.block_no } != 0, "ontology_root");
+    assert!({ r.subscriptions_root.block_no } != 0, "subscriptions_root");
+    assert!({ r.backpointer_root.block_no } != 0, "backpointer_root");
+
+    // Each slot's generation is set (1 under R1c-D1).
+    assert_eq!({ r.chunk_index_root.generation }, 1);
+    assert_eq!({ r.kv_index_root.generation }, 1);
+
+    // Slots that don't yet have engine-side trees (cluster_peers,
+    // disks_overflow, placement_rules, reconcile_*, snapshot_chain,
+    // value_spill, *_history) stay zero — they're populated by later
+    // phases (R6/R7/R12).
+    assert_eq!({ r.cluster_peers_root.block_no }, 0);
+    assert_eq!({ r.snapshot_chain_root.block_no }, 0);
+    assert_eq!({ r.reconcile_work_root.block_no }, 0);
+}
+
+#[test]
+fn rootpointer_slots_stable_across_commit() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+    let pre_commit = *de.superblock.active_root_pointer();
+
+    // Mutate, commit.
+    let _ = de.engine.register_tag("year");
+    de.commit().unwrap();
+    let post_commit = *de.superblock.active_root_pointer();
+
+    // R1c-D1 keeps slots stable (COW reallocation is Tier 3 D3).
+    assert_eq!(
+        { pre_commit.chunk_index_root.block_no },
+        { post_commit.chunk_index_root.block_no },
+        "chunk_index_root drifted across commit",
+    );
+    assert_eq!(
+        { pre_commit.ontology_root.block_no },
+        { post_commit.ontology_root.block_no },
+        "ontology_root drifted across commit",
+    );
+    // seq + lsn advance.
+    assert!({ post_commit.seq } > { pre_commit.seq });
+    assert!({ post_commit.lsn } >= { pre_commit.lsn });
+}
+
+#[test]
+fn rootpointer_survives_open_cycle() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+    let _ = de.engine.register_tag("color");
+    de.commit().unwrap();
+    let pre_drop = *de.superblock.active_root_pointer();
+    drop(de);
+
+    let de2 = DiskEngine::open(&cfg_path).unwrap();
+    let post_open = *de2.superblock.active_root_pointer();
+
+    // Block_no preserved across drop/open.
+    assert_eq!(
+        { pre_drop.tag_index_root.block_no },
+        { post_open.tag_index_root.block_no },
+    );
+    // The tag we registered is still resolvable, proving the load
+    // path went through the RootPointer slot.
+    assert!(de2.engine.resolve_tag_name("color").is_some());
+}

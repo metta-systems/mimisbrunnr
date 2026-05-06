@@ -16,6 +16,7 @@
 
 mod addressing;
 mod alloc;
+mod allocator;
 mod block;
 mod block_device;
 mod btree;
@@ -34,6 +35,7 @@ pub use {
         BUCKET_FLAG_NEEDS_DISCARD, BUCKET_FLAG_PINNED_BY_SNAPSHOT, BucketAllocEntry,
         BucketAllocKey, BucketAllocTable, BucketDataType,
     },
+    allocator::BucketAllocator,
     block::{
         BLOCK_FLAG_CONTINUATION, BLOCK_FLAG_ENCRYPTED, BLOCK_PREAMBLE_MAGIC_BLOCK,
         BLOCK_PREAMBLE_MAGIC_BTREE, BLOCK_SIZE, BLOCK_SIZE_LOG2, BlockHeader, BlockKind,
