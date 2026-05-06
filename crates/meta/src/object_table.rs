@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, btree_map};
 
 use {
-    mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
+    mimisbrunnr_storage::{BlockDevice, BtreeKind, LoadedNode, SortedRun},
     serde::{Deserialize, Serialize},
 };
 
@@ -199,38 +199,57 @@ impl ObjectTable {
     }
 
     /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
-    /// on `device`. Replaces the region wholesale via
-    /// [`BtreeRegion::write_full`].
+    /// on `device`.
+    ///
+    /// **R1c-A2**: writes via the native positional radix-leaf format
+    /// per IMPL §5 (see [`crate::ObjectLeaf`]) — *no longer* via the
+    /// sorted-run B+ tree path. Leaf-only trees: any `oid_local ≥
+    /// LEAF_RECORDS (2044)` returns
+    /// [`MetaError::OidOutOfRange`]; multi-level descent + tree growth
+    /// land in a follow-up.
+    ///
+    /// The previous sorted-run [`Self::to_loaded_node`] /
+    /// [`Self::from_loaded_node`] helpers stay live for now (they
+    /// shipped under R1b-3 and may still be useful for tooling /
+    /// dump-and-diff workflows), but are no longer called by the
+    /// engine's persistence path.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
         offset: u64,
     ) -> Result<(), MetaError> {
-        let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, ObjectTableKey, ObjectTableValue>(device, offset, &mut node)
-            .map_err(MetaError::from)?;
+        let mut leaf = crate::object_leaf::ObjectLeaf::new();
+        for (oid, record) in self.records.iter() {
+            // ObjectId.local is the bottom 48 bits; for leaf-only trees
+            // we further restrict to the first 2044 ids. Larger oids
+            // need multi-level descent (TODO follow-up).
+            let oid_local = oid & ((1u64 << 48) - 1);
+            leaf.set(oid_local, *record)?;
+        }
+        leaf.write(device, offset)?;
         Ok(())
     }
 
     /// Read the in-memory state from the 256 KiB region at byte `offset`
-    /// on `device`. An all-zero region is treated as "empty table" and
-    /// returns [`Self::default`].
+    /// on `device`. An all-zero region returns [`Self::default`].
+    ///
+    /// **R1c-A2**: reads via the native positional radix-leaf format.
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
         offset: u64,
     ) -> Result<Self, MetaError> {
-        let mut probe = [0u8; 8];
-        device.read_at(offset, &mut probe).map_err(MetaError::from)?;
-        if probe.iter().all(|&b| b == 0) {
-            return Ok(Self::default());
+        let leaf = crate::object_leaf::ObjectLeaf::read(device, offset)?;
+        let mut records: BTreeMap<u64, ObjectRecord> = BTreeMap::new();
+        for (oid_local, record) in leaf.iter() {
+            // Leaf only carries `oid_local`; the high 16 bits (node_id)
+            // are *not* persisted in the leaf itself. Read them back
+            // from the record's own `id` field, which carries the full
+            // raw `ObjectId.to_u64()` (see `ObjectRecord::new`).
+            let full_oid = { record.id };
+            let _ = oid_local; // sanity: low 48 bits should match.
+            records.insert(full_oid, *record);
         }
-        let node = BtreeRegion::read::<D, ObjectTableKey, ObjectTableValue>(
-            device,
-            offset,
-            BtreeKind::ObjectTable,
-        )
-        .map_err(MetaError::from)?;
-        Self::from_loaded_node(&node)
+        Ok(Self { records })
     }
 }
 

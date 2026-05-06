@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, btree_map};
 
 use {
-    mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
+    mimisbrunnr_storage::{BlockDevice, BtreeKind, LoadedNode, SortedRun},
     serde::{Deserialize, Serialize},
 };
 
@@ -171,37 +171,50 @@ impl LocationTable {
 
     /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
     /// on `device`.
+    ///
+    /// **R1c-A2**: writes via the native positional radix-leaf format
+    /// per IMPL §6.1 (see [`crate::LocationLeaf`]) — *no longer* via
+    /// the sorted-run B+ tree path. Leaf-only trees: any `oid_local ≥
+    /// LEAF_RECORDS_LOCATION (5440)` returns
+    /// [`MetaError::OidOutOfRange`]; multi-level descent + tree growth
+    /// land in a follow-up.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
         offset: u64,
     ) -> Result<(), MetaError> {
-        let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, LocationTableKey, LocationTableValue>(
-            device, offset, &mut node,
-        )
-        .map_err(MetaError::from)?;
+        let mut leaf = crate::location_leaf::LocationLeaf::new();
+        for (oid, location) in self.locations.iter() {
+            let oid_local = oid & ((1u64 << 48) - 1);
+            leaf.set(oid_local, *location)?;
+        }
+        leaf.write(device, offset)?;
         Ok(())
     }
 
     /// Read the in-memory state from the 256 KiB region at byte `offset`
     /// on `device`. An all-zero region returns [`Self::default`].
+    ///
+    /// **R1c-A2**: reads via the native positional radix-leaf format.
+    /// `node_id` is needed because the leaf only carries `oid_local`
+    /// (the low 48 bits of `ObjectId`); the high 16 bits encode the
+    /// node id (DESIGN §2.1) which can't be recovered from an
+    /// `ObjectLocation` alone. The engine passes its own `node_id`
+    /// for single-node pools; multi-node cluster recovery uses
+    /// `ObjectTable` cross-reference (R12 territory).
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
         offset: u64,
+        node_id: u16,
     ) -> Result<Self, MetaError> {
-        let mut probe = [0u8; 8];
-        device.read_at(offset, &mut probe).map_err(MetaError::from)?;
-        if probe.iter().all(|&b| b == 0) {
-            return Ok(Self::default());
+        let leaf = crate::location_leaf::LocationLeaf::read(device, offset)?;
+        let mut locations: BTreeMap<u64, ObjectLocation> = BTreeMap::new();
+        let node_high = (node_id as u64) << 48;
+        for (oid_local, location) in leaf.iter() {
+            let full_oid = node_high | (oid_local & ((1u64 << 48) - 1));
+            locations.insert(full_oid, *location);
         }
-        let node = BtreeRegion::read::<D, LocationTableKey, LocationTableValue>(
-            device,
-            offset,
-            BtreeKind::LocationTable,
-        )
-        .map_err(MetaError::from)?;
-        Self::from_loaded_node(&node)
+        Ok(Self { locations })
     }
 }
 
@@ -277,7 +290,7 @@ mod tests {
     #[test]
     fn location_table_region_round_trip_empty() {
         let (_dir, dev) = fresh_device();
-        let t = LocationTable::load_from_region(&dev, 0).unwrap();
+        let t = LocationTable::load_from_region(&dev, 0, 0).unwrap();
         assert!(t.is_empty());
     }
 
@@ -303,7 +316,7 @@ mod tests {
         t.insert(99, make_loc(0xabcd, &r4));
 
         t.flush_to_region(&dev, 0).unwrap();
-        let back = LocationTable::load_from_region(&dev, 0).unwrap();
+        let back = LocationTable::load_from_region(&dev, 0, 0).unwrap();
         assert_eq!(back.len(), 51);
         for i in 1u64..=50 {
             let got = back.get(i).expect("oid missing");
@@ -324,7 +337,7 @@ mod tests {
         let r = ReplicaRef { disk_id: 1, sector_offset: 2, bucket_no: 3 };
         t.insert(7, make_loc(0x4000, &[r]));
         t.flush_to_region(&dev, 0).unwrap();
-        let back = LocationTable::load_from_region(&dev, 0).unwrap();
+        let back = LocationTable::load_from_region(&dev, 0, 0).unwrap();
         assert_eq!(back.len(), 1);
         let got = back.get(7).unwrap();
         assert_eq!({ got.header.extent_length }, 0x4000);
@@ -344,7 +357,7 @@ mod tests {
         second.insert(99, make_loc(0x999, &[r]));
         second.flush_to_region(&dev, 0).unwrap();
 
-        let back = LocationTable::load_from_region(&dev, 0).unwrap();
+        let back = LocationTable::load_from_region(&dev, 0, 0).unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!({ back.get(99).unwrap().header.extent_length }, 0x999);
         assert!(back.get(1).is_none());
@@ -361,7 +374,7 @@ mod tests {
         node.header.sorted_run_count = 1;
         BtreeRegion::write_full::<_, u64, Vec<u8>>(&dev, 0, &mut node).unwrap();
 
-        let err = LocationTable::load_from_region(&dev, 0).unwrap_err();
+        let err = LocationTable::load_from_region(&dev, 0, 0).unwrap_err();
         match err {
             MetaError::Storage(_) => {}
             other => panic!("expected MetaError::Storage, got {other:?}"),

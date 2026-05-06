@@ -2172,6 +2172,7 @@ dependencies = [
 name = "mimisbrunnr-engine"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "ciborium",
  "log",
  "mimisbrunnr-index",

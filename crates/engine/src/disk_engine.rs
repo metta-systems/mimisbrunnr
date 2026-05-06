@@ -353,6 +353,7 @@ impl DiskEngine {
             primary_dev.as_ref(),
             zone_offset,
             superblock.active_root_pointer(),
+            config.node_id,
         )?;
 
         // 1b. Restore everything else from the legacy CBOR blob (if any).
@@ -437,6 +438,7 @@ impl DiskEngine {
             primary_dev.as_ref(),
             zone_offset,
             superblock.active_root_pointer(),
+            config.node_id,
         )?;
 
         // Restore everything else from the legacy CBOR blob (if any).
@@ -588,6 +590,7 @@ impl DiskEngine {
     pub fn load_index_state(&mut self) -> Result<(), EngineError> {
         let zone_offset = { self.superblock.index_zone.offset };
         let root = *self.superblock.active_root_pointer();
+        let node_id = self.config.node_id;
 
         // Migrated indices and tables first.
         load_all_regions(
@@ -595,6 +598,7 @@ impl DiskEngine {
             self.primary_device.as_ref(),
             zone_offset,
             &root,
+            node_id,
         )?;
 
         // Legacy CBOR blob (oplog + path_contexts + scalars + transient
@@ -970,11 +974,18 @@ impl DiskEngine {
 /// offsets in the index zone; per IMPL §12.2 they're meant to live on
 /// per-disk roots (`DiskDescriptorOnDisk.{buckets_root, freespace_root}`)
 /// — the per-disk split is Tier 3 E1 / E2.
+///
+/// `node_id` is needed by [`LocationTable::load_from_region`] (R1c-A2)
+/// to reconstruct the full `ObjectId.to_u64()` keys from the leaf's
+/// `oid_local` slot index. Single-node pools pass their own node id;
+/// multi-node cluster recovery (R12) needs cross-reference against
+/// `ObjectTable`.
 fn load_all_regions<D: BlockDevice>(
     engine: &mut Engine,
     device: &D,
     zone_offset: u64,
     root: &mimisbrunnr_storage::RootPointer,
+    node_id: u16,
 ) -> Result<(), EngineError> {
     engine.chunk_index = if is_zero(&root.chunk_index_root) {
         ChunkIndex::default()
@@ -1009,7 +1020,11 @@ fn load_all_regions<D: BlockDevice>(
     engine.location_table = if is_zero(&root.location_table_root) {
         LocationTable::default()
     } else {
-        LocationTable::load_from_region(device, block_ref_offset(&root.location_table_root))?
+        LocationTable::load_from_region(
+            device,
+            block_ref_offset(&root.location_table_root),
+            node_id,
+        )?
     };
     engine.ontology = if is_zero(&root.ontology_root) {
         OntologyState::default()

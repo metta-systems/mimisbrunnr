@@ -28,7 +28,9 @@
 mod backpointer;
 mod error;
 mod location;
+mod location_leaf;
 mod location_table;
+mod object_leaf;
 mod object_table;
 mod overflow;
 mod radix;
@@ -45,8 +47,18 @@ pub use {
         LOCATION_FLAG_CHUNKED, LOCATION_FLAG_REMOTE_ONLY, LOCATION_HEADER_SIZE,
         LocationHeader, MAX_INLINE_REPLICAS, OBJECT_LOCATION_SIZE, ObjectLocation, ReplicaRef,
     },
+    location_leaf::{
+        LOCATION_LEAF_BITMAP_LEN, LOCATION_LEAF_BITMAP_OFFSET, LOCATION_LEAF_FORMAT_VERSION,
+        LOCATION_LEAF_RECORDS_OFFSET, LOCATION_LEAF_SIZE, LOCATION_LEAF_TRAILER_LEN,
+        LOCATION_LEAF_TRAILER_OFFSET, LocationLeaf, LocationLeafTrailer,
+    },
     location_table::{
         LOCATION_TABLE_REGION_SIZE, LocationTable, LocationTableKey, LocationTableValue,
+    },
+    object_leaf::{
+        OBJECT_LEAF_BITMAP_LEN, OBJECT_LEAF_BITMAP_OFFSET, OBJECT_LEAF_FORMAT_VERSION,
+        OBJECT_LEAF_RECORDS_OFFSET, OBJECT_LEAF_SIZE, OBJECT_LEAF_TRAILER_LEN,
+        OBJECT_LEAF_TRAILER_OFFSET, ObjectLeaf, ObjectLeafTrailer,
     },
     object_table::{
         OBJECT_TABLE_REGION_SIZE, ObjectTable, ObjectTableKey, ObjectTableValue,

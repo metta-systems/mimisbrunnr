@@ -1350,6 +1350,65 @@ fn rootpointer_slots_stable_across_commit() {
     assert!({ post_commit.lsn } >= { pre_commit.lsn });
 }
 
+// ----- R1c-A2: object_table / location_table use native positional radix leaves -----
+
+#[test]
+fn object_table_on_disk_uses_native_leaf_layout() {
+    // Insert one record, commit, reopen, then peek the on-disk leaf
+    // bytes. The header at the active object_table_root must carry
+    // BlockKind == ObjectTable and the magic "MIMB".
+    use mimisbrunnr_meta::OBJECT_LEAF_BITMAP_OFFSET;
+    use mimisbrunnr_storage::{BLOCK_PREAMBLE_MAGIC_BTREE, BlockDevice, BtreeKind};
+
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+    let oid = de.create_object().unwrap();
+    de.commit().unwrap();
+
+    let root = de.superblock.active_root_pointer();
+    let block_no = { root.object_table_root.block_no };
+    let offset = block_no as u64 * 4096;
+    drop(de);
+
+    // Peek the leaf header.
+    let dev = mimisbrunnr_storage::FileBlockDevice::open_read_only(
+        small_pool_disk_path(&tmp),
+    )
+    .unwrap();
+    let mut header_bytes = [0u8; 8];
+    dev.read_at(offset, &mut header_bytes).unwrap();
+    let preamble: &mimisbrunnr_storage::BlockPreamble =
+        bytemuck::from_bytes(&header_bytes);
+    assert_eq!({ preamble.magic }, BLOCK_PREAMBLE_MAGIC_BTREE);
+    assert_eq!({ preamble.kind }, BtreeKind::ObjectTable as u16);
+
+    // Bitmap byte at offset 64 must have at least one bit set (the
+    // single object we created lives in some leaf slot).
+    let mut bitmap_byte = [0u8; 1];
+    dev.read_at(offset + OBJECT_LEAF_BITMAP_OFFSET as u64, &mut bitmap_byte)
+        .unwrap();
+    let oid_local = oid.to_u64() & ((1u64 << 48) - 1);
+    let slot = oid_local as usize % 2044;
+    if slot < 8 {
+        assert_ne!(bitmap_byte[0] & (1 << slot), 0);
+    } else {
+        // Read a different bitmap byte for the test-occupied slot.
+        let byte_idx = slot / 8;
+        let mut buf = [0u8; 1];
+        dev.read_at(
+            offset + OBJECT_LEAF_BITMAP_OFFSET as u64 + byte_idx as u64,
+            &mut buf,
+        )
+        .unwrap();
+        assert_ne!(buf[0] & (1 << (slot % 8)), 0);
+    }
+}
+
+fn small_pool_disk_path(tmp: &TempDir) -> std::path::PathBuf {
+    tmp.path().join("disk0.img")
+}
+
 #[test]
 fn rootpointer_survives_open_cycle() {
     let tmp = TempDir::new().unwrap();
