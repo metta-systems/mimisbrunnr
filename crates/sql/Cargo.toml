@@ -10,7 +10,6 @@ mimisbrunnr-index = { workspace = true }
 mimisbrunnr-ontology = { workspace = true }
 mimisbrunnr-query = { workspace = true }
 mimisbrunnr-types = { workspace = true }
-arbitrary-int = { workspace = true }
-roaring = { workspace = true }
+log = { workspace = true }
 sqlparser = { workspace = true }
 thiserror = { workspace = true }

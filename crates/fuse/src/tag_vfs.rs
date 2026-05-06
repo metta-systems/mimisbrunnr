@@ -1,1126 +1,944 @@
-//! Tag-based virtual filesystem, similar to TMSU/tagsistant.
+//! [`TagVfs`] — read-only tag/path VFS over the engine's in-memory mirrors.
 //!
-//! The filesystem exposes a tag-navigable directory hierarchy:
+//! See `docs/DESIGN.md` §12.6 for the mount layout and the faceted-refinement
+//! algorithm under `/tags/`. Everything here is **derived** state; nothing is
+//! persisted.
 //!
-//! ```text
-//! /                          root
-//! ├── tags/                  all tags as directories
-//! │   ├── electronic/        objects tagged 'electronic' + refinement tags
-//! │   │   ├── ambient/       electronic AND ambient (further refinement)
-//! │   │   │   ├── track.flac
-//! │   │   │   └── ...
-//! │   │   ├── track1.flac
-//! │   │   └── track2.mp3
-//! │   ├── ambient/
-//! │   │   └── ...
-//! │   └── ...
-//! └── ctx/                   unix path projection contexts
-//!     └── rpi4-sdcard/
-//!         └── <projected tree>
-//! ```
+//! ## Concurrency
 //!
-//! Each tag directory contains:
-//! - **Files**: objects matching the current tag intersection
-//! - **Subdirectories**: "refinement" tags that appear on at least one matching
-//!   object but are not yet applied (faceted exploration)
-//!
-//! The tag filesystem is **dynamic**: directory contents are computed on-the-fly
-//! via bitmap intersection against the tag/kv/forward indexes. Inode numbers are
-//! assigned lazily and cached for the lifetime of the mount.
+//! `lookup` and `readdir` allocate inodes lazily. To preserve a `&self`
+//! contract (so `fuser::Filesystem` can call us behind its `&self` methods)
+//! we use interior `Mutex`es around the three pieces of mutable state:
+//! the inode table, the `(parent, name) → inode` cache, and the next-inode
+//! counter. None of this is hot — it gets touched once per traversed path.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Mutex;
 
-use {
-    mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex},
-    mimisbrunnr_ontology::ImplicationDag,
-    mimisbrunnr_types::{Assertion, ObjectId, TagId},
-    roaring::RoaringBitmap,
-};
+use log::trace;
+use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
+use mimisbrunnr_ontology::OntologyState;
+use mimisbrunnr_types::{ObjectId, TagId};
+use mimisbrunnr_unix::{PathContextManager, PathProjection};
+use roaring::RoaringBitmap;
 
-use {
-    crate::vfs::{VfsAttr, VfsFileType, VfsTree},
-    log::trace,
-};
+use crate::attr::VfsAttr;
+use crate::entry::{VfsEntry, VfsEntryKind};
+use crate::inode::{INODE_CTX_ROOT, INODE_FIRST_DYNAMIC, INODE_ROOT, INODE_TAGS_ROOT, InodeId};
 
-// Fixed inode numbers for well-known entries.
-const INO_ROOT: u64 = 1;
-const INO_TAGS: u64 = 2;
-const INO_CTX: u64 = 3;
-const INO_FIRST_DYNAMIC: u64 = 4;
-
-/// An entry in the tag filesystem.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TagVfsEntry {
-    /// `/` — the root directory.
-    Root,
-    /// `/tags/` — lists all tags.
-    TagsRoot,
-    /// `/ctx/` — lists all path projection contexts.
-    CtxRoot,
-    /// `/tags/t1/t2/...` — a tag intersection directory.
-    TagDir(BTreeSet<TagId>),
-    /// A file within a tag directory.
-    TagFile {
-        tags: BTreeSet<TagId>,
-        obj_local: u32,
-    },
-    /// `/ctx/<name>/` — a context root.
-    CtxDir(String),
-    /// A node inside a context subtree (delegates to VfsTree).
-    CtxNode {
-        ctx: String,
-        /// Inode in the context's VfsTree.
-        vfs_ino: u64,
-    },
-}
-
-/// A directory entry returned by readdir.
-#[derive(Debug, Clone)]
-pub struct DirEntry {
-    pub ino: u64,
-    pub name: String,
-    pub file_type: VfsFileType,
-}
-
-/// Dynamic tag-based virtual filesystem.
+/// Read-only tag/path VFS (DESIGN §12.6).
 ///
-/// Owns clones of the index structures (snapshot at mount time) and lazily
-/// allocates inodes as directories are explored.
-pub struct TagVfs {
-    tag_index: TagIndex,
-    #[allow(dead_code)] // stored for future KV-based attribute queries
-    kv_index: KvIndex,
-    forward_index: ForwardIndex,
-    dag: ImplicationDag,
+/// Holds shared references into the engine's in-memory mirrors plus a
+/// session-local inode table. Borrows are split into immutable (the
+/// engine-owned indices) and interior-mutable (the inode bookkeeping); the
+/// latter is `Mutex`-guarded so the FUSE adapter can call us behind its
+/// `&self` methods.
+pub struct TagVfs<'a> {
+    /// Tag inverted index — primary source for `HasTag`, faceted refinement.
+    pub tag_index: &'a TagIndex,
+    /// KV equality index (kept for parity; not used in Phase 5b but listed
+    /// in the spec so the engine can reuse the same handle when it adds
+    /// attribute-driven views).
+    pub kv_index: &'a KvIndex,
+    /// Forward index — used to look up an object's per-context unix path
+    /// when serving `/ctx/<context>/…`.
+    pub forward_index: &'a ForwardIndex,
+    /// Ontology — the source of truth for tag id ↔ name mappings.
+    pub ontology: &'a OntologyState,
+    /// Path-context manager — owns the per-context [`PathProjection`]s.
+    pub context_trees: &'a PathContextManager,
 
-    /// Context subtrees (built from PathProjections).
-    context_trees: HashMap<String, VfsTree>,
-
-    /// Blob data for serving file reads.
-    blobs: HashMap<u64, Vec<u8>>,
-
-    // -- Inode allocation --
-    entries: HashMap<u64, TagVfsEntry>,
-    /// Reverse map: tag dir → inode.
-    tag_dir_inos: HashMap<BTreeSet<TagId>, u64>,
-    /// Reverse map: (tag set, obj_local) → inode.
-    file_inos: HashMap<(BTreeSet<TagId>, u32), u64>,
-    /// Reverse map: context name → inode of its CtxDir.
-    ctx_dir_inos: HashMap<String, u64>,
-    /// Reverse map: (ctx, vfs_ino) → global inode.
-    ctx_node_inos: HashMap<(String, u64), u64>,
-
-    next_ino: u64,
+    // ----- Session-local inode bookkeeping. -----
+    entries: Mutex<HashMap<InodeId, VfsEntry>>,
+    lookup_index: Mutex<HashMap<(InodeId, String), InodeId>>,
+    next_ino: Mutex<u64>,
 }
 
-impl TagVfs {
-    /// Create a new tag VFS from index snapshots.
+impl<'a> TagVfs<'a> {
+    /// Build a new VFS over the given engine handles. Initialises the three
+    /// well-known inodes (root, `/tags`, `/ctx`).
     pub fn new(
-        tag_index: TagIndex,
-        kv_index: KvIndex,
-        forward_index: ForwardIndex,
-        dag: ImplicationDag,
+        tag_index: &'a TagIndex,
+        kv_index: &'a KvIndex,
+        forward_index: &'a ForwardIndex,
+        ontology: &'a OntologyState,
+        context_trees: &'a PathContextManager,
     ) -> Self {
-        let mut vfs = Self {
+        let mut entries: HashMap<InodeId, VfsEntry> = HashMap::new();
+        entries.insert(
+            INODE_ROOT,
+            VfsEntry {
+                inode: INODE_ROOT,
+                kind: VfsEntryKind::Root,
+                parent: None,
+            },
+        );
+        entries.insert(
+            INODE_TAGS_ROOT,
+            VfsEntry {
+                inode: INODE_TAGS_ROOT,
+                kind: VfsEntryKind::TagsRoot,
+                parent: Some(INODE_ROOT),
+            },
+        );
+        entries.insert(
+            INODE_CTX_ROOT,
+            VfsEntry {
+                inode: INODE_CTX_ROOT,
+                kind: VfsEntryKind::CtxRoot,
+                parent: Some(INODE_ROOT),
+            },
+        );
+
+        let mut lookup_index: HashMap<(InodeId, String), InodeId> = HashMap::new();
+        lookup_index.insert((INODE_ROOT, "tags".into()), INODE_TAGS_ROOT);
+        lookup_index.insert((INODE_ROOT, "ctx".into()), INODE_CTX_ROOT);
+
+        Self {
             tag_index,
             kv_index,
             forward_index,
-            dag,
-            context_trees: HashMap::new(),
-            blobs: HashMap::new(),
-            entries: HashMap::new(),
-            tag_dir_inos: HashMap::new(),
-            file_inos: HashMap::new(),
-            ctx_dir_inos: HashMap::new(),
-            ctx_node_inos: HashMap::new(),
-            next_ino: INO_FIRST_DYNAMIC,
-        };
-
-        // Register fixed entries.
-        vfs.entries.insert(INO_ROOT, TagVfsEntry::Root);
-        vfs.entries.insert(INO_TAGS, TagVfsEntry::TagsRoot);
-        vfs.entries.insert(INO_CTX, TagVfsEntry::CtxRoot);
-
-        vfs
-    }
-
-    /// Add a context subtree (unix path projection).
-    pub fn add_context(&mut self, name: String, tree: VfsTree) {
-        self.context_trees.insert(name, tree);
-    }
-
-    /// Store blob data for reading files.
-    pub fn set_blob(&mut self, obj_raw: u64, data: Vec<u8>) {
-        self.blobs.insert(obj_raw, data);
-    }
-
-    /// Get an entry by inode.
-    pub fn get(&self, ino: u64) -> Option<&TagVfsEntry> {
-        self.entries.get(&ino)
-    }
-
-    /// Get file attributes for an inode.
-    pub fn getattr(&self, ino: u64) -> Option<VfsAttr> {
-        let entry = self.entries.get(&ino)?;
-        match entry {
-            TagVfsEntry::Root
-            | TagVfsEntry::TagsRoot
-            | TagVfsEntry::CtxRoot
-            | TagVfsEntry::TagDir(_)
-            | TagVfsEntry::CtxDir(_) => Some(dir_attr(ino)),
-
-            TagVfsEntry::TagFile { obj_local, .. } => {
-                let oid = ObjectId::new(0, *obj_local as u64);
-                let size = self
-                    .blobs
-                    .get(&((oid.node() << 48) | oid.local()))
-                    .map(|b| b.len() as u64)
-                    .unwrap_or(0);
-                Some(file_attr(ino, size))
-            }
-
-            TagVfsEntry::CtxNode { ctx, vfs_ino } => {
-                if let Some(tree) = self.context_trees.get(ctx)
-                    && let Some(node) = tree.get(*vfs_ino)
-                {
-                    let mut attr = node.attr.clone();
-                    attr.ino = ino; // remap to global inode
-                    // Use blob size as authoritative file size
-                    if let Some(oid) = node.object
-                        && let Some(blob) = self.blobs.get(&((oid.node() << 48) | oid.local()))
-                    {
-                        attr.size = blob.len() as u64;
-                        attr.blocks = attr.size.div_ceil(512);
-                    }
-                    return Some(attr);
-                }
-                None
-            }
+            ontology,
+            context_trees,
+            entries: Mutex::new(entries),
+            lookup_index: Mutex::new(lookup_index),
+            next_ino: Mutex::new(INODE_FIRST_DYNAMIC),
         }
     }
 
-    /// Lookup a child by name within a directory.
-    pub fn lookup(&mut self, parent_ino: u64, name: &str) -> Option<u64> {
-        trace!("tag_vfs::lookup parent_ino={parent_ino} name={name:?}");
-        let parent = self.entries.get(&parent_ino)?.clone();
-        match parent {
-            TagVfsEntry::Root => match name {
-                "tags" => Some(INO_TAGS),
-                "ctx" => Some(INO_CTX),
+    // ----------------------------------------------------------------------
+    // Public API: lookup, getattr, readdir, allocate_inode.
+    // ----------------------------------------------------------------------
+
+    /// Resolve `(parent, name)` to a full [`VfsEntry`], allocating a fresh
+    /// inode if the child has not been seen before.
+    pub fn lookup(&self, parent: InodeId, name: &str) -> Option<VfsEntry> {
+        trace!("tag_vfs::lookup parent={parent:?} name={name:?}");
+
+        // Cached?
+        if let Some(child) = self
+            .lookup_index
+            .lock()
+            .ok()?
+            .get(&(parent, name.to_string()))
+            .copied()
+        {
+            return self.entry(child);
+        }
+
+        let parent_kind = self.entry(parent)?.kind;
+        let child_kind = self.derive_child_kind(&parent_kind, name)?;
+        let inode = self.allocate_inode(child_kind, parent, name);
+        self.entry(inode)
+    }
+
+    /// stat-like info for `inode`. Returns `None` if the inode is unknown.
+    pub fn getattr(&self, inode: InodeId) -> Option<VfsAttr> {
+        let kind = self.entry(inode)?.kind;
+        Some(self.attr_for_kind(&kind))
+    }
+
+    /// List the contents of the directory at `inode`. Returns `(name, child)`
+    /// pairs in lexical-by-name order; entries that don't yet have an inode
+    /// are allocated on the fly.
+    ///
+    /// Returns an empty `Vec` for non-directory inodes.
+    pub fn readdir(&self, inode: InodeId) -> Vec<(String, VfsEntry)> {
+        trace!("tag_vfs::readdir inode={inode:?}");
+        let entry = match self.entry(inode) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+
+        match entry.kind {
+            VfsEntryKind::Root => self.readdir_root(),
+            VfsEntryKind::TagsRoot => self.readdir_tags_root(inode),
+            VfsEntryKind::CtxRoot => self.readdir_ctx_root(inode),
+            VfsEntryKind::TagDir { ref current_tags } => {
+                self.readdir_tag_dir(inode, current_tags)
+            }
+            VfsEntryKind::CtxDir { context, ref sub_path } => {
+                self.readdir_ctx_dir(inode, context, sub_path.as_str())
+            }
+            VfsEntryKind::TagObject { .. } | VfsEntryKind::CtxObject { .. } => Vec::new(),
+        }
+    }
+
+    /// Allocate (or reuse) the inode for `(parent, name)` of the given
+    /// `kind`. If the `(parent, name)` lookup is already cached, the existing
+    /// inode is returned and `kind` is **ignored** — kinds for a given
+    /// `(parent, name)` are stable for the life of a `TagVfs`.
+    pub fn allocate_inode(&self, kind: VfsEntryKind, parent: InodeId, name: &str) -> InodeId {
+        // Fast path: already cached.
+        {
+            let lookup = self.lookup_index.lock().expect("lookup_index poisoned");
+            if let Some(&existing) = lookup.get(&(parent, name.to_string())) {
+                return existing;
+            }
+        }
+
+        let mut next = self.next_ino.lock().expect("next_ino poisoned");
+        let mut entries = self.entries.lock().expect("entries poisoned");
+        let mut lookup = self.lookup_index.lock().expect("lookup_index poisoned");
+
+        // Re-check under the write locks to handle a concurrent allocator.
+        if let Some(&existing) = lookup.get(&(parent, name.to_string())) {
+            return existing;
+        }
+
+        let id = *next;
+        *next += 1;
+        let inode = InodeId(id);
+        entries.insert(
+            inode,
+            VfsEntry {
+                inode,
+                kind,
+                parent: Some(parent),
+            },
+        );
+        lookup.insert((parent, name.to_string()), inode);
+        inode
+    }
+
+    /// Lookup the full entry record for `inode`.
+    pub fn entry(&self, inode: InodeId) -> Option<VfsEntry> {
+        self.entries
+            .lock()
+            .ok()
+            .and_then(|m| m.get(&inode).cloned())
+    }
+
+    /// Borrow the projection for a `/ctx/` context inode.
+    fn projection_for(&self, context: TagId) -> Option<&PathProjection> {
+        self.context_trees.get(context)
+    }
+
+    // ----------------------------------------------------------------------
+    // lookup helpers
+    // ----------------------------------------------------------------------
+
+    fn derive_child_kind(
+        &self,
+        parent_kind: &VfsEntryKind,
+        name: &str,
+    ) -> Option<VfsEntryKind> {
+        match parent_kind {
+            VfsEntryKind::Root => match name {
+                "tags" => Some(VfsEntryKind::TagsRoot),
+                "ctx" => Some(VfsEntryKind::CtxRoot),
                 _ => None,
             },
-
-            TagVfsEntry::TagsRoot => {
-                let tag_id = self.dag.lookup(name)?;
-                if self.tag_index.bitmap(tag_id)?.is_empty() {
-                    return None;
-                }
-                let tags = BTreeSet::from([tag_id]);
-                Some(self.ensure_tag_dir(tags))
+            VfsEntryKind::TagsRoot => self.derive_child_under_tags_root(name),
+            VfsEntryKind::TagDir { current_tags } => {
+                self.derive_child_under_tag_dir(current_tags, name)
             }
-
-            TagVfsEntry::TagDir(ref parent_tags) => {
-                // Check if `name` is a refinement tag.
-                if let Some(tag_id) = self.dag.lookup(name) {
-                    if !parent_tags.contains(&tag_id) {
-                        let bitmap = self.intersect_tags(parent_tags);
-                        if let Some(tag_bm) = self.tag_index.bitmap(tag_id) {
-                            let refined = &bitmap & tag_bm;
-                            if !refined.is_empty() {
-                                let mut new_tags = parent_tags.clone();
-                                new_tags.insert(tag_id);
-                                return Some(self.ensure_tag_dir(new_tags));
-                            }
-                        }
-                    }
-                    return None;
-                }
-
-                // Check if `name` matches a file in this tag dir.
-                let bitmap = self.intersect_tags(parent_tags);
-                for obj_local in bitmap.iter() {
-                    let file_name = self.object_display_name(obj_local, &bitmap);
-                    if file_name == name {
-                        return Some(self.ensure_file(parent_tags.clone(), obj_local));
-                    }
-                }
-
-                None
+            VfsEntryKind::CtxRoot => self.derive_child_under_ctx_root(name),
+            VfsEntryKind::CtxDir { context, sub_path } => {
+                self.derive_child_under_ctx_dir(*context, sub_path.as_str(), name)
             }
-
-            TagVfsEntry::CtxRoot => {
-                if self.context_trees.contains_key(name) {
-                    Some(self.ensure_ctx_dir(name.to_string()))
-                } else {
-                    None
-                }
-            }
-
-            TagVfsEntry::CtxDir(ref ctx_name) => {
-                if let Some(tree) = self.context_trees.get(ctx_name) {
-                    // Lookup in the context's VfsTree root.
-                    if let Some(node) = tree.lookup(1, name) {
-                        let ctx = ctx_name.clone();
-                        return Some(self.ensure_ctx_node(ctx, node.ino));
-                    }
-                }
-                None
-            }
-
-            TagVfsEntry::CtxNode {
-                ref ctx,
-                ref vfs_ino,
-            } => {
-                let ctx = ctx.clone();
-                let vfs_ino = *vfs_ino;
-                if let Some(tree) = self.context_trees.get(&ctx)
-                    && let Some(node) = tree.lookup(vfs_ino, name)
-                {
-                    return Some(self.ensure_ctx_node(ctx, node.ino));
-                }
-                None
-            }
-
-            _ => None, // Files don't have children
+            VfsEntryKind::TagObject { .. } | VfsEntryKind::CtxObject { .. } => None,
         }
     }
 
-    /// List directory contents.
-    pub fn readdir(&mut self, dir_ino: u64) -> Option<Vec<DirEntry>> {
-        trace!("tag_vfs::readdir dir_ino={dir_ino}");
-        let entry = self.entries.get(&dir_ino)?.clone();
-        let mut result = Vec::new();
-
-        // Always add . and ..
-        let parent_ino = self.parent_ino(dir_ino);
-        result.push(DirEntry {
-            ino: dir_ino,
-            name: ".".into(),
-            file_type: VfsFileType::Directory,
-        });
-        result.push(DirEntry {
-            ino: parent_ino,
-            name: "..".into(),
-            file_type: VfsFileType::Directory,
-        });
-
-        match entry {
-            TagVfsEntry::Root => {
-                result.push(DirEntry {
-                    ino: INO_TAGS,
-                    name: "tags".into(),
-                    file_type: VfsFileType::Directory,
-                });
-                if !self.context_trees.is_empty() {
-                    result.push(DirEntry {
-                        ino: INO_CTX,
-                        name: "ctx".into(),
-                        file_type: VfsFileType::Directory,
-                    });
-                }
-            }
-
-            TagVfsEntry::TagsRoot => {
-                // Collect (tag_id, name) first to avoid borrow conflicts.
-                let tags_with_names: Vec<(TagId, String)> = self
-                    .dag
-                    .all_tags()
-                    .into_iter()
-                    .filter(|tag_id| {
-                        self.tag_index
-                            .bitmap(*tag_id)
-                            .is_some_and(|bm| !bm.is_empty())
-                    })
-                    .filter_map(|tag_id| self.dag.get(tag_id).map(|def| (tag_id, def.name.clone())))
-                    .collect();
-
-                for (tag_id, name) in tags_with_names {
-                    let tags = BTreeSet::from([tag_id]);
-                    let ino = self.ensure_tag_dir(tags);
-                    result.push(DirEntry {
-                        ino,
-                        name,
-                        file_type: VfsFileType::Directory,
-                    });
-                }
-            }
-
-            TagVfsEntry::TagDir(ref parent_tags) => {
-                let bitmap = self.intersect_tags(parent_tags);
-                let parent_tags_owned = parent_tags.clone();
-
-                // 1. Collect refinement tags (faceted exploration).
-                let refinements: Vec<(TagId, BTreeSet<TagId>, String)> = self
-                    .dag
-                    .all_tags()
-                    .into_iter()
-                    .filter(|tag_id| !parent_tags_owned.contains(tag_id))
-                    .filter(|tag_id| {
-                        self.tag_index
-                            .bitmap(*tag_id)
-                            .is_some_and(|tag_bm| !(&bitmap & tag_bm).is_empty())
-                    })
-                    .filter_map(|tag_id| {
-                        let mut new_tags = parent_tags_owned.clone();
-                        new_tags.insert(tag_id);
-                        self.dag
-                            .get(tag_id)
-                            .map(|def| (tag_id, new_tags, def.name.clone()))
-                    })
-                    .collect();
-
-                for (_tag_id, new_tags, name) in refinements {
-                    let ino = self.ensure_tag_dir(new_tags);
-                    result.push(DirEntry {
-                        ino,
-                        name,
-                        file_type: VfsFileType::Directory,
-                    });
-                }
-
-                // 2. Collect files with display names.
-                let files: Vec<(u32, String)> = bitmap
-                    .iter()
-                    .map(|obj_local| {
-                        let name = self.object_display_name(obj_local, &bitmap);
-                        (obj_local, name)
-                    })
-                    .collect();
-
-                for (obj_local, display_name) in files {
-                    let ino = self.ensure_file(parent_tags_owned.clone(), obj_local);
-                    result.push(DirEntry {
-                        ino,
-                        name: display_name,
-                        file_type: VfsFileType::RegularFile,
-                    });
-                }
-            }
-
-            TagVfsEntry::CtxRoot => {
-                let ctx_names: Vec<String> = self.context_trees.keys().cloned().collect();
-                for name in ctx_names {
-                    let ino = self.ensure_ctx_dir(name.clone());
-                    result.push(DirEntry {
-                        ino,
-                        name,
-                        file_type: VfsFileType::Directory,
-                    });
-                }
-            }
-
-            TagVfsEntry::CtxDir(ref ctx_name) => {
-                let ctx = ctx_name.clone();
-                let children: Vec<(u64, String, VfsFileType)> = self
-                    .context_trees
-                    .get(&ctx)
-                    .and_then(|tree| tree.readdir(1))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|(_, name, _)| *name != "." && *name != "..")
-                    .map(|(vfs_ino, name, ft)| (vfs_ino, name.to_string(), ft))
-                    .collect();
-
-                for (vfs_ino, name, file_type) in children {
-                    let ino = self.ensure_ctx_node(ctx.clone(), vfs_ino);
-                    result.push(DirEntry {
-                        ino,
-                        name,
-                        file_type,
-                    });
-                }
-            }
-
-            TagVfsEntry::CtxNode {
-                ref ctx,
-                ref vfs_ino,
-            } => {
-                let ctx = ctx.clone();
-                let vfs_ino = *vfs_ino;
-                let children: Vec<(u64, String, VfsFileType)> = self
-                    .context_trees
-                    .get(&ctx)
-                    .and_then(|tree| tree.readdir(vfs_ino))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|(_, name, _)| *name != "." && *name != "..")
-                    .map(|(vfs_ino, name, ft)| (vfs_ino, name.to_string(), ft))
-                    .collect();
-
-                for (child_vfs_ino, name, file_type) in children {
-                    let ino = self.ensure_ctx_node(ctx.clone(), child_vfs_ino);
-                    result.push(DirEntry {
-                        ino,
-                        name,
-                        file_type,
-                    });
-                }
-            }
-
-            _ => return None, // Not a directory
+    fn derive_child_under_tags_root(&self, name: &str) -> Option<VfsEntryKind> {
+        let tag_id = *self.ontology.names.get(name)?;
+        let bm = self.tag_index.query_simple(tag_id)?;
+        if bm.is_empty() {
+            return None;
         }
-
-        Some(result)
+        let mut current_tags = BTreeSet::new();
+        current_tags.insert(tag_id);
+        Some(VfsEntryKind::TagDir { current_tags })
     }
 
-    /// Read file content.
-    pub fn read(&self, ino: u64, offset: u64, size: u32) -> Option<&[u8]> {
-        trace!("tag_vfs::read ino={ino} offset={offset} size={size}");
-        let entry = self.entries.get(&ino)?;
-        match entry {
-            TagVfsEntry::TagFile { obj_local, .. } => {
-                let oid = ObjectId::new(0, *obj_local as u64);
-                let data = self.blobs.get(&((oid.node() << 48) | oid.local()))?;
-                let start = (offset as usize).min(data.len());
-                let end = (start + size as usize).min(data.len());
-                Some(&data[start..end])
+    fn derive_child_under_tag_dir(
+        &self,
+        current_tags: &BTreeSet<TagId>,
+        name: &str,
+    ) -> Option<VfsEntryKind> {
+        // Try sub-tag first.
+        if let Some(&tag_id) = self.ontology.names.get(name) {
+            if !current_tags.contains(&tag_id) {
+                let current_bm = self.intersect(current_tags);
+                let candidate_bm = self.tag_index.query_simple(tag_id)?;
+                let refined = &current_bm & candidate_bm;
+                if !refined.is_empty() {
+                    let mut next = current_tags.clone();
+                    next.insert(tag_id);
+                    return Some(VfsEntryKind::TagDir { current_tags: next });
+                }
             }
-            TagVfsEntry::CtxNode { ctx, vfs_ino } => {
-                let tree = self.context_trees.get(ctx)?;
-                let node = tree.get(*vfs_ino)?;
-                let oid = node.object?;
-                let data = self.blobs.get(&((oid.node() << 48) | oid.local()))?;
-                let start = (offset as usize).min(data.len());
-                let end = (start + size as usize).min(data.len());
-                Some(&data[start..end])
-            }
-            _ => None,
+            // Fall through — name is a known tag but doesn't refine; not a
+            // valid child here.
+            return None;
         }
+
+        // Otherwise try a decimal ObjectId.
+        let raw: u64 = name.parse().ok()?;
+        let oid = ObjectId::from_u64(raw);
+        let current_bm = self.intersect(current_tags);
+        if !current_bm.contains(low32_of(oid)) {
+            return None;
+        }
+        Some(VfsEntryKind::TagObject { oid })
     }
 
-    /// Get the symlink target for a context node.
-    pub fn readlink(&self, ino: u64) -> Option<&str> {
-        trace!("tag_vfs::readlink ino={ino}");
-        let entry = self.entries.get(&ino)?;
-        if let TagVfsEntry::CtxNode { ctx, vfs_ino } = entry {
-            let tree = self.context_trees.get(ctx)?;
-            let node = tree.get(*vfs_ino)?;
-            node.symlink_target.as_deref()
+    fn derive_child_under_ctx_root(&self, name: &str) -> Option<VfsEntryKind> {
+        let tag_id = *self.ontology.names.get(name)?;
+        if !self.context_trees.projections.contains_key(&tag_id) {
+            return None;
+        }
+        Some(VfsEntryKind::CtxDir {
+            context: tag_id,
+            sub_path: String::new(),
+        })
+    }
+
+    fn derive_child_under_ctx_dir(
+        &self,
+        context: TagId,
+        sub_path: &str,
+        name: &str,
+    ) -> Option<VfsEntryKind> {
+        let projection = self.projection_for(context)?;
+        let candidate_path = if sub_path.is_empty() {
+            name.to_string()
         } else {
-            None
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // Inode allocation helpers
-    // ------------------------------------------------------------------
-
-    fn alloc_ino(&mut self) -> u64 {
-        trace!("tag_vfs::alloc_ino -> {}", self.next_ino);
-        let ino = self.next_ino;
-        self.next_ino += 1;
-        ino
-    }
-
-    fn ensure_tag_dir(&mut self, tags: BTreeSet<TagId>) -> u64 {
-        if let Some(&ino) = self.tag_dir_inos.get(&tags) {
-            return ino;
-        }
-        let ino = self.alloc_ino();
-        self.tag_dir_inos.insert(tags.clone(), ino);
-        self.entries.insert(ino, TagVfsEntry::TagDir(tags));
-        ino
-    }
-
-    fn ensure_file(&mut self, tags: BTreeSet<TagId>, obj_local: u32) -> u64 {
-        let key = (tags.clone(), obj_local);
-        if let Some(&ino) = self.file_inos.get(&key) {
-            return ino;
-        }
-        let ino = self.alloc_ino();
-        self.file_inos.insert(key, ino);
-        self.entries
-            .insert(ino, TagVfsEntry::TagFile { tags, obj_local });
-        ino
-    }
-
-    fn ensure_ctx_dir(&mut self, name: String) -> u64 {
-        if let Some(&ino) = self.ctx_dir_inos.get(&name) {
-            return ino;
-        }
-        let ino = self.alloc_ino();
-        self.ctx_dir_inos.insert(name.clone(), ino);
-        self.entries.insert(ino, TagVfsEntry::CtxDir(name));
-        ino
-    }
-
-    fn ensure_ctx_node(&mut self, ctx: String, vfs_ino: u64) -> u64 {
-        let key = (ctx.clone(), vfs_ino);
-        if let Some(&ino) = self.ctx_node_inos.get(&key) {
-            return ino;
-        }
-        let ino = self.alloc_ino();
-        self.ctx_node_inos.insert(key, ino);
-        self.entries
-            .insert(ino, TagVfsEntry::CtxNode { ctx, vfs_ino });
-        ino
-    }
-
-    // ------------------------------------------------------------------
-    // Query helpers
-    // ------------------------------------------------------------------
-
-    /// Intersect bitmaps for a set of tags.
-    fn intersect_tags(&self, tags: &BTreeSet<TagId>) -> RoaringBitmap {
-        trace!("tag_vfs::intersect_tags tags={tags:?}");
-        let mut iter = tags.iter();
-        let first = match iter.next() {
-            Some(t) => t,
-            None => return RoaringBitmap::new(),
-        };
-        let mut result = self.tag_index.bitmap(*first).cloned().unwrap_or_default();
-        for tag_id in iter {
-            if let Some(bm) = self.tag_index.bitmap(*tag_id) {
-                result &= bm;
-            } else {
-                return RoaringBitmap::new();
-            }
-            if result.is_empty() {
-                break;
-            }
-        }
-        result
-    }
-
-    /// Determine a display name for an object. Uses the `name` attribute
-    /// if available, otherwise falls back to `obj_<id>`.
-    ///
-    /// If multiple objects in the same bitmap share a name, disambiguates
-    /// with `_<id>` suffix.
-    fn object_display_name(&self, obj_local: u32, bitmap: &RoaringBitmap) -> String {
-        let oid = ObjectId::new(0, obj_local as u64);
-        let base_name = self.get_name_attr(oid);
-
-        let name = match base_name {
-            Some(n) => n,
-            None => return format!("obj_{}", obj_local),
+            format!("{sub_path}/{name}")
         };
 
-        // Check for duplicate names within the same directory.
-        let mut count = 0;
-        for other in bitmap.iter() {
-            if other == obj_local {
-                continue;
-            }
-            let other_oid = ObjectId::new(0, other as u64);
-            if let Some(other_name) = self.get_name_attr(other_oid)
-                && other_name == name
-            {
-                count += 1;
-            }
+        // Is `candidate_path` an exact match (file)?
+        if let Some(oid) = projection.reverse_lookup(&candidate_path) {
+            return Some(VfsEntryKind::CtxObject { context, oid });
         }
 
-        if count > 0 {
-            // Disambiguate: insert id before extension.
-            if let Some(dot) = name.rfind('.') {
-                format!("{}_{}{}", &name[..dot], obj_local, &name[dot..])
-            } else {
-                format!("{}_{}", name, obj_local)
-            }
-        } else {
-            name
+        // Is `candidate_path` a directory prefix of some path?
+        let prefix = format!("{candidate_path}/");
+        if projection.iter().any(|(_, p)| p.starts_with(&prefix)) {
+            return Some(VfsEntryKind::CtxDir {
+                context,
+                sub_path: candidate_path,
+            });
         }
-    }
 
-    /// Get the `name` attribute from the forward index.
-    fn get_name_attr(&self, oid: ObjectId) -> Option<String> {
-        use mimisbrunnr_types::Value;
-        let name_tag = self.dag.lookup("name")?;
-        for entry in self.forward_index.get(oid) {
-            if let Assertion::Attr { key, value } = &entry.assertion
-                && *key == name_tag
-            {
-                return match value {
-                    Value::Text(s) => Some(s.clone()),
-                    other => Some(other.to_string()),
-                };
-            }
-        }
         None
     }
 
-    /// Determine the parent inode for a given inode.
-    fn parent_ino(&self, ino: u64) -> u64 {
-        match ino {
-            INO_ROOT => INO_ROOT,
-            INO_TAGS => INO_ROOT,
-            INO_CTX => INO_ROOT,
-            _ => {
-                match self.entries.get(&ino) {
-                    Some(TagVfsEntry::TagDir(tags)) if tags.len() == 1 => INO_TAGS,
-                    Some(TagVfsEntry::TagDir(tags)) => {
-                        // Parent is the same tag set minus the last-inserted tag.
-                        // Since BTreeSet is ordered, we remove the last element.
-                        let mut parent_tags = tags.clone();
-                        parent_tags.pop_last();
-                        self.tag_dir_inos
-                            .get(&parent_tags)
-                            .copied()
-                            .unwrap_or(INO_TAGS)
+    // ----------------------------------------------------------------------
+    // readdir helpers
+    // ----------------------------------------------------------------------
+
+    fn readdir_root(&self) -> Vec<(String, VfsEntry)> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(e) = self.entry(INODE_TAGS_ROOT) {
+            out.push(("tags".into(), e));
+        }
+        if let Some(e) = self.entry(INODE_CTX_ROOT) {
+            out.push(("ctx".into(), e));
+        }
+        out
+    }
+
+    fn readdir_tags_root(&self, parent: InodeId) -> Vec<(String, VfsEntry)> {
+        // Show every tag with a non-empty bitmap, sorted lexically by name.
+        let mut names: Vec<(String, TagId)> = self
+            .ontology
+            .names
+            .iter()
+            .filter_map(|(name, &tag)| {
+                let bm = self.tag_index.query_simple(tag)?;
+                if bm.is_empty() {
+                    None
+                } else {
+                    Some((name.clone(), tag))
+                }
+            })
+            .collect();
+        names.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut out = Vec::with_capacity(names.len());
+        for (name, tag) in names {
+            let mut current_tags = BTreeSet::new();
+            current_tags.insert(tag);
+            let inode = self.allocate_inode(
+                VfsEntryKind::TagDir {
+                    current_tags: current_tags.clone(),
+                },
+                parent,
+                &name,
+            );
+            if let Some(entry) = self.entry(inode) {
+                out.push((name, entry));
+            }
+        }
+        out
+    }
+
+    fn readdir_tag_dir(
+        &self,
+        parent: InodeId,
+        current_tags: &BTreeSet<TagId>,
+    ) -> Vec<(String, VfsEntry)> {
+        let current_bm = self.intersect(current_tags);
+
+        // 1. Sub-tags whose bitmap intersects the current match (faceted
+        //    refinement).
+        let mut refinements: Vec<(String, TagId)> = self
+            .ontology
+            .names
+            .iter()
+            .filter_map(|(name, &tag)| {
+                if current_tags.contains(&tag) {
+                    return None;
+                }
+                let bm = self.tag_index.query_simple(tag)?;
+                let refined = &current_bm & bm;
+                if refined.is_empty() {
+                    None
+                } else {
+                    Some((name.clone(), tag))
+                }
+            })
+            .collect();
+        refinements.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut out: Vec<(String, VfsEntry)> = Vec::new();
+
+        for (name, tag) in refinements {
+            let mut next_tags = current_tags.clone();
+            next_tags.insert(tag);
+            let inode = self.allocate_inode(
+                VfsEntryKind::TagDir {
+                    current_tags: next_tags,
+                },
+                parent,
+                &name,
+            );
+            if let Some(entry) = self.entry(inode) {
+                out.push((name, entry));
+            }
+        }
+
+        // 2. Matched objects, named by ObjectId in decimal.
+        let mut matched: Vec<u32> = current_bm.iter().collect();
+        matched.sort_unstable();
+        for entry32 in matched {
+            // The bitmap key is the low 32 bits of the local seq; reconstruct
+            // a node-0 ObjectId for naming. See `mimisbrunnr_query` for the
+            // same convention.
+            let oid = ObjectId::from_parts(0, entry32 as u64);
+            let name = format!("{}", oid.to_u64());
+            let inode = self.allocate_inode(
+                VfsEntryKind::TagObject { oid },
+                parent,
+                &name,
+            );
+            if let Some(entry) = self.entry(inode) {
+                out.push((name, entry));
+            }
+        }
+
+        out
+    }
+
+    fn readdir_ctx_root(&self, parent: InodeId) -> Vec<(String, VfsEntry)> {
+        let mut names: Vec<(String, TagId)> = self
+            .context_trees
+            .projections
+            .keys()
+            .filter_map(|&tag| {
+                self.ontology
+                    .tags
+                    .get(&tag)
+                    .map(|def| (def.name.clone(), tag))
+            })
+            .collect();
+        names.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut out = Vec::with_capacity(names.len());
+        for (name, tag) in names {
+            let inode = self.allocate_inode(
+                VfsEntryKind::CtxDir {
+                    context: tag,
+                    sub_path: String::new(),
+                },
+                parent,
+                &name,
+            );
+            if let Some(entry) = self.entry(inode) {
+                out.push((name, entry));
+            }
+        }
+        out
+    }
+
+    fn readdir_ctx_dir(
+        &self,
+        parent: InodeId,
+        context: TagId,
+        sub_path: &str,
+    ) -> Vec<(String, VfsEntry)> {
+        let projection = match self.projection_for(context) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+
+        // Walk every (oid, path) pair. For each, strip `sub_path/`; the next
+        // component is either an immediate file or a sub-directory name.
+        let prefix = if sub_path.is_empty() {
+            String::new()
+        } else {
+            format!("{sub_path}/")
+        };
+
+        // Two collections: dir names and (file_name, oid).
+        let mut dir_names: BTreeSet<String> = BTreeSet::new();
+        let mut files: BTreeSet<(String, ObjectId)> = BTreeSet::new();
+
+        for (oid, path) in projection.iter() {
+            if !prefix.is_empty() && !path.starts_with(&prefix) {
+                continue;
+            }
+            let tail = &path[prefix.len()..];
+            if tail.is_empty() {
+                continue;
+            }
+            match tail.find('/') {
+                Some(slash) => {
+                    let dir = tail[..slash].to_string();
+                    if !dir.is_empty() {
+                        dir_names.insert(dir);
                     }
-                    Some(TagVfsEntry::TagFile { tags, .. }) => {
-                        self.tag_dir_inos.get(tags).copied().unwrap_or(INO_TAGS)
-                    }
-                    Some(TagVfsEntry::CtxDir(_)) => INO_CTX,
-                    Some(TagVfsEntry::CtxNode { ctx, vfs_ino }) => {
-                        if *vfs_ino == 1 {
-                            // Root of context tree → parent is CtxDir
-                            self.ctx_dir_inos.get(ctx).copied().unwrap_or(INO_CTX)
-                        } else {
-                            // Find parent in context tree
-                            if let Some(tree) = self.context_trees.get(ctx)
-                                && let Some(node) = tree.get(*vfs_ino)
-                            {
-                                return self
-                                    .ctx_node_inos
-                                    .get(&(ctx.clone(), node.parent))
-                                    .copied()
-                                    .unwrap_or(INO_CTX);
-                            }
-                            INO_CTX
-                        }
-                    }
-                    _ => INO_ROOT,
+                }
+                None => {
+                    files.insert((tail.to_string(), oid));
                 }
             }
         }
+
+        let mut out: Vec<(String, VfsEntry)> = Vec::with_capacity(dir_names.len() + files.len());
+
+        for name in dir_names {
+            let next_sub = if sub_path.is_empty() {
+                name.clone()
+            } else {
+                format!("{sub_path}/{name}")
+            };
+            let inode = self.allocate_inode(
+                VfsEntryKind::CtxDir {
+                    context,
+                    sub_path: next_sub,
+                },
+                parent,
+                &name,
+            );
+            if let Some(entry) = self.entry(inode) {
+                out.push((name, entry));
+            }
+        }
+
+        for (name, oid) in files {
+            let inode =
+                self.allocate_inode(VfsEntryKind::CtxObject { context, oid }, parent, &name);
+            if let Some(entry) = self.entry(inode) {
+                out.push((name, entry));
+            }
+        }
+
+        out
     }
 
-    /// Total number of allocated inodes.
-    pub fn inode_count(&self) -> usize {
-        self.entries.len()
+    // ----------------------------------------------------------------------
+    // attr helper
+    // ----------------------------------------------------------------------
+
+    fn attr_for_kind(&self, kind: &VfsEntryKind) -> VfsAttr {
+        match kind {
+            VfsEntryKind::Root
+            | VfsEntryKind::TagsRoot
+            | VfsEntryKind::CtxRoot
+            | VfsEntryKind::TagDir { .. }
+            | VfsEntryKind::CtxDir { .. } => VfsAttr::directory(),
+            VfsEntryKind::TagObject { .. } | VfsEntryKind::CtxObject { .. } => {
+                // We don't know object size at this layer; the engine plumbs
+                // a content provider into MimisbrunnrFs which provides bytes
+                // on `read`. For `getattr` we report 0; the FUSE adapter
+                // populates the size from the content provider.
+                VfsAttr::regular_file(0)
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // bitmap helper
+    // ----------------------------------------------------------------------
+
+    fn intersect(&self, tags: &BTreeSet<TagId>) -> RoaringBitmap {
+        let v: Vec<TagId> = tags.iter().copied().collect();
+        self.tag_index.intersect(&v)
     }
 }
 
-fn dir_attr(ino: u64) -> VfsAttr {
-    VfsAttr {
-        ino,
-        size: 0,
-        blocks: 0,
-        atime: std::time::SystemTime::UNIX_EPOCH,
-        mtime: std::time::SystemTime::UNIX_EPOCH,
-        ctime: std::time::SystemTime::UNIX_EPOCH,
-        kind: VfsFileType::Directory,
-        mode: 0o755,
-        nlink: 2,
-        uid: 0,
-        gid: 0,
-    }
+/// Pull the low 32 bits of an [`ObjectId`]'s local sequence — this is the
+/// representation used by [`mimisbrunnr_query`] / [`mimisbrunnr_index`] when
+/// they pack object ids into roaring bitmaps. See `mimisbrunnr_query`'s
+/// module docs for the rationale.
+///
+/// TODO(rewrite-phase-N): the 32-bit truncation is a shared limitation; this
+/// will lift when the bitmap representation widens.
+fn low32_of(oid: ObjectId) -> u32 {
+    (oid.local_seq() & 0xffff_ffff) as u32
 }
 
-fn file_attr(ino: u64, size: u64) -> VfsAttr {
-    VfsAttr {
-        ino,
-        size,
-        blocks: size.div_ceil(512),
-        atime: std::time::SystemTime::UNIX_EPOCH,
-        mtime: std::time::SystemTime::UNIX_EPOCH,
-        ctime: std::time::SystemTime::UNIX_EPOCH,
-        kind: VfsFileType::RegularFile,
-        mode: 0o644,
-        nlink: 1,
-        uid: 0,
-        gid: 0,
-    }
-}
+// ----------------------------------------------------------------------
+// Tests
+// ----------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use {
-        super::*,
-        mimisbrunnr_index::TagIndex,
-        mimisbrunnr_ontology::{TagDefinition, TagSemantics, ValueType},
-        mimisbrunnr_types::TagOrigin,
-    };
+    use std::path::PathBuf;
 
-    fn tag(id: u32) -> TagId {
-        TagId::new(id)
+    use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
+    use mimisbrunnr_ontology::{IdAllocator, OntologyModule, OntologyState};
+    use mimisbrunnr_types::{ObjectId, TagDefinition, TagId, TagSemantics};
+    use mimisbrunnr_unix::PathContextManager;
+
+    use super::*;
+
+    fn label(name: &str) -> TagDefinition {
+        TagDefinition {
+            id: TagId::new(0),
+            name: name.into(),
+            semantics: TagSemantics::Label,
+            implies: vec![],
+            storage: None,
+        }
     }
 
-    fn label(id: u32, name: &str) -> TagDefinition {
-        TagDefinition::new(tag(id), name, TagSemantics::Label)
+    fn grouping(name: &str) -> TagDefinition {
+        TagDefinition {
+            id: TagId::new(0),
+            name: name.into(),
+            semantics: TagSemantics::Grouping,
+            implies: vec![],
+            storage: None,
+        }
     }
 
-    fn attr_def(id: u32, name: &str) -> TagDefinition {
-        TagDefinition::new(
-            tag(id),
-            name,
-            TagSemantics::Attribute {
-                value_type: ValueType::Text,
-            },
+    fn oid(local: u64) -> ObjectId {
+        ObjectId::from_parts(0, local)
+    }
+
+    /// A small fixture mirroring the spec example: tags `electronic`,
+    /// `portable`, `stationary`, `discontinued`, `archive`. Objects:
+    /// - 4242: electronic, portable
+    /// - 4789: electronic, portable
+    /// - 1000: electronic, stationary
+    /// - 9999: archive
+    /// - 7000: discontinued, electronic, stationary
+    fn build_state() -> (
+        OntologyState,
+        TagIndex,
+        KvIndex,
+        ForwardIndex,
+        PathContextManager,
+    ) {
+        let mut state = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        let module = OntologyModule {
+            id: "test".into(),
+            version: "0.1.0".into(),
+            name: "test".into(),
+            tags: vec![
+                label("electronic"),
+                label("portable"),
+                label("stationary"),
+                label("discontinued"),
+                label("archive"),
+            ],
+            implications: vec![],
+        };
+        state.install(module, &mut alloc).unwrap();
+
+        let electronic = state.names["electronic"];
+        let portable = state.names["portable"];
+        let stationary = state.names["stationary"];
+        let discontinued = state.names["discontinued"];
+        let archive = state.names["archive"];
+
+        let mut tag_index = TagIndex::new();
+        for o in [4242u64, 4789] {
+            tag_index.add_member(electronic, oid(o));
+            tag_index.add_member(portable, oid(o));
+        }
+        tag_index.add_member(electronic, oid(1000));
+        tag_index.add_member(stationary, oid(1000));
+        tag_index.add_member(archive, oid(9999));
+        tag_index.add_member(discontinued, oid(7000));
+        tag_index.add_member(electronic, oid(7000));
+        tag_index.add_member(stationary, oid(7000));
+
+        (
+            state,
+            tag_index,
+            KvIndex::default(),
+            ForwardIndex::default(),
+            PathContextManager::new(),
         )
     }
 
-    struct TestFixture {
-        tag_index: TagIndex,
-        kv_index: KvIndex,
-        forward_index: ForwardIndex,
-        dag: ImplicationDag,
-    }
-
-    impl TestFixture {
-        fn new() -> Self {
-            Self {
-                tag_index: TagIndex::new(),
-                kv_index: KvIndex::new(),
-                forward_index: ForwardIndex::new(),
-                dag: ImplicationDag::new(),
-            }
-        }
-
-        fn register_tag(&mut self, id: u32, name: &str) -> TagId {
-            self.dag.register_tag(label(id, name)).unwrap()
-        }
-
-        fn register_attr(&mut self, id: u32, name: &str) -> TagId {
-            self.dag.register_tag(attr_def(id, name)).unwrap()
-        }
-
-        fn add_object(&mut self, obj_local: u32, tags: &[TagId], name: Option<&str>) {
-            let oid = ObjectId::new(0, obj_local as u64);
-            for &tag_id in tags {
-                self.tag_index.tag_object(tag_id, obj_local);
-                self.forward_index
-                    .add(oid, Assertion::Tag(tag_id), TagOrigin::Direct);
-            }
-            if let Some(n) = name
-                && let Some(name_tag) = self.dag.lookup("name")
-            {
-                let val = mimisbrunnr_types::Value::Text(n.to_string());
-                self.kv_index.insert(name_tag, &val, obj_local);
-                self.forward_index.add(
-                    oid,
-                    Assertion::Attr {
-                        key: name_tag,
-                        value: val,
-                    },
-                    TagOrigin::Direct,
-                );
-            }
-        }
-
-        fn build_vfs(self) -> TagVfs {
-            TagVfs::new(self.tag_index, self.kv_index, self.forward_index, self.dag)
-        }
-    }
-
-    fn music_fixture() -> TestFixture {
-        let mut f = TestFixture::new();
-        let electronic = f.register_tag(1, "electronic");
-        let ambient = f.register_tag(2, "ambient");
-        let _portable = f.register_tag(3, "portable");
-        let name_attr = f.register_attr(10, "name");
-        let _ = name_attr;
-
-        // obj 1: electronic, ambient
-        f.add_object(1, &[electronic, ambient], Some("track1.flac"));
-        // obj 2: electronic
-        f.add_object(2, &[electronic], Some("track2.mp3"));
-        // obj 3: ambient
-        f.add_object(3, &[ambient], Some("drone.wav"));
-
-        f
+    #[test]
+    fn well_known_inodes_exist() {
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+        assert!(vfs.entry(INODE_ROOT).is_some());
+        assert!(vfs.entry(INODE_TAGS_ROOT).is_some());
+        assert!(vfs.entry(INODE_CTX_ROOT).is_some());
     }
 
     #[test]
-    fn root_has_tags_dir() {
-        let mut vfs = music_fixture().build_vfs();
-        let entries = vfs.readdir(INO_ROOT).unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"tags"));
+    fn lookup_root_tags_returns_tags_root() {
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+        let entry = vfs.lookup(INODE_ROOT, "tags").unwrap();
+        assert_eq!(entry.inode, INODE_TAGS_ROOT);
+        assert!(matches!(entry.kind, VfsEntryKind::TagsRoot));
     }
 
     #[test]
-    fn tags_root_lists_populated_tags() {
-        let mut vfs = music_fixture().build_vfs();
-        let entries = vfs.readdir(INO_TAGS).unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        // Should list electronic and ambient (portable has no objects)
-        assert!(names.contains(&"electronic"));
-        assert!(names.contains(&"ambient"));
-        assert!(!names.contains(&"portable"));
+    fn lookup_root_ctx_returns_ctx_root() {
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+        let entry = vfs.lookup(INODE_ROOT, "ctx").unwrap();
+        assert_eq!(entry.inode, INODE_CTX_ROOT);
     }
 
     #[test]
-    fn lookup_tag_dir() {
-        let mut vfs = music_fixture().build_vfs();
-        let ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
-        let entry = vfs.get(ino).unwrap();
-        assert!(matches!(entry, TagVfsEntry::TagDir(tags) if tags.len() == 1));
+    fn tags_root_lookup_allocates_stable_inode() {
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+        let first = vfs.lookup(INODE_TAGS_ROOT, "electronic").unwrap();
+        let again = vfs.lookup(INODE_TAGS_ROOT, "electronic").unwrap();
+        assert_eq!(first.inode, again.inode);
+        assert!(matches!(first.kind, VfsEntryKind::TagDir { .. }));
     }
 
     #[test]
-    fn tag_dir_lists_files_and_refinements() {
-        let mut vfs = music_fixture().build_vfs();
-        let tag_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
-        let entries = vfs.readdir(tag_ino).unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-
-        // Files: track1.flac (obj 1), track2.mp3 (obj 2)
-        assert!(names.contains(&"track1.flac"));
-        assert!(names.contains(&"track2.mp3"));
-
-        // Refinement: ambient (obj 1 has both electronic and ambient)
-        assert!(names.contains(&"ambient"));
-
-        // Not: portable (no electronic+portable intersection)
-        assert!(!names.contains(&"portable"));
-    }
-
-    #[test]
-    fn nested_tag_intersection() {
-        let mut vfs = music_fixture().build_vfs();
-        let elec_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
-        let amb_ino = vfs.lookup(elec_ino, "ambient").unwrap();
-
-        let entries = vfs.readdir(amb_ino).unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-
-        // Only obj 1 has both electronic AND ambient
-        assert!(names.contains(&"track1.flac"));
-        assert!(!names.contains(&"track2.mp3"));
-        assert!(!names.contains(&"drone.wav"));
-    }
-
-    #[test]
-    fn file_lookup_by_name() {
-        let mut vfs = music_fixture().build_vfs();
-        let tag_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
-        let file_ino = vfs.lookup(tag_ino, "track1.flac").unwrap();
-        let entry = vfs.get(file_ino).unwrap();
-        assert!(matches!(entry, TagVfsEntry::TagFile { obj_local: 1, .. }));
-    }
-
-    #[test]
-    fn file_attr_returns_size() {
-        let f = music_fixture();
-        let mut vfs = f.build_vfs();
-
-        // Set blob data for obj 1.
-        let oid = ObjectId::new(0, 1);
-        vfs.set_blob((oid.node() << 48) | oid.local(), vec![0u8; 1024]);
-
-        let tag_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
-        let file_ino = vfs.lookup(tag_ino, "track1.flac").unwrap();
-
-        let attr = vfs.getattr(file_ino).unwrap();
-        assert_eq!(attr.size, 1024);
-        assert_eq!(attr.kind, VfsFileType::RegularFile);
-    }
-
-    #[test]
-    fn read_file_content() {
-        let mut vfs = music_fixture().build_vfs();
-        let oid = ObjectId::new(0, 1);
-        vfs.set_blob((oid.node() << 48) | oid.local(), b"hello world".to_vec());
-
-        let tag_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
-        let file_ino = vfs.lookup(tag_ino, "track1.flac").unwrap();
-
-        let data = vfs.read(file_ino, 0, 1024).unwrap();
-        assert_eq!(data, b"hello world");
-
-        // Partial read with offset.
-        let data = vfs.read(file_ino, 6, 5).unwrap();
-        assert_eq!(data, b"world");
-    }
-
-    #[test]
-    fn objects_without_name_use_obj_id() {
-        let mut f = TestFixture::new();
-        let music = f.register_tag(1, "music");
-        // No "name" attribute registered, so obj has no name.
-        f.tag_index.tag_object(music, 42);
-        let oid = ObjectId::new(0, 42);
-        f.forward_index
-            .add(oid, Assertion::Tag(music), TagOrigin::Direct);
-
-        let mut vfs = f.build_vfs();
-        let tag_ino = vfs.lookup(INO_TAGS, "music").unwrap();
-        let entries = vfs.readdir(tag_ino).unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"obj_42"));
-    }
-
-    #[test]
-    fn duplicate_names_disambiguated() {
-        let mut f = TestFixture::new();
-        let music = f.register_tag(1, "music");
-        let _name_attr = f.register_attr(10, "name");
-
-        f.add_object(1, &[music], Some("track.mp3"));
-        f.add_object(2, &[music], Some("track.mp3"));
-
-        let mut vfs = f.build_vfs();
-        let tag_ino = vfs.lookup(INO_TAGS, "music").unwrap();
-        let entries = vfs.readdir(tag_ino).unwrap();
-        let file_names: Vec<&str> = entries
-            .iter()
-            .filter(|e| e.file_type == VfsFileType::RegularFile)
-            .map(|e| e.name.as_str())
-            .collect();
-
-        // Both should be present with disambiguation.
-        assert_eq!(file_names.len(), 2);
-        assert!(file_names.contains(&"track_1.mp3"));
-        assert!(file_names.contains(&"track_2.mp3"));
-    }
-
-    #[test]
-    fn commutativity_of_tag_paths() {
-        let mut vfs = music_fixture().build_vfs();
-
-        // /tags/electronic/ambient and /tags/ambient/electronic
-        // should show the same files.
-        let elec_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
-        let elec_amb_ino = vfs.lookup(elec_ino, "ambient").unwrap();
-
-        let amb_ino = vfs.lookup(INO_TAGS, "ambient").unwrap();
-        let amb_elec_ino = vfs.lookup(amb_ino, "electronic").unwrap();
-
-        // Same inode (same BTreeSet of tags).
-        assert_eq!(elec_amb_ino, amb_elec_ino);
-    }
-
-    #[test]
-    fn ctx_dir_integration() {
-        use mimisbrunnr_types::{PathProjection, ProjectedEntry};
-
-        let f = TestFixture::new();
-        let mut vfs = f.build_vfs();
-
-        // Add a context subtree.
-        let mut proj = PathProjection::new("test-ctx");
-        proj.add(ProjectedEntry::file(ObjectId::new(0, 99), "hello.txt"));
-        let tree = VfsTree::from_projection(&proj);
-        vfs.add_context("test-ctx".into(), tree);
-
-        // Root should now show ctx/.
-        let root = vfs.readdir(INO_ROOT).unwrap();
-        let names: Vec<&str> = root.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"ctx"));
-
-        // ctx/ should list test-ctx.
-        let ctx_entries = vfs.readdir(INO_CTX).unwrap();
-        let ctx_names: Vec<&str> = ctx_entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(ctx_names.contains(&"test-ctx"));
-
-        // test-ctx should list hello.txt.
-        let ctx_ino = vfs.lookup(INO_CTX, "test-ctx").unwrap();
-        let ctx_dir = vfs.readdir(ctx_ino).unwrap();
-        let file_names: Vec<&str> = ctx_dir.iter().map(|e| e.name.as_str()).collect();
-        assert!(file_names.contains(&"hello.txt"));
-    }
-
-    #[test]
-    fn getattr_on_all_node_types() {
-        let mut vfs = music_fixture().build_vfs();
-
-        // Root
-        let attr = vfs.getattr(INO_ROOT).unwrap();
-        assert_eq!(attr.kind, VfsFileType::Directory);
-
-        // TagsRoot
-        let attr = vfs.getattr(INO_TAGS).unwrap();
-        assert_eq!(attr.kind, VfsFileType::Directory);
-
-        // Tag dir
-        let ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
-        let attr = vfs.getattr(ino).unwrap();
-        assert_eq!(attr.kind, VfsFileType::Directory);
-
-        // File
-        let file_ino = vfs.lookup(ino, "track1.flac").unwrap();
-        let attr = vfs.getattr(file_ino).unwrap();
-        assert_eq!(attr.kind, VfsFileType::RegularFile);
-    }
-
-    #[test]
-    fn nonexistent_tag_lookup_returns_none() {
-        let mut vfs = music_fixture().build_vfs();
-        assert!(vfs.lookup(INO_TAGS, "nonexistent").is_none());
-    }
-
-    #[test]
-    fn empty_intersection_not_shown() {
-        let mut vfs = music_fixture().build_vfs();
-        // portable tag has no objects, so it should not appear anywhere.
-        let elec_ino = vfs.lookup(INO_TAGS, "electronic").unwrap();
-        assert!(vfs.lookup(elec_ino, "portable").is_none());
-    }
-
-    #[test]
-    fn ctx_node_getattr_returns_blob_size() {
-        use mimisbrunnr_types::{PathProjection, ProjectedEntry};
-
-        let f = TestFixture::new();
-        let mut vfs = f.build_vfs();
-
-        let oid = ObjectId::new(0, 42);
-        let mut proj = PathProjection::new("myctx");
-        proj.add(ProjectedEntry::file(oid, "data.bin"));
-        let tree = VfsTree::from_projection(&proj);
-        vfs.add_context("myctx".into(), tree);
-
-        // Before setting blob, size should be 0
-        let ctx_ino = vfs.lookup(INO_CTX, "myctx").unwrap();
-        let file_ino = vfs.lookup(ctx_ino, "data.bin").unwrap();
-        let attr = vfs.getattr(file_ino).unwrap();
-        assert_eq!(attr.size, 0, "size should be 0 before blob is set");
-
-        // Set blob data — getattr should now return the blob size
-        vfs.set_blob((oid.node() << 48) | oid.local(), vec![0xAB; 5000]);
-        let attr = vfs.getattr(file_ino).unwrap();
-        assert_eq!(attr.size, 5000, "size should reflect blob data");
-        assert_eq!(attr.blocks, 5000u64.div_ceil(512));
-    }
-
-    #[test]
-    fn ctx_node_read_returns_blob_content() {
-        use mimisbrunnr_types::{PathProjection, ProjectedEntry};
-
-        let f = TestFixture::new();
-        let mut vfs = f.build_vfs();
-
-        let oid = ObjectId::new(0, 77);
-        let mut proj = PathProjection::new("proj");
-        proj.add(ProjectedEntry::file(oid, "readme.txt"));
-        let tree = VfsTree::from_projection(&proj);
-        vfs.add_context("proj".into(), tree);
-
-        vfs.set_blob(
-            (oid.node() << 48) | oid.local(),
-            b"file content here".to_vec(),
+    fn tags_root_readdir_lists_populated_tags_lex_sorted() {
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+        let listing = vfs.readdir(INODE_TAGS_ROOT);
+        let names: Vec<&str> = listing.iter().map(|(n, _)| n.as_str()).collect();
+        // All five tags have non-empty bitmaps, sorted alphabetically.
+        assert_eq!(
+            names,
+            vec!["archive", "discontinued", "electronic", "portable", "stationary"]
         );
-
-        let ctx_ino = vfs.lookup(INO_CTX, "proj").unwrap();
-        let file_ino = vfs.lookup(ctx_ino, "readme.txt").unwrap();
-
-        // Full read
-        let data = vfs.read(file_ino, 0, 4096).unwrap();
-        assert_eq!(data, b"file content here");
-
-        // Partial read
-        let data = vfs.read(file_ino, 5, 7).unwrap();
-        assert_eq!(data, b"content");
     }
 
     #[test]
-    fn ctx_node_without_blob_returns_empty_read() {
-        use mimisbrunnr_types::{PathProjection, ProjectedEntry};
+    fn faceted_refinement_under_tag_dir() {
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+        let electronic = vfs.lookup(INODE_TAGS_ROOT, "electronic").unwrap();
+        let listing = vfs.readdir(electronic.inode);
+        let names: Vec<&str> = listing.iter().map(|(n, _)| n.as_str()).collect();
+        // Sub-tags first (sorted), then matched objects (sorted by oid).
+        assert!(names.contains(&"discontinued"));
+        assert!(names.contains(&"portable"));
+        assert!(names.contains(&"stationary"));
+        assert!(!names.contains(&"archive")); // archive ∩ electronic = ∅
+        // Files are decimal oids (low 32 bits → just the local seq).
+        assert!(names.contains(&"1000"));
+        assert!(names.contains(&"4242"));
+        assert!(names.contains(&"4789"));
+        assert!(names.contains(&"7000"));
+    }
 
-        let f = TestFixture::new();
-        let mut vfs = f.build_vfs();
+    #[test]
+    fn faceted_refinement_drops_empty_facet() {
+        // Under /tags/electronic/portable, `discontinued` should not appear
+        // because portable ∩ electronic ∩ discontinued = ∅.
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+        let electronic = vfs.lookup(INODE_TAGS_ROOT, "electronic").unwrap();
+        let portable = vfs.lookup(electronic.inode, "portable").unwrap();
+        let listing = vfs.readdir(portable.inode);
+        let names: Vec<&str> = listing.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(!names.contains(&"discontinued"));
+        // The two portable electronic objects should be the only files.
+        assert!(names.contains(&"4242"));
+        assert!(names.contains(&"4789"));
+        assert!(!names.contains(&"1000"));
+    }
 
-        let oid = ObjectId::new(0, 88);
-        let mut proj = PathProjection::new("ctx");
-        proj.add(ProjectedEntry::file(oid, "empty.bin"));
-        let tree = VfsTree::from_projection(&proj);
-        vfs.add_context("ctx".into(), tree);
+    #[test]
+    fn lookup_object_under_tag_dir() {
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+        let electronic = vfs.lookup(INODE_TAGS_ROOT, "electronic").unwrap();
+        let obj = vfs.lookup(electronic.inode, "4242").unwrap();
+        assert!(matches!(obj.kind, VfsEntryKind::TagObject { .. }));
+    }
 
-        // No blob set — read should return None
-        let ctx_ino = vfs.lookup(INO_CTX, "ctx").unwrap();
-        let file_ino = vfs.lookup(ctx_ino, "empty.bin").unwrap();
-        assert!(vfs.read(file_ino, 0, 4096).is_none());
+    #[test]
+    fn getattr_on_tag_object_is_regular_file() {
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+        let electronic = vfs.lookup(INODE_TAGS_ROOT, "electronic").unwrap();
+        let obj = vfs.lookup(electronic.inode, "4242").unwrap();
+        let attr = vfs.getattr(obj.inode).unwrap();
+        assert_eq!(attr.kind, crate::attr::VfsAttrKind::RegularFile);
+        assert_eq!(attr.nlink, 1);
+        // Size is 0 at this layer; MimisbrunnrFs fills it from the content
+        // provider.
+        assert_eq!(attr.size, 0);
+    }
+
+    #[test]
+    fn getattr_on_directories_reports_directory() {
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+        for inode in [INODE_ROOT, INODE_TAGS_ROOT, INODE_CTX_ROOT] {
+            let attr = vfs.getattr(inode).unwrap();
+            assert_eq!(attr.kind, crate::attr::VfsAttrKind::Directory);
+        }
+    }
+
+    #[test]
+    fn missing_tag_lookup_returns_none() {
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+        assert!(vfs.lookup(INODE_TAGS_ROOT, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn tag_path_order_is_canonical() {
+        // /tags/electronic/portable and /tags/portable/electronic resolve to
+        // the same TagDir kind (BTreeSet semantics). Inodes will differ
+        // because the cache keys on (parent, name), but the *kinds* match.
+        let (state, tag_index, kv_index, forward_index, ctx) = build_state();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
+
+        let e = vfs.lookup(INODE_TAGS_ROOT, "electronic").unwrap();
+        let ep = vfs.lookup(e.inode, "portable").unwrap();
+        let p = vfs.lookup(INODE_TAGS_ROOT, "portable").unwrap();
+        let pe = vfs.lookup(p.inode, "electronic").unwrap();
+
+        match (&ep.kind, &pe.kind) {
+            (
+                VfsEntryKind::TagDir { current_tags: a },
+                VfsEntryKind::TagDir { current_tags: b },
+            ) => {
+                assert_eq!(a, b);
+            }
+            other => panic!("unexpected kinds: {other:?}"),
+        }
+    }
+
+    // ----- /ctx/ tests -----
+
+    fn build_state_with_ctx() -> (
+        OntologyState,
+        TagIndex,
+        KvIndex,
+        ForwardIndex,
+        PathContextManager,
+        TagId,
+    ) {
+        let mut state = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        state
+            .install(
+                OntologyModule {
+                    id: "ctx-test".into(),
+                    version: "0.1.0".into(),
+                    name: "ctx-test".into(),
+                    tags: vec![grouping("rpi4-sdcard"), label("electronic")],
+                    implications: vec![],
+                },
+                &mut alloc,
+            )
+            .unwrap();
+
+        let context = state.names["rpi4-sdcard"];
+        let mut ctx = PathContextManager::new();
+        ctx.create_context(&state, context, PathBuf::from("/host/rpi4")).unwrap();
+        let proj = ctx.get_mut(context).unwrap();
+        proj.add(oid(100), "boot/vesper".into()).unwrap();
+        proj.add(oid(101), "boot/config.txt".into()).unwrap();
+        proj.add(oid(102), "etc/fstab".into()).unwrap();
+
+        (
+            state,
+            TagIndex::default(),
+            KvIndex::default(),
+            ForwardIndex::default(),
+            ctx,
+            context,
+        )
+    }
+
+    #[test]
+    fn ctx_root_lookup_returns_ctx_dir() {
+        let (state, tag_index, kv_index, forward_index, ctx_mgr, _ctx_tag) =
+            build_state_with_ctx();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
+        let dir = vfs.lookup(INODE_CTX_ROOT, "rpi4-sdcard").unwrap();
+        match &dir.kind {
+            VfsEntryKind::CtxDir { sub_path, .. } => assert!(sub_path.is_empty()),
+            other => panic!("expected CtxDir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctx_root_readdir_lists_contexts() {
+        let (state, tag_index, kv_index, forward_index, ctx_mgr, _ctx_tag) =
+            build_state_with_ctx();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
+        let listing = vfs.readdir(INODE_CTX_ROOT);
+        let names: Vec<&str> = listing.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["rpi4-sdcard"]);
+    }
+
+    #[test]
+    fn ctx_dir_readdir_lists_first_level_entries() {
+        let (state, tag_index, kv_index, forward_index, ctx_mgr, _ctx_tag) =
+            build_state_with_ctx();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
+        let dir = vfs.lookup(INODE_CTX_ROOT, "rpi4-sdcard").unwrap();
+        let listing = vfs.readdir(dir.inode);
+        let names: Vec<&str> = listing.iter().map(|(n, _)| n.as_str()).collect();
+        // boot and etc directories synthesised; no top-level files.
+        assert!(names.contains(&"boot"));
+        assert!(names.contains(&"etc"));
+    }
+
+    #[test]
+    fn ctx_dir_lookup_resolves_file() {
+        let (state, tag_index, kv_index, forward_index, ctx_mgr, _ctx_tag) =
+            build_state_with_ctx();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
+        let ctx_dir = vfs.lookup(INODE_CTX_ROOT, "rpi4-sdcard").unwrap();
+        let boot = vfs.lookup(ctx_dir.inode, "boot").unwrap();
+        let vesper = vfs.lookup(boot.inode, "vesper").unwrap();
+        match vesper.kind {
+            VfsEntryKind::CtxObject { oid: o, .. } => assert_eq!(o, oid(100)),
+            other => panic!("expected CtxObject, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctx_dir_readdir_subdir_lists_files() {
+        let (state, tag_index, kv_index, forward_index, ctx_mgr, _ctx_tag) =
+            build_state_with_ctx();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
+        let ctx_dir = vfs.lookup(INODE_CTX_ROOT, "rpi4-sdcard").unwrap();
+        let boot = vfs.lookup(ctx_dir.inode, "boot").unwrap();
+        let listing = vfs.readdir(boot.inode);
+        let names: Vec<&str> = listing.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"vesper"));
+        assert!(names.contains(&"config.txt"));
     }
 }

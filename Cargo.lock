@@ -2174,14 +2174,15 @@ dependencies = [
 name = "mimisbrunnr-fuse"
 version = "0.1.0"
 dependencies = [
- "arbitrary-int",
  "fuser",
  "log",
- "mimisbrunnr-engine",
  "mimisbrunnr-index",
  "mimisbrunnr-ontology",
+ "mimisbrunnr-query",
  "mimisbrunnr-types",
+ "mimisbrunnr-unix",
  "roaring",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -2262,12 +2263,11 @@ dependencies = [
 name = "mimisbrunnr-sql"
 version = "0.1.0"
 dependencies = [
- "arbitrary-int",
+ "log",
  "mimisbrunnr-index",
  "mimisbrunnr-ontology",
  "mimisbrunnr-query",
  "mimisbrunnr-types",
- "roaring",
  "sqlparser",
  "thiserror 2.0.18",
 ]

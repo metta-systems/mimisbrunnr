@@ -1,23 +1,13 @@
-#[derive(Debug, thiserror::Error)]
+//! Error type for the FUSE bridge.
+
+use thiserror::Error;
+
+/// Errors returned by [`crate::TagVfs`] and the [`crate::MimisbrunnrFs`]
+/// adapter.
+#[derive(Debug, Error)]
 pub enum FuseError {
-    #[error("engine error: {0}")]
-    Engine(#[from] mimisbrunnr_engine::EngineError),
-
-    #[error("types error: {0}")]
-    Types(#[from] mimisbrunnr_types::Error),
-
-    #[error("inode not found: {0}")]
-    InodeNotFound(u64),
-
-    #[error("not a directory: inode {0}")]
-    NotADirectory(u64),
-
-    #[error("not a file: inode {0}")]
-    NotAFile(u64),
-
-    #[error("permission denied")]
-    PermissionDenied,
-
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    /// An interior-mutability lock was poisoned (a thread panicked while
+    /// holding it). Treated as fatal.
+    #[error("internal lock poisoned: {0}")]
+    LockPoisoned(&'static str),
 }
