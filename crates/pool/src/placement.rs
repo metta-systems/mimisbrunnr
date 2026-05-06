@@ -1,136 +1,72 @@
-use {mimisbrunnr_transform::CompressionAlgo, mimisbrunnr_types::Query};
+//! Placement-rule serialisation helpers.
+//!
+//! Until the full `BtreeKind::PlacementRules` B+ tree (IMPL §10.4) lands,
+//! placement rules are persisted as a CBOR-encoded `Vec<PlacementRule>`
+//! blob. The blob lives in the pool-state region today; once the B+ tree
+//! is wired this becomes the leaf-payload codec.
+//
+// TODO(rewrite-phase-N): persist via `BtreeKind::PlacementRules` B+ tree
+// per IMPL §10.4; the PoolStateRoot stops carrying these as opaque CBOR.
 
-use crate::StorageTier;
+use mimisbrunnr_types::PlacementRule;
 
-/// Semantic placement rules that bind tag queries to physical topology
-/// and storage policies (tier, compression, encryption).
-///
-/// These rules drive where and how blobs are stored based on their metadata,
-/// replacing the per-dataset approach of traditional filesystems.
-#[derive(Debug, Clone)]
-pub enum PlacementRule {
-    /// Force objects matching `query` onto a specific tier.
-    Pin { query: Query, tier: StorageTier },
-    /// Prefer placing matching objects on a tier (soft constraint).
-    Prefer {
-        query: Query,
-        tier: StorageTier,
-        priority: u8,
-    },
-    /// Replicate matching objects across multiple disks.
-    Replicate {
-        query: Query,
-        min_replicas: u8,
-        across_disks: bool,
-    },
-    /// Co-locate matching objects on the same disk for locality.
-    Colocate { query: Query },
-    /// Automatic tiering based on access age.
-    AutoTier {
-        hot_threshold_days: u32,
-        warm_threshold_days: u32,
-        cold_after: u32,
-    },
-    /// Set compression algorithm for matching objects.
-    ///
-    /// Ontology-driven: "video" → skip compression, "source" → zstd:3, etc.
-    /// First matching Compress rule wins; unmatched objects use the pool default.
-    Compress { query: Query, algo: CompressionAlgo },
+use crate::error::PoolError;
+
+/// Encoded placement-rule blob: opaque CBOR bytes ready to write into a
+/// metadata-zone block.
+pub type PlacementRulesBlob = Vec<u8>;
+
+/// CBOR-encode the rule list.
+pub fn encode_placement_rules(rules: &[PlacementRule]) -> Result<PlacementRulesBlob, PoolError> {
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&rules.to_vec(), &mut buf)
+        .map_err(|e| PoolError::CborEncode(e.to_string()))?;
+    Ok(buf)
 }
 
-impl PlacementRule {
-    /// Get the query associated with this rule, if any.
-    pub fn query(&self) -> Option<&Query> {
-        match self {
-            Self::Pin { query, .. }
-            | Self::Prefer { query, .. }
-            | Self::Replicate { query, .. }
-            | Self::Colocate { query }
-            | Self::Compress { query, .. } => Some(query),
-            Self::AutoTier { .. } => None,
-        }
-    }
-
-    /// Get the target tier for this rule, if it specifies one.
-    pub fn target_tier(&self) -> Option<StorageTier> {
-        match self {
-            Self::Pin { tier, .. } | Self::Prefer { tier, .. } => Some(*tier),
-            _ => None,
-        }
-    }
-
-    /// Get the compression algorithm for this rule, if it specifies one.
-    pub fn compression_algo(&self) -> Option<CompressionAlgo> {
-        match self {
-            Self::Compress { algo, .. } => Some(*algo),
-            _ => None,
-        }
-    }
+/// CBOR-decode a rule list blob.
+pub fn decode_placement_rules(bytes: &[u8]) -> Result<Vec<PlacementRule>, PoolError> {
+    ciborium::de::from_reader(bytes).map_err(|e| PoolError::CborDecode(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
-    use {super::*, mimisbrunnr_types::TagId};
+    use {
+        super::*,
+        mimisbrunnr_types::{ChunkParams, ChunkingAlgo, Query, StorageTier, TagId},
+    };
 
     #[test]
-    fn pin_rule() {
-        let rule = PlacementRule::Pin {
-            query: Query::HasTag(TagId::new(1)),
-            tier: StorageTier::Hot,
-        };
-        assert_eq!(rule.target_tier(), Some(StorageTier::Hot));
-        assert!(rule.query().is_some());
+    fn round_trip_empty() {
+        let bytes = encode_placement_rules(&[]).unwrap();
+        let back = decode_placement_rules(&bytes).unwrap();
+        assert!(back.is_empty());
     }
 
     #[test]
-    fn prefer_rule() {
-        let rule = PlacementRule::Prefer {
-            query: Query::HasTag(TagId::new(2)),
-            tier: StorageTier::Cold,
-            priority: 5,
-        };
-        assert_eq!(rule.target_tier(), Some(StorageTier::Cold));
-    }
-
-    #[test]
-    fn replicate_rule() {
-        let rule = PlacementRule::Replicate {
-            query: Query::HasTag(TagId::new(3)),
-            min_replicas: 3,
-            across_disks: true,
-        };
-        assert!(rule.target_tier().is_none());
-        assert!(rule.query().is_some());
-    }
-
-    #[test]
-    fn auto_tier_rule() {
-        let rule = PlacementRule::AutoTier {
-            hot_threshold_days: 7,
-            warm_threshold_days: 30,
-            cold_after: 90,
-        };
-        assert!(rule.target_tier().is_none());
-        assert!(rule.query().is_none());
-    }
-
-    #[test]
-    fn compress_rule() {
-        let rule = PlacementRule::Compress {
-            query: Query::HasTag(TagId::new(10)),
-            algo: CompressionAlgo::Zstd(9),
-        };
-        assert_eq!(rule.compression_algo(), Some(CompressionAlgo::Zstd(9)));
-        assert!(rule.query().is_some());
-        assert!(rule.target_tier().is_none());
-    }
-
-    #[test]
-    fn compress_skip_rule() {
-        let rule = PlacementRule::Compress {
-            query: Query::HasTag(TagId::new(20)),
-            algo: CompressionAlgo::None,
-        };
-        assert_eq!(rule.compression_algo(), Some(CompressionAlgo::None));
+    fn round_trip_mixed() {
+        let rules = vec![
+            PlacementRule::Pin {
+                query: Query::HasTag(TagId::new(1)),
+                tier: StorageTier::Hot,
+            },
+            PlacementRule::AutoTier {
+                hot_threshold_days: 7,
+                warm_threshold_days: 30,
+                cold_after: 90,
+            },
+            PlacementRule::Chunk {
+                query: Query::HasTag(TagId::new(2)),
+                params: ChunkParams {
+                    algo: ChunkingAlgo::FastCDC,
+                    min_size: 16 * 1024,
+                    avg_size: 64 * 1024,
+                    max_size: 256 * 1024,
+                },
+            },
+        ];
+        let bytes = encode_placement_rules(&rules).unwrap();
+        let back = decode_placement_rules(&bytes).unwrap();
+        assert_eq!(rules, back);
     }
 }

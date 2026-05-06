@@ -1,121 +1,211 @@
-use mimisbrunnr_types::DiskId;
+//! On-disk per-disk descriptor (IMPL §10.4).
+//!
+//! Wire layout for a single disk in the inline `PoolStateRoot.inline_disks[]`
+//! array (or, for >12 disks, in the `BtreeKind::DiskDescriptors` overflow tree
+//! — not yet implemented in this phase).
 
-use crate::StorageTier;
+use {
+    bytemuck::{Pod, Zeroable},
+    mimisbrunnr_storage::BlockRef,
+    mimisbrunnr_types::{DiskId, DiskState, MediaType, StorageTier},
+    static_assertions::const_assert_eq,
+};
 
-/// Physical media type of a disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MediaType {
-    NVMe,
-    Ssd,
-    Hdd,
-    SmrHdd,
-    Remote,
+use crate::error::PoolError;
+
+/// Inline UTF-8 path field width inside [`DiskDescriptorOnDisk`].
+pub const DISK_PATH_INLINE_LEN: usize = 192;
+
+/// Total byte size of one [`DiskDescriptorOnDisk`].
+pub const DISK_DESCRIPTOR_ON_DISK_SIZE: usize = 256;
+
+// ------------------------------------------------------------------------
+// Discriminator encoding for the small enums
+// ------------------------------------------------------------------------
+//
+// `MediaType`, `StorageTier`, and `DiskState` live as logical enums in
+// `mimisbrunnr-types`. Their on-disk byte values are pinned here so the
+// wire format never silently drifts if the enum gets new variants.
+
+const MEDIA_TYPE_NVME: u8 = 0;
+const MEDIA_TYPE_SSD: u8 = 1;
+const MEDIA_TYPE_HDD: u8 = 2;
+const MEDIA_TYPE_SMR_HDD: u8 = 3;
+const MEDIA_TYPE_REMOTE: u8 = 4;
+
+#[inline]
+pub(crate) fn media_type_to_u8(m: MediaType) -> u8 {
+    match m {
+        MediaType::NVMe => MEDIA_TYPE_NVME,
+        MediaType::Ssd => MEDIA_TYPE_SSD,
+        MediaType::Hdd => MEDIA_TYPE_HDD,
+        MediaType::SmrHdd => MEDIA_TYPE_SMR_HDD,
+        MediaType::Remote => MEDIA_TYPE_REMOTE,
+    }
 }
 
-impl MediaType {
-    /// Suggest a default storage tier based on media type.
-    pub fn default_tier(self) -> StorageTier {
-        match self {
-            Self::NVMe => StorageTier::Hot,
-            Self::Ssd => StorageTier::Warm,
-            Self::Hdd | Self::SmrHdd => StorageTier::Cold,
-            Self::Remote => StorageTier::Glacier,
-        }
-    }
+#[inline]
+pub(crate) fn media_type_from_u8(v: u8) -> Result<MediaType, PoolError> {
+    Ok(match v {
+        MEDIA_TYPE_NVME => MediaType::NVMe,
+        MEDIA_TYPE_SSD => MediaType::Ssd,
+        MEDIA_TYPE_HDD => MediaType::Hdd,
+        MEDIA_TYPE_SMR_HDD => MediaType::SmrHdd,
+        MEDIA_TYPE_REMOTE => MediaType::Remote,
+        other => return Err(PoolError::InvalidMediaType(other)),
+    })
+}
 
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::NVMe => "nvme",
-            Self::Ssd => "ssd",
-            Self::Hdd => "hdd",
-            Self::SmrHdd => "smr_hdd",
-            Self::Remote => "remote",
-        }
+const DISK_STATE_ONLINE: u8 = 0;
+const DISK_STATE_DRAINING: u8 = 1;
+const DISK_STATE_REMOVED: u8 = 2;
+const DISK_STATE_FAULTED: u8 = 3;
+
+#[inline]
+pub(crate) fn disk_state_to_u8(s: DiskState) -> u8 {
+    match s {
+        DiskState::Online => DISK_STATE_ONLINE,
+        DiskState::Draining => DISK_STATE_DRAINING,
+        DiskState::Removed => DISK_STATE_REMOVED,
+        DiskState::Faulted => DISK_STATE_FAULTED,
     }
 }
 
-/// Lifecycle state of a disk in the pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiskState {
-    /// Normal operation: reads and writes.
-    Online,
-    /// Being drained for removal: reads served, no new writes.
-    Draining,
-    /// Removed from pool, data migrated away.
-    Removed,
-    /// Disk has failed, needs resilver.
-    Faulted,
+#[inline]
+pub(crate) fn disk_state_from_u8(v: u8) -> Result<DiskState, PoolError> {
+    Ok(match v {
+        DISK_STATE_ONLINE => DiskState::Online,
+        DISK_STATE_DRAINING => DiskState::Draining,
+        DISK_STATE_REMOVED => DiskState::Removed,
+        DISK_STATE_FAULTED => DiskState::Faulted,
+        other => return Err(PoolError::InvalidDiskState(other)),
+    })
 }
 
-/// Describes a disk in the pool.
-#[derive(Debug, Clone)]
-pub struct DiskDescriptor {
-    pub id: DiskId,
-    pub capacity: u64,
-    pub used: u64,
-    pub media_type: MediaType,
-    pub tier: StorageTier,
-    pub state: DiskState,
-    /// Sequential read throughput in MB/s.
-    pub seq_read_mbps: u32,
-    /// Random IOPS.
-    pub random_iops: u32,
-    /// Average latency in microseconds.
-    pub latency_us: u32,
-    /// Filesystem path (for file-backed devices).
-    pub path: Option<String>,
+// ------------------------------------------------------------------------
+// DiskDescriptorOnDisk — 256 bytes, IMPL §10.4
+// ------------------------------------------------------------------------
+
+/// Per-disk on-disk descriptor record. **256 bytes.** IMPL §10.4 lines
+/// 2155–2172.
+///
+/// Field layout (offsets in bytes):
+///
+/// | range       | field                  |
+/// |-------------|------------------------|
+/// | `[0..2]`    | `disk_id` (u16)        |
+/// | `[2..3]`    | `media_type` (u8)      |
+/// | `[3..4]`    | `tier` (u8)            |
+/// | `[4..5]`    | `state` (u8)           |
+/// | `[5..6]`    | `_pad0`                |
+/// | `[6..7]`    | `path_len` (u8)        |
+/// | `[7..8]`    | `_pad1`                |
+/// | `[8..16]`   | `capacity_bytes` (u64) |
+/// | `[16..24]`  | `used_bytes` (u64)     |
+/// | `[24..28]`  | `bucket_count` (u32)   |
+/// | `[28..32]`  | `first_usable_bucket` (u32) |
+/// | `[32..48]`  | `buckets_root: BlockRef` |
+/// | `[48..64]`  | `freespace_root: BlockRef` |
+/// | `[64..256]` | `path[192]`            |
+#[repr(C, packed)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct DiskDescriptorOnDisk {
+    pub disk_id: u16,         // [0..2]
+    pub media_type: u8,       // [2..3]
+    pub tier: u8,             // [3..4]
+    pub state: u8,            // [4..5]
+    pub _pad0: u8,            // [5..6]
+    pub path_len: u8,         // [6..7]
+    pub _pad1: u8,            // [7..8]
+    pub capacity_bytes: u64,  // [8..16]
+    pub used_bytes: u64,      // [16..24]
+    pub bucket_count: u32,    // [24..28]
+    pub first_usable_bucket: u32, // [28..32]
+    pub buckets_root: BlockRef,   // [32..48]
+    pub freespace_root: BlockRef, // [48..64]
+    pub path: [u8; DISK_PATH_INLINE_LEN], // [64..256]
 }
 
-impl DiskDescriptor {
-    pub fn new(id: DiskId, capacity: u64, media_type: MediaType) -> Self {
-        let tier = media_type.default_tier();
-        Self {
-            id,
-            capacity,
-            used: 0,
-            media_type,
-            tier,
-            state: DiskState::Online,
-            seq_read_mbps: 0,
-            random_iops: 0,
-            latency_us: 0,
-            path: None,
+const_assert_eq!(
+    core::mem::size_of::<DiskDescriptorOnDisk>(),
+    DISK_DESCRIPTOR_ON_DISK_SIZE
+);
+
+impl Default for DiskDescriptorOnDisk {
+    fn default() -> Self {
+        bytemuck::Zeroable::zeroed()
+    }
+}
+
+impl DiskDescriptorOnDisk {
+    /// Build a descriptor from logical fields.
+    ///
+    /// `path` must fit in `DISK_PATH_INLINE_LEN` bytes when UTF-8 encoded.
+    pub fn new(
+        disk_id: DiskId,
+        media_type: MediaType,
+        tier: StorageTier,
+        state: DiskState,
+        capacity_bytes: u64,
+        path: &str,
+    ) -> Result<Self, PoolError> {
+        let path_bytes = path.as_bytes();
+        if path_bytes.len() > DISK_PATH_INLINE_LEN {
+            return Err(PoolError::DiskPathTooLong {
+                len: path_bytes.len(),
+                max: DISK_PATH_INLINE_LEN,
+            });
         }
+        let mut out: Self = bytemuck::Zeroable::zeroed();
+        out.disk_id = disk_id;
+        out.media_type = media_type_to_u8(media_type);
+        out.tier = tier as u8;
+        out.state = disk_state_to_u8(state);
+        out.path_len = path_bytes.len() as u8;
+        out.capacity_bytes = capacity_bytes;
+        out.used_bytes = 0;
+        out.bucket_count = 0;
+        out.first_usable_bucket = 0;
+        out.buckets_root = BlockRef::default();
+        out.freespace_root = BlockRef::default();
+        out.path[..path_bytes.len()].copy_from_slice(path_bytes);
+        Ok(out)
     }
 
-    pub fn with_tier(mut self, tier: StorageTier) -> Self {
-        self.tier = tier;
-        self
-    }
-
-    pub fn with_path(mut self, path: impl Into<String>) -> Self {
-        self.path = Some(path.into());
-        self
-    }
-
-    pub fn with_perf(mut self, seq_read_mbps: u32, random_iops: u32, latency_us: u32) -> Self {
-        self.seq_read_mbps = seq_read_mbps;
-        self.random_iops = random_iops;
-        self.latency_us = latency_us;
-        self
-    }
-
-    /// Available space on this disk.
-    pub fn free_space(&self) -> u64 {
-        self.capacity.saturating_sub(self.used)
-    }
-
-    /// Usage ratio (0.0 to 1.0).
-    pub fn usage_ratio(&self) -> f64 {
-        if self.capacity == 0 {
-            return 1.0;
+    /// Decode the path bytes back to a `&str`. Returns
+    /// [`PoolError::InvalidDiskPathUtf8`] on bad UTF-8 and
+    /// [`PoolError::DiskPathTooLong`] if `path_len` exceeds the inline cap.
+    pub fn path_str(&self) -> Result<&str, PoolError> {
+        let len = { self.path_len } as usize;
+        if len > DISK_PATH_INLINE_LEN {
+            return Err(PoolError::DiskPathTooLong {
+                len,
+                max: DISK_PATH_INLINE_LEN,
+            });
         }
-        self.used as f64 / self.capacity as f64
+        std::str::from_utf8(&self.path[..len]).map_err(|_| PoolError::InvalidDiskPathUtf8)
     }
 
-    /// Whether the disk can accept new writes.
-    pub fn is_writable(&self) -> bool {
-        self.state == DiskState::Online && self.free_space() > 0
+    /// Logical media type for this descriptor.
+    pub fn media_type_typed(&self) -> Result<MediaType, PoolError> {
+        media_type_from_u8(self.media_type)
+    }
+
+    /// Logical tier for this descriptor.
+    pub fn tier_typed(&self) -> Result<StorageTier, PoolError> {
+        let raw = { self.tier };
+        StorageTier::from_u8(raw).ok_or(PoolError::InvalidStorageTier(raw))
+    }
+
+    /// Logical lifecycle state for this descriptor.
+    pub fn state_typed(&self) -> Result<DiskState, PoolError> {
+        disk_state_from_u8(self.state)
+    }
+
+    /// Strongly-typed `disk_id`.
+    pub fn disk_id_typed(&self) -> DiskId {
+        let raw = { self.disk_id };
+        raw as DiskId
     }
 }
 
@@ -124,55 +214,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_disk() {
-        let d = DiskDescriptor::new(0, 1_000_000_000, MediaType::NVMe);
-        assert_eq!(d.id, 0);
-        assert_eq!(d.tier, StorageTier::Hot);
-        assert_eq!(d.state, DiskState::Online);
-        assert_eq!(d.free_space(), 1_000_000_000);
-        assert!(d.is_writable());
+    fn size_is_256() {
+        assert_eq!(
+            core::mem::size_of::<DiskDescriptorOnDisk>(),
+            DISK_DESCRIPTOR_ON_DISK_SIZE
+        );
     }
 
     #[test]
-    fn with_builders() {
-        let d = DiskDescriptor::new(1, 500_000_000, MediaType::Ssd)
-            .with_tier(StorageTier::Warm)
-            .with_path("/dev/sda")
-            .with_perf(550, 100_000, 50);
+    fn round_trip_via_pod_cast() {
+        let d = DiskDescriptorOnDisk::new(
+            7,
+            MediaType::Hdd,
+            StorageTier::Cold,
+            DiskState::Draining,
+            1 << 32,
+            "/var/mimir/disk7.img",
+        )
+        .unwrap();
 
-        assert_eq!(d.tier, StorageTier::Warm);
-        assert_eq!(d.path.as_deref(), Some("/dev/sda"));
-        assert_eq!(d.seq_read_mbps, 550);
+        let bytes = bytemuck::bytes_of(&d).to_vec();
+        assert_eq!(bytes.len(), DISK_DESCRIPTOR_ON_DISK_SIZE);
+
+        let back: &DiskDescriptorOnDisk = bytemuck::from_bytes(&bytes);
+        let back_id = { back.disk_id };
+        assert_eq!(back_id, 7);
+        assert_eq!(back.path_str().unwrap(), "/var/mimir/disk7.img");
+        assert_eq!(back.media_type_typed().unwrap(), MediaType::Hdd);
+        assert_eq!(back.tier_typed().unwrap(), StorageTier::Cold);
+        assert_eq!(back.state_typed().unwrap(), DiskState::Draining);
     }
 
     #[test]
-    fn usage_tracking() {
-        let mut d = DiskDescriptor::new(0, 1000, MediaType::Hdd);
-        d.used = 400;
-        assert_eq!(d.free_space(), 600);
-        assert!((d.usage_ratio() - 0.4).abs() < 0.01);
+    fn path_too_long_rejected() {
+        let too_long = "/".repeat(DISK_PATH_INLINE_LEN + 1);
+        let err = DiskDescriptorOnDisk::new(
+            1,
+            MediaType::Ssd,
+            StorageTier::Warm,
+            DiskState::Online,
+            1024,
+            &too_long,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PoolError::DiskPathTooLong { .. }));
     }
 
     #[test]
-    fn full_disk_not_writable() {
-        let mut d = DiskDescriptor::new(0, 1000, MediaType::Ssd);
-        d.used = 1000;
-        assert!(!d.is_writable());
+    fn invalid_media_type_decoding() {
+        let mut d: DiskDescriptorOnDisk = bytemuck::Zeroable::zeroed();
+        d.media_type = 99;
+        let err = d.media_type_typed().unwrap_err();
+        assert!(matches!(err, PoolError::InvalidMediaType(99)));
     }
 
     #[test]
-    fn draining_disk_not_writable() {
-        let mut d = DiskDescriptor::new(0, 1000, MediaType::Ssd);
-        d.state = DiskState::Draining;
-        assert!(!d.is_writable());
+    fn invalid_state_decoding() {
+        let mut d: DiskDescriptorOnDisk = bytemuck::Zeroable::zeroed();
+        d.state = 200;
+        let err = d.state_typed().unwrap_err();
+        assert!(matches!(err, PoolError::InvalidDiskState(200)));
     }
 
     #[test]
-    fn media_default_tiers() {
-        assert_eq!(MediaType::NVMe.default_tier(), StorageTier::Hot);
-        assert_eq!(MediaType::Ssd.default_tier(), StorageTier::Warm);
-        assert_eq!(MediaType::Hdd.default_tier(), StorageTier::Cold);
-        assert_eq!(MediaType::SmrHdd.default_tier(), StorageTier::Cold);
-        assert_eq!(MediaType::Remote.default_tier(), StorageTier::Glacier);
+    fn empty_path_round_trips() {
+        let d = DiskDescriptorOnDisk::new(
+            0,
+            MediaType::Remote,
+            StorageTier::Glacier,
+            DiskState::Online,
+            0,
+            "",
+        )
+        .unwrap();
+        assert_eq!(d.path_str().unwrap(), "");
     }
 }

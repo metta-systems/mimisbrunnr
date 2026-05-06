@@ -1,93 +1,197 @@
-//! Ontology module loader — parses declarative TOML ontology files.
+//! Ontology module loader / serialiser (DESIGN §4).
 //!
-//! Supports the distribution format from the design doc (section 4.2):
-//!
-//! ```toml
-//! [module]
-//! id = "systems.metta.music"
-//! version = "2.1.0"
-//! name = "Music Ontology"
-//!
-//! [[tags]]
-//! name = "artist"
-//! semantics = "attribute"
-//! value_type = "text"
-//!
-//! [[implications]]
-//! from = "rock"
-//! to = "genre"
-//! ```
+//! TOML is the human-edited distribution format; the on-disk form is CBOR
+//! (DESIGN §4 + IMPL §10.1). At install time TOML is parsed into
+//! [`OntologyModule`]; the engine then converts to CBOR before writing.
 
-use serde::Deserialize;
+use std::collections::BTreeMap;
 
-use crate::{
-    ImplicationDag,
-    error::OntologyError,
-    tag_def::{TagDefinition, TagSemantics, ValueType},
+use mimisbrunnr_types::{
+    ChunkParams, ChunkingAlgo, CompressionAlgo, EncryptionMode, ModuleId, StoragePolicy,
+    TagDefinition, TagId, TagSemantics, ValueType,
 };
+use serde::{Deserialize, Serialize};
 
-/// A parsed ontology module — ready to be installed into an ImplicationDag.
-#[derive(Debug, Clone)]
+use crate::error::OntologyError;
+
+/// In-memory representation of a parsed ontology module.
+///
+/// Tag IDs in `tags` are placeholders set to `TagId::new(0)` until install
+/// time, when [`crate::OntologyState::install`] allocates real IDs through an
+/// [`IdAllocator`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OntologyModule {
-    pub id: Option<String>,
-    pub version: Option<String>,
-    pub name: Option<String>,
+    pub id: ModuleId,
+    pub version: String,
+    pub name: String,
     pub tags: Vec<TagDefinition>,
+    /// `(from_name, to_name)` pairs. Names are resolved to IDs at install
+    /// time; this avoids the TOML having to spell out numeric IDs.
     pub implications: Vec<(String, String)>,
 }
 
-// -- TOML schema (serde) --
+/// Result of installing an [`OntologyModule`] into an
+/// [`crate::OntologyState`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstallResult {
+    pub tags_registered: usize,
+    pub tags_skipped: usize,
+    pub implications_added: usize,
+    pub module_id: ModuleId,
+    pub module_name: String,
+}
 
-#[derive(Deserialize)]
+/// Allocates fresh [`TagId`]s during module install. Reused across installs
+/// so IDs never collide.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IdAllocator {
+    next: u32,
+}
+
+impl IdAllocator {
+    /// New allocator starting at `1` (id `0` is reserved as the "unallocated"
+    /// sentinel).
+    pub fn new() -> Self {
+        Self { next: 1 }
+    }
+
+    /// Allocator that begins issuing IDs at `start`.
+    pub fn starting_at(start: u32) -> Self {
+        Self {
+            next: start.max(1),
+        }
+    }
+
+    pub fn next_id(&mut self) -> TagId {
+        let id = TagId::new(self.next);
+        self.next += 1;
+        id
+    }
+
+    /// Bump the allocator past `id` so future allocations don't collide.
+    pub fn observe(&mut self, id: TagId) {
+        if id.raw() >= self.next {
+            self.next = id.raw() + 1;
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// TOML schema (serde-shaped wire types).
+// -------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TomlModule {
-    module: Option<TomlModuleHeader>,
+    module: TomlHeader,
     #[serde(default)]
     tags: Vec<TomlTag>,
     #[serde(default)]
     implications: Vec<TomlImplication>,
 }
 
-#[derive(Deserialize)]
-struct TomlModuleHeader {
-    id: Option<String>,
-    version: Option<String>,
-    name: Option<String>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TomlHeader {
+    id: String,
+    version: String,
+    name: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TomlTag {
     name: String,
     semantics: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     value_type: Option<String>,
-    #[serde(default)]
-    _element_constraint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    element_constraint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    storage: Option<TomlStoragePolicy>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TomlStoragePolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chunking: Option<TomlChunkParams>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compression: Option<TomlCompression>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encryption: Option<TomlEncryption>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TomlChunkParams {
+    algo: String,
+    min_size: u32,
+    avg_size: u32,
+    max_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum TomlCompression {
+    Plain(String),
+    Levelled { algo: String, level: i32 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum TomlEncryption {
+    Plain(String),
+    Hctr2 { algo: String, object_id: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TomlImplication {
     from: String,
     to: String,
 }
 
-impl OntologyModule {
-    /// Parse an ontology module from a TOML string.
-    pub fn from_toml(toml_str: &str) -> Result<Self, OntologyError> {
-        let parsed: TomlModule =
-            toml::from_str(toml_str).map_err(|e| OntologyError::ModuleParse(e.to_string()))?;
+// -------------------------------------------------------------------------
+// TOML <-> OntologyModule conversions.
+// -------------------------------------------------------------------------
 
-        let header = parsed.module.unwrap_or(TomlModuleHeader {
-            id: None,
-            version: None,
-            name: None,
-        });
+impl OntologyModule {
+    /// Parse from a TOML string. Tag IDs are left as placeholder zeros.
+    pub fn from_toml(s: &str) -> Result<Self, OntologyError> {
+        let parsed: TomlModule =
+            toml::from_str(s).map_err(|e| OntologyError::ModuleParse(e.to_string()))?;
+
+        // Optional pre-pass: collect a name → placeholder map so an
+        // `element_constraint` referenced by name can be turned into a TagId
+        // *within the module*. We use sentinel `TagId(0)` placeholders and
+        // resolve by name lookup at install time using the names list.
+        let name_index: BTreeMap<&str, ()> =
+            parsed.tags.iter().map(|t| (t.name.as_str(), ())).collect();
 
         let mut tags = Vec::with_capacity(parsed.tags.len());
         for t in &parsed.tags {
             let semantics = parse_semantics(&t.semantics, t.value_type.as_deref())?;
-            // Tag IDs will be allocated during installation, use placeholder 0.
-            let def = TagDefinition::new(mimisbrunnr_types::TagId::new(0), &t.name, semantics);
-            tags.push(def);
+            // OrderedCollection.element_constraint references must be
+            // resolvable at install time, but we only have names here. Leave
+            // as `None` for now — the engine resolves via a second pass on
+            // install when a real ID exists. (DESIGN §4 only requires
+            // `element_constraint` be optional.)
+            let semantics = if let TagSemantics::OrderedCollection { .. } = semantics {
+                if let Some(name) = &t.element_constraint {
+                    if !name_index.contains_key(name.as_str()) {
+                        return Err(OntologyError::UnknownTag(name.clone()));
+                    }
+                    // Resolved at install time; encode the placeholder.
+                    semantics
+                } else {
+                    semantics
+                }
+            } else {
+                semantics
+            };
+            let storage = parse_storage(t.storage.as_ref())?;
+            tags.push(TagDefinition {
+                id: TagId::new(0),
+                name: t.name.clone(),
+                semantics,
+                implies: Vec::new(),
+                storage,
+            });
         }
 
         let implications: Vec<(String, String)> = parsed
@@ -97,72 +201,53 @@ impl OntologyModule {
             .collect();
 
         Ok(OntologyModule {
-            id: header.id,
-            version: header.version,
-            name: header.name,
+            id: parsed.module.id,
+            version: parsed.module.version,
+            name: parsed.module.name,
             tags,
             implications,
         })
     }
 
-    /// Parse from a TOML file path.
-    pub fn from_file(path: &std::path::Path) -> Result<Self, OntologyError> {
-        let content =
-            std::fs::read_to_string(path).map_err(|e| OntologyError::ModuleParse(e.to_string()))?;
-        Self::from_toml(&content)
+    /// Serialise back to TOML. The `id` field on each [`TagDefinition`] is
+    /// dropped (TOML uses names, not IDs).
+    pub fn to_toml(&self) -> Result<String, OntologyError> {
+        let header = TomlHeader {
+            id: self.id.clone(),
+            version: self.version.clone(),
+            name: self.name.clone(),
+        };
+        let tags: Vec<TomlTag> = self
+            .tags
+            .iter()
+            .map(|t| {
+                let (semantics, value_type, element_constraint) =
+                    encode_semantics(&t.semantics, &self.tags);
+                TomlTag {
+                    name: t.name.clone(),
+                    semantics,
+                    value_type,
+                    element_constraint,
+                    storage: encode_storage(t.storage.as_ref()),
+                }
+            })
+            .collect();
+        let implications = self
+            .implications
+            .iter()
+            .map(|(f, t)| TomlImplication {
+                from: f.clone(),
+                to: t.clone(),
+            })
+            .collect();
+
+        let module = TomlModule {
+            module: header,
+            tags,
+            implications,
+        };
+        toml::to_string_pretty(&module).map_err(|e| OntologyError::ModuleSerialise(e.to_string()))
     }
-
-    /// Install this module into an ImplicationDag.
-    ///
-    /// Registers all tags (allocating IDs) and adds all implications.
-    /// Returns the number of tags registered and implications added.
-    pub fn install(self, dag: &mut ImplicationDag) -> Result<InstallResult, OntologyError> {
-        let mut tags_registered = 0u32;
-        let mut tags_skipped = 0u32;
-        let mut implications_added = 0u32;
-
-        // Phase 1: Register all tags (skip duplicates).
-        for def in &self.tags {
-            if dag.lookup(&def.name).is_some() {
-                tags_skipped += 1;
-                continue;
-            }
-            let id = dag.alloc_tag_id();
-            let new_def = TagDefinition::new(id, &def.name, def.semantics.clone());
-            dag.register_tag(new_def)?;
-            tags_registered += 1;
-        }
-
-        // Phase 2: Add implications (all tags must exist by now).
-        for (from_name, to_name) in &self.implications {
-            let from_id = dag
-                .lookup(from_name)
-                .ok_or_else(|| OntologyError::UnknownTag(from_name.clone()))?;
-            let to_id = dag
-                .lookup(to_name)
-                .ok_or_else(|| OntologyError::UnknownTag(to_name.clone()))?;
-            dag.add_implication(from_id, to_id)?;
-            implications_added += 1;
-        }
-
-        Ok(InstallResult {
-            tags_registered,
-            tags_skipped,
-            implications_added,
-            module_id: self.id,
-            module_name: self.name,
-        })
-    }
-}
-
-/// Result of installing an ontology module.
-#[derive(Debug)]
-pub struct InstallResult {
-    pub tags_registered: u32,
-    pub tags_skipped: u32,
-    pub implications_added: u32,
-    pub module_id: Option<String>,
-    pub module_name: Option<String>,
 }
 
 fn parse_semantics(s: &str, value_type: Option<&str>) -> Result<TagSemantics, OntologyError> {
@@ -177,7 +262,7 @@ fn parse_semantics(s: &str, value_type: Option<&str>) -> Result<TagSemantics, On
                 "blob" => ValueType::Blob,
                 other => {
                     return Err(OntologyError::ModuleParse(format!(
-                        "unknown value type: {other}"
+                        "unknown value type `{other}`"
                     )));
                 }
             };
@@ -189,9 +274,145 @@ fn parse_semantics(s: &str, value_type: Option<&str>) -> Result<TagSemantics, On
         }),
         "hierarchical" => Ok(TagSemantics::Hierarchical),
         other => Err(OntologyError::ModuleParse(format!(
-            "unknown semantics: {other}"
+            "unknown semantics `{other}`"
         ))),
     }
+}
+
+fn encode_semantics(
+    sem: &TagSemantics,
+    _all_tags: &[TagDefinition],
+) -> (String, Option<String>, Option<String>) {
+    match sem {
+        TagSemantics::Label => ("label".into(), None, None),
+        TagSemantics::Attribute { value_type } => {
+            let vt = match value_type {
+                ValueType::Text => "text",
+                ValueType::Int => "int",
+                ValueType::Float => "float",
+                ValueType::Timestamp => "timestamp",
+                ValueType::Blob => "blob",
+            };
+            ("attribute".into(), Some(vt.into()), None)
+        }
+        TagSemantics::Grouping => ("grouping".into(), None, None),
+        TagSemantics::OrderedCollection { .. } => ("ordered-collection".into(), None, None),
+        TagSemantics::Hierarchical => ("hierarchical".into(), None, None),
+    }
+}
+
+fn parse_storage(s: Option<&TomlStoragePolicy>) -> Result<Option<StoragePolicy>, OntologyError> {
+    let Some(s) = s else {
+        return Ok(None);
+    };
+    let chunking = match &s.chunking {
+        None => None,
+        Some(c) => {
+            let algo = match c.algo.as_str() {
+                "none" => ChunkingAlgo::None,
+                "fixed" | "fixed-size" => ChunkingAlgo::FixedSize,
+                "fastcdc" | "cdc" => ChunkingAlgo::FastCDC,
+                other => {
+                    return Err(OntologyError::ModuleParse(format!(
+                        "unknown chunking algo `{other}`"
+                    )));
+                }
+            };
+            Some(ChunkParams {
+                algo,
+                min_size: c.min_size,
+                avg_size: c.avg_size,
+                max_size: c.max_size,
+            })
+        }
+    };
+    let compression = match &s.compression {
+        None => None,
+        Some(TomlCompression::Plain(name)) => Some(match name.as_str() {
+            "none" => CompressionAlgo::None,
+            "lz4" => CompressionAlgo::Lz4,
+            "zstd" => CompressionAlgo::Zstd(3),
+            other => {
+                return Err(OntologyError::ModuleParse(format!(
+                    "unknown compression algo `{other}`"
+                )));
+            }
+        }),
+        Some(TomlCompression::Levelled { algo, level }) => Some(match algo.as_str() {
+            "zstd" => CompressionAlgo::Zstd(*level),
+            other => {
+                return Err(OntologyError::ModuleParse(format!(
+                    "compression algo `{other}` does not take a level"
+                )));
+            }
+        }),
+    };
+    let encryption = match &s.encryption {
+        None => None,
+        Some(TomlEncryption::Plain(name)) => Some(match name.as_str() {
+            "none" => EncryptionMode::None,
+            "xts" => EncryptionMode::Xts,
+            "aes-gcm" | "gcm" => EncryptionMode::AesGcm,
+            "chacha20" | "chacha20-poly1305" => EncryptionMode::ChaCha20Poly1305,
+            other => {
+                return Err(OntologyError::ModuleParse(format!(
+                    "unknown encryption mode `{other}`"
+                )));
+            }
+        }),
+        Some(TomlEncryption::Hctr2 { algo, object_id }) => Some(match algo.as_str() {
+            "hctr2" => EncryptionMode::Hctr2 {
+                object_id: *object_id,
+            },
+            other => {
+                return Err(OntologyError::ModuleParse(format!(
+                    "encryption mode `{other}` does not take an object_id"
+                )));
+            }
+        }),
+    };
+    Ok(Some(StoragePolicy {
+        chunking,
+        compression,
+        encryption,
+    }))
+}
+
+fn encode_storage(p: Option<&StoragePolicy>) -> Option<TomlStoragePolicy> {
+    let p = p?;
+    let chunking = p.chunking.map(|c| TomlChunkParams {
+        algo: match c.algo {
+            ChunkingAlgo::None => "none".into(),
+            ChunkingAlgo::FixedSize => "fixed".into(),
+            ChunkingAlgo::FastCDC => "fastcdc".into(),
+        },
+        min_size: c.min_size,
+        avg_size: c.avg_size,
+        max_size: c.max_size,
+    });
+    let compression = p.compression.map(|c| match c {
+        CompressionAlgo::None => TomlCompression::Plain("none".into()),
+        CompressionAlgo::Lz4 => TomlCompression::Plain("lz4".into()),
+        CompressionAlgo::Zstd(level) => TomlCompression::Levelled {
+            algo: "zstd".into(),
+            level,
+        },
+    });
+    let encryption = p.encryption.map(|e| match e {
+        EncryptionMode::None => TomlEncryption::Plain("none".into()),
+        EncryptionMode::Xts => TomlEncryption::Plain("xts".into()),
+        EncryptionMode::AesGcm => TomlEncryption::Plain("aes-gcm".into()),
+        EncryptionMode::ChaCha20Poly1305 => TomlEncryption::Plain("chacha20-poly1305".into()),
+        EncryptionMode::Hctr2 { object_id } => TomlEncryption::Hctr2 {
+            algo: "hctr2".into(),
+            object_id,
+        },
+    });
+    Some(TomlStoragePolicy {
+        chunking,
+        compression,
+        encryption,
+    })
 }
 
 #[cfg(test)]
@@ -199,22 +420,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_minimal_module() {
-        let toml = r#"
-[[tags]]
-name = "electronic"
-semantics = "label"
-"#;
-        let module = OntologyModule::from_toml(toml).unwrap();
-        assert_eq!(module.tags.len(), 1);
-        assert_eq!(module.tags[0].name, "electronic");
-        assert_eq!(module.tags[0].semantics, TagSemantics::Label);
-        assert!(module.implications.is_empty());
+    fn id_allocator_starts_at_one() {
+        let mut a = IdAllocator::new();
+        assert_eq!(a.next_id().raw(), 1);
+        assert_eq!(a.next_id().raw(), 2);
     }
 
     #[test]
-    fn parse_with_header() {
-        let toml = r#"
+    fn id_allocator_observe_advances() {
+        let mut a = IdAllocator::new();
+        a.observe(TagId::new(42));
+        assert_eq!(a.next_id().raw(), 43);
+    }
+
+    #[test]
+    fn parse_design_42_example() {
+        let src = r#"
 [module]
 id = "systems.metta.music"
 version = "2.1.0"
@@ -225,212 +446,101 @@ name = "artist"
 semantics = "attribute"
 value_type = "text"
 
-[[implications]]
-from = "rock"
-to = "genre"
-"#;
-        let module = OntologyModule::from_toml(toml).unwrap();
-        assert_eq!(module.id.as_deref(), Some("systems.metta.music"));
-        assert_eq!(module.version.as_deref(), Some("2.1.0"));
-        assert_eq!(module.name.as_deref(), Some("Music Ontology"));
-        assert_eq!(module.tags.len(), 1);
-        assert_eq!(module.implications.len(), 1);
-        assert_eq!(module.implications[0], ("rock".into(), "genre".into()));
-    }
-
-    #[test]
-    fn parse_attribute_types() {
-        let toml = r#"
 [[tags]]
-name = "year"
-semantics = "attribute"
-value_type = "int"
-
-[[tags]]
-name = "score"
-semantics = "attribute"
-value_type = "float"
-
-[[tags]]
-name = "data"
-semantics = "attribute"
-value_type = "blob"
-"#;
-        let module = OntologyModule::from_toml(toml).unwrap();
-        assert_eq!(module.tags.len(), 3);
-        assert!(matches!(
-            module.tags[0].semantics,
-            TagSemantics::Attribute {
-                value_type: ValueType::Int
-            }
-        ));
-        assert!(matches!(
-            module.tags[1].semantics,
-            TagSemantics::Attribute {
-                value_type: ValueType::Float
-            }
-        ));
-        assert!(matches!(
-            module.tags[2].semantics,
-            TagSemantics::Attribute {
-                value_type: ValueType::Blob
-            }
-        ));
-    }
-
-    #[test]
-    fn parse_all_semantics() {
-        let toml = r#"
-[[tags]]
-name = "t1"
-semantics = "label"
-
-[[tags]]
-name = "t2"
-semantics = "grouping"
-
-[[tags]]
-name = "t3"
+name = "playlist"
 semantics = "ordered-collection"
 
 [[tags]]
-name = "t4"
-semantics = "hierarchical"
+name = "genre"
+semantics = "grouping"
+
+[[implications]]
+from = "rock"
+to = "genre"
+
+[[implications]]
+from = "flac"
+to = "audio"
 "#;
-        let module = OntologyModule::from_toml(toml).unwrap();
-        assert_eq!(module.tags[0].semantics, TagSemantics::Label);
-        assert_eq!(module.tags[1].semantics, TagSemantics::Grouping);
+        let m = OntologyModule::from_toml(src).unwrap();
+        assert_eq!(m.id, "systems.metta.music");
+        assert_eq!(m.version, "2.1.0");
+        assert_eq!(m.tags.len(), 3);
+        assert_eq!(m.implications.len(), 2);
+        assert_eq!(m.tags[0].name, "artist");
         assert!(matches!(
-            module.tags[2].semantics,
+            m.tags[0].semantics,
+            TagSemantics::Attribute {
+                value_type: ValueType::Text
+            }
+        ));
+        assert!(matches!(
+            m.tags[1].semantics,
             TagSemantics::OrderedCollection { .. }
         ));
-        assert_eq!(module.tags[3].semantics, TagSemantics::Hierarchical);
+        assert_eq!(m.tags[2].semantics, TagSemantics::Grouping);
     }
 
     #[test]
-    fn parse_error_unknown_semantics() {
-        let toml = r#"
+    fn round_trip_via_toml() {
+        let module = OntologyModule {
+            id: "test.example".into(),
+            version: "0.1.0".into(),
+            name: "Test".into(),
+            tags: vec![
+                TagDefinition {
+                    id: TagId::new(0),
+                    name: "file".into(),
+                    semantics: TagSemantics::Label,
+                    implies: vec![],
+                    storage: Some(StoragePolicy {
+                        chunking: Some(ChunkParams {
+                            algo: ChunkingAlgo::FastCDC,
+                            min_size: 1024,
+                            avg_size: 4096,
+                            max_size: 16384,
+                        }),
+                        compression: Some(CompressionAlgo::Zstd(9)),
+                        encryption: Some(EncryptionMode::Xts),
+                    }),
+                },
+                TagDefinition {
+                    id: TagId::new(0),
+                    name: "binary".into(),
+                    semantics: TagSemantics::Label,
+                    implies: vec![],
+                    storage: None,
+                },
+            ],
+            implications: vec![("binary".into(), "file".into())],
+        };
+        let s = module.to_toml().unwrap();
+        let back = OntologyModule::from_toml(&s).unwrap();
+        assert_eq!(module, back);
+    }
+
+    #[test]
+    fn unknown_semantics_errors() {
+        let src = r#"
+[module]
+id = "x"
+version = "0.0.1"
+name = "x"
+
 [[tags]]
-name = "bad"
+name = "x"
 semantics = "quantum"
 "#;
-        let result = OntologyModule::from_toml(toml);
-        assert!(result.is_err());
+        assert!(OntologyModule::from_toml(src).is_err());
     }
 
     #[test]
-    fn install_into_dag() {
-        let toml = r#"
+    fn missing_module_header_errors() {
+        let src = r#"
 [[tags]]
-name = "electronic"
-semantics = "label"
-
-[[tags]]
-name = "ambient"
-semantics = "label"
-
-[[tags]]
-name = "media"
-semantics = "label"
-
-[[tags]]
-name = "artist"
-semantics = "attribute"
-value_type = "text"
-
-[[implications]]
-from = "electronic"
-to = "media"
-
-[[implications]]
-from = "ambient"
-to = "electronic"
-"#;
-        let module = OntologyModule::from_toml(toml).unwrap();
-        let mut dag = ImplicationDag::new();
-        let result = module.install(&mut dag).unwrap();
-
-        assert_eq!(result.tags_registered, 4);
-        assert_eq!(result.tags_skipped, 0);
-        assert_eq!(result.implications_added, 2);
-
-        // Verify tags exist
-        assert!(dag.lookup("electronic").is_some());
-        assert!(dag.lookup("ambient").is_some());
-        assert!(dag.lookup("media").is_some());
-        assert!(dag.lookup("artist").is_some());
-
-        // Verify implications
-        let electronic = dag.lookup("electronic").unwrap();
-        let media = dag.lookup("media").unwrap();
-        let implies = dag.direct_implies(electronic);
-        assert!(implies.contains(&media));
-    }
-
-    #[test]
-    fn install_skips_existing_tags() {
-        let toml = r#"
-[[tags]]
-name = "existing"
-semantics = "label"
-
-[[tags]]
-name = "new"
+name = "x"
 semantics = "label"
 "#;
-        let module = OntologyModule::from_toml(toml).unwrap();
-        let mut dag = ImplicationDag::new();
-
-        // Pre-register "existing"
-        let id = dag.alloc_tag_id();
-        dag.register_tag(TagDefinition::new(id, "existing", TagSemantics::Label))
-            .unwrap();
-
-        let result = module.install(&mut dag).unwrap();
-        assert_eq!(result.tags_registered, 1);
-        assert_eq!(result.tags_skipped, 1);
-    }
-
-    #[test]
-    fn install_error_on_unknown_implication_target() {
-        let toml = r#"
-[[tags]]
-name = "a"
-semantics = "label"
-
-[[implications]]
-from = "a"
-to = "nonexistent"
-"#;
-        let module = OntologyModule::from_toml(toml).unwrap();
-        let mut dag = ImplicationDag::new();
-        let result = module.install(&mut dag);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_demo_labels_format() {
-        let toml = r#"
-[[tags]]
-name = "electronic"
-semantics = "label"
-
-[[tags]]
-name = "artist"
-semantics = "attribute"
-value_type = "text"
-
-[[tags]]
-name = "year"
-semantics = "attribute"
-value_type = "int"
-
-[[implications]]
-from = "electronic"
-to = "media"
-"#;
-        let module = OntologyModule::from_toml(toml).unwrap();
-        assert_eq!(module.tags.len(), 3);
-        assert_eq!(module.implications.len(), 1);
+        assert!(OntologyModule::from_toml(src).is_err());
     }
 }

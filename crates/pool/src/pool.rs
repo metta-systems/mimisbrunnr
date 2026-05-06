@@ -1,513 +1,282 @@
-use std::collections::HashMap;
+//! `PoolStateRoot` — pool-wide on-disk state (IMPL §10.4).
+//!
+//! A single 4 KiB block holding pool-wide scalars and the inline
+//! disk-descriptor array. For pools with ≤12 disks the entire descriptor
+//! list lives inline; for >12 the spec calls for spillover into the
+//! `BtreeKind::DiskDescriptors` B+ tree (rooted at
+//! `RootPointer.disks_overflow_root`). The B+ tree spillover is *not yet
+//! implemented* in this phase — see TODO below.
 
-use mimisbrunnr_types::DiskId;
-
-use crate::{
-    disk::{DiskDescriptor, DiskState},
-    error::PoolError,
-    placement::PlacementRule,
-    tier::StorageTier,
+use {
+    bytemuck::{Pod, Zeroable},
+    log::trace,
+    mimisbrunnr_storage::{
+        BLOCK_PREAMBLE_MAGIC_BLOCK, BLOCK_SIZE, BlockDevice, BlockHeader, BlockKind, block_crc,
+    },
+    static_assertions::const_assert_eq,
 };
 
-/// Manages a pool of disks with semantic placement and tiering.
-pub struct PoolManager {
-    /// All disks in the pool.
-    disks: HashMap<DiskId, DiskDescriptor>,
-    /// Active placement rules.
-    rules: Vec<PlacementRule>,
-    /// Default tier for objects without matching placement rules.
-    default_tier: StorageTier,
-    /// Next disk ID to assign.
-    next_disk_id: DiskId,
+use crate::{
+    disk::{DISK_DESCRIPTOR_ON_DISK_SIZE, DiskDescriptorOnDisk},
+    error::PoolError,
+};
+
+/// Number of inline `DiskDescriptorOnDisk` slots.
+pub const POOL_STATE_ROOT_INLINE_DISKS: usize = 12;
+
+/// Total byte size of [`PoolStateRoot`] (= 4 KiB block).
+pub const POOL_STATE_ROOT_SIZE: usize = BLOCK_SIZE;
+
+// Reserved trailer width: chosen so the block totals 4096 bytes exactly.
+//   header (32) + disk_count (4) + cluster_node_count (4)
+//   + inline_disks (12 × 256 = 3072) + reserved (980) + crc (4) = 4096.
+const POOL_STATE_ROOT_RESERVED: usize = 980;
+
+const POOL_STATE_ROOT_CRC_OFFSET: usize = POOL_STATE_ROOT_SIZE - 4; // 4092
+
+/// Format-version slot for [`PoolStateRoot`]'s `BlockHeader`.
+const POOL_STATE_ROOT_FORMAT_VERSION: u16 = 1;
+
+/// 4 KiB on-disk pool state block. IMPL §10.4 lines 2125–2132.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug)]
+pub struct PoolStateRoot {
+    pub header: BlockHeader,        // [0..32]    kind = PoolStateRoot
+    pub disk_count: u32,            // [32..36]
+    pub cluster_node_count: u32,    // [36..40]
+    pub inline_disks: [DiskDescriptorOnDisk; POOL_STATE_ROOT_INLINE_DISKS], // [40..3112]
+    pub _reserved: [u8; POOL_STATE_ROOT_RESERVED], // [3112..4092]
+    pub crc: u32,                   // [4092..4096]   CRC32C of bytes [0..4092]
 }
 
-impl PoolManager {
-    pub fn new() -> Self {
-        Self {
-            disks: HashMap::new(),
-            rules: Vec::new(),
-            default_tier: StorageTier::Warm,
-            next_disk_id: 0,
+const_assert_eq!(core::mem::size_of::<PoolStateRoot>(), POOL_STATE_ROOT_SIZE);
+const_assert_eq!(
+    core::mem::size_of::<DiskDescriptorOnDisk>() * POOL_STATE_ROOT_INLINE_DISKS,
+    DISK_DESCRIPTOR_ON_DISK_SIZE * POOL_STATE_ROOT_INLINE_DISKS
+);
+
+impl PoolStateRoot {
+    /// Build a zero-initialised `PoolStateRoot` block with header populated.
+    /// The CRC is **not** computed by this constructor — call
+    /// [`Self::recompute_crc`] before persisting.
+    pub fn new_blank() -> Self {
+        let mut out: Self = bytemuck::Zeroable::zeroed();
+        out.header = BlockHeader::new(
+            BlockKind::PoolStateRoot,
+            POOL_STATE_ROOT_FORMAT_VERSION,
+            (POOL_STATE_ROOT_SIZE - core::mem::size_of::<BlockHeader>() - 4) as u32,
+        );
+        out
+    }
+
+    /// Recompute and store the trailing CRC32C over bytes `[0..4092]`.
+    pub fn recompute_crc(&mut self) {
+        self.crc = 0;
+        let crc = block_crc(&bytemuck::bytes_of(self)[..POOL_STATE_ROOT_CRC_OFFSET]);
+        self.crc = crc;
+    }
+
+    /// Validate the trailing CRC.
+    pub fn verify_crc(&self) -> Result<(), PoolError> {
+        let expected = { self.crc };
+        let mut copy = *self;
+        copy.crc = 0;
+        let actual = block_crc(&bytemuck::bytes_of(&copy)[..POOL_STATE_ROOT_CRC_OFFSET]);
+        if expected == actual {
+            Ok(())
+        } else {
+            Err(PoolError::CrcMismatch { expected, actual })
         }
     }
 
-    /// Add a disk to the pool. Returns the assigned DiskId.
-    pub fn add_disk(&mut self, mut desc: DiskDescriptor) -> Result<DiskId, PoolError> {
-        let id = desc.id;
-        if self.disks.contains_key(&id) {
-            return Err(PoolError::DiskAlreadyExists(id));
-        }
-        desc.state = DiskState::Online;
-        self.disks.insert(id, desc);
-        if id >= self.next_disk_id {
-            self.next_disk_id = id + 1;
-        }
-        Ok(id)
+    /// Active inline-disk count, clipped to `POOL_STATE_ROOT_INLINE_DISKS`.
+    /// Disks beyond the inline cap live in the overflow B+ tree (not yet
+    /// implemented in this phase).
+    pub fn inline_disk_count(&self) -> usize {
+        let raw = { self.disk_count } as usize;
+        raw.min(POOL_STATE_ROOT_INLINE_DISKS)
     }
 
-    /// Begin draining a disk for removal. No new writes, reads still served.
-    pub fn begin_drain(&mut self, disk_id: DiskId) -> Result<(), PoolError> {
-        if self.online_count() <= 1 {
-            return Err(PoolError::LastDisk);
+    /// Set the inline `disks` array, recomputing `disk_count`. Errors if
+    /// more than [`POOL_STATE_ROOT_INLINE_DISKS`] disks are supplied — that
+    /// case requires the overflow B+ tree which is not yet wired.
+    pub fn set_inline_disks(&mut self, disks: &[DiskDescriptorOnDisk]) -> Result<(), PoolError> {
+        if disks.len() > POOL_STATE_ROOT_INLINE_DISKS {
+            return Err(PoolError::DiskOverflowUnsupported {
+                count: disks.len() as u32,
+                max: POOL_STATE_ROOT_INLINE_DISKS as u32,
+            });
         }
-        let disk = self
-            .disks
-            .get_mut(&disk_id)
-            .ok_or(PoolError::DiskNotFound(disk_id))?;
-        disk.state = DiskState::Draining;
+        // Zero the inline array first so previously-occupied slots clear.
+        self.inline_disks = [DiskDescriptorOnDisk::default(); POOL_STATE_ROOT_INLINE_DISKS];
+        for (slot, disk) in self.inline_disks.iter_mut().zip(disks.iter()) {
+            *slot = *disk;
+        }
+        self.disk_count = disks.len() as u32;
         Ok(())
     }
 
-    /// Complete removal of a drained disk.
-    pub fn remove_disk(&mut self, disk_id: DiskId) -> Result<DiskDescriptor, PoolError> {
-        let disk = self
-            .disks
-            .get(&disk_id)
-            .ok_or(PoolError::DiskNotFound(disk_id))?;
-        if disk.state != DiskState::Draining && disk.state != DiskState::Removed {
-            return Err(PoolError::DiskNotFound(disk_id)); // Must drain first
-        }
-        Ok(self.disks.remove(&disk_id).unwrap())
+    /// Iterator over the live inline descriptors.
+    pub fn inline_iter(&self) -> impl Iterator<Item = &DiskDescriptorOnDisk> {
+        let count = self.inline_disk_count();
+        self.inline_disks[..count].iter()
     }
 
-    /// Mark a disk as faulted.
-    pub fn mark_faulted(&mut self, disk_id: DiskId) -> Result<(), PoolError> {
-        let disk = self
-            .disks
-            .get_mut(&disk_id)
-            .ok_or(PoolError::DiskNotFound(disk_id))?;
-        disk.state = DiskState::Faulted;
+    /// Validate the block header's magic and kind.
+    fn validate_header(&self) -> Result<(), PoolError> {
+        let magic = { self.header.pre.magic };
+        if magic != BLOCK_PREAMBLE_MAGIC_BLOCK {
+            return Err(PoolError::InvalidPayload(format!(
+                "bad block preamble magic: {magic:?}"
+            )));
+        }
+        let kind_raw = { self.header.pre.kind };
+        if kind_raw != BlockKind::PoolStateRoot as u16 {
+            return Err(PoolError::InvalidBlockKind(kind_raw));
+        }
         Ok(())
     }
 
-    /// Get a disk descriptor.
-    pub fn get_disk(&self, disk_id: DiskId) -> Option<&DiskDescriptor> {
-        self.disks.get(&disk_id)
-    }
-
-    /// Get a mutable disk descriptor.
-    pub fn get_disk_mut(&mut self, disk_id: DiskId) -> Option<&mut DiskDescriptor> {
-        self.disks.get_mut(&disk_id)
-    }
-
-    /// Select the best disk for writing data to a given tier.
-    ///
-    /// Strategy: among writable disks in the target tier, pick the one with
-    /// the most free space. Falls back to any writable disk if no tier match.
-    pub fn select_disk_for_tier(&self, tier: StorageTier) -> Result<DiskId, PoolError> {
-        // First try exact tier match
-        let candidates: Vec<_> = self
-            .disks
-            .values()
-            .filter(|d| d.is_writable() && d.tier == tier)
-            .collect();
-
-        if let Some(best) = candidates.iter().max_by_key(|d| d.free_space()) {
-            return Ok(best.id);
-        }
-
-        // Fall back to nearest tier
-        let nearest = self.nearest_writable_tier(tier)?;
-        Ok(nearest)
-    }
-
-    /// Select a disk for writing with `needed` bytes, respecting placement rules.
-    pub fn select_disk(
-        &self,
-        needed: u64,
-        preferred_tier: Option<StorageTier>,
-    ) -> Result<DiskId, PoolError> {
-        let tier = preferred_tier.unwrap_or(self.default_tier);
-
-        // Among writable disks with enough space and matching tier
-        let candidates: Vec<_> = self
-            .disks
-            .values()
-            .filter(|d| d.is_writable() && d.free_space() >= needed && d.tier == tier)
-            .collect();
-
-        if let Some(best) = candidates.iter().max_by_key(|d| d.free_space()) {
-            return Ok(best.id);
-        }
-
-        // Fall back to any writable disk with enough space
-        let any: Vec<_> = self
-            .disks
-            .values()
-            .filter(|d| d.is_writable() && d.free_space() >= needed)
-            .collect();
-
-        if let Some(best) = any.iter().max_by_key(|d| d.free_space()) {
-            return Ok(best.id);
-        }
-
-        Err(PoolError::NoSuitableDisk(tier))
-    }
-
-    /// Record that bytes were written to a disk.
-    pub fn record_write(&mut self, disk_id: DiskId, bytes: u64) -> Result<(), PoolError> {
-        let disk = self
-            .disks
-            .get_mut(&disk_id)
-            .ok_or(PoolError::DiskNotFound(disk_id))?;
-        if !disk.is_writable() {
-            return Err(PoolError::DiskDraining(disk_id));
-        }
-        disk.used += bytes;
+    /// Persist this block to `device` at byte `offset`. Recomputes the CRC.
+    pub fn write(&mut self, device: &dyn BlockDevice, offset: u64) -> Result<(), PoolError> {
+        trace!("PoolStateRoot::write offset={offset}");
+        self.recompute_crc();
+        device.write_at(offset, bytemuck::bytes_of(self))?;
         Ok(())
     }
 
-    /// Record that bytes were freed on a disk.
-    pub fn record_free(&mut self, disk_id: DiskId, bytes: u64) -> Result<(), PoolError> {
-        let disk = self
-            .disks
-            .get_mut(&disk_id)
-            .ok_or(PoolError::DiskNotFound(disk_id))?;
-        disk.used = disk.used.saturating_sub(bytes);
-        Ok(())
-    }
-
-    /// Add a placement rule.
-    pub fn add_rule(&mut self, rule: PlacementRule) {
-        self.rules.push(rule);
-    }
-
-    /// Get all placement rules.
-    pub fn rules(&self) -> &[PlacementRule] {
-        &self.rules
-    }
-
-    /// Set the default tier for objects without matching rules.
-    pub fn set_default_tier(&mut self, tier: StorageTier) {
-        self.default_tier = tier;
-    }
-
-    /// All disks in the pool.
-    pub fn all_disks(&self) -> impl Iterator<Item = &DiskDescriptor> {
-        self.disks.values()
-    }
-
-    /// Number of online (writable) disks.
-    pub fn online_count(&self) -> usize {
-        self.disks
-            .values()
-            .filter(|d| d.state == DiskState::Online)
-            .count()
-    }
-
-    /// Total capacity across all online disks.
-    pub fn total_capacity(&self) -> u64 {
-        self.disks
-            .values()
-            .filter(|d| d.state == DiskState::Online)
-            .map(|d| d.capacity)
-            .sum()
-    }
-
-    /// Total used across all online disks.
-    pub fn total_used(&self) -> u64 {
-        self.disks
-            .values()
-            .filter(|d| d.state == DiskState::Online)
-            .map(|d| d.used)
-            .sum()
-    }
-
-    /// Disks in a specific tier.
-    pub fn disks_in_tier(&self, tier: StorageTier) -> Vec<&DiskDescriptor> {
-        self.disks
-            .values()
-            .filter(|d| d.tier == tier && d.state == DiskState::Online)
-            .collect()
-    }
-
-    /// Plan objects that need migration from a draining disk.
-    /// Returns a list of (object_extent_offset, suggested_destination_disk).
-    pub fn plan_drain(&self, draining_disk: DiskId) -> Result<Vec<DiskId>, PoolError> {
-        let disk = self
-            .disks
-            .get(&draining_disk)
-            .ok_or(PoolError::DiskNotFound(draining_disk))?;
-        if disk.state != DiskState::Draining {
-            return Err(PoolError::DiskNotFound(draining_disk));
-        }
-
-        // Find other online disks to migrate to, preferring same tier
-        let targets: Vec<_> = self
-            .disks
-            .values()
-            .filter(|d| d.id != draining_disk && d.is_writable())
-            .collect();
-
-        if targets.is_empty() {
-            return Err(PoolError::EmptyPool);
-        }
-
-        // Return available target disk IDs
-        Ok(targets.iter().map(|d| d.id).collect())
-    }
-
-    fn nearest_writable_tier(&self, preferred: StorageTier) -> Result<DiskId, PoolError> {
-        // Try tiers in order of distance from preferred
-        let all_tiers = [
-            StorageTier::Hot,
-            StorageTier::Warm,
-            StorageTier::Cold,
-            StorageTier::Glacier,
-        ];
-        let pref_idx = all_tiers.iter().position(|&t| t == preferred).unwrap_or(1);
-
-        // Expand outward from preferred
-        for distance in 0..all_tiers.len() {
-            for dir in [0isize, -1, 1] {
-                let idx = pref_idx as isize + dir * distance as isize;
-                if idx >= 0 && (idx as usize) < all_tiers.len() {
-                    let tier = all_tiers[idx as usize];
-                    if let Some(best) = self
-                        .disks
-                        .values()
-                        .filter(|d| d.is_writable() && d.tier == tier)
-                        .max_by_key(|d| d.free_space())
-                    {
-                        return Ok(best.id);
-                    }
-                }
-            }
-        }
-
-        Err(PoolError::EmptyPool)
-    }
-}
-
-impl Default for PoolManager {
-    fn default() -> Self {
-        Self::new()
+    /// Read a `PoolStateRoot` from `device` at byte `offset`. Validates the
+    /// block header magic, kind, and trailing CRC.
+    pub fn read(device: &dyn BlockDevice, offset: u64) -> Result<Self, PoolError> {
+        trace!("PoolStateRoot::read offset={offset}");
+        let mut buf = vec![0u8; POOL_STATE_ROOT_SIZE];
+        device.read_at(offset, &mut buf)?;
+        let psr: &Self = bytemuck::try_from_bytes(&buf)
+            .map_err(|e| PoolError::InvalidPayload(format!("pod cast failed: {e}")))?;
+        let psr = *psr;
+        psr.validate_header()?;
+        psr.verify_crc()?;
+        Ok(psr)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::disk::MediaType, mimisbrunnr_types::Query};
+    use {
+        super::*,
+        crate::disk::DiskDescriptorOnDisk,
+        mimisbrunnr_storage::FileBlockDevice,
+        mimisbrunnr_types::{DiskState, MediaType, StorageTier},
+        tempfile::NamedTempFile,
+    };
 
-    fn nvme(id: DiskId, cap: u64) -> DiskDescriptor {
-        DiskDescriptor::new(id, cap, MediaType::NVMe)
-    }
-
-    fn ssd(id: DiskId, cap: u64) -> DiskDescriptor {
-        DiskDescriptor::new(id, cap, MediaType::Ssd)
-    }
-
-    fn hdd(id: DiskId, cap: u64) -> DiskDescriptor {
-        DiskDescriptor::new(id, cap, MediaType::Hdd)
-    }
-
-    #[test]
-    fn add_and_get_disk() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(nvme(0, 1_000_000)).unwrap();
-
-        let disk = pool.get_disk(0).unwrap();
-        assert_eq!(disk.id, 0);
-        assert_eq!(disk.tier, StorageTier::Hot);
-        assert_eq!(pool.online_count(), 1);
+    fn make_disk(id: u16, path: &str) -> DiskDescriptorOnDisk {
+        DiskDescriptorOnDisk::new(
+            id,
+            MediaType::Ssd,
+            StorageTier::Warm,
+            DiskState::Online,
+            1024 * 1024 * 1024,
+            path,
+        )
+        .unwrap()
     }
 
     #[test]
-    fn duplicate_disk_rejected() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(nvme(0, 1000)).unwrap();
-        assert!(pool.add_disk(nvme(0, 2000)).is_err());
+    fn pool_state_root_is_4096() {
+        assert_eq!(core::mem::size_of::<PoolStateRoot>(), 4096);
     }
 
     #[test]
-    fn select_disk_by_tier() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(nvme(0, 1_000_000)).unwrap();
-        pool.add_disk(ssd(1, 5_000_000)).unwrap();
-        pool.add_disk(hdd(2, 10_000_000)).unwrap();
-
-        assert_eq!(pool.select_disk_for_tier(StorageTier::Hot).unwrap(), 0);
-        assert_eq!(pool.select_disk_for_tier(StorageTier::Warm).unwrap(), 1);
-        assert_eq!(pool.select_disk_for_tier(StorageTier::Cold).unwrap(), 2);
-    }
-
-    #[test]
-    fn select_disk_fallback() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(ssd(0, 1_000_000)).unwrap(); // Warm only
-
-        // Requesting Hot should fall back to Warm
-        let disk = pool.select_disk_for_tier(StorageTier::Hot).unwrap();
-        assert_eq!(disk, 0);
-    }
-
-    #[test]
-    fn select_disk_with_capacity() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(ssd(0, 1_000_000)).unwrap();
-        pool.add_disk(ssd(1, 5_000_000)).unwrap();
-
-        // Should pick disk with more space
-        let disk = pool.select_disk(100, Some(StorageTier::Warm)).unwrap();
-        assert_eq!(disk, 1); // 5M > 1M
-    }
-
-    #[test]
-    fn select_disk_insufficient_space() {
-        let mut pool = PoolManager::new();
-        let mut d = ssd(0, 1000);
-        d.used = 1000;
-        pool.add_disk(d).unwrap();
-
-        assert!(pool.select_disk(100, None).is_err());
-    }
-
-    #[test]
-    fn record_write_and_free() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(ssd(0, 10_000)).unwrap();
-
-        pool.record_write(0, 3000).unwrap();
-        assert_eq!(pool.get_disk(0).unwrap().used, 3000);
-
-        pool.record_free(0, 1000).unwrap();
-        assert_eq!(pool.get_disk(0).unwrap().used, 2000);
-    }
-
-    #[test]
-    fn drain_and_remove() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(ssd(0, 1000)).unwrap();
-        pool.add_disk(ssd(1, 1000)).unwrap();
-
-        pool.begin_drain(0).unwrap();
-        assert_eq!(pool.get_disk(0).unwrap().state, DiskState::Draining);
-        assert!(!pool.get_disk(0).unwrap().is_writable());
-
-        let removed = pool.remove_disk(0).unwrap();
-        assert_eq!(removed.id, 0);
-        assert!(pool.get_disk(0).is_none());
-    }
-
-    #[test]
-    fn cannot_drain_last_disk() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(ssd(0, 1000)).unwrap();
-
-        assert!(matches!(pool.begin_drain(0), Err(PoolError::LastDisk)));
-    }
-
-    #[test]
-    fn cannot_remove_online_disk() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(ssd(0, 1000)).unwrap();
-
-        // Must drain before removing
-        assert!(pool.remove_disk(0).is_err());
-    }
-
-    #[test]
-    fn plan_drain_targets() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(ssd(0, 1000)).unwrap();
-        pool.add_disk(ssd(1, 2000)).unwrap();
-        pool.add_disk(hdd(2, 5000)).unwrap();
-
-        pool.begin_drain(0).unwrap();
-        let targets = pool.plan_drain(0).unwrap();
-        // Should suggest disks 1 and 2
-        assert!(targets.contains(&1));
-        assert!(targets.contains(&2));
-        assert!(!targets.contains(&0));
-    }
-
-    #[test]
-    fn faulted_disk() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(ssd(0, 1000)).unwrap();
-
-        pool.mark_faulted(0).unwrap();
-        assert_eq!(pool.get_disk(0).unwrap().state, DiskState::Faulted);
-        assert!(!pool.get_disk(0).unwrap().is_writable());
-    }
-
-    #[test]
-    fn total_capacity_and_used() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(ssd(0, 1000)).unwrap();
-        pool.add_disk(ssd(1, 2000)).unwrap();
-
-        pool.record_write(0, 500).unwrap();
-        pool.record_write(1, 300).unwrap();
-
-        assert_eq!(pool.total_capacity(), 3000);
-        assert_eq!(pool.total_used(), 800);
-    }
-
-    #[test]
-    fn disks_in_tier() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(nvme(0, 1000)).unwrap();
-        pool.add_disk(ssd(1, 2000)).unwrap();
-        pool.add_disk(ssd(2, 3000)).unwrap();
-        pool.add_disk(hdd(3, 5000)).unwrap();
-
-        assert_eq!(pool.disks_in_tier(StorageTier::Hot).len(), 1);
-        assert_eq!(pool.disks_in_tier(StorageTier::Warm).len(), 2);
-        assert_eq!(pool.disks_in_tier(StorageTier::Cold).len(), 1);
-        assert_eq!(pool.disks_in_tier(StorageTier::Glacier).len(), 0);
-    }
-
-    #[test]
-    fn placement_rules() {
-        let mut pool = PoolManager::new();
-        pool.add_rule(PlacementRule::Pin {
-            query: Query::HasTag(mimisbrunnr_types::TagId::new(1)),
-            tier: StorageTier::Hot,
-        });
-        pool.add_rule(PlacementRule::AutoTier {
-            hot_threshold_days: 7,
-            warm_threshold_days: 30,
-            cold_after: 90,
-        });
-
-        assert_eq!(pool.rules().len(), 2);
-    }
-
-    #[test]
-    fn write_to_draining_fails() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(ssd(0, 1000)).unwrap();
-        pool.add_disk(ssd(1, 1000)).unwrap();
-
-        pool.begin_drain(0).unwrap();
-        assert!(matches!(
-            pool.record_write(0, 100),
-            Err(PoolError::DiskDraining(_))
-        ));
-    }
-
-    #[test]
-    fn empty_pool_select_fails() {
-        let pool = PoolManager::new();
-        assert!(pool.select_disk(100, None).is_err());
-    }
-
-    #[test]
-    fn multi_tier_pool() {
-        let mut pool = PoolManager::new();
-        pool.add_disk(nvme(0, 100_000).with_perf(3000, 500_000, 10))
+    fn round_trip_pod_bytes() {
+        let mut psr = PoolStateRoot::new_blank();
+        psr.set_inline_disks(&[make_disk(1, "/disk1"), make_disk(2, "/disk2")])
             .unwrap();
-        pool.add_disk(ssd(1, 500_000).with_perf(550, 100_000, 50))
-            .unwrap();
-        pool.add_disk(hdd(2, 2_000_000).with_perf(150, 200, 5000))
-            .unwrap();
+        psr.recompute_crc();
+        let bytes = bytemuck::bytes_of(&psr).to_vec();
+        let back: &PoolStateRoot = bytemuck::from_bytes(&bytes);
+        assert_eq!({ back.disk_count }, 2);
+        back.verify_crc().unwrap();
+    }
 
-        // Hot data goes to NVMe
-        assert_eq!(pool.select_disk_for_tier(StorageTier::Hot).unwrap(), 0);
-        // Warm to SSD
-        assert_eq!(pool.select_disk_for_tier(StorageTier::Warm).unwrap(), 1);
-        // Cold to HDD
-        assert_eq!(pool.select_disk_for_tier(StorageTier::Cold).unwrap(), 2);
+    #[test]
+    fn read_write_through_block_device() {
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+
+        let mut psr = PoolStateRoot::new_blank();
+        psr.cluster_node_count = 1;
+        psr.set_inline_disks(&[make_disk(0, "/disk0"), make_disk(1, "/disk1")])
+            .unwrap();
+        psr.write(&dev, 0).unwrap();
+
+        let back = PoolStateRoot::read(&dev, 0).unwrap();
+        assert_eq!({ back.disk_count }, 2);
+        assert_eq!({ back.cluster_node_count }, 1);
+        let names: Vec<_> = back
+            .inline_iter()
+            .map(|d| d.path_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, vec!["/disk0", "/disk1"]);
+    }
+
+    #[test]
+    fn corrupt_crc_rejected() {
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+        let mut psr = PoolStateRoot::new_blank();
+        psr.write(&dev, 0).unwrap();
+
+        // Flip a payload byte without recomputing the CRC.
+        let mut buf = vec![0u8; POOL_STATE_ROOT_SIZE];
+        dev.read_at(0, &mut buf).unwrap();
+        buf[40] ^= 0xFF;
+        dev.write_at(0, &buf).unwrap();
+
+        let err = PoolStateRoot::read(&dev, 0).unwrap_err();
+        assert!(matches!(err, PoolError::CrcMismatch { .. }));
+    }
+
+    #[test]
+    fn wrong_block_kind_rejected() {
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+        let mut psr = PoolStateRoot::new_blank();
+        psr.write(&dev, 0).unwrap();
+
+        // Splice a different BlockKind discriminant into the preamble and fix the CRC.
+        let mut buf = vec![0u8; POOL_STATE_ROOT_SIZE];
+        dev.read_at(0, &mut buf).unwrap();
+        buf[4] = BlockKind::ZoneMap as u8; // pre.kind low byte
+        buf[5] = 0;
+        // Recompute trailing CRC.
+        buf[POOL_STATE_ROOT_CRC_OFFSET..POOL_STATE_ROOT_CRC_OFFSET + 4].copy_from_slice(&[0; 4]);
+        let new_crc = block_crc(&buf[..POOL_STATE_ROOT_CRC_OFFSET]);
+        buf[POOL_STATE_ROOT_CRC_OFFSET..POOL_STATE_ROOT_CRC_OFFSET + 4]
+            .copy_from_slice(&new_crc.to_le_bytes());
+        dev.write_at(0, &buf).unwrap();
+
+        let err = PoolStateRoot::read(&dev, 0).unwrap_err();
+        assert!(matches!(err, PoolError::InvalidBlockKind(_)));
+    }
+
+    #[test]
+    fn overflow_inline_rejected() {
+        let mut psr = PoolStateRoot::new_blank();
+        let many: Vec<_> = (0..(POOL_STATE_ROOT_INLINE_DISKS as u16 + 1))
+            .map(|i| make_disk(i, &format!("/d{i}")))
+            .collect();
+        let err = psr.set_inline_disks(&many).unwrap_err();
+        assert!(matches!(err, PoolError::DiskOverflowUnsupported { .. }));
+    }
+
+    #[test]
+    fn fits_exactly_twelve() {
+        let mut psr = PoolStateRoot::new_blank();
+        let twelve: Vec<_> = (0..POOL_STATE_ROOT_INLINE_DISKS as u16)
+            .map(|i| make_disk(i, &format!("/d{i}")))
+            .collect();
+        psr.set_inline_disks(&twelve).unwrap();
+        assert_eq!(psr.inline_disk_count(), POOL_STATE_ROOT_INLINE_DISKS);
     }
 }

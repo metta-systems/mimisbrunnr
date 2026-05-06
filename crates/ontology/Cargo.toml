@@ -1,17 +1,18 @@
 [package]
 name = "mimisbrunnr-ontology"
-description = "Ontology management"
+description = "Ontology engine: implication DAG, materializer, modules, storage-policy resolution"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-mimisbrunnr-index = { workspace = true }
 mimisbrunnr-types = { workspace = true }
+ciborium = { workspace = true }
+log = { workspace = true }
+petgraph = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
-arbitrary-int = { workspace = true }
 tempfile = { workspace = true }

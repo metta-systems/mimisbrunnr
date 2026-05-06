@@ -6,8 +6,15 @@ license.workspace = true
 
 [dependencies]
 mimisbrunnr-types = { workspace = true }
-arbitrary-int = { workspace = true }
+mimisbrunnr-storage = { workspace = true }
+mimisbrunnr-meta = { workspace = true }
+bytemuck = { workspace = true }
+ciborium = { workspace = true }
+log = { workspace = true }
 roaring = { workspace = true }
+serde = { workspace = true }
+siphasher = { workspace = true }
+static_assertions = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
