@@ -1,32 +1,84 @@
-#[derive(Debug, thiserror::Error)]
+//! Engine-level error type.
+//!
+//! Wraps the per-crate errors of every dependency the engine talks to, plus a
+//! few engine-internal cases.
+
+use mimisbrunnr_index::IndexError;
+use mimisbrunnr_meta::MetaError;
+use mimisbrunnr_ontology::OntologyError;
+use mimisbrunnr_pool::PoolError;
+use mimisbrunnr_query::QueryError;
+use mimisbrunnr_storage::StorageError;
+use mimisbrunnr_transform::TransformError;
+use mimisbrunnr_types::ObjectId;
+use mimisbrunnr_unix::UnixError;
+use mimisbrunnr_wal::WalError;
+use mimisbrunnr_watch::WatchError;
+use thiserror::Error;
+
+/// All errors emitted by the engine layer.
+#[derive(Debug, Error)]
 pub enum EngineError {
-    #[error("storage error: {0}")]
-    Storage(#[from] mimisbrunnr_storage::StorageError),
+    #[error("storage: {0}")]
+    Storage(#[from] StorageError),
 
-    #[error("WAL error: {0}")]
-    Wal(#[from] mimisbrunnr_wal::WalError),
+    #[error("wal: {0}")]
+    Wal(#[from] WalError),
 
-    #[error("metadata error: {0}")]
-    Meta(#[from] mimisbrunnr_meta::MetaError),
+    #[error("meta: {0}")]
+    Meta(#[from] MetaError),
 
-    #[error("ontology error: {0}")]
-    Ontology(#[from] mimisbrunnr_ontology::OntologyError),
+    #[error("index: {0}")]
+    Index(#[from] IndexError),
 
-    #[error("transform error: {0}")]
-    Transform(#[from] mimisbrunnr_transform::TransformError),
+    #[error("ontology: {0}")]
+    Ontology(#[from] OntologyError),
 
-    #[error("query error: {0}")]
-    Query(#[from] mimisbrunnr_query::QueryError),
+    #[error("pool: {0}")]
+    Pool(#[from] PoolError),
+
+    #[error("transform: {0}")]
+    Transform(#[from] TransformError),
+
+    #[error("query: {0}")]
+    Query(#[from] QueryError),
+
+    #[error("watch: {0}")]
+    Watch(#[from] WatchError),
+
+    #[error("unix: {0}")]
+    Unix(#[from] UnixError),
+
+    #[error("cbor: {0}")]
+    Cbor(String),
+
+    #[error("not implemented: {0}")]
+    NotImplemented(&'static str),
 
     #[error("object not found: {0}")]
-    ObjectNotFound(mimisbrunnr_types::ObjectId),
+    ObjectNotFound(ObjectId),
 
-    #[error("object already deleted: {0}")]
-    ObjectDeleted(mimisbrunnr_types::ObjectId),
+    #[error("LSN {0} already applied")]
+    LsnAlreadyApplied(u64),
 
-    #[error("engine not initialized")]
-    NotInitialized,
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
 
-    #[error("I/O error: {0}")]
-    Io(std::io::Error),
+impl<T> From<ciborium::ser::Error<T>> for EngineError
+where
+    T: std::fmt::Debug,
+{
+    fn from(value: ciborium::ser::Error<T>) -> Self {
+        EngineError::Cbor(format!("encode: {value:?}"))
+    }
+}
+
+impl<T> From<ciborium::de::Error<T>> for EngineError
+where
+    T: std::fmt::Debug,
+{
+    fn from(value: ciborium::de::Error<T>) -> Self {
+        EngineError::Cbor(format!("decode: {value:?}"))
+    }
 }

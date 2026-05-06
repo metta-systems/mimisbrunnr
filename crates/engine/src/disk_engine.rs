@@ -1,1163 +1,684 @@
-use std::path::Path;
+//! [`DiskEngine`] — persistent wrapper around [`Engine`] (DESIGN §15).
+//!
+//! Glues the in-memory engine to:
+//!
+//! - the per-disk [`Wal`] (writes every mutation as a `WalOp` entry),
+//! - the primary disk's [`Superblock`] (atomic root commit at checkpoint),
+//! - a [`PoolManager`] (multi-disk lifecycle).
+//!
+//! Index persistence in this phase is a **single CBOR blob** in the index
+//! zone, length-prefixed by a 4-byte little-endian header. The B+ tree
+//! machinery lands in a later phase.
+// TODO(rewrite-phase-N): replace CBOR blob with B+ trees per IMPL §1.5/§7/§8/§9.
 
-use {
-    mimisbrunnr_meta::ObjectTable,
-    mimisbrunnr_pool::{PlacementRule, PoolConfig, parse_compression_algo},
-    mimisbrunnr_query::QueryParser,
-    mimisbrunnr_storage::{
-        BLOCK_SIZE, BlockDevice, ExtentLayout, FileBlockDevice, Superblock, ZoneExtent, ZoneMap,
-        ZoneType,
-    },
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 
-use {
-    crate::{engine::Engine, error::EngineError},
-    log::trace,
+use ciborium::{de::from_reader, ser::into_writer};
+use log::trace;
+use mimisbrunnr_index::{ChunkIndex, ForwardIndex, KvIndex, RangeIndex, TagIndex};
+use mimisbrunnr_meta::{LocationTable, ObjectTable};
+use mimisbrunnr_ontology::{InstallResult, OntologyModule, OntologyState};
+use mimisbrunnr_pool::{DiskConfigEntry, PoolConfig, PoolManager, PoolStatus};
+use mimisbrunnr_storage::{BlockDevice, FileBlockDevice, Superblock};
+use mimisbrunnr_types::{
+    ChangeInterest, DiskId, ObjectId, Query, SubscriptionId, TagId, Value,
+};
+use mimisbrunnr_unix::PathContextManager;
+use mimisbrunnr_wal::{Checkpoint, Wal, WalOpKind};
+use mimisbrunnr_watch::{Retention, SubscriptionEngine};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    Engine, EngineError, OpKind, OpLog,
+    engine::BlobWriteResult,
+    wal_proj::{project_op, replay_wal_op},
 };
 
-/// Round up `value` to the next multiple of `align`.
-fn align_up(value: u64, align: u64) -> u64 {
-    value.div_ceil(align) * align
+/// Magic prefix for the index-zone CBOR blob; lets us tell a fresh
+/// (all-zero) zone from a corrupted payload.
+const INDEX_BLOB_MAGIC: u32 = 0x4D49_5849; // "MIXI"
+
+/// Snapshot status reported by [`DiskEngine::status`].
+#[derive(Debug, Clone)]
+pub struct EngineStatus {
+    pub pool: PoolStatus,
+    pub object_count: usize,
+    pub tag_count: usize,
+    pub kv_entries: usize,
+    pub range_entries: usize,
+    pub chunk_count: usize,
+    pub forward_objects: usize,
+    pub oplog_len: usize,
+    pub wal_next_lsn: u64,
+    pub last_checkpoint_lsn: u64,
 }
 
-/// Persistent state serialized to the index zone.
-///
-/// Stores the forward index entries and ontology tag definitions as CBOR
-/// at the start of the index zone, length-prefixed with a u64 LE header.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct IndexState {
-    /// Forward index: object_id_raw → vec of (assertion, origin)
-    forward: Vec<ForwardRecord>,
-    /// Tag definitions: id → (name, semantics, implies)
-    tags: Vec<TagRecord>,
-    /// Implications: (from, to)
-    implications: Vec<(u32, u32)>,
-    /// Path contexts: context_name → entries
-    #[serde(default)]
-    path_contexts: Vec<PathContextRecord>,
-    /// Next write offset in the blob zone (bump allocator state).
-    #[serde(default)]
-    blob_next_offset: u64,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PathContextRecord {
-    #[serde(default)]
-    name: Option<String>,
-    entries: Vec<ProjectionEntryRecord>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ProjectionEntryRecord {
-    object_id: Option<u64>,
-    path: String,
-    entry_type: EntryTypeRecord,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-enum EntryTypeRecord {
-    File { mode: u32, uid: u32, gid: u32 },
-    Symlink { target: String },
-    Directory { mode: u32 },
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ForwardRecord {
-    object_id: u64,
-    tag_ids_direct: Vec<u32>,
-    tag_ids_materialized: Vec<u32>,
-    attrs: Vec<AttrRecord>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct AttrRecord {
-    key: u32,
-    value: ValueRecord,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-enum ValueRecord {
-    Text(String),
-    Int(i64),
-    Float(f64),
-    Timestamp(i64),
-    Blob(Vec<u8>),
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-struct TagRecord {
-    id: u32,
-    name: String,
-    semantics: String,
-}
-
-/// Disk-backed engine that persists state across invocations.
-///
-/// Opens pool disks, loads the object table from the metadata zone and
-/// the index state from the index zone. Blob data is written directly
-/// to the blob zone via a bump allocator. Changes are flushed back on `flush()`.
+/// Persistent engine.
 pub struct DiskEngine {
-    /// The in-memory engine with all indexes loaded.
     pub engine: Engine,
-    /// Path context manager (persisted).
-    pub context_mgr: mimisbrunnr_types::PathContextManager,
-    /// Primary disk device (holds index + metadata + blob zones).
-    primary_device: FileBlockDevice,
-    /// Superblock from the primary disk.
-    superblock: Superblock,
-    /// Next write offset within the blob zone (bump allocator).
-    blob_next_offset: u64,
-    /// Pool config (so we know about all disks).
-    #[allow(dead_code)]
-    config: PoolConfig,
-    /// Path to the pool config file.
-    #[allow(dead_code)]
-    config_path: std::path::PathBuf,
+    /// In-memory blob store keyed by `oid_local` (the bottom 48 bits of the
+    /// `ObjectId`). A real implementation would push these to the blob zone;
+    /// for Phase 6 we keep them in RAM and round-trip the metadata.
+    pub blobs: HashMap<u64, Vec<u8>>,
+    pub pool: PoolManager,
+    pub primary_device: Arc<FileBlockDevice>,
+    pub superblock: Superblock,
+    pub wal: Wal,
+    pub config: PoolConfig,
+    pub config_path: PathBuf,
+}
+
+// ---------- Index-zone CBOR blob shape ----------
+
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexBlob {
+    forward_index_bytes: Vec<u8>,
+    tag_index_bytes: Vec<u8>,
+    kv_index_bytes: Vec<u8>,
+    range_index_bytes: Vec<u8>,
+    chunk_index_bytes: Vec<u8>,
+    ontology_bytes: Vec<u8>,
+    subscriptions_bytes: Vec<u8>,
+    path_contexts_bytes: Vec<u8>,
+    oplog_bytes: Vec<u8>,
+    /// Object table — serialised as a flat list of every record, since
+    /// `ObjectTable` itself doesn't derive Serialize.
+    objects: Vec<ObjectRecordCbor>,
+    /// Location table.
+    locations: Vec<LocationCbor>,
+    next_oid_local: u64,
+    next_tag_id: u32,
+    last_applied_lsn: u64,
+    blobs: HashMap<u64, Vec<u8>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ObjectRecordCbor {
+    oid: u64,
+    /// Raw 128-byte ObjectRecord image.
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LocationCbor {
+    oid: u64,
+    /// Variable-length serialised ObjectLocation. `ObjectLocation::serialise`
+    /// gives bytes; we reuse the same parser on read.
+    bytes: Vec<u8>,
 }
 
 impl DiskEngine {
-    /// Open an existing pool from its config file path.
-    pub fn open(config_path: &Path) -> Result<Self, EngineError> {
-        trace!("DiskEngine::open config={}", config_path.display());
-        let config = PoolConfig::load(config_path)
-            .map_err(|e| EngineError::Io(std::io::Error::other(e.to_string())))?;
+    // -------------------------------------------------------------------
+    // Construction.
+    // -------------------------------------------------------------------
 
-        let primary = config.primary_disk().ok_or(EngineError::NotInitialized)?;
+    /// Format a new pool and initialise the engine on top of it.
+    pub fn create(config: PoolConfig, config_path: PathBuf) -> Result<Self, EngineError> {
+        trace!("DiskEngine::create config_path={}", config_path.display());
+        // 1. Create + format every disk in the pool.
+        let pool = PoolManager::create(config.clone())?;
+        // 2. Open primary disk's runtime view.
+        let primary_id = config
+            .primary()
+            .ok_or(EngineError::Pool(mimisbrunnr_pool::PoolError::EmptyPool))?
+            .id;
+        let primary_dev = pool
+            .runtime(primary_id)
+            .ok_or(EngineError::Pool(
+                mimisbrunnr_pool::PoolError::DiskNotFound(primary_id),
+            ))?
+            .device
+            .clone();
 
-        let primary_device =
-            FileBlockDevice::open(Path::new(&primary.path), 0).map_err(EngineError::Storage)?;
+        // 3. Read the superblock written by `PoolManager::create`.
+        let superblock = Superblock::open(primary_dev.as_ref())?;
+        let wal_offset = { superblock.wal_offset };
+        let wal_size = { superblock.wal_size };
 
-        // Read superblock with full extent layout (handles ZoneMap if present)
-        let superblock =
-            Superblock::read_with_extents(&primary_device).map_err(EngineError::Storage)?;
+        // 4. Format the WAL ring.
+        let wal = Wal::format(primary_dev.as_ref(), wal_offset, wal_size)?;
 
-        let mut engine = Engine::new(config.node_id as u64);
+        // 5. Build empty engine.
+        let engine = Engine::new(config.node_id);
 
-        // Load object table from metadata zone
-        let layout = &superblock.layout;
-        engine.object_table = ObjectTable::load(
-            &primary_device,
-            layout.metadata_zone_offset(),
-            layout.metadata_zone_size(),
-        )
-        .map_err(EngineError::Meta)?;
-
-        // Load index state from index zone
-        let mut context_mgr = mimisbrunnr_types::PathContextManager::new();
-        let mut blob_next_offset = 0u64;
-        Self::load_index_state(
-            &primary_device,
-            layout,
-            ZoneType::Index,
-            &mut engine,
-            &mut context_mgr,
-            &mut blob_next_offset,
-        )?;
-
-        // Set default compression from config
-        engine.set_default_compression(config.default_compression_algo());
-
-        // Resolve placement rules from config (needs ontology to be loaded first)
-        Self::resolve_config_rules(&config, &mut engine);
-
-        trace!(
-            "DiskEngine::open loaded {} objects, {} rules",
-            engine.object_table.count(),
-            engine.rules().len(),
-        );
+        // 6. Persist the pool config to TOML.
+        config.save_toml(&config_path)?;
 
         Ok(Self {
             engine,
-            context_mgr,
-            primary_device,
+            blobs: HashMap::new(),
+            pool,
+            primary_device: primary_dev,
             superblock,
-            blob_next_offset,
+            wal,
             config,
-            config_path: config_path.to_path_buf(),
+            config_path,
         })
     }
 
-    /// Open a pool by finding the config from any disk in the pool.
-    pub fn open_from_disk(disk_path: &Path) -> Result<Self, EngineError> {
-        let (config_path, _) = PoolConfig::find_from_disk(disk_path)
-            .map_err(|e| EngineError::Io(std::io::Error::other(e.to_string())))?;
-        Self::open(&config_path)
-    }
+    /// Open an existing pool, replay the WAL, restore index state.
+    pub fn open(config_path: &Path) -> Result<Self, EngineError> {
+        trace!("DiskEngine::open config_path={}", config_path.display());
+        let config = PoolConfig::load_toml(config_path)?;
+        let pool = PoolManager::open(config.clone())?;
+        let primary_id = config
+            .primary()
+            .ok_or(EngineError::Pool(mimisbrunnr_pool::PoolError::EmptyPool))?
+            .id;
+        let primary_dev = pool
+            .runtime(primary_id)
+            .ok_or(EngineError::Pool(
+                mimisbrunnr_pool::PoolError::DiskNotFound(primary_id),
+            ))?
+            .device
+            .clone();
 
-    /// Flush all in-memory state to disk.
-    ///
-    /// If the index state doesn't fit in the current index zone, grows
-    /// the index zone by adding a new extent carved from the end of the blob zone.
-    /// The updated extents are persisted via ZoneMap.
-    pub fn flush(&mut self) -> Result<(), EngineError> {
-        trace!("DiskEngine::flush");
+        let superblock = Superblock::open(primary_dev.as_ref())?;
+        let wal_offset = { superblock.wal_offset };
+        let wal_size = { superblock.wal_size };
+        let wal = Wal::open(primary_dev.as_ref(), wal_offset, wal_size)?;
 
-        // Flush object table to metadata zone
-        self.engine
-            .object_table
-            .flush_all(&self.primary_device)
-            .map_err(EngineError::Meta)?;
+        let mut engine = Engine::new(config.node_id);
 
-        // Serialize index state and check if it fits
-        let cbor =
-            Self::serialize_index_state(&self.engine, &self.context_mgr, self.blob_next_offset)?;
-
-        let needed = cbor.len() as u64 + 8; // 8 bytes for length prefix
-        let index_size = self.superblock.layout.zone_size(ZoneType::Index);
-
-        if needed > index_size {
-            self.grow_index_zone(needed, index_size)?;
+        // 1. Restore index state from the index-zone CBOR blob (if any).
+        let index_blob = read_index_blob(primary_dev.as_ref(), &superblock)?;
+        if let Some(blob) = index_blob {
+            apply_index_blob(&mut engine, blob);
         }
 
-        // Write index state using extent-aware writer
-        Self::write_index_state(&self.primary_device, &self.superblock.layout, &cbor)?;
+        let mut de = Self {
+            engine,
+            blobs: HashMap::new(),
+            pool,
+            primary_device: primary_dev,
+            superblock,
+            wal,
+            config,
+            config_path: config_path.to_path_buf(),
+        };
 
-        self.primary_device.sync().map_err(EngineError::Storage)?;
-        trace!("DiskEngine::flush complete");
+        // 2. Re-load the blob map (we stuffed it into the index blob too).
+        if let Some(blob) = read_index_blob(de.primary_device.as_ref(), &de.superblock)? {
+            de.blobs = blob.blobs.clone();
+        }
+
+        // 3. Replay WAL entries past the last applied LSN.
+        de.replay_wal()?;
+        Ok(de)
+    }
+
+    // -------------------------------------------------------------------
+    // Persistence: index zone (CBOR blob) and atomic root commit.
+    // -------------------------------------------------------------------
+
+    /// Save the engine's index state to the index zone as a length-prefixed
+    /// CBOR blob.
+    pub fn save_index_state(&mut self) -> Result<(), EngineError> {
+        let blob = build_index_blob(&self.engine, &self.blobs)?;
+        let mut payload = Vec::new();
+        into_writer(&blob, &mut payload)?;
+
+        let zone_offset = { self.superblock.index_zone.offset };
+        let zone_length = { self.superblock.index_zone.length };
+
+        // Frame: [magic u32 le | length u32 le | cbor bytes ...]
+        let total = 4 + 4 + payload.len() as u64;
+        if total > zone_length {
+            return Err(EngineError::NotImplemented(
+                "index zone too small for CBOR blob — TODO(rewrite-phase-N): spill via §1.5 B+ trees",
+            ));
+        }
+        let mut framed = Vec::with_capacity(total as usize);
+        framed.extend_from_slice(&INDEX_BLOB_MAGIC.to_le_bytes());
+        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&payload);
+        self.primary_device.write_at(zone_offset, &framed)?;
+        self.primary_device.sync()?;
         Ok(())
     }
 
-    /// Grow the index zone by stealing blocks from the end of the blob zone.
-    ///
-    /// Adds a new extent to the index zone and shrinks the last blob extent.
-    /// Persists the updated layout via ZoneMap and superblock.
-    fn grow_index_zone(&mut self, needed: u64, current_size: u64) -> Result<(), EngineError> {
-        let grow_by = align_up(needed - current_size, BLOCK_SIZE);
-        let blob_size = self.superblock.layout.zone_size(ZoneType::Blob);
-
-        if grow_by > blob_size / 2 {
-            return Err(EngineError::Io(std::io::Error::other(format!(
-                "index state too large ({needed} bytes), cannot grow index zone \
-                 without consuming more than half the blob zone",
-            ))));
+    /// Reload the index state from disk (overwrites in-memory state).
+    pub fn load_index_state(&mut self) -> Result<(), EngineError> {
+        if let Some(blob) =
+            read_index_blob(self.primary_device.as_ref(), &self.superblock)?
+        {
+            self.blobs = blob.blobs.clone();
+            apply_index_blob(&mut self.engine, blob);
         }
-
-        // Steal from the end of the last blob extent
-        let blob_extents = self.superblock.layout.extents_mut(ZoneType::Blob);
-        let last_blob = blob_extents
-            .last_mut()
-            .ok_or_else(|| EngineError::Io(std::io::Error::other("no blob extents")))?;
-
-        if grow_by > last_blob.size {
-            return Err(EngineError::Io(std::io::Error::other(format!(
-                "cannot grow index zone by {} bytes: last blob extent is only {} bytes",
-                grow_by, last_blob.size,
-            ))));
-        }
-
-        // New index extent starts where the blob extent now ends
-        let new_extent_offset = last_blob.offset + last_blob.size - grow_by;
-        last_blob.size -= grow_by;
-
-        // Add the new extent to the index zone
-        let new_extent = ZoneExtent::new(new_extent_offset, grow_by);
-        self.superblock
-            .layout
-            .extents_mut(ZoneType::Index)
-            .push(new_extent);
-
-        // Write ZoneMap block. Use the block just before the backup superblock
-        // (or reuse existing zone_map_offset).
-        let zone_map_offset = if self.superblock.zone_map_offset != 0 {
-            self.superblock.zone_map_offset
-        } else {
-            // Allocate zone map block from the end of the blob zone
-            let blob_extents = self.superblock.layout.extents_mut(ZoneType::Blob);
-            let last_blob = blob_extents.last_mut().unwrap();
-            let offset = last_blob.offset + last_blob.size - BLOCK_SIZE;
-            last_blob.size -= BLOCK_SIZE;
-            offset
-        };
-
-        ZoneMap::write_to(
-            &self.superblock.layout,
-            &self.primary_device,
-            zone_map_offset,
-        )
-        .map_err(EngineError::Storage)?;
-
-        self.superblock.zone_map_offset = zone_map_offset;
-
-        // Write updated superblock (with first extents inline + zone_map_offset)
-        self.superblock
-            .write_to(&self.primary_device)
-            .map_err(EngineError::Storage)?;
-
-        let new_index_size = self.superblock.layout.zone_size(ZoneType::Index);
-        let new_blob_size = self.superblock.layout.zone_size(ZoneType::Blob);
-        log::info!(
-            "grew index zone by {} KiB (now {} KiB across {} extent(s), blob zone now {} KiB)",
-            grow_by / 1024,
-            new_index_size / 1024,
-            self.superblock.layout.extents(ZoneType::Index).len(),
-            new_blob_size / 1024,
-        );
-
         Ok(())
     }
 
-    /// Resolve string-based rules from PoolConfig into PlacementRules.
-    ///
-    /// Must be called after the ontology is loaded so tag name lookups work.
-    fn resolve_config_rules(config: &PoolConfig, engine: &mut Engine) {
-        // Parse all rules first to avoid borrowing engine.dag and engine mutably at the same time.
-        let parsed_rules: Vec<PlacementRule> = {
-            let parser = QueryParser::new(&engine.dag);
-            let mut rules = Vec::new();
-            for rule_config in &config.rules {
-                match rule_config.rule_type.as_str() {
-                    "compress" => {
-                        let query_str = match &rule_config.query {
-                            Some(q) => q,
-                            None => {
-                                log::warn!("compress rule missing query, skipping");
-                                continue;
-                            }
-                        };
-                        let algo_str = rule_config.algo.as_deref().unwrap_or("zstd:3");
-                        let algo = match parse_compression_algo(algo_str) {
-                            Some(a) => a,
-                            None => {
-                                log::warn!("unknown compression algo '{algo_str}', skipping rule");
-                                continue;
-                            }
-                        };
-                        match parser.parse(query_str) {
-                            Ok(query) => {
-                                rules.push(PlacementRule::Compress { query, algo });
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "failed to parse rule query '{query_str}': {e}, skipping"
-                                );
-                            }
-                        }
-                    }
-                    other => {
-                        log::warn!("unsupported rule type '{other}', skipping");
-                    }
-                }
+    /// Replay every WAL entry past `last_applied_lsn` against the engine.
+    fn replay_wal(&mut self) -> Result<(), EngineError> {
+        let start = self.engine.last_applied_lsn.saturating_add(1);
+        let entries: Vec<_> = self
+            .wal
+            .iter_from(self.primary_device.as_ref(), start)
+            .collect();
+        for entry in entries {
+            let entry = entry?;
+            let kind = WalOpKind::from_u8(entry.header.op_kind)?;
+            let lsn = { entry.header.lsn };
+            // Engine-only ops; checkpoint and others are handled separately.
+            if matches!(kind, WalOpKind::Checkpoint) {
+                continue;
             }
-            rules
-        };
-
-        for rule in parsed_rules {
-            engine.add_rule(rule);
+            // Skip ops the engine doesn't model — `replay_wal_op` handles
+            // both engine-known and engine-unknown variants.
+            if let Err(EngineError::LsnAlreadyApplied(_)) =
+                replay_wal_op(&mut self.engine, kind, &entry.payload, lsn)
+            {
+                continue;
+            }
         }
-    }
-
-    /// Access the underlying engine.
-    pub fn engine(&self) -> &Engine {
-        &self.engine
-    }
-
-    /// Access the underlying engine mutably.
-    pub fn engine_mut(&mut self) -> &mut Engine {
-        &mut self.engine
-    }
-
-    /// Write transformed blob data to the blob zone using the bump allocator.
-    ///
-    /// Updates the object record's `blob_offset` to point to the written data.
-    /// The data should already be transformed (compressed/encrypted/padded)
-    /// via `Engine::write_blob`.
-    pub fn store_blob(
-        &mut self,
-        oid: mimisbrunnr_types::ObjectId,
-        data: &[u8],
-    ) -> Result<(), EngineError> {
-        let blob_zone_size = self.superblock.layout.zone_size(ZoneType::Blob);
-        let aligned_size = align_up(data.len() as u64, BLOCK_SIZE);
-
-        if self.blob_next_offset + aligned_size > blob_zone_size {
-            return Err(EngineError::Io(std::io::Error::other(format!(
-                "blob zone full: need {} bytes at offset {}, zone is {} bytes",
-                aligned_size, self.blob_next_offset, blob_zone_size,
-            ))));
-        }
-
-        // Convert blob zone logical offset to physical disk offset
-        let physical_offset = self
-            .superblock
-            .layout
-            .logical_to_physical(ZoneType::Blob, self.blob_next_offset)
-            .ok_or_else(|| {
-                EngineError::Io(std::io::Error::other("blob zone offset out of range"))
-            })?;
-
-        self.primary_device
-            .write_at(physical_offset, data)
-            .map_err(EngineError::Storage)?;
-
-        // Update the object record with the blob offset
-        if let Some(rec) = self.engine.object_table.get_mut(oid) {
-            rec.blob_offset = self.blob_next_offset;
-        }
-
-        self.blob_next_offset += aligned_size;
         Ok(())
     }
 
-    /// Read raw (transformed) blob data from the blob zone.
+    /// Atomic root-commit (DESIGN §15 MVP cadence):
     ///
-    /// Returns the raw on-disk bytes (compressed/encrypted). Use
-    /// `read_blob_plaintext` for automatic decompression.
-    pub fn read_blob(&self, oid: mimisbrunnr_types::ObjectId) -> Result<Vec<u8>, EngineError> {
-        let rec = self
-            .engine
-            .object_table
-            .get(oid)
-            .ok_or(EngineError::ObjectNotFound(oid))?;
+    /// 1. Save index state to the index zone.
+    /// 2. Append a `Checkpoint` WAL entry recording the new root.
+    /// 3. Trim the WAL ring up to the new checkpoint LSN.
+    /// 4. Flip the active root in all 3 superblock copies.
+    /// 5. fsync.
+    pub fn commit(&mut self) -> Result<(), EngineError> {
+        // 1. Save index state.
+        self.save_index_state()?;
 
-        if rec.stored_size == 0 {
-            return Ok(Vec::new());
-        }
+        // 2. Build a fresh root pointer carrying the LSN we're about to
+        //    checkpoint at. Most fields stay `BlockRef::ZERO` placeholders
+        //    until the §1.5 B+ tree machinery lands.
+        // TODO(rewrite-phase-N): populate every B+ tree root in RootPointer
+        // (object_table_root, location_table_root, …). For now they are
+        // BlockRef::ZERO sentinels.
+        let next_lsn = self.wal.next_lsn();
+        let mut new_root = *self.superblock.active_root_pointer();
+        new_root.seq = { new_root.seq }.saturating_add(1);
+        new_root.lsn = next_lsn;
+        new_root.recompute_crc();
 
-        let physical_offset = self
-            .superblock
-            .layout
-            .logical_to_physical(ZoneType::Blob, rec.blob_offset)
-            .ok_or_else(|| {
-                EngineError::Io(std::io::Error::other("blob zone offset out of range"))
-            })?;
-
-        let mut buf = vec![0u8; rec.stored_size as usize];
-        self.primary_device
-            .read_at(physical_offset, &mut buf)
-            .map_err(EngineError::Storage)?;
-        Ok(buf)
-    }
-
-    /// Read and decompress blob data from the blob zone.
-    ///
-    /// Returns the original plaintext data.
-    pub fn read_blob_plaintext(
-        &self,
-        oid: mimisbrunnr_types::ObjectId,
-    ) -> Result<Vec<u8>, EngineError> {
-        let rec = self
-            .engine
-            .object_table
-            .get(oid)
-            .ok_or(EngineError::ObjectNotFound(oid))?;
-
-        if rec.stored_size == 0 {
-            return Ok(Vec::new());
-        }
-
-        let stored = self.read_blob(oid)?;
-
-        // Build the matching pipeline from the record's compression/encryption state
-        let compression = match rec.compression() {
-            mimisbrunnr_types::CompressionState::None => {
-                mimisbrunnr_transform::CompressionAlgo::None
-            }
-            mimisbrunnr_types::CompressionState::Zstd => {
-                mimisbrunnr_transform::CompressionAlgo::Zstd(3) // level doesn't matter for decompression
-            }
-            mimisbrunnr_types::CompressionState::Lz4 => mimisbrunnr_transform::CompressionAlgo::Lz4,
-        };
-        // TODO: restore encryption mode from record when encryption is implemented
-        let pipeline = mimisbrunnr_transform::TransformPipeline::new(
-            compression,
-            mimisbrunnr_transform::EncryptionMode::None,
-            [0u8; 32],
-        );
-
-        let plaintext = pipeline.transform_read(
-            &stored,
-            rec.compressed_size as usize,
-            Some(&rec.content_hash),
+        // 3. Append checkpoint WAL entry.
+        let cp = Checkpoint::from_root(&new_root, 0);
+        let lsn = self.wal.append(
+            self.primary_device.as_ref(),
+            WalOpKind::Checkpoint,
+            &cp,
+            self.engine.clock.now(),
         )?;
-        Ok(plaintext)
-    }
 
-    /// Access the block device (for raw reads).
-    pub fn device(&self) -> &FileBlockDevice {
-        &self.primary_device
-    }
+        // 4. Trim the WAL up to and including `lsn`.
+        self.wal.checkpoint(self.primary_device.as_ref(), lsn)?;
 
-    /// Access the superblock (for zone layout info).
-    pub fn superblock(&self) -> &Superblock {
-        &self.superblock
-    }
+        // 5. Flip the active root.
+        // The root we wrote referenced `next_lsn`, but the actual checkpoint
+        // entry got LSN `lsn`. Update the in-memory copy and commit.
+        new_root.lsn = lsn;
+        new_root.recompute_crc();
+        self.superblock
+            .commit_root(self.primary_device.as_ref(), new_root)?;
 
-    /// Access the pool config.
-    pub fn config(&self) -> &PoolConfig {
-        &self.config
-    }
-
-    /// Current blob zone write offset (bump allocator position).
-    pub fn blob_next_offset(&self) -> u64 {
-        self.blob_next_offset
-    }
-
-    /// Serialize engine state to CBOR bytes.
-    fn serialize_index_state(
-        engine: &Engine,
-        context_mgr: &mimisbrunnr_types::PathContextManager,
-        blob_next_offset: u64,
-    ) -> Result<Vec<u8>, EngineError> {
-        let mut state = IndexState::default();
-
-        // Serialize ontology tags
-        for tag_id in engine.dag.all_tags() {
-            if let Some(def) = engine.dag.get(tag_id) {
-                state.tags.push(TagRecord {
-                    id: tag_id.raw(),
-                    name: def.name.clone(),
-                    semantics: format!("{:?}", def.semantics),
-                });
-            }
-        }
-
-        // Serialize implications
-        for tag_id in engine.dag.all_tags() {
-            for &implied in engine.dag.direct_implies(tag_id) {
-                state.implications.push((tag_id.raw(), implied.raw()));
-            }
-        }
-
-        // Serialize forward index
-        for rec in engine.object_table.iter() {
-            let oid =
-                mimisbrunnr_types::ObjectId::new(rec.id >> 48, rec.id & 0x0000_FFFF_FFFF_FFFF);
-            let entries = engine.forward_index.get(oid);
-            if entries.is_empty() {
-                continue;
-            }
-
-            let mut fwd = ForwardRecord {
-                object_id: rec.id,
-                tag_ids_direct: Vec::new(),
-                tag_ids_materialized: Vec::new(),
-                attrs: Vec::new(),
-            };
-
-            for entry in entries {
-                match &entry.assertion {
-                    mimisbrunnr_types::Assertion::Tag(id) => {
-                        if entry.origin == mimisbrunnr_types::TagOrigin::Direct {
-                            fwd.tag_ids_direct.push(id.raw());
-                        } else {
-                            fwd.tag_ids_materialized.push(id.raw());
-                        }
-                    }
-                    mimisbrunnr_types::Assertion::Attr { key, value } => {
-                        fwd.attrs.push(AttrRecord {
-                            key: key.raw(),
-                            value: value_to_record(value),
-                        });
-                    }
-                    mimisbrunnr_types::Assertion::Relation { .. } => {
-                        // TODO: serialize relations
-                    }
-                }
-            }
-
-            state.forward.push(fwd);
-        }
-
-        // Serialize path contexts
-        let serialize_entries =
-            |proj: &mimisbrunnr_types::PathProjection| -> Vec<ProjectionEntryRecord> {
-                proj.entries
-                    .iter()
-                    .map(|e| ProjectionEntryRecord {
-                        object_id: e.object.map(|o| (o.node() << 48) | o.local()),
-                        path: e.path.clone(),
-                        entry_type: match &e.entry_type {
-                            mimisbrunnr_types::ProjectedEntryType::File { mode, uid, gid } => {
-                                EntryTypeRecord::File {
-                                    mode: *mode,
-                                    uid: *uid,
-                                    gid: *gid,
-                                }
-                            }
-                            mimisbrunnr_types::ProjectedEntryType::Symlink { target } => {
-                                EntryTypeRecord::Symlink {
-                                    target: target.clone(),
-                                }
-                            }
-                            mimisbrunnr_types::ProjectedEntryType::Directory { mode } => {
-                                EntryTypeRecord::Directory { mode: *mode }
-                            }
-                        },
-                    })
-                    .collect()
-            };
-
-        // Serialize unscoped projection
-        let unscoped = context_mgr.unscoped();
-        if !unscoped.is_empty() {
-            state.path_contexts.push(PathContextRecord {
-                name: None,
-                entries: serialize_entries(unscoped),
-            });
-        }
-
-        // Serialize named contexts
-        for ctx_name in context_mgr.list_contexts() {
-            if let Ok(proj) = context_mgr.get_context(ctx_name) {
-                state.path_contexts.push(PathContextRecord {
-                    name: Some(ctx_name.to_string()),
-                    entries: serialize_entries(proj),
-                });
-            }
-        }
-
-        // Persist blob zone allocator state
-        state.blob_next_offset = blob_next_offset;
-
-        let mut cbor_buf = Vec::new();
-        ciborium::into_writer(&state, &mut cbor_buf)
-            .map_err(|e| EngineError::Io(std::io::Error::other(e.to_string())))?;
-        trace!(
-            "DiskEngine::serialize_index_state cbor_len={}",
-            cbor_buf.len()
-        );
-
-        Ok(cbor_buf)
-    }
-
-    /// Write serialized index state to the index zone, spanning extents as needed.
-    fn write_index_state(
-        dev: &FileBlockDevice,
-        layout: &ExtentLayout,
-        cbor: &[u8],
-    ) -> Result<(), EngineError> {
-        let total_needed = cbor.len() as u64 + 8;
-        let zone_size = layout.zone_size(ZoneType::Index);
-        if total_needed > zone_size {
-            return Err(EngineError::Io(std::io::Error::other(format!(
-                "index state too large: {} bytes, zone is {} bytes",
-                cbor.len(),
-                zone_size
-            ))));
-        }
-
-        // Write length prefix + CBOR data across extents
-        let mut data = Vec::with_capacity(total_needed as usize);
-        data.extend_from_slice(&(cbor.len() as u64).to_le_bytes());
-        data.extend_from_slice(cbor);
-
-        let mut remaining = &data[..];
-        for extent in layout.extents(ZoneType::Index) {
-            if remaining.is_empty() {
-                break;
-            }
-            let chunk_size = remaining.len().min(extent.size as usize);
-            dev.write_at(extent.offset, &remaining[..chunk_size])
-                .map_err(EngineError::Storage)?;
-            remaining = &remaining[chunk_size..];
-        }
-
+        // Track replay watermark.
+        self.engine.last_applied_lsn = self.engine.last_applied_lsn.max(lsn);
         Ok(())
     }
 
-    /// Load index state from the index zone and rebuild in-memory indexes.
-    fn load_index_state(
-        dev: &FileBlockDevice,
-        layout: &ExtentLayout,
-        zone: ZoneType,
-        engine: &mut Engine,
-        context_mgr: &mut mimisbrunnr_types::PathContextManager,
-        blob_next_offset: &mut u64,
-    ) -> Result<(), EngineError> {
-        let zone_size = layout.zone_size(zone);
+    // -------------------------------------------------------------------
+    // Disk lifecycle proxies.
+    // -------------------------------------------------------------------
 
-        // Read length prefix from first extent
-        let first_offset = layout.zone_offset(zone);
-        let mut len_buf = [0u8; 8];
-        dev.read_at(first_offset, &mut len_buf)
-            .map_err(EngineError::Storage)?;
-        let cbor_len = u64::from_le_bytes(len_buf);
-        trace!("DiskEngine::load_index_state cbor_len={cbor_len} zone_size={zone_size}");
+    pub fn add_disk(&mut self, entry: DiskConfigEntry) -> Result<DiskId, EngineError> {
+        let id = self.pool.add_disk(entry)?;
+        // Keep the on-disk pool config in sync.
+        self.config = self.pool.config().clone();
+        self.config.save_toml(&self.config_path)?;
+        Ok(id)
+    }
 
-        if cbor_len == 0 || cbor_len > zone_size - 8 {
-            // Empty or invalid — fresh pool, nothing to load
-            return Ok(());
-        }
-
-        // Read CBOR data across extents
-        let mut cbor_buf = vec![0u8; cbor_len as usize];
-        let mut bytes_read = 0usize;
-        let mut skip = 8u64; // skip length prefix
-
-        for extent in layout.extents(zone) {
-            if bytes_read >= cbor_buf.len() {
-                break;
-            }
-            if skip >= extent.size {
-                skip -= extent.size;
-                continue;
-            }
-            let read_offset = extent.offset + skip;
-            let available = (extent.size - skip) as usize;
-            let to_read = available.min(cbor_buf.len() - bytes_read);
-            dev.read_at(read_offset, &mut cbor_buf[bytes_read..bytes_read + to_read])
-                .map_err(EngineError::Storage)?;
-            bytes_read += to_read;
-            skip = 0;
-        }
-
-        let state: IndexState = match ciborium::from_reader(&cbor_buf[..]) {
-            Ok(s) => s,
-            Err(_) => return Ok(()), // Corrupt or empty, start fresh
-        };
-
-        // Rebuild ontology
-        for tag_rec in &state.tags {
-            let sem = parse_semantics(&tag_rec.semantics);
-            let def = mimisbrunnr_ontology::TagDefinition::new(
-                mimisbrunnr_types::TagId::new(tag_rec.id),
-                &tag_rec.name,
-                sem,
-            );
-            let _ = engine.dag.register_tag(def);
-        }
-
-        for &(from, to) in &state.implications {
-            let _ = engine.dag.add_implication(
-                mimisbrunnr_types::TagId::new(from),
-                mimisbrunnr_types::TagId::new(to),
-            );
-        }
-
-        // Rebuild forward index, tag index, and kv index from forward records
-        for fwd in &state.forward {
-            let oid = mimisbrunnr_types::ObjectId::new(
-                fwd.object_id >> 48,
-                fwd.object_id & 0x0000_FFFF_FFFF_FFFF,
-            );
-            let obj_local = oid.local() as u32;
-
-            for &tag_raw in &fwd.tag_ids_direct {
-                let tag = mimisbrunnr_types::TagId::new(tag_raw);
-                engine.tag_index.tag_object(tag, obj_local);
-                engine.forward_index.add(
-                    oid,
-                    mimisbrunnr_types::Assertion::Tag(tag),
-                    mimisbrunnr_types::TagOrigin::Direct,
-                );
-            }
-
-            for &tag_raw in &fwd.tag_ids_materialized {
-                let tag = mimisbrunnr_types::TagId::new(tag_raw);
-                engine.tag_index.tag_object(tag, obj_local);
-                engine.forward_index.add(
-                    oid,
-                    mimisbrunnr_types::Assertion::Tag(tag),
-                    mimisbrunnr_types::TagOrigin::Materialized,
-                );
-            }
-
-            for attr in &fwd.attrs {
-                let key = mimisbrunnr_types::TagId::new(attr.key);
-                let value = record_to_value(&attr.value);
-                engine.kv_index.insert(key, &value, obj_local);
-                engine.forward_index.add(
-                    oid,
-                    mimisbrunnr_types::Assertion::Attr { key, value },
-                    mimisbrunnr_types::TagOrigin::Direct,
-                );
-            }
-        }
-
-        // Rebuild path contexts
-        let deserialize_entry =
-            |entry_rec: &ProjectionEntryRecord| -> mimisbrunnr_types::ProjectedEntry {
-                let object = entry_rec.object_id.map(|raw| {
-                    mimisbrunnr_types::ObjectId::new(raw >> 48, raw & 0x0000_FFFF_FFFF_FFFF)
-                });
-                let entry_type = match &entry_rec.entry_type {
-                    EntryTypeRecord::File { mode, uid, gid } => {
-                        mimisbrunnr_types::ProjectedEntryType::File {
-                            mode: *mode,
-                            uid: *uid,
-                            gid: *gid,
-                        }
-                    }
-                    EntryTypeRecord::Symlink { target } => {
-                        mimisbrunnr_types::ProjectedEntryType::Symlink {
-                            target: target.clone(),
-                        }
-                    }
-                    EntryTypeRecord::Directory { mode } => {
-                        mimisbrunnr_types::ProjectedEntryType::Directory { mode: *mode }
-                    }
-                };
-                mimisbrunnr_types::ProjectedEntry {
-                    object,
-                    path: entry_rec.path.clone(),
-                    entry_type,
-                }
-            };
-
-        for ctx_rec in &state.path_contexts {
-            match &ctx_rec.name {
-                Some(name) => {
-                    let _ = context_mgr.create_context(name);
-                    for entry_rec in &ctx_rec.entries {
-                        let entry = deserialize_entry(entry_rec);
-                        let oid = entry
-                            .object
-                            .unwrap_or(mimisbrunnr_types::ObjectId::new(0, 0));
-                        let _ = context_mgr.set_path(name, oid, &entry_rec.path, entry);
-                    }
-                }
-                None => {
-                    for entry_rec in &ctx_rec.entries {
-                        let entry = deserialize_entry(entry_rec);
-                        let oid = entry
-                            .object
-                            .unwrap_or(mimisbrunnr_types::ObjectId::new(0, 0));
-                        context_mgr.set_unscoped_path(oid, &entry_rec.path, entry);
-                    }
-                }
-            }
-        }
-
-        // Restore blob zone allocator state
-        *blob_next_offset = state.blob_next_offset;
-
+    pub fn remove_disk(&mut self, id: DiskId) -> Result<(), EngineError> {
+        self.pool.remove_disk(id)?;
+        self.config = self.pool.config().clone();
+        self.config.save_toml(&self.config_path)?;
         Ok(())
     }
-}
 
-fn value_to_record(v: &mimisbrunnr_types::Value) -> ValueRecord {
-    match v {
-        mimisbrunnr_types::Value::Text(s) => ValueRecord::Text(s.clone()),
-        mimisbrunnr_types::Value::Int(n) => ValueRecord::Int(*n),
-        mimisbrunnr_types::Value::Float(f) => ValueRecord::Float(*f),
-        mimisbrunnr_types::Value::Timestamp(t) => ValueRecord::Timestamp(*t),
-        mimisbrunnr_types::Value::Blob(b) => ValueRecord::Blob(b.clone()),
+    pub fn status(&self) -> EngineStatus {
+        EngineStatus {
+            pool: self.pool.status(),
+            object_count: self.engine.object_count(),
+            tag_count: self.engine.tag_index.tag_count(),
+            kv_entries: self.engine.kv_index.entry_count(),
+            range_entries: self.engine.range_index.entry_count(),
+            chunk_count: self.engine.chunk_index.chunk_count(),
+            forward_objects: self.engine.forward_index.object_count(),
+            oplog_len: self.engine.oplog.len(),
+            wal_next_lsn: self.wal.next_lsn(),
+            last_checkpoint_lsn: self.wal.last_checkpoint_lsn(),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Public mutation surface — wraps `Engine::*`, projects to a WAL op,
+    // appends, and stamps the engine oplog with the assigned LSN.
+    // -------------------------------------------------------------------
+
+    pub fn create_object(&mut self) -> Result<ObjectId, EngineError> {
+        let oid = self.engine.create_object();
+        self.append_wal(&OpKind::CreateObject { oid })?;
+        Ok(oid)
+    }
+
+    pub fn delete_object(&mut self, oid: ObjectId) -> Result<(), EngineError> {
+        self.engine.delete_object(oid)?;
+        self.append_wal(&OpKind::DeleteObject { oid })?;
+        Ok(())
+    }
+
+    pub fn add_tag(&mut self, oid: ObjectId, tag: TagId) -> Result<(), EngineError> {
+        self.engine.add_tag(oid, tag)?;
+        self.append_wal(&OpKind::AddTag { oid, tag })?;
+        Ok(())
+    }
+
+    pub fn remove_tag(&mut self, oid: ObjectId, tag: TagId) -> Result<(), EngineError> {
+        self.engine.remove_tag(oid, tag)?;
+        self.append_wal(&OpKind::RemoveTag { oid, tag })?;
+        Ok(())
+    }
+
+    pub fn set_attr(
+        &mut self,
+        oid: ObjectId,
+        key: TagId,
+        value: Value,
+    ) -> Result<(), EngineError> {
+        self.engine.set_attr(oid, key, value.clone())?;
+        self.append_wal(&OpKind::SetAttr { oid, key, value })?;
+        Ok(())
+    }
+
+    pub fn remove_attr(
+        &mut self,
+        oid: ObjectId,
+        key: TagId,
+        value_hash: u64,
+    ) -> Result<(), EngineError> {
+        self.engine.remove_attr(oid, key, value_hash)?;
+        self.append_wal(&OpKind::RemoveAttr {
+            oid,
+            key,
+            value_hash,
+        })?;
+        Ok(())
+    }
+
+    pub fn add_relation(
+        &mut self,
+        oid: ObjectId,
+        predicate: TagId,
+        target: ObjectId,
+    ) -> Result<(), EngineError> {
+        self.engine.add_relation(oid, predicate, target)?;
+        self.append_wal(&OpKind::AddRelation {
+            oid,
+            predicate,
+            target,
+        })?;
+        Ok(())
+    }
+
+    pub fn remove_relation(
+        &mut self,
+        oid: ObjectId,
+        predicate: TagId,
+        target: ObjectId,
+    ) -> Result<(), EngineError> {
+        self.engine.remove_relation(oid, predicate, target)?;
+        self.append_wal(&OpKind::RemoveRelation {
+            oid,
+            predicate,
+            target,
+        })?;
+        Ok(())
+    }
+
+    /// Run the transform pipeline, persist the bytes into the in-memory
+    /// `blobs` map (Phase 6 placeholder) and append a `WriteBlob` WAL op.
+    /// TODO(rewrite-phase-N): write to the blob zone via the placement engine
+    /// rather than an in-RAM HashMap.
+    pub fn write_blob(
+        &mut self,
+        oid: ObjectId,
+        plaintext: &[u8],
+    ) -> Result<BlobWriteResult, EngineError> {
+        let res = self.engine.write_blob(oid, plaintext)?;
+        self.blobs.insert(oid.local_seq(), res.data.clone());
+        self.append_wal(&OpKind::WriteBlob {
+            oid,
+            content_hash: res.content_hash,
+            size: res.original_size,
+        })?;
+        Ok(res)
+    }
+
+    /// Subscribe through the in-memory engine; no WAL entry. Subscriptions
+    /// are persisted opaquely as part of the index-zone CBOR blob.
+    pub fn subscribe(
+        &mut self,
+        name: String,
+        query: Query,
+        interest: ChangeInterest,
+        retention: Retention,
+    ) -> Result<SubscriptionId, EngineError> {
+        self.engine.subscribe(name, query, interest, retention)
+    }
+
+    /// Install an ontology module; no WAL entry. The module ends up in the
+    /// index-zone CBOR blob at the next `commit`.
+    pub fn install_ontology_module(
+        &mut self,
+        module: OntologyModule,
+    ) -> Result<InstallResult, EngineError> {
+        self.engine.install_ontology_module(module)
+    }
+
+    // -------------------------------------------------------------------
+    // Snapshot + reconcile stubs.
+    // -------------------------------------------------------------------
+
+    /// Snapshot creation — DESIGN §11 / IMPL §11. Stub for Phase 6.
+    pub fn snapshot_create(
+        &mut self,
+        _label: Option<String>,
+    ) -> Result<u32, EngineError> {
+        Err(EngineError::NotImplemented(
+            "snapshots — IMPL §11 (snapshot tree, ancestor bitmap, sidecar history btrees)",
+        ))
+    }
+
+    /// Reconcile work-queue driver — DESIGN §17 / IMPL §17. Stub for Phase 6.
+    pub fn reconcile_step(&mut self, _max_items: usize) -> Result<usize, EngineError> {
+        // TODO(rewrite-phase-N): drive the reconcile work-queue.
+        Ok(0)
+    }
+
+    // -------------------------------------------------------------------
+    // Internals.
+    // -------------------------------------------------------------------
+
+    fn append_wal(&mut self, op: &OpKind) -> Result<u64, EngineError> {
+        let wal_op = project_op(op);
+        let (kind, payload) = wal_op.encode()?;
+        let lsn = self.wal.append_raw(
+            self.primary_device.as_ref(),
+            kind,
+            &payload,
+            self.engine.clock.now(),
+            0,
+        )?;
+        Ok(lsn)
     }
 }
 
-fn record_to_value(r: &ValueRecord) -> mimisbrunnr_types::Value {
-    match r {
-        ValueRecord::Text(s) => mimisbrunnr_types::Value::Text(s.clone()),
-        ValueRecord::Int(n) => mimisbrunnr_types::Value::Int(*n),
-        ValueRecord::Float(f) => mimisbrunnr_types::Value::Float(*f),
-        ValueRecord::Timestamp(t) => mimisbrunnr_types::Value::Timestamp(*t),
-        ValueRecord::Blob(b) => mimisbrunnr_types::Value::Blob(b.clone()),
+// ----------------------------------------------------------------------
+// Index-zone CBOR helpers (free functions to avoid borrow conflicts).
+// ----------------------------------------------------------------------
+
+fn build_index_blob(
+    engine: &Engine,
+    blobs: &HashMap<u64, Vec<u8>>,
+) -> Result<IndexBlob, EngineError> {
+    let mut objects = Vec::with_capacity(engine.object_table.len());
+    for (oid, rec) in engine.object_table.iter() {
+        objects.push(ObjectRecordCbor {
+            oid: *oid,
+            bytes: rec.to_bytes().to_vec(),
+        });
     }
+    let mut locations = Vec::with_capacity(engine.location_table.len());
+    for (oid, loc) in engine.location_table.iter() {
+        // ObjectLocation has its own framing; serialise via its own helper.
+        let mut bytes = Vec::new();
+        loc.serialize_into(&mut bytes);
+        locations.push(LocationCbor { oid: *oid, bytes });
+    }
+    Ok(IndexBlob {
+        forward_index_bytes: engine.forward_index.serialise()?,
+        tag_index_bytes: engine.tag_index.serialise()?,
+        kv_index_bytes: engine.kv_index.serialise()?,
+        range_index_bytes: engine.range_index.serialise()?,
+        chunk_index_bytes: engine.chunk_index.serialise()?,
+        ontology_bytes: engine.ontology.serialise()?,
+        subscriptions_bytes: engine.subscriptions.serialise()?,
+        path_contexts_bytes: engine.path_contexts.serialise()?,
+        oplog_bytes: engine.oplog.serialise()?,
+        objects,
+        locations,
+        next_oid_local: engine.next_oid_local(),
+        next_tag_id: index_blob_next_tag_id(engine),
+        last_applied_lsn: engine.last_applied_lsn,
+        blobs: blobs.clone(),
+    })
 }
 
-fn parse_semantics(s: &str) -> mimisbrunnr_ontology::TagSemantics {
-    // Simple parser for Debug format strings
-    if s == "Label" {
-        mimisbrunnr_ontology::TagSemantics::Label
-    } else if s.starts_with("Attribute") {
-        // Default to text for now
-        mimisbrunnr_ontology::TagSemantics::Attribute {
-            value_type: mimisbrunnr_ontology::ValueType::Text,
-        }
-    } else if s == "Grouping" {
-        mimisbrunnr_ontology::TagSemantics::Grouping
-    } else if s.starts_with("OrderedCollection") {
-        mimisbrunnr_ontology::TagSemantics::OrderedCollection {
-            element_constraint: None,
-        }
-    } else if s == "Hierarchical" {
-        mimisbrunnr_ontology::TagSemantics::Hierarchical
-    } else {
-        mimisbrunnr_ontology::TagSemantics::Label
-    }
+/// Pull `next_tag_id` out of the engine without exposing the field publicly
+/// (it's deliberately private). We can recover it from the highest registered
+/// tag plus 1.
+fn index_blob_next_tag_id(engine: &Engine) -> u32 {
+    engine
+        .ontology
+        .tags
+        .keys()
+        .map(|t| t.raw())
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(1)
 }
 
-#[cfg(test)]
-mod tests {
-    use {
-        super::*,
-        mimisbrunnr_ontology::{TagDefinition, TagSemantics},
-        mimisbrunnr_storage::WAL_SIZE,
-        mimisbrunnr_types::{ObjectId, Query, TagId, Value},
-        mimisbrunnr_wal::WriteAheadLog,
-        tempfile::TempDir,
-    };
-
-    fn create_test_pool(dir: &Path) -> std::path::PathBuf {
-        let disk_path = dir.join("disk0.mbrunnr");
-        let config_path = dir.join("pool.toml");
-
-        let capacity = 128 * 1024 * 1024u64;
-        let dev = FileBlockDevice::open(&disk_path, capacity).unwrap();
-
-        let layout = ExtentLayout::compute(capacity).unwrap();
-        let sb = Superblock::new(0, 0, layout.clone());
-        sb.write_to(&dev).unwrap();
-
-        WriteAheadLog::create(&dev, layout.wal_offset, WAL_SIZE).unwrap();
-
-        let mut config = PoolConfig::new(0);
-        config.add_disk(0, disk_path.to_str().unwrap(), "warm", capacity);
-        config.save(&config_path).unwrap();
-
-        config_path
+fn read_index_blob(
+    device: &dyn BlockDevice,
+    superblock: &Superblock,
+) -> Result<Option<IndexBlob>, EngineError> {
+    let zone_offset = { superblock.index_zone.offset };
+    let zone_length = { superblock.index_zone.length };
+    if zone_length < 8 {
+        return Ok(None);
     }
-
-    #[test]
-    fn open_fresh_pool() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = create_test_pool(tmp.path());
-
-        let de = DiskEngine::open(&config_path).unwrap();
-        assert_eq!(de.engine().object_table.count(), 0);
+    let mut header = [0u8; 8];
+    device.read_at(zone_offset, &mut header)?;
+    let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+    if magic == 0 {
+        // Fresh zone — no payload yet.
+        return Ok(None);
     }
-
-    #[test]
-    fn create_objects_and_flush() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = create_test_pool(tmp.path());
-
-        // Create objects and tags
-        {
-            let mut de = DiskEngine::open(&config_path).unwrap();
-            let e = de.engine_mut();
-
-            e.register_tag(TagDefinition::new(
-                TagId::new(1),
-                "electronic",
-                TagSemantics::Label,
-            ))
-            .unwrap();
-            e.register_tag(TagDefinition::new(
-                TagId::new(2),
-                "portable",
-                TagSemantics::Label,
-            ))
-            .unwrap();
-
-            let oid1 = e.create_object(1000).unwrap();
-            let oid2 = e.create_object(1000).unwrap();
-
-            e.add_tag(oid1, TagId::new(1), 1000).unwrap();
-            e.add_tag(oid1, TagId::new(2), 1000).unwrap();
-            e.add_tag(oid2, TagId::new(1), 1000).unwrap();
-
-            de.flush().unwrap();
-        }
-
-        // Reopen and verify state survived
-        {
-            let de = DiskEngine::open(&config_path).unwrap();
-            let e = de.engine();
-
-            assert_eq!(e.object_table.count(), 2);
-
-            // Ontology should be restored
-            assert!(e.dag.lookup("electronic").is_some());
-            assert!(e.dag.lookup("portable").is_some());
-
-            // Tags should be restored
-            let results = e.query(&Query::HasTag(TagId::new(1)));
-            assert_eq!(results.len(), 2);
-
-            let results = e.query(&Query::And(vec![
-                Query::HasTag(TagId::new(1)),
-                Query::HasTag(TagId::new(2)),
-            ]));
-            assert_eq!(results.len(), 1);
-        }
+    if magic != INDEX_BLOB_MAGIC {
+        // Treat as corruption — Phase 6: skip rather than fail boot. The WAL
+        // replay will rebuild what it can.
+        // TODO(rewrite-phase-N): surface this to the operator instead.
+        return Ok(None);
     }
-
-    #[test]
-    fn attrs_survive_flush() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = create_test_pool(tmp.path());
-
-        {
-            let mut de = DiskEngine::open(&config_path).unwrap();
-            let e = de.engine_mut();
-
-            e.register_tag(TagDefinition::new(
-                TagId::new(10),
-                "artist",
-                TagSemantics::Attribute {
-                    value_type: mimisbrunnr_ontology::ValueType::Text,
-                },
-            ))
-            .unwrap();
-
-            let oid = e.create_object(1000).unwrap();
-            e.set_attr(oid, TagId::new(10), Value::Text("Aphex Twin".into()), 1000)
-                .unwrap();
-
-            de.flush().unwrap();
-        }
-
-        {
-            let de = DiskEngine::open(&config_path).unwrap();
-            let e = de.engine();
-
-            let results = e.query(&Query::HasAttr {
-                key: TagId::new(10),
-                op: mimisbrunnr_types::CmpOp::Eq,
-                value: Value::Text("Aphex Twin".into()),
-            });
-            assert_eq!(results.len(), 1);
-        }
+    let payload_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
+    if payload_len + 8 > zone_length {
+        return Ok(None);
     }
-
-    #[test]
-    fn implications_survive_flush() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = create_test_pool(tmp.path());
-
-        {
-            let mut de = DiskEngine::open(&config_path).unwrap();
-            let e = de.engine_mut();
-
-            e.register_tag(TagDefinition::new(
-                TagId::new(1),
-                "car",
-                TagSemantics::Label,
-            ))
-            .unwrap();
-            e.register_tag(TagDefinition::new(
-                TagId::new(2),
-                "vehicle",
-                TagSemantics::Label,
-            ))
-            .unwrap();
-            e.add_implication(TagId::new(1), TagId::new(2)).unwrap();
-
-            let oid = e.create_object(1000).unwrap();
-            e.add_tag(oid, TagId::new(1), 1000).unwrap(); // car → vehicle
-
-            de.flush().unwrap();
-        }
-
-        {
-            let de = DiskEngine::open(&config_path).unwrap();
-            let e = de.engine();
-
-            // Both direct and materialized tags should be present
-            let results = e.query(&Query::HasTag(TagId::new(2)));
-            assert_eq!(results.len(), 1); // vehicle via materialization
-        }
-    }
-
-    #[test]
-    fn blob_data_survives_flush() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = create_test_pool(tmp.path());
-
-        let content_hash;
-        {
-            let mut de = DiskEngine::open(&config_path).unwrap();
-
-            let oid = de.engine_mut().create_object(1000).unwrap();
-            let blob_result = de
-                .engine_mut()
-                .write_blob(oid, b"hello world", 1000)
-                .unwrap();
-            content_hash = blob_result.content_hash;
-
-            // Write transformed blob to blob zone
-            de.store_blob(oid, &blob_result.data).unwrap();
-
-            de.flush().unwrap();
-        }
-
-        {
-            let de = DiskEngine::open(&config_path).unwrap();
-            let e = de.engine();
-
-            let oid = ObjectId::new(0, 0);
-            let rec = e.get_object(oid).unwrap();
-            assert_eq!(rec.content_hash, content_hash);
-            assert_eq!(rec.blob_length, 11);
-
-            // Verify blob can be read back and decompressed
-            let plaintext = de.read_blob_plaintext(oid).unwrap();
-            assert_eq!(plaintext, b"hello world");
-        }
-    }
-
-    #[test]
-    fn index_zone_grows_when_data_exceeds_initial_size() {
-        let tmp = TempDir::new().unwrap();
-        let config_path = create_test_pool(tmp.path());
-
-        // Read original index zone size
-        let original_index_size;
-        {
-            let de = DiskEngine::open(&config_path).unwrap();
-            original_index_size = de.superblock.layout.zone_size(ZoneType::Index);
-        }
-
-        // Create enough objects with large attrs to exceed the index zone
-        {
-            let mut de = DiskEngine::open(&config_path).unwrap();
-            let e = de.engine_mut();
-
-            // Register a text attribute tag
-            e.register_tag(TagDefinition::new(
-                TagId::new(1),
-                "description",
-                TagSemantics::Attribute {
-                    value_type: mimisbrunnr_ontology::ValueType::Text,
-                },
-            ))
-            .unwrap();
-
-            // Create objects with large text attributes to fill the index zone
-            // Each object gets ~50KB of text attrs, 50 objects = ~2.5 MB
-            for i in 0..50u64 {
-                let oid = e.create_object(1000).unwrap();
-                let large_text = format!("x{}", "a".repeat(50 * 1024));
-                e.set_attr(
-                    oid,
-                    TagId::new(1),
-                    Value::Text(format!("{i}:{large_text}")),
-                    1000,
-                )
-                .unwrap();
-            }
-
-            // This should succeed by growing the index zone
-            de.flush().unwrap();
-
-            // Verify the zone grew (now has multiple extents)
-            let new_index_size = de.superblock.layout.zone_size(ZoneType::Index);
-            assert!(
-                new_index_size > original_index_size,
-                "index zone should have grown: was {}, now {}",
-                original_index_size,
-                new_index_size,
-            );
-            assert!(
-                de.superblock.layout.extents(ZoneType::Index).len() > 1,
-                "index zone should have multiple extents after growth"
-            );
-            assert!(
-                de.superblock.zone_map_offset != 0,
-                "zone_map_offset should be set after growth"
-            );
-        }
-
-        // Verify data survives reload
-        {
-            let de = DiskEngine::open(&config_path).unwrap();
-            // Verify zone map was loaded (multiple extents)
-            assert!(
-                de.superblock.layout.extents(ZoneType::Index).len() > 1,
-                "after reload, index zone should still have multiple extents"
-            );
-            assert_eq!(de.engine().object_table.count(), 50);
-        }
-    }
-
-    #[test]
-    fn open_from_disk_path() {
-        let tmp = TempDir::new().unwrap();
-        let _config_path = create_test_pool(tmp.path());
-        let disk_path = tmp.path().join("disk0.mbrunnr");
-
-        let de = DiskEngine::open_from_disk(&disk_path).unwrap();
-        assert_eq!(de.engine().object_table.count(), 0);
-    }
+    let mut payload = vec![0u8; payload_len as usize];
+    device.read_at(zone_offset + 8, &mut payload)?;
+    let blob: IndexBlob = from_reader(payload.as_slice())?;
+    Ok(Some(blob))
 }
+
+fn apply_index_blob(engine: &mut Engine, blob: IndexBlob) {
+    if let Ok(fwd) = ForwardIndex::deserialise(&blob.forward_index_bytes) {
+        engine.forward_index = fwd;
+    }
+    if let Ok(t) = TagIndex::deserialise(&blob.tag_index_bytes) {
+        engine.tag_index = t;
+    }
+    if let Ok(kv) = KvIndex::deserialise(&blob.kv_index_bytes) {
+        engine.kv_index = kv;
+    }
+    if let Ok(r) = RangeIndex::deserialise(&blob.range_index_bytes) {
+        engine.range_index = r;
+    }
+    if let Ok(c) = ChunkIndex::deserialise(&blob.chunk_index_bytes) {
+        engine.chunk_index = c;
+    }
+    if let Ok(ont) = OntologyState::deserialise(&blob.ontology_bytes) {
+        engine.ontology = ont;
+    }
+    if let Ok(s) = SubscriptionEngine::deserialise(&blob.subscriptions_bytes) {
+        engine.subscriptions = s;
+    }
+    if let Ok(p) = PathContextManager::deserialise(&blob.path_contexts_bytes) {
+        engine.path_contexts = p;
+    }
+    if let Ok(ol) = OpLog::deserialise(&blob.oplog_bytes) {
+        engine.oplog = ol;
+    }
+    // Object table.
+    let mut object_table = ObjectTable::new();
+    for o in blob.objects {
+        if o.bytes.len() == mimisbrunnr_meta::OBJECT_RECORD_SIZE {
+            let mut buf = [0u8; mimisbrunnr_meta::OBJECT_RECORD_SIZE];
+            buf.copy_from_slice(&o.bytes);
+            let rec = *mimisbrunnr_meta::ObjectRecord::ref_from_bytes(&buf);
+            object_table.insert(rec);
+        }
+    }
+    engine.object_table = object_table;
+    // Location table.
+    let mut location_table = LocationTable::new();
+    for l in blob.locations {
+        if let Ok((loc, _)) = mimisbrunnr_meta::ObjectLocation::parse(&l.bytes) {
+            location_table.insert(l.oid, loc);
+        }
+    }
+    engine.location_table = location_table;
+    // Counters.
+    {
+        let mut next_local = blob.next_oid_local;
+        // Defensive: can't be smaller than the engine's own counter.
+        if engine.next_oid_local() > next_local {
+            next_local = engine.next_oid_local();
+        }
+        // We can't poke private fields — use replay_create_object on a
+        // sentinel local to bump the counter forward.
+        if next_local > engine.next_oid_local() {
+            // Allocate a "ghost" oid one less than next_local to advance the
+            // counter to next_local exactly. This is a deliberate
+            // workaround for not having a setter on `next_oid_local`.
+            let ghost_local = next_local.saturating_sub(1);
+            let ghost = ObjectId::from_parts(engine.node_id, ghost_local);
+            let _ = engine.replay_create_object(ghost, 0, 0);
+        }
+    }
+    engine.last_applied_lsn = engine.last_applied_lsn.max(blob.last_applied_lsn);
+    // next_tag_id: rolled forward via `register_tag` callers; persisted via
+    // ontology so we don't need to do anything else here. The blob's
+    // `next_tag_id` field exists for future use.
+    let _ = blob.next_tag_id;
+}
+

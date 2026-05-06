@@ -2153,7 +2153,6 @@ dependencies = [
 name = "mimisbrunnr-engine"
 version = "0.1.0"
 dependencies = [
- "arbitrary-int",
  "ciborium",
  "log",
  "mimisbrunnr-index",
@@ -2164,7 +2163,10 @@ dependencies = [
  "mimisbrunnr-storage",
  "mimisbrunnr-transform",
  "mimisbrunnr-types",
+ "mimisbrunnr-unix",
  "mimisbrunnr-wal",
+ "mimisbrunnr-watch",
+ "roaring",
  "serde",
  "tempfile",
  "thiserror 2.0.18",

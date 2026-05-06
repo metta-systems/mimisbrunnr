@@ -1,814 +1,826 @@
-use {
-    mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex},
-    mimisbrunnr_meta::ObjectTable,
-    mimisbrunnr_ontology::{ImplicationDag, Materializer},
-    mimisbrunnr_pool::PlacementRule,
-    mimisbrunnr_query::QueryExecutor,
-    mimisbrunnr_transform::{CompressionAlgo, EncryptionMode, TransformPipeline},
-    mimisbrunnr_types::{
-        Assertion, CompressionState, HybridTimestamp, ObjectId, ObjectState, Query, TagId,
-        TagOrigin, Value,
-    },
-};
+//! [`Engine`] — central in-memory state holder (DESIGN §15).
+//!
+//! Owns every in-memory mirror (object table, location table, all five
+//! indices, ontology state, subscriptions, path contexts, oplog) plus the
+//! HLC clock and the transform pipeline configuration. Mutations land in the
+//! mirrors first; the durable WAL append happens at the [`crate::DiskEngine`]
+//! layer.
 
-use {
-    crate::{
-        error::EngineError,
-        oplog::{OpKind, OpLog, OpLogEntry},
-    },
-    log::trace,
+use mimisbrunnr_index::{ChunkIndex, ForwardIndex, KvIndex, RangeIndex, TagIndex};
+use mimisbrunnr_meta::{LocationTable, OBJECT_RECORD_SIZE, ObjectRecord, ObjectTable};
+use mimisbrunnr_ontology::{IdAllocator, InstallResult, OntologyModule, OntologyState};
+use mimisbrunnr_query::QueryExecutor;
+use mimisbrunnr_transform::{TransformPipeline, TransformResult};
+use mimisbrunnr_types::{
+    Assertion, ChangeInterest, NodeId, ObjectId, ObjectState, Query, SubscriptionId, TagDefinition,
+    TagId, TagOrigin, TagSemantics, Value,
 };
+use mimisbrunnr_unix::PathContextManager;
+use mimisbrunnr_watch::{Retention, SubscriptionEngine};
+use roaring::RoaringBitmap;
 
-/// Result of writing blob data through the transform pipeline.
+use crate::{EngineError, OpKind, OpLog, clock::HybridClock, oplog::DEFAULT_OPLOG_CAPACITY};
+use crate::wal_proj::engine_value_hash;
+
+/// Result of [`Engine::write_blob`]: the post-transform metadata. The engine
+/// itself does not own the blob bytes — those land in
+/// [`crate::DiskEngine::blobs`].
+#[derive(Debug, Clone)]
 pub struct BlobWriteResult {
-    /// BLAKE3 hash of the original plaintext.
     pub content_hash: [u8; 32],
-    /// Transformed (compressed/encrypted/padded) data ready for disk storage.
+    pub original_size: u64,
+    pub stored_size: u64,
+    /// Post-transform bytes (compressed / padded / encrypted as configured).
     pub data: Vec<u8>,
-    /// Original plaintext size.
-    pub original_size: usize,
-    /// Size after compression (before padding).
-    pub compressed_size: usize,
-    /// Final on-disk size (after padding to sector alignment).
-    pub stored_size: usize,
 }
 
-/// The main storage engine, tying all layers together.
-///
-/// Provides object CRUD, tagging, querying, and the 4-phase deletion protocol.
-/// All mutations are recorded in the oplog for subscription catch-up.
-/// Compression is determined per-object by evaluating placement rules
-/// against the object's tags (ontology-driven storage).
+/// In-memory engine state.
 pub struct Engine {
-    /// Object metadata table.
     pub object_table: ObjectTable,
-    /// Tag inverted index (bitmap per tag).
-    pub tag_index: TagIndex,
-    /// Forward index (object → assertions).
+    pub location_table: LocationTable,
     pub forward_index: ForwardIndex,
-    /// Key-value equality index.
+    pub tag_index: TagIndex,
     pub kv_index: KvIndex,
-    /// Ontology: tag definitions and implication DAG.
-    pub dag: ImplicationDag,
-    /// Operation log for subscriptions.
+    pub range_index: RangeIndex,
+    pub chunk_index: ChunkIndex,
+    pub ontology: OntologyState,
+    pub subscriptions: SubscriptionEngine,
+    pub path_contexts: PathContextManager,
     pub oplog: OpLog,
-    /// HLC clock for this node.
-    clock: HybridTimestamp,
-    /// This node's ID.
-    node_id: u64,
-    /// Placement rules (including compression rules).
-    placement_rules: Vec<PlacementRule>,
-    /// Default compression for objects not matching any Compress rule.
-    default_compression: CompressionAlgo,
-    /// Encryption mode for blob data.
-    encryption: EncryptionMode,
-    /// Encryption key.
-    encryption_key: [u8; 32],
+    pub clock: HybridClock,
+    pub node_id: NodeId,
+    pub transform: TransformPipeline,
+    /// Monotonic local sequence counter for newly minted ObjectIds.
+    next_oid_local: u64,
+    /// Allocator base for `register_tag` (ad-hoc tags).
+    next_tag_id: u32,
+    /// LSN of the most recently *replayed* WAL entry — used to make replay
+    /// idempotent. Live mutations don't bump this (they go through the
+    /// `record_*` helpers in `DiskEngine` instead).
+    pub last_applied_lsn: u64,
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("node_id", &self.node_id)
+            .field("next_oid_local", &self.next_oid_local)
+            .field("next_tag_id", &self.next_tag_id)
+            .field("last_applied_lsn", &self.last_applied_lsn)
+            .field("object_count", &self.object_table.len())
+            .field("oplog_len", &self.oplog.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Engine {
-    /// Create a new in-memory engine (no disk backing yet).
-    pub fn new(node_id: u64) -> Self {
+    /// New empty engine attributing all events to `node_id`.
+    pub fn new(node_id: NodeId) -> Self {
         Self {
-            // 1M record capacity for in-memory use
-            object_table: ObjectTable::new(0, 128 * 1024 * 1024),
-            tag_index: TagIndex::new(),
+            object_table: ObjectTable::new(),
+            location_table: LocationTable::new(),
             forward_index: ForwardIndex::new(),
+            tag_index: TagIndex::new(),
             kv_index: KvIndex::new(),
-            dag: ImplicationDag::new(),
-            oplog: OpLog::new(),
-            clock: HybridTimestamp::new(0, 0, node_id),
+            range_index: RangeIndex::new(),
+            chunk_index: ChunkIndex::new(),
+            ontology: OntologyState::new(),
+            subscriptions: SubscriptionEngine::new(),
+            path_contexts: PathContextManager::new(),
+            oplog: OpLog::new(DEFAULT_OPLOG_CAPACITY),
+            clock: HybridClock::new(node_id),
             node_id,
-            placement_rules: Vec::new(),
-            default_compression: CompressionAlgo::Zstd(3),
-            encryption: EncryptionMode::None,
-            encryption_key: [0u8; 32],
+            transform: TransformPipeline::passthrough(),
+            next_oid_local: 1,
+            next_tag_id: 1,
+            last_applied_lsn: 0,
         }
     }
 
-    /// Set the default compression algorithm for objects not matching any rule.
-    pub fn set_default_compression(&mut self, algo: CompressionAlgo) {
-        self.default_compression = algo;
+    /// Override the transform pipeline (compression / encryption choice). The
+    /// default is [`TransformPipeline::passthrough`].
+    pub fn set_transform(&mut self, pipeline: TransformPipeline) {
+        self.transform = pipeline;
     }
 
-    /// Set encryption mode and key for blob data.
-    pub fn set_encryption(&mut self, mode: EncryptionMode, key: [u8; 32]) {
-        self.encryption = mode;
-        self.encryption_key = key;
+    // ----------------------------------------------------------------------
+    // Mutation API. Each call updates the mirrors *and* the in-memory oplog;
+    // WAL append is the DiskEngine's job.
+    // ----------------------------------------------------------------------
+
+    /// Allocate a fresh `ObjectId` and insert an Active `ObjectRecord`.
+    pub fn create_object(&mut self) -> ObjectId {
+        let local = self.next_oid_local;
+        self.next_oid_local = self.next_oid_local.saturating_add(1);
+        let oid = ObjectId::from_parts(self.node_id, local);
+
+        let ts = self.clock.now();
+        let mut rec = ObjectRecord::new(oid.to_u64());
+        rec.set_state(ObjectState::Active);
+        rec.created_ns = ts.physical_ns;
+        rec.modified_ns = ts.physical_ns;
+        self.object_table.insert(rec);
+
+        // Engine-level oplog. LSN 0 — DiskEngine overwrites with the WAL LSN
+        // when persisted.
+        self.oplog
+            .record(OpKind::CreateObject { oid }, 0, ts);
+
+        // Subscription hook: object birth.
+        self.subscriptions
+            .on_object_created(oid, 0, ts.physical_ns);
+        oid
     }
 
-    /// Add a placement rule.
-    pub fn add_rule(&mut self, rule: PlacementRule) {
-        self.placement_rules.push(rule);
-    }
-
-    /// Get all placement rules.
-    pub fn rules(&self) -> &[PlacementRule] {
-        &self.placement_rules
-    }
-
-    /// Resolve the compression algorithm for an object based on placement rules.
-    ///
-    /// Evaluates Compress rules in order against the object's current tags.
-    /// First matching rule wins. Returns default_compression if no rule matches.
-    pub fn resolve_compression(&self, oid: ObjectId) -> CompressionAlgo {
-        let executor = QueryExecutor::new(&self.tag_index, &self.kv_index, &self.dag);
-        let obj_local = oid.local() as u32;
-
-        for rule in &self.placement_rules {
-            if let PlacementRule::Compress { query, algo } = rule {
-                let result = executor.execute(query);
-                if result.contains(obj_local) {
-                    return *algo;
-                }
-            }
-        }
-
-        self.default_compression
-    }
-
-    /// Build a transform pipeline for a specific compression algorithm.
-    fn pipeline_for(&self, compression: CompressionAlgo) -> TransformPipeline {
-        TransformPipeline::new(compression, self.encryption, self.encryption_key)
-    }
-
-    /// Advance the clock and return the new timestamp.
-    fn tick(&mut self, now_ms: u64) -> HybridTimestamp {
-        self.clock.tick(now_ms);
-        self.clock
-    }
-
-    fn emit_op(&mut self, now_ms: u64, op: OpKind) -> u64 {
-        let ts = self.tick(now_ms);
-        let lsn = self.oplog.len() as u64 + 1;
-        self.oplog.push(OpLogEntry {
-            timestamp: ts,
-            lsn,
-            op,
-        });
-        lsn
-    }
-
-    // ── Object CRUD ────────────────────────────────────────────────
-
-    /// Create a new object. Returns its ObjectId.
-    pub fn create_object(&mut self, now_ms: u64) -> Result<ObjectId, EngineError> {
-        trace!("engine::create_object");
-        let oid = self.object_table.create(self.node_id)?;
-        trace!("engine::create_object -> {oid}");
-        let rec = self.object_table.get_mut(oid).unwrap();
-        rec.created_ns = (now_ms as i64) * 1_000_000;
-        rec.modified_ns = rec.created_ns;
-
-        self.emit_op(now_ms, OpKind::CreateObject { oid });
-        Ok(oid)
-    }
-
-    /// Delete an object (phase 1: tombstone).
-    pub fn delete_object(&mut self, oid: ObjectId, now_ms: u64) -> Result<(), EngineError> {
-        trace!("engine::delete_object oid={oid}");
+    /// Delete `oid`: tombstone the record, drop assertions from every index,
+    /// emit subscription hooks. Per DESIGN §7 the ID is **never** reused.
+    pub fn delete_object(&mut self, oid: ObjectId) -> Result<(), EngineError> {
+        let raw = oid.to_u64();
         let rec = self
             .object_table
-            .get_mut(oid)
+            .get_mut(raw)
             .ok_or(EngineError::ObjectNotFound(oid))?;
-
-        if rec.state() != ObjectState::Active {
-            return Err(EngineError::ObjectDeleted(oid));
-        }
-
-        // Phase 1: Tombstone
+        let ts = self.clock.now();
         rec.set_state(ObjectState::Tombstoned);
+        rec.modified_ns = ts.physical_ns;
 
-        // Phase 2: Index cleanup — remove from all bitmaps using forward index
-        let entries = self.forward_index.remove_object(oid);
-        let obj_local = oid.local() as u32;
-        for entry in &entries {
-            match &entry.assertion {
-                Assertion::Tag(tag) => {
-                    self.tag_index.untag_object(*tag, obj_local);
-                }
-                Assertion::Attr { key, value } => {
-                    self.kv_index.remove(*key, value, obj_local);
-                }
-                Assertion::Relation { .. } => {}
+        // Drop from indices.
+        self.tag_index.remove_object_from_all(oid);
+        // KV / range index entries are keyed by `(tag, value_hash)` — strip
+        // every Attr assertion observed in the forward index.
+        let assertions = self.forward_index.assertions_of(oid).to_vec();
+        for (a, _origin) in &assertions {
+            if let Assertion::Attr { key, value } = a {
+                let local32 = (raw & 0xffff_ffff) as u32;
+                self.kv_index.remove(*key, value, local32);
+                self.range_index.remove(*key, value, local32);
             }
         }
+        let _ = self.forward_index.remove_object(oid);
+        self.location_table.remove(raw);
 
-        self.emit_op(now_ms, OpKind::DeleteObject { oid });
+        self.oplog
+            .record(OpKind::DeleteObject { oid }, 0, ts);
+        self.subscriptions
+            .on_object_deleted(oid, 0, ts.physical_ns);
         Ok(())
     }
 
-    /// Get object info.
-    pub fn get_object(
-        &self,
-        oid: ObjectId,
-    ) -> Result<&mimisbrunnr_meta::ObjectRecord, EngineError> {
-        self.object_table
-            .get(oid)
-            .filter(|r| r.state() == ObjectState::Active)
-            .ok_or(EngineError::ObjectNotFound(oid))
-    }
+    /// Add a Direct tag and apply the ontology's implication closure as
+    /// Materialized tags.
+    pub fn add_tag(&mut self, oid: ObjectId, tag: TagId) -> Result<(), EngineError> {
+        let raw = oid.to_u64();
+        if self.object_table.get(raw).is_none() {
+            return Err(EngineError::ObjectNotFound(oid));
+        }
+        let ts = self.clock.now();
+        let closure = self.ontology.materialise(&[tag]);
+        let closure_count = closure.len() as u16;
 
-    // ── Tagging ────────────────────────────────────────────────────
+        // Insert all closure tags. The original `tag` carries Direct; every
+        // other closure member is Materialized.
+        for closure_tag in &closure {
+            let origin = if *closure_tag == tag {
+                TagOrigin::Direct
+            } else {
+                TagOrigin::Materialized
+            };
+            // Forward index: skip duplicates (HasTag idempotent).
+            let already = self
+                .forward_index
+                .assertions_of(oid)
+                .iter()
+                .any(|(a, _)| matches!(a, Assertion::Tag(t) if *t == *closure_tag));
+            if !already {
+                self.forward_index
+                    .add_assertion(oid, Assertion::Tag(*closure_tag), origin);
+                self.tag_index.add_member(*closure_tag, oid);
+            }
+        }
+        // Watch hook only for the Direct tag — materialised tags are
+        // recoverable from ontology + direct tag, so a separate hook would
+        // double-fire.
+        self.subscriptions
+            .on_tag_added(oid, tag, 0, ts.physical_ns);
 
-    /// Add a tag to an object, with automatic materialization of implied tags.
-    pub fn add_tag(
-        &mut self,
-        oid: ObjectId,
-        tag: TagId,
-        now_ms: u64,
-    ) -> Result<Vec<TagId>, EngineError> {
-        trace!("engine::add_tag oid={oid} tag={tag}");
-        self.ensure_active(oid)?;
-        let obj_local = oid.local() as u32;
-
-        // Add direct tag
-        self.tag_index.tag_object(tag, obj_local);
-        self.forward_index
-            .add(oid, Assertion::Tag(tag), TagOrigin::Direct);
-
-        // Materialize implied tags
-        let materialized = Materializer::materialize_tag(
-            &self.dag,
-            &mut self.tag_index,
-            &mut self.forward_index,
-            oid,
-            tag,
-        );
-        trace!(
-            "engine::add_tag materialized {} implied tags",
-            materialized.len()
-        );
-
-        // Update record
-        if let Some(rec) = self.object_table.get_mut(oid) {
-            rec.tag_count = self.forward_index.tag_ids(oid).len() as u16;
-            rec.modified_ns = (now_ms as i64) * 1_000_000;
+        // ObjectRecord bookkeeping.
+        if let Some(rec) = self.object_table.get_mut(raw) {
+            rec.tag_count = rec.tag_count.saturating_add(closure_count);
+            rec.modified_ns = ts.physical_ns;
         }
 
-        self.emit_op(now_ms, OpKind::AddTag { oid, tag });
-        Ok(materialized)
+        self.oplog.record(OpKind::AddTag { oid, tag }, 0, ts);
+        Ok(())
     }
 
-    /// Remove a tag from an object, with de-materialization.
-    pub fn remove_tag(
-        &mut self,
-        oid: ObjectId,
-        tag: TagId,
-        now_ms: u64,
-    ) -> Result<Vec<TagId>, EngineError> {
-        trace!("engine::remove_tag oid={oid} tag={tag}");
-        self.ensure_active(oid)?;
-        let obj_local = oid.local() as u32;
+    /// Remove a tag. **Semantics**: removing a Direct tag also removes the
+    /// Materialized tags that this Direct tag *uniquely* sourced — i.e. any
+    /// implied tag that no other Direct tag still implies stays gone, others
+    /// stay. Removing a Materialized tag directly is allowed but only
+    /// removes that single edge (it may reappear after another `add_tag`).
+    pub fn remove_tag(&mut self, oid: ObjectId, tag: TagId) -> Result<(), EngineError> {
+        let raw = oid.to_u64();
+        if self.object_table.get(raw).is_none() {
+            return Err(EngineError::ObjectNotFound(oid));
+        }
+        let ts = self.clock.now();
 
-        // Remove direct tag
-        self.tag_index.untag_object(tag, obj_local);
-        self.forward_index.remove(oid, &Assertion::Tag(tag));
+        let was_direct = self
+            .forward_index
+            .assertions_of(oid)
+            .iter()
+            .any(|(a, o)| matches!(a, Assertion::Tag(t) if *t == tag) && *o == TagOrigin::Direct);
 
-        // De-materialize tags no longer justified
-        let dematerialized = Materializer::dematerialize_tag(
-            &self.dag,
-            &mut self.tag_index,
-            &mut self.forward_index,
-            oid,
-            tag,
-        );
-
-        // Update record
-        if let Some(rec) = self.object_table.get_mut(oid) {
-            rec.tag_count = self.forward_index.tag_ids(oid).len() as u16;
-            rec.modified_ns = (now_ms as i64) * 1_000_000;
+        if self
+            .forward_index
+            .remove_assertion(oid, &Assertion::Tag(tag))
+        {
+            self.tag_index.remove_member(tag, oid);
         }
 
-        self.emit_op(now_ms, OpKind::RemoveTag { oid, tag });
-        Ok(dematerialized)
+        if was_direct {
+            let surviving_direct: Vec<TagId> = self.forward_index.direct_tags(oid);
+            let mut still_implied = std::collections::BTreeSet::new();
+            for t in &surviving_direct {
+                for c in self.ontology.materialise(&[*t]) {
+                    still_implied.insert(c);
+                }
+            }
+            let materialized_now: Vec<TagId> = self.forward_index.materialized_tags(oid);
+            for m in materialized_now {
+                if !still_implied.contains(&m)
+                    && self
+                        .forward_index
+                        .remove_assertion(oid, &Assertion::Tag(m))
+                {
+                    self.tag_index.remove_member(m, oid);
+                }
+            }
+        }
+
+        if let Some(rec) = self.object_table.get_mut(raw) {
+            rec.tag_count = rec.tag_count.saturating_sub(1);
+            rec.modified_ns = ts.physical_ns;
+        }
+
+        self.subscriptions
+            .on_tag_removed(oid, tag, 0, ts.physical_ns);
+        self.oplog.record(OpKind::RemoveTag { oid, tag }, 0, ts);
+        Ok(())
     }
 
-    // ── Attributes ─────────────────────────────────────────────────
-
-    /// Set an attribute on an object.
+    /// Set / overwrite an attribute. Updates kv-index and range-index, and
+    /// records a forward-index `Attr` assertion (Direct origin).
     pub fn set_attr(
         &mut self,
         oid: ObjectId,
         key: TagId,
         value: Value,
-        now_ms: u64,
     ) -> Result<(), EngineError> {
-        trace!("engine::set_attr oid={oid} key={key}");
-        self.ensure_active(oid)?;
-        let obj_local = oid.local() as u32;
+        let raw = oid.to_u64();
+        if self.object_table.get(raw).is_none() {
+            return Err(EngineError::ObjectNotFound(oid));
+        }
+        let ts = self.clock.now();
+        let local32 = (raw & 0xffff_ffff) as u32;
+        self.forward_index.add_assertion(
+            oid,
+            Assertion::Attr {
+                key,
+                value: value.clone(),
+            },
+            TagOrigin::Direct,
+        );
+        self.kv_index.insert(key, &value, local32);
+        self.range_index.insert(key, &value, local32);
 
-        // Remove previous value for this key (if any) from kv index
-        let existing: Vec<_> = self
-            .forward_index
-            .get(oid)
-            .iter()
-            .filter_map(|e| match &e.assertion {
-                Assertion::Attr { key: k, value: v } if *k == key => Some(v.clone()),
-                _ => None,
-            })
-            .collect();
-        for old_val in &existing {
-            self.kv_index.remove(key, old_val, obj_local);
-            self.forward_index.remove(
-                oid,
-                &Assertion::Attr {
-                    key,
-                    value: old_val.clone(),
-                },
-            );
+        if let Some(rec) = self.object_table.get_mut(raw) {
+            rec.attr_count = rec.attr_count.saturating_add(1);
+            rec.modified_ns = ts.physical_ns;
         }
 
-        // Add new value
-        self.kv_index.insert(key, &value, obj_local);
-        self.forward_index
-            .add(oid, Assertion::Attr { key, value }, TagOrigin::Direct);
-
-        if let Some(rec) = self.object_table.get_mut(oid) {
-            rec.attr_count = self
-                .forward_index
-                .get(oid)
-                .iter()
-                .filter(|e| matches!(e.assertion, Assertion::Attr { .. }))
-                .count() as u16;
-            rec.modified_ns = (now_ms as i64) * 1_000_000;
-        }
-
-        self.emit_op(now_ms, OpKind::SetAttr { oid, tag: key });
+        self.subscriptions
+            .on_content_changed(oid, 0, ts.physical_ns);
+        self.oplog
+            .record(OpKind::SetAttr { oid, key, value }, 0, ts);
         Ok(())
     }
 
-    /// Remove an attribute from an object.
+    /// Remove an attribute by `(key, value_hash)`.
     pub fn remove_attr(
         &mut self,
         oid: ObjectId,
         key: TagId,
-        value: &Value,
-        now_ms: u64,
+        value_hash: u64,
     ) -> Result<(), EngineError> {
-        trace!("engine::remove_attr oid={oid} key={key}");
-        self.ensure_active(oid)?;
-        let obj_local = oid.local() as u32;
+        let raw = oid.to_u64();
+        if self.object_table.get(raw).is_none() {
+            return Err(EngineError::ObjectNotFound(oid));
+        }
+        let ts = self.clock.now();
+        let local32 = (raw & 0xffff_ffff) as u32;
 
-        self.kv_index.remove(key, value, obj_local);
-        self.forward_index.remove(
-            oid,
-            &Assertion::Attr {
-                key,
-                value: value.clone(),
-            },
-        );
-
-        if let Some(rec) = self.object_table.get_mut(oid) {
-            rec.attr_count = self
-                .forward_index
-                .get(oid)
-                .iter()
-                .filter(|e| matches!(e.assertion, Assertion::Attr { .. }))
-                .count() as u16;
-            rec.modified_ns = (now_ms as i64) * 1_000_000;
+        let assertions = self.forward_index.assertions_of(oid).to_vec();
+        let mut to_remove: Option<Value> = None;
+        for (a, _) in &assertions {
+            if let Assertion::Attr { key: k, value } = a
+                && *k == key
+                && engine_value_hash(value) == value_hash
+            {
+                to_remove = Some(value.clone());
+                break;
+            }
+        }
+        if let Some(value) = to_remove {
+            self.forward_index.remove_assertion(
+                oid,
+                &Assertion::Attr {
+                    key,
+                    value: value.clone(),
+                },
+            );
+            self.kv_index.remove(key, &value, local32);
+            self.range_index.remove(key, &value, local32);
+            if let Some(rec) = self.object_table.get_mut(raw) {
+                rec.attr_count = rec.attr_count.saturating_sub(1);
+                rec.modified_ns = ts.physical_ns;
+            }
         }
 
-        self.emit_op(now_ms, OpKind::RemoveAttr { oid, tag: key });
+        self.subscriptions
+            .on_content_changed(oid, 0, ts.physical_ns);
+        self.oplog.record(
+            OpKind::RemoveAttr {
+                oid,
+                key,
+                value_hash,
+            },
+            0,
+            ts,
+        );
         Ok(())
     }
 
-    // ── Blob data ──────────────────────────────────────────────────
+    /// Add a `(predicate, target)` relation.
+    pub fn add_relation(
+        &mut self,
+        oid: ObjectId,
+        predicate: TagId,
+        target: ObjectId,
+    ) -> Result<(), EngineError> {
+        let raw = oid.to_u64();
+        if self.object_table.get(raw).is_none() {
+            return Err(EngineError::ObjectNotFound(oid));
+        }
+        let ts = self.clock.now();
+        self.forward_index.add_assertion(
+            oid,
+            Assertion::Relation { predicate, target },
+            TagOrigin::Direct,
+        );
+        if let Some(rec) = self.object_table.get_mut(raw) {
+            rec.relation_count = rec.relation_count.saturating_add(1);
+            rec.modified_ns = ts.physical_ns;
+        }
+        self.oplog.record(
+            OpKind::AddRelation {
+                oid,
+                predicate,
+                target,
+            },
+            0,
+            ts,
+        );
+        Ok(())
+    }
 
-    /// Write blob data for an object through the transform pipeline.
-    ///
-    /// Compression is resolved per-object by evaluating placement rules
-    /// against the object's current tags. First matching `Compress` rule
-    /// wins; unmatched objects use the pool's default compression.
-    ///
-    /// Returns the transformed data and metadata. The caller is responsible
-    /// for writing the data to the blob zone on disk.
+    /// Remove a `(predicate, target)` relation.
+    pub fn remove_relation(
+        &mut self,
+        oid: ObjectId,
+        predicate: TagId,
+        target: ObjectId,
+    ) -> Result<(), EngineError> {
+        let raw = oid.to_u64();
+        if self.object_table.get(raw).is_none() {
+            return Err(EngineError::ObjectNotFound(oid));
+        }
+        let ts = self.clock.now();
+        let removed = self
+            .forward_index
+            .remove_assertion(oid, &Assertion::Relation { predicate, target });
+        if removed
+            && let Some(rec) = self.object_table.get_mut(raw)
+        {
+            rec.relation_count = rec.relation_count.saturating_sub(1);
+            rec.modified_ns = ts.physical_ns;
+        }
+        self.oplog.record(
+            OpKind::RemoveRelation {
+                oid,
+                predicate,
+                target,
+            },
+            0,
+            ts,
+        );
+        Ok(())
+    }
+
+    /// Run the configured transform pipeline over `plaintext` and update the
+    /// `ObjectRecord` content metadata.
     pub fn write_blob(
         &mut self,
         oid: ObjectId,
-        data: &[u8],
-        now_ms: u64,
+        plaintext: &[u8],
     ) -> Result<BlobWriteResult, EngineError> {
-        trace!("engine::write_blob oid={oid} len={}", data.len());
-        self.ensure_active(oid)?;
-
-        let compression = self.resolve_compression(oid);
-        let pipeline = self.pipeline_for(compression);
-        let result = pipeline.transform_write(data)?;
-
-        if let Some(rec) = self.object_table.get_mut(oid) {
-            rec.content_hash = result.content_hash;
-            rec.blob_length = result.original_size as u64;
-            rec.stored_size = result.stored_size as u64;
-            rec.compressed_size = result.compressed_size as u64;
-            rec.modified_ns = (now_ms as i64) * 1_000_000;
-            rec.set_compression(match compression {
-                CompressionAlgo::None => CompressionState::None,
-                CompressionAlgo::Zstd(_) => CompressionState::Zstd,
-                CompressionAlgo::Lz4 => CompressionState::Lz4,
-            });
+        let raw = oid.to_u64();
+        if self.object_table.get(raw).is_none() {
+            return Err(EngineError::ObjectNotFound(oid));
         }
-
-        self.emit_op(now_ms, OpKind::WriteBlob { oid });
+        let ts = self.clock.now();
+        let result: TransformResult = self.transform.apply(plaintext)?;
+        if let Some(rec) = self.object_table.get_mut(raw) {
+            rec.content_hash = result.content_hash;
+            rec.blob_length = result.original_size;
+            rec.stored_size = result.stored_size;
+            rec.modified_ns = ts.physical_ns;
+        }
+        self.subscriptions
+            .on_content_changed(oid, 0, ts.physical_ns);
+        self.oplog.record(
+            OpKind::WriteBlob {
+                oid,
+                content_hash: result.content_hash,
+                size: result.original_size,
+            },
+            0,
+            ts,
+        );
         Ok(BlobWriteResult {
             content_hash: result.content_hash,
-            data: result.data,
             original_size: result.original_size,
-            compressed_size: result.compressed_size,
             stored_size: result.stored_size,
+            data: result.data,
         })
     }
 
-    // ── Queries ────────────────────────────────────────────────────
+    // ----------------------------------------------------------------------
+    // Query / read API.
+    // ----------------------------------------------------------------------
 
-    /// Execute a query and return matching object IDs.
-    pub fn query(&self, query: &Query) -> Vec<ObjectId> {
-        trace!("engine::query");
-        let executor = QueryExecutor::new(&self.tag_index, &self.kv_index, &self.dag);
-        executor
-            .execute(query)
-            .iter()
-            .filter_map(|local| {
-                let oid = ObjectId::new(self.node_id, local as u64);
-                // Only return active objects
-                self.object_table
-                    .get(oid)
-                    .filter(|r| r.state() == ObjectState::Active)
-                    .map(|_| oid)
-            })
-            .collect()
+    /// Evaluate a query against the live indices.
+    pub fn query(&self, query: &Query) -> Result<RoaringBitmap, EngineError> {
+        let exec = QueryExecutor::new(
+            &self.tag_index,
+            &self.kv_index,
+            &self.range_index,
+            &self.forward_index,
+            &self.ontology,
+        );
+        Ok(exec.evaluate(query)?)
     }
 
-    /// Parse and execute a query string.
-    pub fn query_str(&self, query_str: &str) -> Result<Vec<ObjectId>, EngineError> {
-        trace!("engine::query_str query={query_str:?}");
-        let parser = mimisbrunnr_query::QueryParser::new(&self.dag);
-        let query = parser.parse(query_str)?;
-        Ok(self.query(&query))
+    /// Evaluate a query and reconstruct full [`ObjectId`]s.
+    pub fn query_full(&self, query: &Query) -> Result<Vec<ObjectId>, EngineError> {
+        let exec = QueryExecutor::new(
+            &self.tag_index,
+            &self.kv_index,
+            &self.range_index,
+            &self.forward_index,
+            &self.ontology,
+        );
+        Ok(exec.evaluate_full(query)?)
     }
 
-    // ── Info ───────────────────────────────────────────────────────
+    // ----------------------------------------------------------------------
+    // Subscriptions.
+    // ----------------------------------------------------------------------
 
-    /// Get all assertions for an object.
-    pub fn assertions(
-        &self,
-        oid: ObjectId,
-    ) -> Result<&[mimisbrunnr_index::ForwardEntry], EngineError> {
-        self.ensure_active(oid)?;
-        Ok(self.forward_index.get(oid))
-    }
-
-    /// Get all tags on an object (both direct and materialized).
-    pub fn tags(&self, oid: ObjectId) -> Result<Vec<TagId>, EngineError> {
-        self.ensure_active(oid)?;
-        Ok(self.forward_index.tag_ids(oid))
-    }
-
-    /// Get only direct tags on an object.
-    pub fn direct_tags(&self, oid: ObjectId) -> Result<Vec<TagId>, EngineError> {
-        self.ensure_active(oid)?;
-        Ok(self.forward_index.direct_tags(oid))
-    }
-
-    // ── Ontology ───────────────────────────────────────────────────
-
-    /// Register a tag in the ontology.
-    pub fn register_tag(
+    /// Register a subscription. Computes the initial result via the live
+    /// query executor.
+    ///
+    /// Note (DESIGN §11.3): for arbitrary boolean queries the engine layer is
+    /// expected to call `SubscriptionEngine::set_membership` after every
+    /// mutation that could change a sub's matched set. Phase 6 leaves this as
+    /// a TODO — only `HasTag` / `IsA` clauses get correct live updates.
+    /// TODO(rewrite-phase-N): re-evaluate boolean queries on every mutation.
+    pub fn subscribe(
         &mut self,
-        def: mimisbrunnr_ontology::TagDefinition,
-    ) -> Result<TagId, EngineError> {
-        trace!("engine::register_tag name={}", def.name);
-        Ok(self.dag.register_tag(def)?)
+        name: String,
+        query: Query,
+        interest: ChangeInterest,
+        retention: Retention,
+    ) -> Result<SubscriptionId, EngineError> {
+        let initial = {
+            let exec = QueryExecutor::new(
+                &self.tag_index,
+                &self.kv_index,
+                &self.range_index,
+                &self.forward_index,
+                &self.ontology,
+            );
+            exec.evaluate(&query)?
+        };
+        let id = self
+            .subscriptions
+            .register(name, query, interest, retention, initial, 0);
+        Ok(id)
     }
 
-    /// Add an implication and materialize it across existing objects.
-    pub fn add_implication(&mut self, from: TagId, to: TagId) -> Result<(), EngineError> {
-        trace!("engine::add_implication from={from} to={to}");
-        self.dag.add_implication(from, to)?;
-        Materializer::materialize_implication(&mut self.tag_index, from, to);
+    // ----------------------------------------------------------------------
+    // Ontology.
+    // ----------------------------------------------------------------------
+
+    /// Install an [`OntologyModule`].
+    pub fn install_ontology_module(
+        &mut self,
+        module: OntologyModule,
+    ) -> Result<InstallResult, EngineError> {
+        let mut alloc = IdAllocator::starting_at(self.next_tag_id);
+        let res = self.ontology.install(module, &mut alloc)?;
+        let max_id = self
+            .ontology
+            .tags
+            .keys()
+            .map(|t| t.raw())
+            .max()
+            .unwrap_or(0);
+        self.next_tag_id = self.next_tag_id.max(max_id + 1);
+        self.subscriptions.refresh_ontology_links(&self.ontology);
+        Ok(res)
+    }
+
+    /// Look up a tag by name.
+    pub fn resolve_tag_name(&self, name: &str) -> Option<TagId> {
+        self.ontology.names.get(name).copied()
+    }
+
+    /// Register an ad-hoc Label tag if absent. Returns the tag's id.
+    pub fn register_tag(&mut self, name: &str) -> TagId {
+        if let Some(existing) = self.resolve_tag_name(name) {
+            return existing;
+        }
+        let id = TagId::new(self.next_tag_id);
+        self.next_tag_id = self.next_tag_id.saturating_add(1);
+        let def = TagDefinition {
+            id,
+            name: name.into(),
+            semantics: TagSemantics::Label,
+            implies: vec![],
+            storage: None,
+        };
+        self.ontology.dag.add_tag(id);
+        self.ontology.names.insert(name.to_string(), id);
+        self.ontology.tags.insert(id, def);
+        id
+    }
+
+    // ----------------------------------------------------------------------
+    // Replay helpers — called by `wal_proj::replay_wal_op` only.
+    // ----------------------------------------------------------------------
+
+    pub(crate) fn replay_create_object(
+        &mut self,
+        oid: ObjectId,
+        created_ns: i64,
+        _lsn: u64,
+    ) -> Result<(), EngineError> {
+        let raw = oid.to_u64();
+        if self.object_table.get(raw).is_none() {
+            let mut rec = ObjectRecord::new(raw);
+            rec.set_state(ObjectState::Active);
+            rec.created_ns = created_ns;
+            rec.modified_ns = created_ns;
+            self.object_table.insert(rec);
+        }
+        let local = oid.local_seq();
+        if local >= self.next_oid_local {
+            self.next_oid_local = local.saturating_add(1);
+        }
         Ok(())
     }
 
-    /// This node's ID.
-    pub fn node_id(&self) -> u64 {
-        self.node_id
-    }
-
-    // ── Helpers ─────────────────────────────────────────────────────
-
-    fn ensure_active(&self, oid: ObjectId) -> Result<(), EngineError> {
-        match self.object_table.get(oid) {
-            Some(rec) if rec.state() == ObjectState::Active => Ok(()),
-            Some(_) => Err(EngineError::ObjectDeleted(oid)),
-            None => Err(EngineError::ObjectNotFound(oid)),
+    pub(crate) fn replay_delete_object(
+        &mut self,
+        oid: ObjectId,
+        _lsn: u64,
+    ) -> Result<(), EngineError> {
+        let raw = oid.to_u64();
+        if let Some(rec) = self.object_table.get_mut(raw) {
+            rec.set_state(ObjectState::Tombstoned);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use {
-        super::*,
-        mimisbrunnr_ontology::{TagDefinition, TagSemantics, ValueType},
-        mimisbrunnr_types::CmpOp,
-    };
-
-    fn tag(id: u32) -> TagId {
-        TagId::new(id)
+        self.tag_index.remove_object_from_all(oid);
+        self.forward_index.remove_object(oid);
+        self.location_table.remove(raw);
+        Ok(())
     }
 
-    fn label(id: u32, name: &str) -> TagDefinition {
-        TagDefinition::new(tag(id), name, TagSemantics::Label)
+    pub(crate) fn replay_add_tag(
+        &mut self,
+        oid: ObjectId,
+        tag: TagId,
+        _lsn: u64,
+    ) -> Result<(), EngineError> {
+        if self.object_table.get(oid.to_u64()).is_none() {
+            let mut rec = ObjectRecord::new(oid.to_u64());
+            rec.set_state(ObjectState::Active);
+            self.object_table.insert(rec);
+        }
+        let closure = self.ontology.materialise(&[tag]);
+        for closure_tag in &closure {
+            let origin = if *closure_tag == tag {
+                TagOrigin::Direct
+            } else {
+                TagOrigin::Materialized
+            };
+            let already = self
+                .forward_index
+                .assertions_of(oid)
+                .iter()
+                .any(|(a, _)| matches!(a, Assertion::Tag(t) if *t == *closure_tag));
+            if !already {
+                self.forward_index
+                    .add_assertion(oid, Assertion::Tag(*closure_tag), origin);
+                self.tag_index.add_member(*closure_tag, oid);
+            }
+        }
+        Ok(())
     }
 
-    fn attr_def(id: u32, name: &str) -> TagDefinition {
-        TagDefinition::new(
-            tag(id),
-            name,
-            TagSemantics::Attribute {
-                value_type: ValueType::Text,
+    pub(crate) fn replay_remove_tag(
+        &mut self,
+        oid: ObjectId,
+        tag: TagId,
+        _lsn: u64,
+    ) -> Result<(), EngineError> {
+        if self.object_table.get(oid.to_u64()).is_none() {
+            return Ok(());
+        }
+        let was_direct = self
+            .forward_index
+            .assertions_of(oid)
+            .iter()
+            .any(|(a, o)| matches!(a, Assertion::Tag(t) if *t == tag) && *o == TagOrigin::Direct);
+        if self
+            .forward_index
+            .remove_assertion(oid, &Assertion::Tag(tag))
+        {
+            self.tag_index.remove_member(tag, oid);
+        }
+        if was_direct {
+            let surviving_direct: Vec<TagId> = self.forward_index.direct_tags(oid);
+            let mut still_implied = std::collections::BTreeSet::new();
+            for t in &surviving_direct {
+                for c in self.ontology.materialise(&[*t]) {
+                    still_implied.insert(c);
+                }
+            }
+            let materialized_now: Vec<TagId> = self.forward_index.materialized_tags(oid);
+            for m in materialized_now {
+                if !still_implied.contains(&m)
+                    && self
+                        .forward_index
+                        .remove_assertion(oid, &Assertion::Tag(m))
+                {
+                    self.tag_index.remove_member(m, oid);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn replay_set_attr(
+        &mut self,
+        oid: ObjectId,
+        key: TagId,
+        value: Value,
+        _lsn: u64,
+    ) -> Result<(), EngineError> {
+        if self.object_table.get(oid.to_u64()).is_none() {
+            let mut rec = ObjectRecord::new(oid.to_u64());
+            rec.set_state(ObjectState::Active);
+            self.object_table.insert(rec);
+        }
+        let local32 = (oid.to_u64() & 0xffff_ffff) as u32;
+        self.forward_index.add_assertion(
+            oid,
+            Assertion::Attr {
+                key,
+                value: value.clone(),
             },
-        )
+            TagOrigin::Direct,
+        );
+        self.kv_index.insert(key, &value, local32);
+        self.range_index.insert(key, &value, local32);
+        Ok(())
     }
 
-    fn setup_engine() -> Engine {
-        let mut e = Engine::new(0);
-        // Register some tags
-        e.register_tag(label(1, "electronic")).unwrap();
-        e.register_tag(label(2, "portable")).unwrap();
-        e.register_tag(label(3, "discontinued")).unwrap();
-        e.register_tag(label(4, "vehicle")).unwrap();
-        e.register_tag(label(5, "car")).unwrap();
-        e.register_tag(label(6, "truck")).unwrap();
-        e.register_tag(attr_def(10, "artist")).unwrap();
-        e.register_tag(TagDefinition::new(
-            tag(11),
-            "year",
-            TagSemantics::Attribute {
-                value_type: ValueType::Int,
-            },
-        ))
-        .unwrap();
-
-        // car → vehicle, truck → vehicle
-        e.add_implication(tag(5), tag(4)).unwrap();
-        e.add_implication(tag(6), tag(4)).unwrap();
-        e
+    pub(crate) fn replay_remove_attr_by_hash(
+        &mut self,
+        oid: ObjectId,
+        key: TagId,
+        value_hash: u64,
+        _lsn: u64,
+    ) -> Result<(), EngineError> {
+        let local32 = (oid.to_u64() & 0xffff_ffff) as u32;
+        let assertions = self.forward_index.assertions_of(oid).to_vec();
+        for (a, _) in &assertions {
+            if let Assertion::Attr { key: k, value } = a
+                && *k == key
+                && engine_value_hash(value) == value_hash
+            {
+                self.forward_index.remove_assertion(
+                    oid,
+                    &Assertion::Attr {
+                        key,
+                        value: value.clone(),
+                    },
+                );
+                self.kv_index.remove(key, value, local32);
+                self.range_index.remove(key, value, local32);
+                break;
+            }
+        }
+        Ok(())
     }
 
-    #[test]
-    fn create_and_get_object() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-
-        let rec = e.get_object(oid).unwrap();
-        assert_eq!(rec.id, (oid.node() << 48) | oid.local());
-        assert!(rec.is_active());
+    pub(crate) fn replay_add_relation(
+        &mut self,
+        oid: ObjectId,
+        predicate: TagId,
+        target: ObjectId,
+        _lsn: u64,
+    ) -> Result<(), EngineError> {
+        if self.object_table.get(oid.to_u64()).is_none() {
+            let mut rec = ObjectRecord::new(oid.to_u64());
+            rec.set_state(ObjectState::Active);
+            self.object_table.insert(rec);
+        }
+        self.forward_index.add_assertion(
+            oid,
+            Assertion::Relation { predicate, target },
+            TagOrigin::Direct,
+        );
+        Ok(())
     }
 
-    #[test]
-    fn add_tag_and_query() {
-        let mut e = setup_engine();
-        let oid1 = e.create_object(1000).unwrap();
-        let oid2 = e.create_object(1000).unwrap();
-
-        e.add_tag(oid1, tag(1), 1000).unwrap(); // electronic
-        e.add_tag(oid2, tag(1), 1000).unwrap(); // electronic
-        e.add_tag(oid1, tag(2), 1000).unwrap(); // portable
-
-        let result = e.query(&Query::HasTag(tag(1)));
-        assert_eq!(result.len(), 2);
-
-        let result = e.query(&Query::And(vec![
-            Query::HasTag(tag(1)),
-            Query::HasTag(tag(2)),
-        ]));
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], oid1);
+    pub(crate) fn replay_remove_relation(
+        &mut self,
+        oid: ObjectId,
+        predicate: TagId,
+        target: ObjectId,
+        _lsn: u64,
+    ) -> Result<(), EngineError> {
+        self.forward_index
+            .remove_assertion(oid, &Assertion::Relation { predicate, target });
+        Ok(())
     }
 
-    #[test]
-    fn tag_materialization() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-
-        let materialized = e.add_tag(oid, tag(5), 1000).unwrap(); // car
-        assert!(materialized.contains(&tag(4))); // vehicle materialized
-
-        // Query for vehicle should find the car
-        let result = e.query(&Query::HasTag(tag(4)));
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], oid);
+    pub(crate) fn replay_write_blob(
+        &mut self,
+        oid: ObjectId,
+        content_hash: [u8; 32],
+        size: u64,
+        _lsn: u64,
+    ) -> Result<(), EngineError> {
+        if self.object_table.get(oid.to_u64()).is_none() {
+            let mut rec = ObjectRecord::new(oid.to_u64());
+            rec.set_state(ObjectState::Active);
+            self.object_table.insert(rec);
+        }
+        if let Some(rec) = self.object_table.get_mut(oid.to_u64()) {
+            rec.content_hash = content_hash;
+            rec.blob_length = size;
+            rec.stored_size = size;
+        }
+        Ok(())
     }
 
-    #[test]
-    fn remove_tag_dematerialization() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
+    // ----------------------------------------------------------------------
+    // Helpers for tests / external callers (not part of the durable surface).
+    // ----------------------------------------------------------------------
 
-        e.add_tag(oid, tag(5), 1000).unwrap(); // car → vehicle
-        e.remove_tag(oid, tag(5), 2000).unwrap();
-
-        // Vehicle should be gone too
-        let result = e.query(&Query::HasTag(tag(4)));
-        assert!(result.is_empty());
+    /// Borrow the highest local sequence number issued so far.
+    pub fn next_oid_local(&self) -> u64 {
+        self.next_oid_local
     }
 
-    #[test]
-    fn remove_tag_keeps_justified() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-
-        e.add_tag(oid, tag(5), 1000).unwrap(); // car → vehicle
-        e.add_tag(oid, tag(6), 1000).unwrap(); // truck → vehicle
-
-        e.remove_tag(oid, tag(5), 2000).unwrap(); // remove car
-
-        // Vehicle still present via truck
-        let result = e.query(&Query::HasTag(tag(4)));
-        assert_eq!(result.len(), 1);
+    /// Number of objects currently in the table (active + tombstoned).
+    pub fn object_count(&self) -> usize {
+        self.object_table.len()
     }
 
-    #[test]
-    fn set_and_query_attr() {
-        let mut e = setup_engine();
-        let oid1 = e.create_object(1000).unwrap();
-        let oid2 = e.create_object(1000).unwrap();
-
-        e.set_attr(oid1, tag(10), Value::Text("Aphex Twin".into()), 1000)
-            .unwrap();
-        e.set_attr(oid2, tag(10), Value::Text("Boards of Canada".into()), 1000)
-            .unwrap();
-
-        let result = e.query(&Query::HasAttr {
-            key: tag(10),
-            op: CmpOp::Eq,
-            value: Value::Text("Aphex Twin".into()),
-        });
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], oid1);
+    /// Quickly probe whether a tag has at least one member object.
+    pub fn tag_has_members(&self, tag: TagId) -> bool {
+        self.tag_index
+            .get(tag)
+            .is_some_and(|s| !s.members().is_empty())
     }
 
-    #[test]
-    fn set_attr_replaces_previous() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-
-        e.set_attr(oid, tag(10), Value::Text("old".into()), 1000)
-            .unwrap();
-        e.set_attr(oid, tag(10), Value::Text("new".into()), 2000)
-            .unwrap();
-
-        // Old value should not match
-        let old_result = e.query(&Query::HasAttr {
-            key: tag(10),
-            op: CmpOp::Eq,
-            value: Value::Text("old".into()),
-        });
-        assert!(old_result.is_empty());
-
-        // New value should match
-        let new_result = e.query(&Query::HasAttr {
-            key: tag(10),
-            op: CmpOp::Eq,
-            value: Value::Text("new".into()),
-        });
-        assert_eq!(new_result.len(), 1);
-    }
-
-    #[test]
-    fn delete_object() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-        e.add_tag(oid, tag(1), 1000).unwrap();
-
-        e.delete_object(oid, 2000).unwrap();
-
-        // Should not appear in queries
-        let result = e.query(&Query::HasTag(tag(1)));
-        assert!(result.is_empty());
-
-        // Should not be gettable
-        assert!(e.get_object(oid).is_err());
-    }
-
-    #[test]
-    fn delete_removes_from_indexes() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-        e.add_tag(oid, tag(1), 1000).unwrap();
-        e.add_tag(oid, tag(2), 1000).unwrap();
-        e.set_attr(oid, tag(10), Value::Text("test".into()), 1000)
-            .unwrap();
-
-        e.delete_object(oid, 2000).unwrap();
-
-        // All indexes should be clean
-        assert!(!e.tag_index.has_tag(tag(1), oid.local() as u32));
-        assert!(!e.tag_index.has_tag(tag(2), oid.local() as u32));
-        assert!(e.forward_index.get(oid).is_empty());
-    }
-
-    #[test]
-    fn double_delete_fails() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-        e.delete_object(oid, 2000).unwrap();
-        assert!(e.delete_object(oid, 3000).is_err());
-    }
-
-    #[test]
-    fn write_blob() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-
-        let result = e.write_blob(oid, b"hello world", 1000).unwrap();
-        assert_ne!(result.content_hash, [0u8; 32]);
-        assert!(!result.data.is_empty());
-        assert_eq!(result.original_size, 11);
-
-        let rec = e.get_object(oid).unwrap();
-        assert_eq!(rec.content_hash, result.content_hash);
-        assert_eq!(rec.blob_length, 11);
-    }
-
-    #[test]
-    fn query_str() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-        e.add_tag(oid, tag(1), 1000).unwrap(); // electronic
-
-        let result = e.query_str("electronic").unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], oid);
-    }
-
-    #[test]
-    fn complex_query_str() {
-        let mut e = setup_engine();
-        let oid1 = e.create_object(1000).unwrap();
-        let oid2 = e.create_object(1000).unwrap();
-        let oid3 = e.create_object(1000).unwrap();
-
-        e.add_tag(oid1, tag(1), 1000).unwrap(); // electronic
-        e.add_tag(oid1, tag(2), 1000).unwrap(); // portable
-        e.add_tag(oid2, tag(1), 1000).unwrap(); // electronic
-        e.add_tag(oid3, tag(1), 1000).unwrap(); // electronic
-        e.add_tag(oid3, tag(3), 1000).unwrap(); // discontinued
-
-        let result = e.query_str("electronic AND NOT discontinued").unwrap();
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn oplog_records_operations() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-        e.add_tag(oid, tag(1), 1000).unwrap();
-        e.set_attr(oid, tag(10), Value::Text("test".into()), 1000)
-            .unwrap();
-        e.delete_object(oid, 2000).unwrap();
-
-        assert_eq!(e.oplog.len(), 4); // create + tag + attr + delete
-    }
-
-    #[test]
-    fn assertions_list() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-        e.add_tag(oid, tag(1), 1000).unwrap();
-        e.set_attr(oid, tag(10), Value::Text("hello".into()), 1000)
-            .unwrap();
-
-        let assertions = e.assertions(oid).unwrap();
-        assert!(assertions.len() >= 2); // tag + attr (+ possible materialized)
-    }
-
-    #[test]
-    fn direct_vs_all_tags() {
-        let mut e = setup_engine();
-        let oid = e.create_object(1000).unwrap();
-        e.add_tag(oid, tag(5), 1000).unwrap(); // car → vehicle
-
-        let all = e.tags(oid).unwrap();
-        let direct = e.direct_tags(oid).unwrap();
-
-        assert!(all.len() > direct.len()); // all includes materialized
-        assert_eq!(direct, vec![tag(5)]); // only car is direct
-        assert!(all.contains(&tag(4))); // vehicle is materialized
-    }
-
-    #[test]
-    fn isa_query_through_engine() {
-        let mut e = setup_engine();
-        let oid1 = e.create_object(1000).unwrap();
-        let oid2 = e.create_object(1000).unwrap();
-
-        e.add_tag(oid1, tag(5), 1000).unwrap(); // car
-        e.add_tag(oid2, tag(6), 1000).unwrap(); // truck
-
-        // IsA(vehicle) should find both via materialized tags
-        let result = e.query(&Query::IsA(tag(4)));
-        assert_eq!(result.len(), 2);
+    /// Diagnostic — total bytes the object table would occupy if flushed
+    /// without overflow records.
+    pub fn object_table_bytes(&self) -> usize {
+        self.object_table.len() * OBJECT_RECORD_SIZE
     }
 }
