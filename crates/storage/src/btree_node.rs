@@ -141,6 +141,13 @@ pub const FIELD_FORMAT_FLAG_SIGNED: u8 = 1 << 0;
 /// Field-format flag: MSB-first packing (big-endian).
 pub const FIELD_FORMAT_FLAG_MSB_FIRST: u8 = 1 << 1;
 
+/// `SortedRunKeyFormat.value_size_kind = 0` — every entry has the same value
+/// length; no per-entry length prefix on the wire.
+pub const VALUE_SIZE_KIND_FIXED: u8 = 0;
+/// `SortedRunKeyFormat.value_size_kind = 1` — each entry is preceded by an
+/// unsigned LEB128 varint giving the *elided-tail* length in bytes.
+pub const VALUE_SIZE_KIND_VARINT: u8 = 1;
+
 /// 16-byte per-field descriptor for packed keys. IMPL §1.5.6.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
@@ -164,7 +171,7 @@ pub struct SortedRunKeyFormat {
     pub nr_fields: u8,           // [0..1]   1..=8
     pub key_header_bytes: u8,    // [1..2]   0..=4
     pub common_value_prefix: u8, // [2..3]   0..=255
-    pub _pad: u8,                // [3..4]
+    pub value_size_kind: u8,     // [3..4]   0 = fixed; 1 = varint per-entry tail length
     pub sum_bit_width: u32,      // [4..8]   total packed-key bits incl. header
 }
 
@@ -287,7 +294,7 @@ mod tests {
             nr_fields: 2,
             key_header_bytes: 2,
             common_value_prefix: 4,
-            _pad: 0,
+            value_size_kind: VALUE_SIZE_KIND_FIXED,
             sum_bit_width: 24,
         };
         let fields = vec![
@@ -312,7 +319,7 @@ mod tests {
             nr_fields: 1,
             key_header_bytes: 0,
             common_value_prefix: 0,
-            _pad: 0,
+            value_size_kind: VALUE_SIZE_KIND_FIXED,
             sum_bit_width: 32,
         };
         let fields = vec![FieldFormat {

@@ -360,7 +360,7 @@ struct SortedRunKeyFormat {                       // 8 + nr_fields × 16 + commo
     nr_fields: u8,                           // 1..=8
     key_header_bytes: u8,                    // 0..=4 (entry-type discriminator + flags)
     common_value_prefix: u8,                 // bytes shared at the start of every value (0..=255)
-    _pad: u8,
+    value_size_kind: u8,                     // 0 = fixed; 1 = varint per-entry tail length
     sum_bit_width: u32,                      // total packed-key bits (incl. header), informational
     fields: [FieldFormat; nr_fields],
     value_prefix: [u8; common_value_prefix], // elided leading value bytes; readers
@@ -368,6 +368,12 @@ struct SortedRunKeyFormat {                       // 8 + nr_fields × 16 + commo
                                              // `value_prefix || value_tail_i` without
                                              // any out-of-band state.
 }
+
+// SortedRunKeyFormat.value_size_kind values
+const VALUE_SIZE_KIND_FIXED:  u8 = 0;        // every entry has the same value length;
+                                             // no per-entry length prefix on the wire.
+const VALUE_SIZE_KIND_VARINT: u8 = 1;        // each entry is preceded by an unsigned LEB128
+                                             // varint giving the *elided-tail* length in bytes.
 
 #[repr(C, packed)]
 struct FieldFormat {                         // 16 bytes
@@ -399,18 +405,24 @@ small (a few bytes for shared `store_kind` / leading-zero padding), so 60–80 b
 header; no alignment padding follows the `value_prefix` bytes (the per-key bit stream begins
 immediately after, on a byte boundary).
 
-**Encoding.** A packed key is:
+**Encoding.** A packed key + value is:
 
 ```
 [ key_header_bytes of type / flags ]
 [ ∑ field[i].bit_width  bits of (field[i] − base[i]) for each field ]
 [ pad to byte boundary ]
-[ value bytes; first `common_value_prefix` bytes elided ]
+if value_size_kind == 0 (fixed):
+    [ value tail bytes — exactly (value_size − common_value_prefix) bytes ]
+if value_size_kind == 1 (varint):
+    [ unsigned LEB128 varint giving tail_len in bytes ]
+    [ value tail bytes — exactly tail_len bytes ]
 ```
 
 Keys are laid out back-to-back with no inter-key padding. Binary search within a sorted run compares
 packed keys **directly** without decoding — base subtraction is strictly monotonic, so packed
-ordering matches unpacked ordering. Full decoding happens only at the lookup boundary.
+ordering matches unpacked ordering. Full decoding happens only at the lookup boundary. The
+variable-length value tail comes *after* the packed key bytes and so does not affect ordering;
+keys still sort the same way regardless of `value_size_kind`.
 
 **`common_value_prefix` and reconstruction.** The elision applies only to bytes at the
 **leading offsets** of the value that are bit-for-bit identical across **every entry in the
@@ -429,6 +441,28 @@ full compaction by scanning the merged sorted run's values and counting leading 
 by every entry; if the sorted run mixes shapes, the count is bounded by the shortest value.
 Single-entry sorted runs may set the prefix to the full value length without harm because
 the bytes are persisted in the descriptor.
+
+**Variable-size values.** When a sorted run mixes entries with different value lengths
+(notably §7.1's `LeafEntry`, which switches between an inline assertion array and a 16 B
+`BlockRef` spill reference, and any other heterogeneous-shape value such as
+§10.2 `SubscriptionRecord` blobs that opt into the codec), the encoder sets
+`value_size_kind = 1` (varint mode) and prefixes each per-entry value tail with an unsigned
+LEB128 length giving the *elided tail's* byte count. The full value reconstructs as
+`value_prefix || tail_bytes` and has length `common_value_prefix + tail_len`. Per-entry
+overhead is 1 byte for tails ≤ 127 B, 2 bytes through 16 383 B, growing to a worst case of
+10 bytes for the full `u64` range — dominated by the savings the codec recovers over the
+CBOR fallback. Variable mode does not affect key ordering: keys are still bit-packed in
+declaration order and binary search compares packed-key byte slices directly; the per-entry
+length prefix and value tail come *after* the key bytes and are read only once a candidate
+entry has been located.
+
+Format selection picks `value_size_kind = 0` (fixed) when every entry's value length is
+equal and `value_size_kind = 1` (varint) otherwise. The constraint
+`value.len() ≥ common_value_prefix` for every entry holds in both modes; in variable mode
+the encoder additionally verifies each value before writing. Random-access by entry index
+is O(1) in fixed mode (constant stride) but O(N) in variable mode (sequential parse) —
+acceptable because the heterogeneous-shape callers (forward leaves, subscription records)
+read entire runs at a time rather than indexing into them.
 
 **Format selection.** Full compaction (§1.5.4) computes an optimal format for the merged sorted run
 by scanning the key distribution: `max − min` for each field gives the minimum bit width.
@@ -462,7 +496,10 @@ form is then bit-for-bit identical to the unpacked hash bytes.
 
 **Footprint impact.** Combined across the metadata zone, packing reduces B+ tree footprint by
 ~30% and improves cache utilisation proportionally — more keys per cache line means more keys
-inspected per memory fetch during binary search.
+inspected per memory fetch during binary search. For runs in `value_size_kind = 1` (varint)
+mode, per-entry overhead is typically 1 B (LEB128 for tail lengths ≤ 127 B). The variable-size
+overhead is dwarfed by the codec's savings over the CBOR fallback for heterogeneous-shape
+values (§7.1 forward-leaf entries are the canonical example).
 
 ---
 

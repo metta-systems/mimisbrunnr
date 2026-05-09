@@ -38,19 +38,23 @@
 //!   that comparing the byte slice lexicographically yields the same result
 //!   as comparing the underlying field tuple.
 //!
-//! ## Variable-size values — out of scope
+//! ## Variable-size values
 //!
-//! R1a-pack supports only fixed-size values (every entry's value occupies
-//! the same number of bytes). Variable-shape values (notably forward leaf
-//! entries with their inline-vs-spill body discriminator) must use the CBOR
-//! payload path; calling [`encode_packed_run`] with a slice of values that
-//! aren't all the same length returns [`PackError::Malformed`].
+//! When a sorted run mixes entries with different value lengths the
+//! encoder sets `head.value_size_kind = VALUE_SIZE_KIND_VARINT`, and each
+//! per-entry value tail is preceded by an unsigned LEB128 varint giving
+//! the *elided-tail* byte count. The decoder branches on the same field;
+//! reconstructed values are byte-exact in both modes.
 //!
-//! TODO(rewrite-phase-R1a-pack-2): variable-size values via per-entry
-//! length prefix in the value tail.
+//! [`select_format`] picks the mode automatically: it returns
+//! `VALUE_SIZE_KIND_FIXED` when every entry's value has the same length
+//! (the common case, byte-identical to the pre-amendment encoding) and
+//! `VALUE_SIZE_KIND_VARINT` otherwise. Callers don't have to know in
+//! advance whether their values are uniform.
 
 use crate::btree_node::{
     FIELD_FORMAT_FLAG_MSB_FIRST, FIELD_FORMAT_FLAG_SIGNED, FieldFormat, SortedRunKeyFormat,
+    VALUE_SIZE_KIND_FIXED, VALUE_SIZE_KIND_VARINT,
 };
 
 // ---------- PackError ----------
@@ -381,14 +385,73 @@ pub fn select_format<K: PackableKey, V: AsRef<[u8]>>(
         (count as u8, first[..count].to_vec())
     };
 
+    // Mode selection: fixed if every value has the same length (the common
+    // case), varint otherwise. Empty input → fixed (degenerate).
+    let value_size_kind = if entries.len() < 2 {
+        VALUE_SIZE_KIND_FIXED
+    } else {
+        let first_len = entries[0].1.as_ref().len();
+        if entries.iter().all(|(_, v)| v.as_ref().len() == first_len) {
+            VALUE_SIZE_KIND_FIXED
+        } else {
+            VALUE_SIZE_KIND_VARINT
+        }
+    };
+
     let head = SortedRunKeyFormat {
         nr_fields: nr as u8,
         key_header_bytes: header_bytes as u8,
         common_value_prefix: common_prefix_len,
-        _pad: 0,
+        value_size_kind,
         sum_bit_width,
     };
     Ok((head, fields, prefix_bytes))
+}
+
+// ---------- Varint (unsigned LEB128) helpers ----------
+
+/// Append `value` as an unsigned LEB128 varint to `buf`. Standard
+/// 7-data-bits-per-byte encoding with the MSB of each byte signalling
+/// continuation.
+fn write_varint_u64(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value == 0 {
+            buf.push(byte);
+            return;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+/// Read an unsigned LEB128 varint starting at `*pos` from `buf`. Advances
+/// `*pos` past the varint on success. Errors on truncation or on widths
+/// beyond the `u64` representable range.
+fn read_varint_u64(buf: &[u8], pos: &mut usize) -> Result<u64, PackError> {
+    let mut result: u64 = 0;
+    let mut shift: u32 = 0;
+    loop {
+        if *pos >= buf.len() {
+            return Err(PackError::Malformed("varint: truncated"));
+        }
+        let byte = buf[*pos];
+        *pos += 1;
+        // Detect a final byte that would overflow u64. The varint is at
+        // most 10 bytes long; the final byte may carry at most 1 bit.
+        if shift >= 64 {
+            return Err(PackError::Malformed("varint: too wide for u64"));
+        }
+        let chunk = (byte & 0x7F) as u64;
+        if shift == 63 && chunk > 1 {
+            return Err(PackError::Malformed("varint: too wide for u64"));
+        }
+        result |= chunk << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
 }
 
 // ---------- Bit packing helpers ----------
@@ -477,9 +540,17 @@ fn bytes_per_key(head: &SortedRunKeyFormat, fields: &[FieldFormat]) -> usize {
 /// entry's value must begin with exactly those bytes. The encoder strips
 /// those leading bytes from each value tail.
 ///
-/// **Variable-size values are not supported in R1a-pack.** Every entry's
-/// value must have the same length; otherwise [`PackError::Malformed`] is
-/// returned.
+/// **Value-size mode** is selected by `head.value_size_kind`:
+///
+/// - `VALUE_SIZE_KIND_FIXED` — every entry's value must have the same
+///   length; the value tail is written verbatim with no per-entry prefix.
+/// - `VALUE_SIZE_KIND_VARINT` — values may have arbitrary, mixed lengths;
+///   each entry is preceded by an unsigned LEB128 varint giving the
+///   *elided-tail* byte count.
+///
+/// In both modes every entry must satisfy `value.len() ≥
+/// common_value_prefix` and the leading prefix bytes must match
+/// `value_prefix`.
 pub fn encode_packed_run<K: PackableKey, V: AsRef<[u8]>>(
     entries: &[(K, V)],
     head: &SortedRunKeyFormat,
@@ -494,8 +565,12 @@ pub fn encode_packed_run<K: PackableKey, V: AsRef<[u8]>>(
     }
     let header_bytes = { head.key_header_bytes } as usize;
     let prefix = { head.common_value_prefix } as usize;
+    let value_size_kind = { head.value_size_kind };
     if value_prefix.len() != prefix {
         return Err(PackError::InvalidPrefix(value_prefix.len()));
+    }
+    if value_size_kind != VALUE_SIZE_KIND_FIXED && value_size_kind != VALUE_SIZE_KIND_VARINT {
+        return Err(PackError::Malformed("encode: unknown value_size_kind"));
     }
 
     // Pre-allocate output. The format descriptor goes first (head + fields +
@@ -507,30 +582,34 @@ pub fn encode_packed_run<K: PackableKey, V: AsRef<[u8]>>(
         return Ok(out);
     }
 
-    // Fixed-size value invariant.
-    let value_size = entries[0].1.as_ref().len();
-    if entries.iter().any(|(_, v)| v.as_ref().len() != value_size) {
-        return Err(PackError::Malformed(
-            "encode: variable-size values not supported in R1a-pack",
-        ));
-    }
-    if prefix > value_size {
-        return Err(PackError::InvalidPrefix(prefix));
-    }
-    // Verify the recorded common prefix actually matches every value.
-    if prefix > 0 {
-        for (_, v) in entries.iter() {
-            if &v.as_ref()[..prefix] != value_prefix {
-                return Err(PackError::Malformed(
-                    "encode: common_value_prefix does not match every value",
-                ));
-            }
+    // Fixed-mode invariant: every value has the same length.
+    if value_size_kind == VALUE_SIZE_KIND_FIXED {
+        let value_size = entries[0].1.as_ref().len();
+        if entries.iter().any(|(_, v)| v.as_ref().len() != value_size) {
+            return Err(PackError::Malformed(
+                "encode: fixed mode requires uniform value lengths; \
+                 select_format should have chosen VARINT",
+            ));
         }
     }
 
-    let value_tail_size = value_size - prefix;
+    // Both modes: prefix length must not exceed any value, and the leading
+    // bytes of every value must match `value_prefix`.
+    for (_, v) in entries.iter() {
+        let v = v.as_ref();
+        if v.len() < prefix {
+            return Err(PackError::InvalidPrefix(prefix));
+        }
+        if prefix > 0 && &v[..prefix] != value_prefix {
+            return Err(PackError::Malformed(
+                "encode: common_value_prefix does not match every value",
+            ));
+        }
+    }
+
     let body_size = bytes_per_key(head, fields);
-    out.reserve(entries.len() * (body_size + value_tail_size));
+    // Reserve a sensible amount; varint mode is hard to size precisely.
+    out.reserve(entries.len() * body_size);
 
     let mut field_buf = vec![0u64; nr];
     for (k, v) in entries {
@@ -583,8 +662,12 @@ pub fn encode_packed_run<K: PackableKey, V: AsRef<[u8]>>(
         }
         out.extend_from_slice(&packed);
 
-        // Value tail (prefix elided).
-        out.extend_from_slice(&v.as_ref()[prefix..]);
+        // Value tail (prefix elided). In varint mode emit the length first.
+        let tail = &v.as_ref()[prefix..];
+        if value_size_kind == VALUE_SIZE_KIND_VARINT {
+            write_varint_u64(&mut out, tail.len() as u64);
+        }
+        out.extend_from_slice(tail);
     }
 
     Ok(out)
@@ -599,8 +682,11 @@ pub type DecodedRun<K> = (Vec<(K, Vec<u8>)>, SortedRunKeyFormat, Vec<FieldFormat
 
 /// Decode a packed sorted-run payload.
 ///
-/// `value_size` is the *total* per-entry value size in bytes, before
-/// prefix elision. `entry_count` matches `SortedRunHeader.entry_count`.
+/// `value_size` is the *total* per-entry value size in bytes (before
+/// prefix elision) for runs whose descriptor says `value_size_kind = 0`
+/// (fixed). For varint-mode runs the per-entry length is on the wire and
+/// `value_size` is ignored. `entry_count` matches
+/// `SortedRunHeader.entry_count`.
 ///
 /// The descriptor's `value_prefix` tail is read directly from the payload
 /// and prepended to each entry's value tail, so reconstruction needs no
@@ -620,19 +706,30 @@ pub fn decode_packed_run<K: PackableKey>(
     }
     let header_bytes = { head.key_header_bytes } as usize;
     let prefix = { head.common_value_prefix } as usize;
-    if prefix > value_size {
-        return Err(PackError::InvalidPrefix(prefix));
-    }
+    let value_size_kind = { head.value_size_kind };
     debug_assert_eq!(value_prefix.len(), prefix);
-    let value_tail_size = value_size - prefix;
     let body_size = bytes_per_key(&head, &fields);
 
     let after_format = head.total_size();
     let entries_bytes = &payload[after_format..];
-    let stride = body_size + value_tail_size;
-    let needed = (entry_count as usize) * stride;
-    if entries_bytes.len() < needed {
-        return Err(PackError::Malformed("decode: entries truncated"));
+
+    // Up-front bounds check is mode-specific:
+    // - fixed: stride = body + (value_size − prefix) is constant.
+    // - varint: per-entry length on the wire; checked entry-by-entry below.
+    match value_size_kind {
+        VALUE_SIZE_KIND_FIXED => {
+            if prefix > value_size {
+                return Err(PackError::InvalidPrefix(prefix));
+            }
+            let value_tail_size = value_size - prefix;
+            let stride = body_size + value_tail_size;
+            let needed = (entry_count as usize) * stride;
+            if entries_bytes.len() < needed {
+                return Err(PackError::Malformed("decode: entries truncated"));
+            }
+        }
+        VALUE_SIZE_KIND_VARINT => {}
+        _ => return Err(PackError::Malformed("decode: unknown value_size_kind")),
     }
 
     let mut out: Vec<(K, Vec<u8>)> = Vec::with_capacity(entry_count as usize);
@@ -640,13 +737,16 @@ pub fn decode_packed_run<K: PackableKey>(
     let mut field_vals = vec![0u64; nr];
     for _ in 0..entry_count {
         // Header.
+        let data_bytes = body_size - header_bytes;
+        if cursor + body_size > entries_bytes.len() {
+            return Err(PackError::Malformed("decode: entry body truncated"));
+        }
         let mut h: u32 = 0;
         for b in 0..header_bytes {
             h |= (entries_bytes[cursor + b] as u32) << (b * 8);
         }
         cursor += header_bytes;
         // Packed fields.
-        let data_bytes = body_size - header_bytes;
         let packed = &entries_bytes[cursor..cursor + data_bytes];
         cursor += data_bytes;
         let mut bit_pos = 0usize;
@@ -657,12 +757,24 @@ pub fn decode_packed_run<K: PackableKey>(
             let delta = read_bits(packed, &mut bit_pos, bw)?;
             field_vals[i] = base.wrapping_add(delta);
         }
-        // Value tail.
-        let value_tail = &entries_bytes[cursor..cursor + value_tail_size];
-        cursor += value_tail_size;
+
+        // Value tail. Length depends on mode.
+        let tail_len = match value_size_kind {
+            VALUE_SIZE_KIND_FIXED => value_size - prefix,
+            VALUE_SIZE_KIND_VARINT => {
+                read_varint_u64(entries_bytes, &mut cursor)? as usize
+            }
+            _ => unreachable!("value_size_kind validated above"),
+        };
+        if cursor + tail_len > entries_bytes.len() {
+            return Err(PackError::Malformed("decode: value tail truncated"));
+        }
+        let value_tail = &entries_bytes[cursor..cursor + tail_len];
+        cursor += tail_len;
+
         // Reconstruct full value: prefix bytes from the descriptor, then
         // the per-entry value tail.
-        let mut full_value = Vec::with_capacity(value_size);
+        let mut full_value = Vec::with_capacity(prefix + tail_len);
         full_value.extend_from_slice(&value_prefix);
         full_value.extend_from_slice(value_tail);
 
@@ -798,7 +910,7 @@ pub fn check_fit<K: PackableKey>(
         nr_fields: nr as u8,
         key_header_bytes: header_bytes,
         common_value_prefix: { head.common_value_prefix },
-        _pad: 0,
+        value_size_kind: VALUE_SIZE_KIND_FIXED,
         sum_bit_width: sum_bw,
     };
     Ok(FormatFit::NeedsPromotion(new_head, new_fields))
@@ -1204,7 +1316,7 @@ mod tests {
             nr_fields: 3,
             key_header_bytes: 0,
             common_value_prefix: 0,
-            _pad: 0,
+            value_size_kind: VALUE_SIZE_KIND_FIXED,
             sum_bit_width: 15,
         };
         let fields = vec![
@@ -1239,7 +1351,7 @@ mod tests {
             nr_fields: 1,
             key_header_bytes: 0,
             common_value_prefix: 0,
-            _pad: 0,
+            value_size_kind: VALUE_SIZE_KIND_FIXED,
             sum_bit_width: 0,
         };
         let fields = vec![FieldFormat {
@@ -1315,18 +1427,137 @@ mod tests {
         assert_eq!(decoded[0].1, vec![0xCA, 0xFE, 0xBA, 0xBE]);
     }
 
-    // --- variable-size values rejected ---
+    // --- variable-size values (varint mode) ---
 
     #[test]
-    fn variable_size_values_rejected() {
+    fn select_format_chooses_varint_mode_for_mixed_lengths() {
+        // Two entries whose values differ in both length AND content (no
+        // shared prefix beyond the discriminator).
         let entries: Vec<(u64, Vec<u8>)> = vec![
             (0u64, vec![1, 2, 3]),
-            (1u64, vec![1, 2]),
+            (1u64, vec![5, 6]),
         ];
-        // select_format won't reject; encoder will.
+        let (head, _fields, _prefix) = select_format(&entries).unwrap();
+        assert_eq!({ head.value_size_kind }, VALUE_SIZE_KIND_VARINT);
+    }
+
+    #[test]
+    fn select_format_chooses_fixed_mode_for_uniform_lengths() {
+        let entries: Vec<(u64, Vec<u8>)> = vec![
+            (0u64, vec![1, 2, 3, 4]),
+            (1u64, vec![1, 2, 3, 5]),
+        ];
+        let (head, _fields, _prefix) = select_format(&entries).unwrap();
+        assert_eq!({ head.value_size_kind }, VALUE_SIZE_KIND_FIXED);
+    }
+
+    #[test]
+    fn varint_mode_round_trips_mixed_length_values() {
+        let entries: Vec<(u64, Vec<u8>)> = vec![
+            (0u64, vec![0xA, 0xB, 0xC]),
+            (1u64, vec![0xA, 0xB]),
+            (2u64, vec![0xA, 0xB, 0xC, 0xD, 0xE]),
+            (3u64, vec![0xA]),
+        ];
         let (head, fields, prefix) = select_format(&entries).unwrap();
-        let err = encode_packed_run(&entries, &head, &fields, &prefix).unwrap_err();
-        assert!(matches!(err, PackError::Malformed(_)));
+        assert_eq!({ head.value_size_kind }, VALUE_SIZE_KIND_VARINT);
+        // Shared prefix is bounded by the shortest value (1 byte).
+        assert_eq!({ head.common_value_prefix }, 1);
+        assert_eq!(prefix, vec![0xA]);
+
+        let payload = encode_packed_run(&entries, &head, &fields, &prefix).unwrap();
+        // value_size argument is ignored in varint mode; pass a dummy.
+        let (decoded, _head, _fields) =
+            decode_packed_run::<u64>(&payload, /* ignored */ 0, entries.len() as u32)
+                .unwrap();
+        assert_eq!(decoded.len(), entries.len());
+        for (orig, dec) in entries.iter().zip(decoded.iter()) {
+            assert_eq!(orig.0, dec.0);
+            assert_eq!(orig.1, dec.1, "value bytes differ for key {}", orig.0);
+        }
+    }
+
+    #[test]
+    fn varint_mode_handles_empty_values() {
+        let entries: Vec<(u64, Vec<u8>)> = vec![
+            (0u64, vec![]),
+            (1u64, vec![0xFF, 0xFE]),
+        ];
+        let (head, fields, prefix) = select_format(&entries).unwrap();
+        assert_eq!({ head.value_size_kind }, VALUE_SIZE_KIND_VARINT);
+        // No shared prefix possible when one value is empty.
+        assert_eq!({ head.common_value_prefix }, 0);
+        let payload = encode_packed_run(&entries, &head, &fields, &prefix).unwrap();
+        let (decoded, _head, _fields) =
+            decode_packed_run::<u64>(&payload, 0, 2).unwrap();
+        assert_eq!(decoded[0].1, Vec::<u8>::new());
+        assert_eq!(decoded[1].1, vec![0xFF, 0xFE]);
+    }
+
+    #[test]
+    fn fixed_mode_payload_is_unchanged_by_amendment() {
+        // Fixed-mode runs encode byte-identically to the pre-C2 layout —
+        // i.e. no per-entry length prefix, just the value tail. We verify
+        // by encoding under each mode (the FIXED kind value is `0`, same
+        // bit pattern as the pre-amendment `_pad` byte).
+        let entries: Vec<(u64, Vec<u8>)> = vec![
+            (0u64, vec![1, 2, 3, 4]),
+            (1u64, vec![1, 2, 3, 5]),
+            (2u64, vec![1, 2, 3, 6]),
+        ];
+        let (head, fields, prefix) = select_format(&entries).unwrap();
+        assert_eq!({ head.value_size_kind }, VALUE_SIZE_KIND_FIXED);
+        let payload = encode_packed_run(&entries, &head, &fields, &prefix).unwrap();
+        // Each entry's wire size = body + (value_size - prefix). No varint.
+        let descriptor_size = head.total_size();
+        let body_size = bytes_per_key(&head, &fields);
+        let value_tail_size = 4 - { head.common_value_prefix } as usize;
+        let expected_total =
+            descriptor_size + entries.len() * (body_size + value_tail_size);
+        assert_eq!(payload.len(), expected_total);
+    }
+
+    // --- varint helpers ---
+
+    #[test]
+    fn varint_round_trip_small_values() {
+        for v in [0u64, 1, 42, 127, 128, 200, 16_383, 16_384, u32::MAX as u64] {
+            let mut buf = Vec::new();
+            write_varint_u64(&mut buf, v);
+            let mut pos = 0;
+            assert_eq!(read_varint_u64(&buf, &mut pos).unwrap(), v);
+            assert_eq!(pos, buf.len());
+        }
+    }
+
+    #[test]
+    fn varint_round_trip_full_u64() {
+        let mut buf = Vec::new();
+        write_varint_u64(&mut buf, u64::MAX);
+        assert_eq!(buf.len(), 10); // LEB128 needs 10 bytes for u64::MAX
+        let mut pos = 0;
+        assert_eq!(read_varint_u64(&buf, &mut pos).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn varint_truncated_errors() {
+        let buf = [0x80u8]; // continuation bit set, but no follow-up byte
+        let mut pos = 0;
+        assert!(matches!(
+            read_varint_u64(&buf, &mut pos),
+            Err(PackError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn varint_overlong_errors() {
+        // 11-byte varint: more than the u64 maximum encoding length.
+        let buf = [0x80u8; 11];
+        let mut pos = 0;
+        assert!(matches!(
+            read_varint_u64(&buf, &mut pos),
+            Err(PackError::Malformed(_))
+        ));
     }
 
     // --- pack_bits / read_bits round-trip ---
