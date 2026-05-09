@@ -41,8 +41,8 @@ mod tag_store;
 
 pub use {
     chunk_index::{
-        BlobRefSerde, CHUNK_INDEX_LEAF_ENTRY_SIZE, CHUNK_INDEX_VALUE_SIZE, ChunkEntrySerde,
-        ChunkHashKey, ChunkIndex, ChunkIndexKey, ChunkIndexLeafEntry, ChunkIndexValue,
+        CHUNK_INDEX_LEAF_ENTRY_SIZE, CHUNK_INDEX_VALUE_SIZE, ChunkHashKey, ChunkIndex,
+        ChunkIndexLeafEntry, ChunkIndexValue,
     },
     chunk_list::{
         CHUNK_LIST_ENTRY_SIZE, CHUNK_PARAMS_RECORD_SIZE, ChunkListEntry,

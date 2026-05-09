@@ -784,7 +784,7 @@ fn all_five_migrated_indices_round_trip_together() {
         block_no: 4242,
         length: 4096,
     };
-    de.engine.chunk_index.insert_or_bump([0xc1u8; 32], blob_ref);
+    de.engine.chunk_index.insert_or_bump([0xc1u8; 32], blob_ref, 4096);
 
     // ForwardIndex / TagIndex / KvIndex / RangeIndex via the public surface.
     let red = de.engine.register_tag("red");
@@ -835,9 +835,9 @@ fn migrated_indices_persist_across_commit_drop_open() {
         block_no: 1234,
         length: 4096,
     };
-    de.engine.chunk_index.insert_or_bump([0xa1u8; 32], blob_ref);
-    de.engine.chunk_index.insert_or_bump([0xa1u8; 32], blob_ref); // ref_count = 2
-    de.engine.chunk_index.insert_or_bump([0xb2u8; 32], blob_ref);
+    de.engine.chunk_index.insert_or_bump([0xa1u8; 32], blob_ref, 4096);
+    de.engine.chunk_index.insert_or_bump([0xa1u8; 32], blob_ref, 4096); // ref_count = 2
+    de.engine.chunk_index.insert_or_bump([0xb2u8; 32], blob_ref, 4096);
 
     // KvIndex inserts go through the public set_attr path.
     let key = de.engine.register_tag("yr");
@@ -1006,7 +1006,7 @@ fn all_ten_migrated_structures_round_trip_together() {
         block_no: 5050,
         length: 4096,
     };
-    de.engine.chunk_index.insert_or_bump([0xc7u8; 32], blob_ref);
+    de.engine.chunk_index.insert_or_bump([0xc7u8; 32], blob_ref, 4096);
 
     // ObjectTable + ForwardIndex + TagIndex + KvIndex + RangeIndex via
     // the public surface (create_object inserts into object_table; add_tag
@@ -1214,7 +1214,7 @@ fn all_twelve_migrated_structures_round_trip_together() {
         block_no: 5050,
         length: 4096,
     };
-    de.engine.chunk_index.insert_or_bump([0xc7u8; 32], blob_ref);
+    de.engine.chunk_index.insert_or_bump([0xc7u8; 32], blob_ref, 4096);
 
     // ObjectTable + ForwardIndex + TagIndex + KvIndex + RangeIndex via
     // the public surface.

@@ -1,43 +1,23 @@
 //! Chunk index — content-addressed dedup directory (IMPL §9.3).
 //!
 //! On-disk: a B+ tree of large nodes keyed by 32-byte BLAKE3 chunk hash; the
-//! leaf entry [`ChunkIndexLeafEntry`] is 56 B per IMPL §9.3 lines 1946–1951.
+//! leaf entry [`ChunkIndexLeafEntry`] is 56 B per IMPL §9.3 lines 1946–1951
+//! (32 B hash + 4 B `ref_count` + 4 B `length` + 16 B `BlobRef`). With the
+//! hash carried as the §1.5.6 packed key, the on-disk value tail is the
+//! 24-byte [`ChunkIndexValue`] = `(ref_count, length, blob_ref)`.
 //!
-//! In-memory mirror: [`ChunkIndex`] = `HashMap<[u8;32], (BlobRef, u32 ref_count)>`.
+//! In-memory mirror: [`ChunkIndex`] = `HashMap<[u8;32], ChunkIndexValue>`.
 //!
-//! ## Persistence (R1b-1)
+//! ## Persistence (R1c-A3.1)
 //!
 //! On disk the index occupies one 256 KiB §1.5 B+ tree region of
-//! [`BtreeKind::ChunkIndex`]. The in-memory mirror is materialised into a
-//! single CBOR-encoded sorted run via [`BtreeRegion::write_full`]; reload
-//! goes through [`BtreeRegion::read`].
-//!
-//! ### Why CBOR rather than the §1.5.6 packed-key codec
-//!
-//! The packed codec auto-detects bytes shared by every value in a sorted
-//! run and elides them, recording only the prefix *length* in the
-//! descriptor. On read it reconstructs full values by patching a
-//! caller-supplied template, which has no on-disk source of truth. Two
-//! pathological cases motivate the fallback:
-//!
-//! - Multi-disk pools whose entries all happen to share a non-zero
-//!   `disk_id` would have those bytes elided and silently zero-filled on
-//!   read.
-//! - The single-entry case: with one entry, every byte of its 20-byte
-//!   value matches itself, so `common_value_prefix = 20` (capped at 24 by
-//!   the spec, hits the value's own length first), eliding the value
-//!   entirely; the on-disk run carries nothing to round-trip.
-//!
-//! TODO(rewrite-phase-R1c): once the storage layer offers a
-//! pin-`common_value_prefix=0` knob (or a per-run "first value bytes"
-//! sidecar), switch this index to the packed path. Type scaffolding
-//! ([`ChunkIndexKey`], [`ChunkIndexValue`], the [`PackableKey`] impl) is
-//! kept in place for that landing.
-//!
-//! Per IMPL §9.3 the **leaf value shape** is a fixed 56-byte
-//! `ChunkIndexLeafEntry` (32 B hash + 4 B ref_count + 4 B length + 16 B
-//! BlobRef). The current `ChunkIndex::ChunkEntrySerde` mirror omits
-//! `length`; that's tracked under R1b-2 alongside the §1.5 leaf-entry rewrite.
+//! [`BtreeKind::ChunkIndex`]. Entries are serialised through the
+//! `SORTED_RUN_FLAG_PACKED_KEYS` codec (§1.5.6) — keys are packed as four
+//! big-endian `u64` fields covering the 32-byte hash, values are written as
+//! the 24-byte [`ChunkIndexValue`] byte image. The C1 amendment persists the
+//! `common_value_prefix` bytes inline in the descriptor, so the codec
+//! correctly round-trips even single-entry runs and runs whose values
+//! happen to share leading bytes (e.g. all entries with the same `disk_id`).
 
 use std::collections::HashMap;
 
@@ -59,15 +39,15 @@ use crate::error::IndexError;
 pub const CHUNK_INDEX_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
-// ---------- ChunkIndexLeafEntry ----------
+// ---------- ChunkIndexLeafEntry (full record, mirror only) ----------
 
 /// Size in bytes of [`ChunkIndexLeafEntry`] (56). IMPL §9.3.
 pub const CHUNK_INDEX_LEAF_ENTRY_SIZE: usize = 56;
 
-/// On-disk leaf entry for the content-addressed `ChunkIndex` B+ tree.
-/// IMPL §9.3.
-///
-/// Layout:
+/// On-disk leaf entry layout described by IMPL §9.3. The full record is
+/// 56 B; the codec splits it into the 32 B `chunk_hash` (the §1.5.6
+/// packed key) and the 24 B [`ChunkIndexValue`] tail. This struct exists
+/// for analyze-style tooling that wants to render the full record.
 ///
 /// ```text
 /// [0..32]  chunk_hash  [u8; 32]   (BLAKE3 of plaintext)
@@ -88,15 +68,13 @@ const_assert_eq!(
     core::mem::size_of::<ChunkIndexLeafEntry>(),
     CHUNK_INDEX_LEAF_ENTRY_SIZE
 );
-// computed: 32 (chunk_hash) + 4 (ref_count) + 4 (length) + 16 (BlobRef) = 56
+// 32 (chunk_hash) + 4 (ref_count) + 4 (length) + 16 (BlobRef) = 56
 
-// ---------- ChunkIndex (in-memory mirror) ----------
+// ---------- ChunkHashKey (packable key) ----------
 
-/// Newtype around a 32-byte chunk hash so the `ChunkIndex` can derive
-/// `Serialize`/`Deserialize` directly. Serde's default `[u8; 32]` map-key
-/// representation depends on the format (CBOR encodes the byte array, but
-/// JSON-style formats reject byte-array keys); using a base-16 string here
-/// is unambiguous, format-agnostic, and stable across crate versions.
+/// 32-byte BLAKE3 chunk hash. Used as the [`ChunkIndex`] map key and as the
+/// §1.5.6 packed-run key (decomposes into four big-endian `u64` fields so
+/// byte-wise lexicographic compare matches the natural hash byte order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkHashKey(pub [u8; 32]);
 
@@ -121,7 +99,9 @@ impl From<ChunkHashKey> for [u8; 32] {
 
 impl Serialize for ChunkHashKey {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        // Lowercase base-16; 64 chars total, no separators.
+        // Lowercase base-16; 64 chars total, no separators. Used by the CBOR
+        // fallback path inside `BtreeRegion::read_packed`'s `K: Deserialize`
+        // bound; the production path round-trips through the packed codec.
         let mut buf = [0u8; 64];
         for (i, byte) in self.0.iter().enumerate() {
             const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -163,257 +143,14 @@ fn hex_nibble(c: u8) -> Result<u8, &'static str> {
     }
 }
 
-/// Serialisable proxy for `BlobRef` (the upstream type derives neither
-/// `Serialize` nor `Deserialize`). Exposed as `pub` because it appears in
-/// the [`ChunkIndex::to_loaded_node`] / [`ChunkIndex::from_loaded_node`]
-/// signatures; callers normally only use those indirectly via
-/// [`ChunkIndex::flush_to_region`] and [`ChunkIndex::load_from_region`].
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct BlobRefSerde {
-    /// Mirror of [`BlobRef::disk_id`].
-    pub disk_id: u16,
-    /// Mirror of [`BlobRef::_pad`] (always zero today).
-    pub pad: u16,
-    /// Mirror of [`BlobRef::block_no`].
-    pub block_no: u32,
-    /// Mirror of [`BlobRef::length`].
-    pub length: u64,
-}
-
-impl From<BlobRef> for BlobRefSerde {
-    fn from(b: BlobRef) -> Self {
-        Self {
-            disk_id: { b.disk_id },
-            pad: { b._pad },
-            block_no: { b.block_no },
-            length: { b.length },
-        }
-    }
-}
-
-impl From<BlobRefSerde> for BlobRef {
-    fn from(s: BlobRefSerde) -> Self {
-        Self {
-            disk_id: s.disk_id,
-            _pad: s.pad,
-            block_no: s.block_no,
-            length: s.length,
-        }
-    }
-}
-
-/// Serde-friendly value: the proxy `BlobRef` plus the refcount.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct ChunkEntrySerde {
-    /// Physical extent of the chunk.
-    pub blob: BlobRefSerde,
-    /// Number of `ChunkList` chains referencing this chunk.
-    pub ref_count: u32,
-}
-
-/// In-memory `ChunkIndex`. Keyed by BLAKE3 chunk hash, value is the physical
-/// extent and a reference count tracking how many `ChunkList` chains point
-/// at this chunk (DESIGN §5 / IMPL §9.3).
-///
-/// `Serialize` / `Deserialize` are derived via the [`ChunkHashKey`] newtype
-/// (base-16 string keys) and a per-entry serde proxy for [`BlobRef`]. That
-/// makes the type usable directly with `ciborium::ser::into_writer` /
-/// `ciborium::de::from_reader` — no crate-local helpers needed.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ChunkIndex {
-    entries: HashMap<ChunkHashKey, ChunkEntrySerde>,
-}
-
-impl ChunkIndex {
-    /// New, empty `ChunkIndex`.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Look up a chunk by hash. Returns `None` if absent.
-    pub fn lookup(&self, hash: &[u8; 32]) -> Option<BlobRef> {
-        self.entries
-            .get(&ChunkHashKey(*hash))
-            .map(|e| e.blob.into())
-    }
-
-    /// Borrow `(blob, ref_count)` for a given hash.
-    pub fn entry(&self, hash: &[u8; 32]) -> Option<(BlobRef, u32)> {
-        self.entries
-            .get(&ChunkHashKey(*hash))
-            .map(|e| (e.blob.into(), e.ref_count))
-    }
-
-    /// Insert a new chunk if missing, otherwise increment its `ref_count`.
-    /// Returns the resulting `BlobRef` (the freshly inserted one, or the
-    /// existing one — content-addressed dedup makes them identical).
-    pub fn insert_or_bump(&mut self, hash: [u8; 32], blob: BlobRef) -> BlobRef {
-        let entry = self.entries.entry(ChunkHashKey(hash)).or_insert(ChunkEntrySerde {
-            blob: blob.into(),
-            ref_count: 0,
-        });
-        entry.ref_count = entry.ref_count.saturating_add(1);
-        entry.blob.into()
-    }
-
-    /// Decrement the refcount; remove if it reaches zero. Returns `true` if
-    /// the entry was removed (caller should reclaim the blob).
-    pub fn decrement(&mut self, hash: &[u8; 32]) -> bool {
-        let key = ChunkHashKey(*hash);
-        if let Some(entry) = self.entries.get_mut(&key) {
-            if entry.ref_count <= 1 {
-                self.entries.remove(&key);
-                true
-            } else {
-                entry.ref_count -= 1;
-                false
-            }
-        } else {
-            false
-        }
-    }
-
-    /// Number of unique chunks tracked.
-    pub fn chunk_count(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Reference count for a hash, or 0 if absent.
-    pub fn ref_count(&self, hash: &[u8; 32]) -> u32 {
-        self.entries
-            .get(&ChunkHashKey(*hash))
-            .map(|e| e.ref_count)
-            .unwrap_or(0)
-    }
-
-    /// Serialise to CBOR. The type derives `Serialize` directly; this
-    /// helper is retained for symmetry with the other indices.
-    pub fn serialise(&self) -> Result<Vec<u8>, IndexError> {
-        let mut buf = Vec::new();
-        ciborium::ser::into_writer(self, &mut buf)
-            .map_err(|e| IndexError::CborEncode(e.to_string()))?;
-        Ok(buf)
-    }
-
-    /// Deserialise from CBOR.
-    pub fn deserialise(bytes: &[u8]) -> Result<Self, IndexError> {
-        ciborium::de::from_reader(bytes).map_err(|e| IndexError::CborDecode(e.to_string()))
-    }
-
-    // ----------------------------------------------------------------
-    // R1b-1: §1.5 B+ tree persistence (CBOR-encoded sorted run).
-    // ----------------------------------------------------------------
-
-    /// Build a [`LoadedNode`] containing every entry as a single CBOR sorted
-    /// run sorted by chunk hash. The node uses [`BtreeKind::ChunkIndex`] and
-    /// the spec's 18-bit (256 KiB) region size.
-    ///
-    /// Type-level scaffolding for the packed-key codec ([`ChunkIndexKey`] /
-    /// [`ChunkIndexValue`]) lives below — see the crate-level doc on why we
-    /// stick with CBOR for now.
-    pub fn to_loaded_node(&self) -> LoadedNode<ChunkHashKey, ChunkEntrySerde> {
-        let mut entries: Vec<(ChunkHashKey, ChunkEntrySerde)> =
-            self.entries.iter().map(|(k, v)| (*k, *v)).collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mut node: LoadedNode<ChunkHashKey, ChunkEntrySerde> =
-            LoadedNode::new(BtreeKind::ChunkIndex, 0, REGION_SIZE_LOG2);
-        if !entries.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, entries);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        node
-    }
-
-    /// Restore the in-memory state from a [`LoadedNode`] parsed via
-    /// [`BtreeRegion::read`].
-    pub fn from_loaded_node(node: &LoadedNode<ChunkHashKey, ChunkEntrySerde>) -> Self {
-        let mut entries: HashMap<ChunkHashKey, ChunkEntrySerde> = HashMap::new();
-        for (k, v) in node.merge_iter() {
-            entries.insert(*k, *v);
-        }
-        Self { entries }
-    }
-
-    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
-    /// on `device`. Replaces the region wholesale via
-    /// [`BtreeRegion::write_full`].
-    pub fn flush_to_region<D: BlockDevice>(
-        &self,
-        device: &D,
-        offset: u64,
-    ) -> Result<(), IndexError> {
-        let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, ChunkHashKey, ChunkEntrySerde>(device, offset, &mut node)?;
-        Ok(())
-    }
-
-    /// Read the in-memory state from the 256 KiB region at byte `offset` on
-    /// `device`. An all-zero region is treated as "empty index" and returns
-    /// [`Self::default`].
-    pub fn load_from_region<D: BlockDevice>(
-        device: &D,
-        offset: u64,
-    ) -> Result<Self, IndexError> {
-        // Probe the first 8 bytes — a fresh (all-zero) region has no magic.
-        let mut probe = [0u8; 8];
-        device.read_at(offset, &mut probe)?;
-        if probe.iter().all(|&b| b == 0) {
-            return Ok(Self::default());
-        }
-        let node = BtreeRegion::read::<D, ChunkHashKey, ChunkEntrySerde>(
-            device,
-            offset,
-            BtreeKind::ChunkIndex,
-        )?;
-        Ok(Self::from_loaded_node(&node))
-    }
-}
-
-// ---------- ChunkIndexKey (PackableKey) ----------
-
-/// Packed-B+-tree key for the [`ChunkIndex`]. Wraps a 32-byte BLAKE3 hash
-/// and decomposes it into four `u64` fields (big-endian, MSB-first) so the
-/// natural lexicographic byte ordering matches the packed sort order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct ChunkIndexKey(pub [u8; 32]);
-
-impl Ord for ChunkIndexKey {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-impl PartialOrd for ChunkIndexKey {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-// `BtreeRegion::read_packed` needs `Serialize + Deserialize` for the CBOR
-// fallback path, even though we always go through the packed codec for this
-// key. Round-trip through `ChunkHashKey`'s hex encoding for consistency.
-impl Serialize for ChunkIndexKey {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ChunkHashKey(self.0).serialize(ser)
-    }
-}
-
-impl<'de> Deserialize<'de> for ChunkIndexKey {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        let inner = ChunkHashKey::deserialize(de)?;
-        Ok(Self(inner.0))
-    }
-}
-
-const CHUNK_INDEX_KEY_HINTS: [FieldHints; 4] = [
+const CHUNK_HASH_KEY_HINTS: [FieldHints; 4] = [
     FieldHints::unsigned_msb(),
     FieldHints::unsigned_msb(),
     FieldHints::unsigned_msb(),
     FieldHints::unsigned_msb(),
 ];
 
-impl PackableKey for ChunkIndexKey {
+impl PackableKey for ChunkHashKey {
     fn nr_fields() -> usize {
         4
     }
@@ -421,7 +158,7 @@ impl PackableKey for ChunkIndexKey {
         0
     }
     fn field_hints() -> &'static [FieldHints] {
-        &CHUNK_INDEX_KEY_HINTS
+        &CHUNK_HASH_KEY_HINTS
     }
     fn field_values(&self, out: &mut [u64]) {
         // Big-endian within each 8-byte chunk so lexicographic byte compare
@@ -434,7 +171,7 @@ impl PackableKey for ChunkIndexKey {
     }
     fn from_components(_header: u32, fields: &[u64]) -> Result<Self, PackError> {
         if fields.len() != 4 {
-            return Err(PackError::Malformed("ChunkIndexKey: wrong field count"));
+            return Err(PackError::Malformed("ChunkHashKey: wrong field count"));
         }
         let mut bytes = [0u8; 32];
         for (i, &field) in fields.iter().enumerate().take(4) {
@@ -444,34 +181,39 @@ impl PackableKey for ChunkIndexKey {
     }
 }
 
-// ---------- ChunkIndexValue (fixed-size 20 B value image) ----------
+// ---------- ChunkIndexValue (24 B fixed value image) ----------
 
-/// Size in bytes of [`ChunkIndexValue`]'s on-disk byte image (20 = 16 B
-/// `BlobRef` + 4 B `ref_count`).
-pub const CHUNK_INDEX_VALUE_SIZE: usize = 20;
+/// Size in bytes of [`ChunkIndexValue`]'s on-disk byte image (24 = 4 B
+/// `ref_count` + 4 B `length` + 16 B `BlobRef`).
+pub const CHUNK_INDEX_VALUE_SIZE: usize = 24;
 
-/// Fixed-size 20-byte value image for the [`ChunkIndex`] B+ tree. Layout:
+/// Fixed-size 24-byte value tail for the [`ChunkIndex`] B+ tree. Together
+/// with the 32 B `chunk_hash` packed-key prefix this reproduces the spec's
+/// 56 B [`ChunkIndexLeafEntry`] layout. Field order matches IMPL §9.3.
 ///
 /// ```text
-/// [0..16]  blob_ref  BlobRef   (disk_id u16 | _pad u16 | block_no u32 | length u64)
-/// [16..20] ref_count u32
+/// [0..4]   ref_count u32
+/// [4..8]   length    u32
+/// [8..24]  blob_ref  BlobRef   (disk_id u16 | _pad u16 | block_no u32 | length u64)
 /// ```
-///
-/// The `Pod + Zeroable` impl makes the byte image directly castable, and
-/// `AsRef<[u8]>` / `From<Vec<u8>>` integrate with the packed-B+-tree path.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct ChunkIndexValue {
-    blob_ref: BlobRef, // [0..16]
-    ref_count: u32,    // [16..20]
+    ref_count: u32, // [0..4]
+    length: u32,    // [4..8]
+    blob_ref: BlobRef, // [8..24]
 }
 
 const_assert_eq!(core::mem::size_of::<ChunkIndexValue>(), CHUNK_INDEX_VALUE_SIZE);
 
 impl ChunkIndexValue {
     /// Construct a fresh value.
-    pub fn new(blob_ref: BlobRef, ref_count: u32) -> Self {
-        Self { blob_ref, ref_count }
+    pub fn new(blob_ref: BlobRef, ref_count: u32, length: u32) -> Self {
+        Self {
+            ref_count,
+            length,
+            blob_ref,
+        }
     }
 
     /// Copy the [`BlobRef`] out (works around `#[repr(packed)]` alignment).
@@ -482,6 +224,11 @@ impl ChunkIndexValue {
     /// Reference count.
     pub fn ref_count(&self) -> u32 {
         self.ref_count
+    }
+
+    /// Plaintext byte count of the chunk this entry references.
+    pub fn length(&self) -> u32 {
+        self.length
     }
 }
 
@@ -510,8 +257,6 @@ impl From<Vec<u8>> for ChunkIndexValue {
 // the compiler needs the impls anyway.
 impl Serialize for ChunkIndexValue {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        // 20 bytes; serialise as a fixed-length byte array via serde's
-        // `serialize_bytes`.
         ser.serialize_bytes(self.as_ref())
     }
 }
@@ -555,6 +300,162 @@ mod serde_bytes_helper {
     }
 }
 
+// ---------- ChunkIndex (in-memory mirror) ----------
+
+/// In-memory `ChunkIndex`. Keyed by BLAKE3 chunk hash, value is the physical
+/// extent + reference count + plaintext length tracked per chunk
+/// (DESIGN §5 / IMPL §9.3).
+#[derive(Debug, Clone, Default)]
+pub struct ChunkIndex {
+    entries: HashMap<ChunkHashKey, ChunkIndexValue>,
+}
+
+impl ChunkIndex {
+    /// New, empty `ChunkIndex`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Look up a chunk by hash. Returns `None` if absent.
+    pub fn lookup(&self, hash: &[u8; 32]) -> Option<BlobRef> {
+        self.entries
+            .get(&ChunkHashKey(*hash))
+            .map(|v| v.blob_ref())
+    }
+
+    /// Borrow `(blob, ref_count, length)` for a given hash.
+    pub fn entry(&self, hash: &[u8; 32]) -> Option<(BlobRef, u32, u32)> {
+        self.entries
+            .get(&ChunkHashKey(*hash))
+            .map(|v| (v.blob_ref(), v.ref_count(), v.length()))
+    }
+
+    /// Plaintext byte count of the chunk, or 0 if absent.
+    pub fn length(&self, hash: &[u8; 32]) -> u32 {
+        self.entries
+            .get(&ChunkHashKey(*hash))
+            .map(|v| v.length())
+            .unwrap_or(0)
+    }
+
+    /// Insert a new chunk if missing, otherwise increment its `ref_count`.
+    /// `length` is the chunk's plaintext byte count; on a duplicate insert
+    /// the stored length is left unchanged (the existing entry is the
+    /// authoritative copy by content-addressed dedup). Returns the
+    /// resulting `BlobRef`.
+    pub fn insert_or_bump(&mut self, hash: [u8; 32], blob: BlobRef, length: u32) -> BlobRef {
+        let entry = self
+            .entries
+            .entry(ChunkHashKey(hash))
+            .or_insert_with(|| ChunkIndexValue::new(blob, 0, length));
+        entry.ref_count = entry.ref_count.saturating_add(1);
+        entry.blob_ref()
+    }
+
+    /// Decrement the refcount; remove if it reaches zero. Returns `true` if
+    /// the entry was removed (caller should reclaim the blob).
+    pub fn decrement(&mut self, hash: &[u8; 32]) -> bool {
+        let key = ChunkHashKey(*hash);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if entry.ref_count <= 1 {
+                self.entries.remove(&key);
+                true
+            } else {
+                entry.ref_count -= 1;
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Number of unique chunks tracked.
+    pub fn chunk_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Reference count for a hash, or 0 if absent.
+    pub fn ref_count(&self, hash: &[u8; 32]) -> u32 {
+        self.entries
+            .get(&ChunkHashKey(*hash))
+            .map(|v| v.ref_count())
+            .unwrap_or(0)
+    }
+
+    // ----------------------------------------------------------------
+    // §1.5 B+ tree persistence (packed-key codec, §1.5.6).
+    // ----------------------------------------------------------------
+
+    /// Build a [`LoadedNode`] containing every entry as a single packed
+    /// sorted run sorted by chunk hash. The node uses
+    /// [`BtreeKind::ChunkIndex`] and the spec's 18-bit (256 KiB) region
+    /// size.
+    pub fn to_loaded_node(&self) -> LoadedNode<ChunkHashKey, ChunkIndexValue> {
+        let mut entries: Vec<(ChunkHashKey, ChunkIndexValue)> =
+            self.entries.iter().map(|(k, v)| (*k, *v)).collect();
+        entries.sort_by_key(|e| e.0);
+
+        let mut node: LoadedNode<ChunkHashKey, ChunkIndexValue> =
+            LoadedNode::new(BtreeKind::ChunkIndex, 0, REGION_SIZE_LOG2);
+        if !entries.is_empty() {
+            let run = SortedRun::from_sorted(0, 0, entries);
+            node.sorted_runs.push(run);
+            node.header.sorted_run_count = 1;
+        }
+        node
+    }
+
+    /// Restore the in-memory state from a [`LoadedNode`] produced by
+    /// [`BtreeRegion::read_packed`].
+    pub fn from_loaded_node(node: &LoadedNode<ChunkHashKey, ChunkIndexValue>) -> Self {
+        let mut entries: HashMap<ChunkHashKey, ChunkIndexValue> = HashMap::new();
+        for (k, v) in node.merge_iter() {
+            entries.insert(*k, *v);
+        }
+        Self { entries }
+    }
+
+    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
+    /// on `device`. Replaces the region wholesale via
+    /// [`BtreeRegion::write_full_packed`].
+    pub fn flush_to_region<D: BlockDevice>(
+        &self,
+        device: &D,
+        offset: u64,
+    ) -> Result<(), IndexError> {
+        let mut node = self.to_loaded_node();
+        BtreeRegion::write_full_packed::<D, ChunkHashKey, ChunkIndexValue>(
+            device,
+            offset,
+            &mut node,
+            CHUNK_INDEX_VALUE_SIZE,
+        )?;
+        Ok(())
+    }
+
+    /// Read the in-memory state from the 256 KiB region at byte `offset` on
+    /// `device`. An all-zero region is treated as "empty index" and returns
+    /// [`Self::default`].
+    pub fn load_from_region<D: BlockDevice>(
+        device: &D,
+        offset: u64,
+    ) -> Result<Self, IndexError> {
+        // Probe the first 8 bytes — a fresh (all-zero) region has no magic.
+        let mut probe = [0u8; 8];
+        device.read_at(offset, &mut probe)?;
+        if probe.iter().all(|&b| b == 0) {
+            return Ok(Self::default());
+        }
+        let node = BtreeRegion::read_packed::<D, ChunkHashKey, ChunkIndexValue>(
+            device,
+            offset,
+            BtreeKind::ChunkIndex,
+            CHUNK_INDEX_VALUE_SIZE,
+        )?;
+        Ok(Self::from_loaded_node(&node))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,6 +473,8 @@ mod tests {
         }
     }
 
+    const TEST_LEN: u32 = 4096;
+
     #[test]
     fn chunk_index_leaf_entry_size_is_56() {
         // computed: 32 + 4 + 4 + 16 = 56
@@ -579,20 +482,26 @@ mod tests {
     }
 
     #[test]
+    fn chunk_index_value_size_is_24() {
+        assert_eq!(core::mem::size_of::<ChunkIndexValue>(), 24);
+    }
+
+    #[test]
     fn insert_and_dedup_bumps_refcount() {
         let mut idx = ChunkIndex::new();
-        let r1 = idx.insert_or_bump(h(1), b(100));
-        let r2 = idx.insert_or_bump(h(1), b(200)); // duplicate — second blob arg ignored
+        let r1 = idx.insert_or_bump(h(1), b(100), TEST_LEN);
+        let r2 = idx.insert_or_bump(h(1), b(200), 9999); // duplicate — second args ignored
         assert_eq!(r1, r2);
         assert_eq!(idx.ref_count(&h(1)), 2);
+        assert_eq!(idx.length(&h(1)), TEST_LEN);
         assert_eq!(idx.chunk_count(), 1);
     }
 
     #[test]
     fn decrement_removes_when_zero() {
         let mut idx = ChunkIndex::new();
-        idx.insert_or_bump(h(1), b(100));
-        idx.insert_or_bump(h(1), b(100));
+        idx.insert_or_bump(h(1), b(100), TEST_LEN);
+        idx.insert_or_bump(h(1), b(100), TEST_LEN);
         assert_eq!(idx.ref_count(&h(1)), 2);
         assert!(!idx.decrement(&h(1)));
         assert_eq!(idx.ref_count(&h(1)), 1);
@@ -604,39 +513,21 @@ mod tests {
     fn lookup_absent_returns_none() {
         let mut idx = ChunkIndex::new();
         assert!(idx.lookup(&h(99)).is_none());
+        assert_eq!(idx.length(&h(99)), 0);
         assert!(!idx.decrement(&h(99)));
     }
 
     #[test]
-    fn chunk_hash_key_serde_round_trip_via_ciborium_directly() {
-        // Verify the ChunkIndex derives Serialize/Deserialize and round-trips
-        // through `ciborium::{ser,de}` without crate-local helpers.
+    fn entry_returns_full_triple() {
         let mut idx = ChunkIndex::new();
-        idx.insert_or_bump(h(7), b(700));
-        idx.insert_or_bump(h(8), b(800));
-        idx.insert_or_bump(h(8), b(800));
-        let mut buf = Vec::new();
-        ciborium::ser::into_writer(&idx, &mut buf).unwrap();
-        let back: ChunkIndex = ciborium::de::from_reader(buf.as_slice()).unwrap();
-        assert_eq!(back.chunk_count(), 2);
-        assert_eq!(back.ref_count(&h(7)), 1);
-        assert_eq!(back.ref_count(&h(8)), 2);
+        idx.insert_or_bump(h(5), b(50), 2048);
+        let (blob, rc, len) = idx.entry(&h(5)).unwrap();
+        assert_eq!(blob, b(50));
+        assert_eq!(rc, 1);
+        assert_eq!(len, 2048);
     }
 
-    #[test]
-    fn cbor_round_trip() {
-        let mut idx = ChunkIndex::new();
-        idx.insert_or_bump(h(1), b(100));
-        idx.insert_or_bump(h(2), b(200));
-        idx.insert_or_bump(h(2), b(200));
-        let bytes = idx.serialise().unwrap();
-        let back = ChunkIndex::deserialise(&bytes).unwrap();
-        assert_eq!(back.chunk_count(), 2);
-        assert_eq!(back.ref_count(&h(1)), 1);
-        assert_eq!(back.ref_count(&h(2)), 2);
-    }
-
-    // ----- B+ tree region round-trip (R1b-1) -----
+    // ----- B+ tree region round-trip (packed wire format) -----
 
     use mimisbrunnr_storage::FileBlockDevice;
     use tempfile::TempDir;
@@ -652,45 +543,64 @@ mod tests {
     #[test]
     fn region_round_trip_empty_returns_default() {
         let (_dir, dev) = fresh_device();
-        // Reading a fresh (zeroed) region must not error.
         let idx = ChunkIndex::load_from_region(&dev, 0).unwrap();
         assert_eq!(idx.chunk_count(), 0);
     }
 
     #[test]
-    fn region_round_trip_preserves_entries_and_refcounts() {
+    fn region_round_trip_preserves_entries_refcounts_and_lengths() {
         let (_dir, dev) = fresh_device();
         let mut idx = ChunkIndex::new();
         for i in 1u8..=10 {
-            idx.insert_or_bump(h(i), b(i as u32 * 100));
+            idx.insert_or_bump(h(i), b(i as u32 * 100), i as u32 * 1024);
         }
         // Bump a few to non-1 refcounts.
-        idx.insert_or_bump(h(3), b(300));
-        idx.insert_or_bump(h(3), b(300));
-        idx.insert_or_bump(h(7), b(700));
+        idx.insert_or_bump(h(3), b(300), 3 * 1024);
+        idx.insert_or_bump(h(3), b(300), 3 * 1024);
+        idx.insert_or_bump(h(7), b(700), 7 * 1024);
 
         idx.flush_to_region(&dev, 0).unwrap();
         let back = ChunkIndex::load_from_region(&dev, 0).unwrap();
 
         assert_eq!(back.chunk_count(), idx.chunk_count());
         for i in 1u8..=10 {
-            assert_eq!(back.lookup(&h(i)), Some(b(i as u32 * 100)), "hash {i}");
+            assert_eq!(back.lookup(&h(i)), Some(b(i as u32 * 100)), "blob {i}");
             assert_eq!(back.ref_count(&h(i)), idx.ref_count(&h(i)), "rc {i}");
+            assert_eq!(back.length(&h(i)), i as u32 * 1024, "len {i}");
         }
     }
 
     #[test]
-    fn region_round_trip_survives_single_disk_value_prefix() {
-        // All entries have disk_id = 0 + _pad = 0, i.e. values share a
-        // 4-byte leading zero prefix. The CBOR codec we use is unaffected
-        // by this; this test exists as a regression guard against
-        // accidentally switching back to the packed path without first
-        // wiring a real prefix-template recovery story (see crate-level
-        // doc TODO marker).
+    fn region_round_trip_single_entry() {
+        // The single-entry case used to trigger the C1 prefix-elision bug
+        // (the descriptor's `common_value_prefix` would saturate to the
+        // value's full length, eliding the entire value with no on-disk
+        // record). Post-C1, the descriptor persists the prefix bytes
+        // inline so reconstruction is byte-exact.
+        let (_dir, dev) = fresh_device();
+        let mut idx = ChunkIndex::new();
+        idx.insert_or_bump(h(42), b(4242), 8192);
+        idx.flush_to_region(&dev, 0).unwrap();
+        let back = ChunkIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.chunk_count(), 1);
+        assert_eq!(back.lookup(&h(42)), Some(b(4242)));
+        assert_eq!(back.ref_count(&h(42)), 1);
+        assert_eq!(back.length(&h(42)), 8192);
+    }
+
+    #[test]
+    fn region_round_trip_with_shared_disk_id_value_prefix() {
+        // All entries share `disk_id = 0` + `_pad = 0`, so the value tail
+        // has 4 leading bytes (the BlobRef's leading u16+u16) shared
+        // across every entry — wait, actually with the new layout the
+        // BlobRef sits at offset 8, so the shared prefix is bounded by
+        // the prefix of the (ref_count, length) pair, which varies. Even
+        // so, this is a useful regression guard against future field
+        // reorderings.
         let (_dir, dev) = fresh_device();
         let mut idx = ChunkIndex::new();
         for i in 0u8..32 {
-            idx.insert_or_bump(h(i + 1), b(i as u32 + 1));
+            idx.insert_or_bump(h(i + 1), b(i as u32 + 1), 1024);
         }
         idx.flush_to_region(&dev, 0).unwrap();
         let back = ChunkIndex::load_from_region(&dev, 0).unwrap();
@@ -704,12 +614,12 @@ mod tests {
     fn region_overwrite_replaces_state() {
         let (_dir, dev) = fresh_device();
         let mut first = ChunkIndex::new();
-        first.insert_or_bump(h(1), b(100));
-        first.insert_or_bump(h(2), b(200));
+        first.insert_or_bump(h(1), b(100), TEST_LEN);
+        first.insert_or_bump(h(2), b(200), TEST_LEN);
         first.flush_to_region(&dev, 0).unwrap();
 
         let mut second = ChunkIndex::new();
-        second.insert_or_bump(h(9), b(900));
+        second.insert_or_bump(h(9), b(900), TEST_LEN);
         second.flush_to_region(&dev, 0).unwrap();
 
         let back = ChunkIndex::load_from_region(&dev, 0).unwrap();
@@ -731,10 +641,10 @@ mod tests {
     fn loaded_node_round_trip_preserves_all_entries() {
         let mut idx = ChunkIndex::new();
         for i in 1u8..=5 {
-            idx.insert_or_bump(h(i), b(i as u32 * 10));
+            idx.insert_or_bump(h(i), b(i as u32 * 10), i as u32 * 100);
         }
-        idx.insert_or_bump(h(3), b(30));
-        idx.insert_or_bump(h(3), b(30));
+        idx.insert_or_bump(h(3), b(30), 300);
+        idx.insert_or_bump(h(3), b(30), 300);
 
         let node = idx.to_loaded_node();
         assert_eq!(node.sorted_runs.len(), 1);
@@ -743,6 +653,7 @@ mod tests {
         assert_eq!(back.chunk_count(), 5);
         for i in 1u8..=5 {
             assert_eq!(back.lookup(&h(i)), Some(b(i as u32 * 10)));
+            assert_eq!(back.length(&h(i)), i as u32 * 100);
         }
         assert_eq!(back.ref_count(&h(3)), 3);
     }
@@ -758,7 +669,7 @@ mod tests {
             for (j, slot) in hash.iter_mut().enumerate() {
                 *slot = ((i.wrapping_mul(j as u32 + 17) ^ 0xa5) & 0xff) as u8;
             }
-            idx.insert_or_bump(hash, b(i + 1));
+            idx.insert_or_bump(hash, b(i + 1), i + 1);
         }
         assert_eq!(idx.chunk_count(), 100);
         idx.flush_to_region(&dev, 0).unwrap();
@@ -770,33 +681,59 @@ mod tests {
                 *slot = ((i.wrapping_mul(j as u32 + 17) ^ 0xa5) & 0xff) as u8;
             }
             assert_eq!(back.lookup(&hash), Some(b(i + 1)));
+            assert_eq!(back.length(&hash), i + 1);
         }
     }
 
-    // ----- ChunkIndexKey / ChunkIndexValue scaffolding -----
+    #[test]
+    fn on_disk_run_carries_packed_keys_flag() {
+        use mimisbrunnr_storage::{
+            BLOCK_SIZE, BlockDevice, BtreeNodeHeader, SORTED_RUN_FLAG_PACKED_KEYS, SortedRunHeader,
+        };
+        let (_dir, dev) = fresh_device();
+        let mut idx = ChunkIndex::new();
+        for i in 1u8..=4 {
+            idx.insert_or_bump(h(i), b(i as u32), TEST_LEN);
+        }
+        idx.flush_to_region(&dev, 0).unwrap();
+
+        // Read the §1.5 region header + first sorted-run header off disk
+        // and verify the packed flag is set — the codec is in use.
+        let mut header_sector = vec![0u8; BLOCK_SIZE];
+        dev.read_at(0, &mut header_sector).unwrap();
+        let _ = BtreeNodeHeader::parse(&header_sector).unwrap();
+
+        let mut run_header_buf = [0u8; std::mem::size_of::<SortedRunHeader>()];
+        dev.read_at(BLOCK_SIZE as u64, &mut run_header_buf).unwrap();
+        let run_header: SortedRunHeader = *bytemuck::from_bytes(&run_header_buf);
+        assert!(({ run_header.flags } & SORTED_RUN_FLAG_PACKED_KEYS) != 0);
+    }
+
+    // ----- ChunkHashKey scaffolding -----
 
     #[test]
-    fn chunk_index_key_packable_round_trip() {
+    fn chunk_hash_key_packable_round_trip() {
         let mut bytes = [0u8; 32];
         for (i, slot) in bytes.iter_mut().enumerate() {
             *slot = (i * 7 + 3) as u8;
         }
-        let key = ChunkIndexKey(bytes);
+        let key = ChunkHashKey(bytes);
         let mut fields = [0u64; 4];
         key.field_values(&mut fields);
-        let recovered = ChunkIndexKey::from_components(0, &fields).unwrap();
+        let recovered = ChunkHashKey::from_components(0, &fields).unwrap();
         assert_eq!(recovered, key);
     }
 
     #[test]
     fn chunk_index_value_byte_image_round_trip() {
-        let v = ChunkIndexValue::new(b(42), 7);
+        let v = ChunkIndexValue::new(b(42), 7, 8192);
         let bytes = v.as_ref().to_vec();
         assert_eq!(bytes.len(), CHUNK_INDEX_VALUE_SIZE);
         let back = ChunkIndexValue::from(bytes);
         assert_eq!(back, v);
         assert_eq!(back.blob_ref(), b(42));
         assert_eq!(back.ref_count(), 7);
+        assert_eq!(back.length(), 8192);
     }
 
     // ----- Two-region independence (ChunkIndex + KvIndex side-by-side) -----
@@ -808,12 +745,12 @@ mod tests {
         let dev = FileBlockDevice::open(&path, 1 << 20).unwrap();
 
         let mut idx_a = ChunkIndex::new();
-        idx_a.insert_or_bump(h(1), b(11));
-        idx_a.insert_or_bump(h(2), b(22));
+        idx_a.insert_or_bump(h(1), b(11), TEST_LEN);
+        idx_a.insert_or_bump(h(2), b(22), TEST_LEN);
         idx_a.flush_to_region(&dev, 0).unwrap();
 
         let mut idx_b = ChunkIndex::new();
-        idx_b.insert_or_bump(h(9), b(99));
+        idx_b.insert_or_bump(h(9), b(99), TEST_LEN);
         idx_b.flush_to_region(&dev, 256 * 1024).unwrap();
 
         let back_a = ChunkIndex::load_from_region(&dev, 0).unwrap();
