@@ -119,6 +119,7 @@ mod tests {
             name: "test".into(),
             tags: names.iter().map(|n| label(n)).collect(),
             implications: vec![],
+            relations: vec![],
         };
         state.install(module, &mut alloc).unwrap();
         state

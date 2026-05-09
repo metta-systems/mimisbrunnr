@@ -470,6 +470,7 @@ mod tests {
                 .iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))
                 .collect(),
+            relations: vec![],
         };
         state.install(module, &mut alloc).unwrap();
     }

@@ -674,6 +674,7 @@ mod tests {
                 label("archive"),
             ],
             implications: vec![],
+            relations: vec![],
         };
         state.install(module, &mut alloc).unwrap();
 
@@ -873,6 +874,7 @@ mod tests {
                     name: "ctx-test".into(),
                     tags: vec![grouping("rpi4-sdcard"), label("electronic")],
                     implications: vec![],
+                    relations: vec![],
                 },
                 &mut alloc,
             )

@@ -1,26 +1,23 @@
 //! [`OntologyState`] — the live registry plus install / upgrade / scrub /
 //! policy-resolution machinery (DESIGN §3.5, §4.4–§4.6).
 //!
-//! ## Persistence (R1b-8)
+//! ## Persistence (IMPL §10.1)
 //!
-//! On disk the ontology occupies one 256 KiB §1.5 B+ tree region of
-//! [`BtreeKind::Ontology`]. The whole [`PersistedState`] (tags, DAG,
-//! module records) is materialised into a single CBOR-encoded sorted-run
-//! entry keyed by `u32 snapshot` (always `0` today; R6 will populate
-//! older snapshots) via [`BtreeRegion::write_full`]; reload goes through
-//! [`BtreeRegion::read`].
+//! The ontology is fully loaded into memory at mount and rewritten as a
+//! single coherent [`OntologyImage`] (CBOR) on every checkpoint. On disk
+//! the image lives as one sorted-run entry per snapshot inside the §1.5
+//! B+ tree region of [`BtreeKind::Ontology`] — `RootPointer.ontology_root`
+//! points at this region directly (no 4 KiB envelope block).
 //!
-//! TODO(rewrite-phase-R1d): replace the single-entry blob with the IMPL
-//! §10.1 native multi-tree shape — `OntologyRoot` 4 KiB block holding
-//! four sub-trees (`modules_root`, `tags_root`, `tag_names`, `dag_root`),
-//! each a `BtreeKind::Ontology` §1.5 large node. R6 ships the snapshot
-//! axis the spec requires; until then the single-entry encoding is
-//! enough to put `RootPointer.ontology_root` on a real B+ tree region.
+//! Updates are batch-shaped (rare; one update touches many tags and
+//! relations at once), so the on-disk form is optimised for batch rewrite
+//! and compact serialised size — not per-element disk-resident lookup.
+//! See `docs/IMPLEMENTATION.md` §10.1 for the rationale.
 
 use std::collections::{BTreeSet, HashMap};
 
 use mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun};
-use mimisbrunnr_types::{ModuleId, StoragePolicy, TagDefinition, TagId};
+use mimisbrunnr_types::{ModuleId, StoragePolicy, TagDefinition, TagId, TagRelation};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -37,7 +34,7 @@ pub const ONTOLOGY_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
 /// Bookkeeping per installed module: lets us scrub later by knowing which
-/// tags / implications this module added.
+/// tags / implications / relations this module added.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModuleRecord {
     pub id: ModuleId,
@@ -48,15 +45,23 @@ pub struct ModuleRecord {
     pub installed_tags: Vec<TagId>,
     /// Implications this module added at install time.
     pub installed_implications: Vec<(TagId, TagId)>,
+    /// Tag-to-tag relations (mutex / requires / alias) this module added
+    /// at install time. `ImpliedBy` relations live in `installed_implications`.
+    #[serde(default)]
+    pub installed_relations: Vec<(TagId, TagRelation, TagId)>,
 }
 
-/// Live ontology registry. Owns the [`ImplicationDag`], the tag tables and a
-/// catalogue of installed modules.
+/// Live ontology registry. Owns the [`ImplicationDag`], the tag tables, the
+/// tag-to-tag relation set, and a catalogue of installed modules.
 #[derive(Debug, Clone, Default)]
 pub struct OntologyState {
     pub tags: HashMap<TagId, TagDefinition>,
     pub names: HashMap<String, TagId>,
     pub dag: ImplicationDag,
+    /// Tag-to-tag relations carrying `MutuallyExclusive` / `Requires` /
+    /// `Alias` semantics (DESIGN §3.2). `ImpliedBy` relations are folded
+    /// into `dag` and `TagDefinition.implies` rather than stored here.
+    pub relations: Vec<(TagId, TagRelation, TagId)>,
     pub installed_modules: HashMap<ModuleId, ModuleRecord>,
 }
 
@@ -141,7 +146,32 @@ impl OntologyState {
             }
         }
 
-        // Phase 3: static invariant — every storage axis must form a chain
+        // Phase 3: add tag-to-tag relations (mutex / requires / alias).
+        // `ImpliedBy` would duplicate the dag edges built in phase 2 and is
+        // rejected. References must resolve to known tag names.
+        let mut module_relations: Vec<(TagId, TagRelation, TagId)> = Vec::new();
+        for (from_name, kind, to_name) in module.relations {
+            if matches!(kind, TagRelation::ImpliedBy) {
+                return Err(OntologyError::ModuleParse(
+                    "use [[implications]] instead of a relation of kind `implied-by`".into(),
+                ));
+            }
+            let from = *self
+                .names
+                .get(&from_name)
+                .ok_or_else(|| OntologyError::UnknownTag(from_name.clone()))?;
+            let to = *self
+                .names
+                .get(&to_name)
+                .ok_or_else(|| OntologyError::UnknownTag(to_name.clone()))?;
+            let edge = (from, kind, to);
+            if !self.relations.contains(&edge) {
+                self.relations.push(edge);
+            }
+            module_relations.push(edge);
+        }
+
+        // Phase 4: static invariant — every storage axis must form a chain
         // among its declaring tags.
         self.check_axis_invariant()?;
 
@@ -151,6 +181,7 @@ impl OntologyState {
             name: module_name.clone(),
             installed_tags: newly_registered_tags,
             installed_implications: module_implications,
+            installed_relations: module_relations,
         };
         self.installed_modules.insert(module_id.clone(), record);
 
@@ -227,8 +258,15 @@ impl OntologyState {
                         combined_imps.push(*i);
                     }
                 }
+                let mut combined_rels = prev_record.installed_relations.clone();
+                for r in &new_record.installed_relations {
+                    if !combined_rels.contains(r) {
+                        combined_rels.push(*r);
+                    }
+                }
                 new_record.installed_tags = combined_tags;
                 new_record.installed_implications = combined_imps;
+                new_record.installed_relations = combined_rels;
                 res.tags_skipped += prev_record.installed_tags.len();
                 Ok(res)
             }
@@ -261,6 +299,12 @@ impl OntologyState {
             shared_imps.extend(other.installed_implications.iter().copied());
         }
 
+        // Relations also added by another module survive.
+        let mut shared_rels: BTreeSet<(TagId, TagRelation, TagId)> = BTreeSet::new();
+        for other in self.installed_modules.values() {
+            shared_rels.extend(other.installed_relations.iter().copied());
+        }
+
         // Remove implications first (so that tag removal doesn't have to
         // touch them via remove_tag's edge cleanup unnecessarily).
         for &(from, to) in &record.installed_implications {
@@ -269,6 +313,13 @@ impl OntologyState {
                 if let Some(def) = self.tags.get_mut(&from) {
                     def.implies.retain(|t| *t != to);
                 }
+            }
+        }
+
+        // Drop relations no longer claimed by any installed module.
+        for edge in &record.installed_relations {
+            if !shared_rels.contains(edge) {
+                self.relations.retain(|e| e != edge);
             }
         }
 
@@ -425,41 +476,42 @@ impl OntologyState {
     }
 
     // ---------------------------------------------------------------------
-    // CBOR persistence (placeholder).
+    // CBOR persistence (IMPL §10.1).
     // ---------------------------------------------------------------------
 
-    /// Serialise to CBOR. Placeholder for the on-disk B+ tree shape per IMPL
-    /// §10.1.
-    // TODO(rewrite-phase-N): replace with BtreeKind::Ontology B+ tree.
+    /// Serialise to a standalone CBOR(OntologyImage) blob (no §1.5 framing).
+    /// Useful for tooling and tests; the on-disk path goes through
+    /// [`Self::flush_to_region`].
     pub fn serialise(&self) -> Result<Vec<u8>, OntologyError> {
-        let snap = self.snapshot();
+        let image = self.to_image();
         let mut buf = Vec::new();
-        ciborium::ser::into_writer(&snap, &mut buf)
+        ciborium::ser::into_writer(&image, &mut buf)
             .map_err(|e| OntologyError::Cbor(e.to_string()))?;
         Ok(buf)
     }
 
-    /// Restore a serialised state.
-    // TODO(rewrite-phase-N): replace with BtreeKind::Ontology B+ tree.
+    /// Restore a state produced by [`Self::serialise`].
     pub fn deserialise(bytes: &[u8]) -> Result<Self, OntologyError> {
-        let snap: PersistedState =
+        let image: OntologyImage =
             ciborium::de::from_reader(bytes).map_err(|e| OntologyError::Cbor(e.to_string()))?;
-        snap.into_state()
+        image.into_state()
     }
 
     // ----------------------------------------------------------------
-    // R1b-8: §1.5 B+ tree persistence (single-entry CBOR run).
+    // §1.5 region persistence (IMPL §10.1) — one CBOR(OntologyImage)
+    // sorted-run entry per snapshot. R6 will populate non-zero
+    // snapshots; today every write goes under `snapshot = 0`.
     // ----------------------------------------------------------------
 
     /// Build a [`LoadedNode`] containing a single sorted-run entry
-    /// `(snapshot=0, PersistedState)`. The node uses
+    /// `(snapshot = 0, OntologyImage)` for the current state. Uses
     /// [`BtreeKind::Ontology`] and the spec's 18-bit (256 KiB) region
     /// size.
-    pub fn to_loaded_node(&self) -> LoadedNode<u32, PersistedState> {
-        let snap = self.snapshot();
-        let entries = vec![(0u32, snap)];
+    pub fn to_loaded_node(&self) -> LoadedNode<u32, OntologyImage> {
+        let image = self.to_image();
+        let entries = vec![(0u32, image)];
 
-        let mut node: LoadedNode<u32, PersistedState> =
+        let mut node: LoadedNode<u32, OntologyImage> =
             LoadedNode::new(BtreeKind::Ontology, 0, REGION_SIZE_LOG2);
         let run = SortedRun::from_sorted(0, 0, entries);
         node.sorted_runs.push(run);
@@ -468,17 +520,22 @@ impl OntologyState {
     }
 
     /// Restore the in-memory state from a [`LoadedNode`] read via
-    /// [`BtreeRegion::read`]. Picks the entry under `snapshot = 0`; an
-    /// empty node returns the default.
+    /// [`BtreeRegion::read`]. Picks the latest entry (highest snapshot
+    /// key) so newly-installed images shadow older ones; an empty node
+    /// returns the default.
     pub fn from_loaded_node(
-        node: &LoadedNode<u32, PersistedState>,
+        node: &LoadedNode<u32, OntologyImage>,
     ) -> Result<Self, OntologyError> {
+        let mut latest: Option<(u32, OntologyImage)> = None;
         for (k, v) in node.merge_iter() {
-            if *k == 0 {
-                return v.clone().into_state();
+            if latest.as_ref().is_none_or(|(prev_k, _)| *k >= *prev_k) {
+                latest = Some((*k, v.clone()));
             }
         }
-        Ok(Self::default())
+        match latest {
+            Some((_, image)) => image.into_state(),
+            None => Ok(Self::default()),
+        }
     }
 
     /// Write the in-memory state as a fresh 256 KiB region at byte
@@ -489,7 +546,7 @@ impl OntologyState {
         offset: u64,
     ) -> Result<(), OntologyError> {
         let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, u32, PersistedState>(device, offset, &mut node)
+        BtreeRegion::write_full::<D, u32, OntologyImage>(device, offset, &mut node)
             .map_err(|e| OntologyError::Cbor(e.to_string()))?;
         Ok(())
     }
@@ -508,7 +565,7 @@ impl OntologyState {
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, u32, PersistedState>(
+        let node = BtreeRegion::read::<D, u32, OntologyImage>(
             device,
             offset,
             BtreeKind::Ontology,
@@ -517,34 +574,54 @@ impl OntologyState {
         Self::from_loaded_node(&node)
     }
 
-    fn snapshot(&self) -> PersistedState {
+    fn to_image(&self) -> OntologyImage {
         let mut tags: Vec<TagDefinition> = self.tags.values().cloned().collect();
         tags.sort_by_key(|t| t.id);
         let mut modules: Vec<ModuleRecord> = self.installed_modules.values().cloned().collect();
         modules.sort_by(|a, b| a.id.cmp(&b.id));
-        PersistedState {
+        let mut relations = self.relations.clone();
+        relations.sort();
+        OntologyImage {
+            format_version: ONTOLOGY_IMAGE_FORMAT_VERSION,
             tags,
             dag: self.dag.snapshot(),
+            relations,
             modules,
         }
     }
 }
 
-/// Snapshot of the on-disk ontology state. Serialised as the value of
-/// each entry in the [`BtreeKind::Ontology`] B+ tree region (R1b-8) and
-/// as the body of the legacy [`OntologyState::serialise`] CBOR blob.
+/// Format version of [`OntologyImage`]. Bumped on incompatible CBOR shape
+/// changes; readers refuse newer versions they don't recognise.
+pub const ONTOLOGY_IMAGE_FORMAT_VERSION: u16 = 1;
+
+/// On-disk image of the ontology (IMPL §10.1). Serialised as the value of
+/// each entry in the [`BtreeKind::Ontology`] §1.5 region keyed by
+/// `snapshot: u32`, and also as the body of [`OntologyState::serialise`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedState {
+pub struct OntologyImage {
+    /// Format version — see [`ONTOLOGY_IMAGE_FORMAT_VERSION`].
+    pub format_version: u16,
     /// Tag definitions, sorted by id for deterministic encoding.
     pub tags: Vec<TagDefinition>,
     /// Implication DAG.
     pub dag: DagSnapshot,
+    /// Tag-to-tag relations (mutex / requires / alias), sorted for
+    /// deterministic encoding. `ImpliedBy` semantics live in `dag`.
+    #[serde(default)]
+    pub relations: Vec<(TagId, TagRelation, TagId)>,
     /// Installed module bookkeeping records, sorted by id.
     pub modules: Vec<ModuleRecord>,
 }
 
-impl PersistedState {
+impl OntologyImage {
     fn into_state(self) -> Result<OntologyState, OntologyError> {
+        if self.format_version > ONTOLOGY_IMAGE_FORMAT_VERSION {
+            return Err(OntologyError::Cbor(format!(
+                "ontology image format_version {} exceeds supported {}",
+                self.format_version, ONTOLOGY_IMAGE_FORMAT_VERSION
+            )));
+        }
         let mut tags = HashMap::new();
         let mut names = HashMap::new();
         for def in self.tags {
@@ -560,6 +637,7 @@ impl PersistedState {
             tags,
             names,
             dag,
+            relations: self.relations,
             installed_modules,
         })
     }
@@ -602,6 +680,29 @@ mod tests {
             implications: imps
                 .iter()
                 .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+            relations: Vec::new(),
+        }
+    }
+
+    fn module_with_relations(
+        id: &str,
+        tags: Vec<TagDefinition>,
+        imps: &[(&str, &str)],
+        rels: &[(&str, TagRelation, &str)],
+    ) -> OntologyModule {
+        OntologyModule {
+            id: id.into(),
+            version: "0.1.0".into(),
+            name: id.into(),
+            tags,
+            implications: imps
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+            relations: rels
+                .iter()
+                .map(|(a, k, b)| (a.to_string(), *k, b.to_string()))
                 .collect(),
         }
     }
@@ -834,6 +935,7 @@ mod tests {
             name: "m".into(),
             tags: vec![label("a"), label("b")],
             implications: vec![("b".into(), "a".into())],
+            relations: Vec::new(),
         };
         let res = state.upgrade(upgrade).unwrap();
         assert_eq!(res.tags_registered, 1); // only `b` is new
@@ -962,5 +1064,153 @@ mod tests {
         assert!(!back.installed_modules.contains_key("a"));
         assert!(back.names.contains_key("z"));
         assert!(!back.names.contains_key("x"));
+    }
+
+    // ----- Tag relations (mutex / requires / alias) -----
+
+    #[test]
+    fn install_records_relations() {
+        let mut state = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        let m = module_with_relations(
+            "core",
+            vec![label("active"), label("discontinued"), label("usb-c"), label("electronics")],
+            &[],
+            &[
+                ("active", TagRelation::MutuallyExclusive, "discontinued"),
+                ("usb-c", TagRelation::Requires, "electronics"),
+            ],
+        );
+        state.install(m, &mut alloc).unwrap();
+        assert_eq!(state.relations.len(), 2);
+        let active = state.names["active"];
+        let discontinued = state.names["discontinued"];
+        let usb_c = state.names["usb-c"];
+        let electronics = state.names["electronics"];
+        assert!(state.relations.contains(&(active, TagRelation::MutuallyExclusive, discontinued)));
+        assert!(state.relations.contains(&(usb_c, TagRelation::Requires, electronics)));
+
+        let rec = &state.installed_modules["core"];
+        assert_eq!(rec.installed_relations.len(), 2);
+    }
+
+    #[test]
+    fn install_rejects_implied_by_in_relations() {
+        let mut state = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        let m = module_with_relations(
+            "x",
+            vec![label("car"), label("vehicle")],
+            &[],
+            &[("car", TagRelation::ImpliedBy, "vehicle")],
+        );
+        let err = state.install(m, &mut alloc).unwrap_err();
+        assert!(matches!(err, OntologyError::ModuleParse(_)));
+        // Rolled back — no tags installed either.
+        assert!(state.tags.is_empty());
+    }
+
+    #[test]
+    fn install_relation_unknown_tag_errors() {
+        let mut state = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        let m = module_with_relations(
+            "x",
+            vec![label("a")],
+            &[],
+            &[("a", TagRelation::Requires, "ghost")],
+        );
+        let err = state.install(m, &mut alloc).unwrap_err();
+        assert!(matches!(err, OntologyError::UnknownTag(_)));
+        assert!(state.tags.is_empty());
+    }
+
+    #[test]
+    fn ontology_region_round_trip_preserves_relations() {
+        let (_dir, dev) = fresh_device();
+        let mut state = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        state
+            .install(
+                module_with_relations(
+                    "core",
+                    vec![label("active"), label("discontinued"), label("laptop"), label("notebook")],
+                    &[],
+                    &[
+                        ("active", TagRelation::MutuallyExclusive, "discontinued"),
+                        ("laptop", TagRelation::Alias, "notebook"),
+                    ],
+                ),
+                &mut alloc,
+            )
+            .unwrap();
+
+        state.flush_to_region(&dev, 0).unwrap();
+        let back = OntologyState::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.relations.len(), 2);
+        let active = back.names["active"];
+        let discontinued = back.names["discontinued"];
+        let laptop = back.names["laptop"];
+        let notebook = back.names["notebook"];
+        assert!(back.relations.contains(&(active, TagRelation::MutuallyExclusive, discontinued)));
+        assert!(back.relations.contains(&(laptop, TagRelation::Alias, notebook)));
+        assert_eq!(back.installed_modules["core"].installed_relations.len(), 2);
+    }
+
+    #[test]
+    fn cbor_round_trip_preserves_relations() {
+        let mut state = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        state
+            .install(
+                module_with_relations(
+                    "x",
+                    vec![label("a"), label("b")],
+                    &[],
+                    &[("a", TagRelation::Requires, "b")],
+                ),
+                &mut alloc,
+            )
+            .unwrap();
+        let bytes = state.serialise().unwrap();
+        let back = OntologyState::deserialise(&bytes).unwrap();
+        assert_eq!(state.relations, back.relations);
+    }
+
+    #[test]
+    fn scrub_removes_exclusive_relations_keeps_shared() {
+        let mut state = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        state
+            .install(
+                module_with_relations(
+                    "A",
+                    vec![label("a"), label("b"), label("c")],
+                    &[],
+                    &[
+                        ("a", TagRelation::Requires, "b"),
+                        ("a", TagRelation::Requires, "c"),
+                    ],
+                ),
+                &mut alloc,
+            )
+            .unwrap();
+        // Pretend module B was installed with the (a, Requires, b) relation too.
+        let a = state.names["a"];
+        let b = state.names["b"];
+        let b_record = ModuleRecord {
+            id: "B".into(),
+            version: "0.1.0".into(),
+            name: "B".into(),
+            installed_tags: vec![],
+            installed_implications: vec![],
+            installed_relations: vec![(a, TagRelation::Requires, b)],
+        };
+        state.installed_modules.insert("B".into(), b_record);
+
+        state.scrub(&"A".to_string()).unwrap();
+        // (a, Requires, b) is shared → kept; (a, Requires, c) was exclusive → gone.
+        assert_eq!(state.relations.len(), 1);
+        assert_eq!(state.relations[0], (a, TagRelation::Requires, b));
     }
 }

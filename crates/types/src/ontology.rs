@@ -49,7 +49,7 @@ pub struct TagDefinition {
 }
 
 /// Tag-to-tag relation (DESIGN §3.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum TagRelation {
     /// `child` "is-a" `parent`. (`car` ⇒ `vehicle`.)
     ImpliedBy,

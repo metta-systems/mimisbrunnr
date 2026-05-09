@@ -152,6 +152,7 @@ mod tests {
                 storage: None,
             }],
             implications: vec![],
+            relations: vec![],
         };
         state.install(module, &mut alloc).unwrap();
         let tag = state.names[name];

@@ -1029,6 +1029,7 @@ mod tests {
             name: "core".into(),
             tags: vec![label("vehicle"), label("car")],
             implications: vec![("car".into(), "vehicle".into())],
+            relations: vec![],
         };
         state.install(module, &mut alloc).unwrap();
         let vehicle = state.names["vehicle"];

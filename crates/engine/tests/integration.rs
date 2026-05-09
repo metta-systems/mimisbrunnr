@@ -55,6 +55,7 @@ fn install_car_vehicle(engine: &mut Engine) -> (TagId, TagId) {
         name: "core".into(),
         tags: vec![label("vehicle"), label("car")],
         implications: vec![("car".into(), "vehicle".into())],
+        relations: vec![],
     };
     engine.install_ontology_module(module).unwrap();
     let car = engine.resolve_tag_name("car").unwrap();
@@ -152,6 +153,7 @@ fn remove_tag_keeps_materialised_when_another_direct_implies_it() {
         name: "vehicles".into(),
         tags: vec![label("vehicle"), label("car"), label("truck")],
         implications: vec![("car".into(), "vehicle".into()), ("truck".into(), "vehicle".into())],
+        relations: vec![],
     };
     e.install_ontology_module(module).unwrap();
     let car = e.resolve_tag_name("car").unwrap();

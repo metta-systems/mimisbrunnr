@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use mimisbrunnr_types::{
     ChunkParams, ChunkingAlgo, CompressionAlgo, EncryptionMode, ModuleId, StoragePolicy,
-    TagDefinition, TagId, TagSemantics, ValueType,
+    TagDefinition, TagId, TagRelation, TagSemantics, ValueType,
 };
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +28,11 @@ pub struct OntologyModule {
     /// `(from_name, to_name)` pairs. Names are resolved to IDs at install
     /// time; this avoids the TOML having to spell out numeric IDs.
     pub implications: Vec<(String, String)>,
+    /// `(from_name, kind, to_name)` triples for the non-implication relations
+    /// (`MutuallyExclusive` / `Requires` / `Alias`). `ImpliedBy` belongs in
+    /// `implications`; install rejects it here.
+    #[serde(default)]
+    pub relations: Vec<(String, TagRelation, String)>,
 }
 
 /// Result of installing an [`OntologyModule`] into an
@@ -87,6 +92,8 @@ struct TomlModule {
     tags: Vec<TomlTag>,
     #[serde(default)]
     implications: Vec<TomlImplication>,
+    #[serde(default)]
+    relations: Vec<TomlRelation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +153,15 @@ struct TomlImplication {
     to: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TomlRelation {
+    from: String,
+    /// One of: `mutex` / `mutually-exclusive`, `requires`, `alias`.
+    /// `implied-by` is rejected here — use `[[implications]]` instead.
+    kind: String,
+    to: String,
+}
+
 // -------------------------------------------------------------------------
 // TOML <-> OntologyModule conversions.
 // -------------------------------------------------------------------------
@@ -200,12 +216,19 @@ impl OntologyModule {
             .map(|i| (i.from, i.to))
             .collect();
 
+        let mut relations = Vec::with_capacity(parsed.relations.len());
+        for r in parsed.relations {
+            let kind = parse_relation_kind(&r.kind)?;
+            relations.push((r.from, kind, r.to));
+        }
+
         Ok(OntologyModule {
             id: parsed.module.id,
             version: parsed.module.version,
             name: parsed.module.name,
             tags,
             implications,
+            relations,
         })
     }
 
@@ -241,10 +264,21 @@ impl OntologyModule {
             })
             .collect();
 
+        let relations = self
+            .relations
+            .iter()
+            .map(|(f, kind, t)| TomlRelation {
+                from: f.clone(),
+                kind: relation_kind_to_str(*kind).into(),
+                to: t.clone(),
+            })
+            .collect();
+
         let module = TomlModule {
             module: header,
             tags,
             implications,
+            relations,
         };
         toml::to_string_pretty(&module).map_err(|e| OntologyError::ModuleSerialise(e.to_string()))
     }
@@ -298,6 +332,33 @@ fn encode_semantics(
         TagSemantics::Grouping => ("grouping".into(), None, None),
         TagSemantics::OrderedCollection { .. } => ("ordered-collection".into(), None, None),
         TagSemantics::Hierarchical => ("hierarchical".into(), None, None),
+    }
+}
+
+fn parse_relation_kind(s: &str) -> Result<TagRelation, OntologyError> {
+    match s {
+        "mutex" | "mutually-exclusive" => Ok(TagRelation::MutuallyExclusive),
+        "requires" => Ok(TagRelation::Requires),
+        "alias" => Ok(TagRelation::Alias),
+        "implies" | "implied-by" | "is-a" => Err(OntologyError::ModuleParse(format!(
+            "use [[implications]] for relation kind `{s}`"
+        ))),
+        other => Err(OntologyError::ModuleParse(format!(
+            "unknown relation kind `{other}`"
+        ))),
+    }
+}
+
+fn relation_kind_to_str(kind: TagRelation) -> &'static str {
+    match kind {
+        TagRelation::MutuallyExclusive => "mutually-exclusive",
+        TagRelation::Requires => "requires",
+        TagRelation::Alias => "alias",
+        // ImpliedBy doesn't appear in the TOML relations list (it lives in
+        // [[implications]]), but be defensive: emit the most common spelling
+        // so a round-trip via `to_toml` followed by `from_toml` surfaces a
+        // clear "use [[implications]]" error rather than a silent drop.
+        TagRelation::ImpliedBy => "implied-by",
     }
 }
 
@@ -513,6 +574,103 @@ to = "audio"
                 },
             ],
             implications: vec![("binary".into(), "file".into())],
+            relations: Vec::new(),
+        };
+        let s = module.to_toml().unwrap();
+        let back = OntologyModule::from_toml(&s).unwrap();
+        assert_eq!(module, back);
+    }
+
+    #[test]
+    fn parse_relations_section() {
+        let src = r#"
+[module]
+id = "x"
+version = "0.0.1"
+name = "x"
+
+[[tags]]
+name = "active"
+semantics = "label"
+
+[[tags]]
+name = "discontinued"
+semantics = "label"
+
+[[tags]]
+name = "usb-c"
+semantics = "label"
+
+[[tags]]
+name = "electronics"
+semantics = "label"
+
+[[relations]]
+from = "active"
+kind = "mutually-exclusive"
+to = "discontinued"
+
+[[relations]]
+from = "usb-c"
+kind = "requires"
+to = "electronics"
+"#;
+        let m = OntologyModule::from_toml(src).unwrap();
+        assert_eq!(m.relations.len(), 2);
+        assert_eq!(m.relations[0].1, TagRelation::MutuallyExclusive);
+        assert_eq!(m.relations[1].1, TagRelation::Requires);
+    }
+
+    #[test]
+    fn parse_relation_kind_implies_redirects() {
+        let src = r#"
+[module]
+id = "x"
+version = "0.0.1"
+name = "x"
+
+[[tags]]
+name = "a"
+semantics = "label"
+
+[[relations]]
+from = "a"
+kind = "implies"
+to = "a"
+"#;
+        let err = OntologyModule::from_toml(src).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("[[implications]]"), "got {msg}");
+    }
+
+    #[test]
+    fn round_trip_via_toml_with_relations() {
+        let module = OntologyModule {
+            id: "rel.example".into(),
+            version: "0.1.0".into(),
+            name: "Rel".into(),
+            tags: vec![
+                TagDefinition {
+                    id: TagId::new(0),
+                    name: "active".into(),
+                    semantics: TagSemantics::Label,
+                    implies: vec![],
+                    storage: None,
+                },
+                TagDefinition {
+                    id: TagId::new(0),
+                    name: "discontinued".into(),
+                    semantics: TagSemantics::Label,
+                    implies: vec![],
+                    storage: None,
+                },
+            ],
+            implications: vec![],
+            relations: vec![(
+                "active".into(),
+                TagRelation::MutuallyExclusive,
+                "discontinued".into(),
+            )],
         };
         let s = module.to_toml().unwrap();
         let back = OntologyModule::from_toml(&s).unwrap();
