@@ -756,8 +756,9 @@ mod packed_region {
 
     /// Build a `LoadedNode` of `(u64, u32)` keys -> 4-byte values and persist
     /// it via `write_full_packed`, then reload via `read_packed`. The values
-    /// share a 2-byte common prefix that the codec elides and the reader
-    /// reinstates from the supplied template.
+    /// share a 2-byte common prefix that the codec elides; the descriptor
+    /// carries the prefix bytes so the reader reconstructs values without
+    /// any caller-supplied template.
     #[test]
     fn write_full_packed_then_read_round_trip() {
         let device = MemoryBlockDevice::new(TEST_REGION_SIZE);
@@ -771,16 +772,8 @@ mod packed_region {
 
         BtreeRegion::write_full_packed(&device, 0, &mut node, 4).unwrap();
 
-        // Reload with the same prefix template.
-        let prefix_template = vec![0xAA, 0xBB];
-        let reloaded: LoadedNode<(u64, u32), Vec<u8>> = BtreeRegion::read_packed(
-            &device,
-            0,
-            BtreeKind::Forward,
-            4,
-            &prefix_template,
-        )
-        .unwrap();
+        let reloaded: LoadedNode<(u64, u32), Vec<u8>> =
+            BtreeRegion::read_packed(&device, 0, BtreeKind::Forward, 4).unwrap();
         assert_eq!(reloaded.sorted_runs.len(), 1);
         let run = &reloaded.sorted_runs[0];
         assert_eq!(run.entries.len(), entries.len());
@@ -792,8 +785,10 @@ mod packed_region {
         assert!(run.flags & SORTED_RUN_FLAG_PACKED_KEYS != 0);
     }
 
-    /// Two packed sorted runs in one region: write_full_packed handles
-    /// multiple runs.
+    /// Two packed sorted runs in one region with **different** value
+    /// prefixes: write_full_packed handles multiple runs, and read_packed
+    /// reconstructs each entry from its own descriptor's prefix slot
+    /// without any caller-supplied template.
     #[test]
     fn write_full_packed_multiple_runs() {
         let device = MemoryBlockDevice::new(TEST_REGION_SIZE);
@@ -808,25 +803,6 @@ mod packed_region {
 
         BtreeRegion::write_full_packed(&device, 0, &mut node, 4).unwrap();
 
-        // Reload — different runs may have different prefixes; pass run A's
-        // prefix template, which will leave run B's first 4 bytes patched
-        // incorrectly. Instead, test with empty prefix by using values
-        // without a common prefix across runs.
-        // Simpler: use the trivial prefix-template for both runs (they both
-        // share the constant). Here run A prefix = [1,2,3,4]; run B prefix
-        // = [5,6,7,8]. Test by verifying via the underlying packed bytes:
-        // the reloaded entries (with patched-zero prefix) should still
-        // round-trip the correct keys, and the values' tails should differ
-        // even if the prefix slot is bogus.
-        // We use prefix=0 by passing a value_size=4 and an empty prefix
-        // template (descriptor records prefix=4 because all values within
-        // each run are identical-prefixed).
-        // For round-trip clarity, just check that read_packed succeeds and
-        // returns the right count + keys.
-        let prefix_template_a = vec![1u8, 2, 3, 4];
-        // Reading fails with prefix mismatch on run B, so skip the
-        // patch-step by reading via raw decode_packed_run for each run.
-        // Here we just sanity-check that the header reflects two runs.
         let header_sector = {
             let mut buf = vec![0u8; BLOCK_SIZE];
             device.read_at(0, &mut buf).unwrap();
@@ -835,11 +811,11 @@ mod packed_region {
         let header = BtreeNodeHeader::parse(&header_sector).unwrap();
         assert_eq!({ header.sorted_run_count }, 2);
 
-        // And run A reads back correctly with its prefix.
-        // (Run B would need a separate read with its own prefix; in real
-        // code, runs in a node share a prefix or the codec treats them
-        // independently.)
-        let _ = prefix_template_a;
+        let reloaded: LoadedNode<u64, Vec<u8>> =
+            BtreeRegion::read_packed(&device, 0, BtreeKind::Forward, 4).unwrap();
+        assert_eq!(reloaded.sorted_runs.len(), 2);
+        assert_eq!(reloaded.sorted_runs[0].entries, entries_a);
+        assert_eq!(reloaded.sorted_runs[1].entries, entries_b);
     }
 
     /// `append_sorted_run_packed` mutates the header sector while leaving
@@ -910,15 +886,8 @@ mod packed_region {
         // Note: V::from(Vec<u8>) is required for packed-decoded values; for
         // CBOR-encoded values, ciborium decodes directly to V. We use
         // Vec<u8> as V here, where Vec<u8>: From<Vec<u8>> is the identity.
-        let prefix_template = vec![9u8, 8u8]; // matches the packed run's prefix
-        let reloaded: LoadedNode<u64, Vec<u8>> = BtreeRegion::read_packed(
-            &device,
-            0,
-            BtreeKind::Forward,
-            4,
-            &prefix_template,
-        )
-        .unwrap();
+        let reloaded: LoadedNode<u64, Vec<u8>> =
+            BtreeRegion::read_packed(&device, 0, BtreeKind::Forward, 4).unwrap();
         assert_eq!(reloaded.sorted_runs.len(), 2);
         // Run 0 = CBOR; run 1 = packed.
         let run0 = &reloaded.sorted_runs[0];
@@ -939,7 +908,7 @@ mod packed_region {
     #[test]
     fn format_promote_event_constructible() {
         let entries: Vec<(u64, Vec<u8>)> = vec![(0u64, vec![]), (255u64, vec![])];
-        let (head, fields) = pack::select_format(&entries).unwrap();
+        let (head, fields, _prefix) = pack::select_format(&entries).unwrap();
         let evt = pack::FormatPromoteEvent {
             sorted_run_seq: 7,
             new_format: head,

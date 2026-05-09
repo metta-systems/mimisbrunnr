@@ -356,13 +356,17 @@ recorded once in the descriptor rather than per key.
 
 ```rust
 #[repr(C, packed)]
-struct SortedRunKeyFormat {                       // 8 + nr_fields × 16 bytes
+struct SortedRunKeyFormat {                       // 8 + nr_fields × 16 + common_value_prefix bytes
     nr_fields: u8,                           // 1..=8
-    key_header_bytes: u8,                    // 1..=4 (entry-type discriminator + flags)
-    common_value_prefix: u8,                 // bytes shared at the start of every value (0..=24)
+    key_header_bytes: u8,                    // 0..=4 (entry-type discriminator + flags)
+    common_value_prefix: u8,                 // bytes shared at the start of every value (0..=255)
     _pad: u8,
     sum_bit_width: u32,                      // total packed-key bits (incl. header), informational
     fields: [FieldFormat; nr_fields],
+    value_prefix: [u8; common_value_prefix], // elided leading value bytes; readers
+                                             // reconstruct each value as
+                                             // `value_prefix || value_tail_i` without
+                                             // any out-of-band state.
 }
 
 #[repr(C, packed)]
@@ -387,8 +391,13 @@ flag is left clear; bit-packed values still compare correctly because the packed
 field's two's-complement value with `base` subtracted, monotonic by construction.
 
 The descriptor is part of the `SortedRunHeader` payload (§1.5.1), prepended before the packed-key
-stream. With the typical 3-field shape it adds 8 + 48 = 56 bytes per sorted run — amortised over
-hundreds to thousands of keys.
+stream. With the typical 3-field shape and a short `common_value_prefix`, it adds
+8 + 48 + (0..255) = 56–311 bytes per sorted run; on real workloads `common_value_prefix` is
+small (a few bytes for shared `store_kind` / leading-zero padding), so 60–80 bytes is typical
+— amortised over hundreds to thousands of keys. The descriptor's on-disk length is
+`8 + nr_fields × 16 + common_value_prefix` and is fully determined by the leading 8-byte
+header; no alignment padding follows the `value_prefix` bytes (the per-key bit stream begins
+immediately after, on a byte boundary).
 
 **Encoding.** A packed key is:
 
@@ -403,18 +412,23 @@ Keys are laid out back-to-back with no inter-key padding. Binary search within a
 packed keys **directly** without decoding — base subtraction is strictly monotonic, so packed
 ordering matches unpacked ordering. Full decoding happens only at the lookup boundary.
 
-**`common_value_prefix` and variable-size values.** The elision applies only to bytes at the
+**`common_value_prefix` and reconstruction.** The elision applies only to bytes at the
 **leading offsets** of the value that are bit-for-bit identical across **every entry in the
-sorted run**. For fixed-shape values (e.g. `TagIndexLeafEntry`'s 32-byte value following `tag_id`)
-this is the natural common prefix — typically a few bytes of `store_kind` plus zeroed
-padding when most entries in a leaf share the same store kind. For **variable-shape values**
-(notably §7.1's `LeafEntry`, where the body is either an inline assertion array sized by
-`header & 0x7FFF` or a 16 B `BlockRef` for the spill case), the common prefix can only cover
-bytes that exist *and* are identical in every variant — in practice the 2-byte `header`'s
-discriminator bits (`is_spill`) are not shared, so `common_value_prefix = 0` is the typical
-setting for `LeafEntry`. Format selection (§1.5.4) computes the prefix during full
-compaction by scanning the merged sorted run's values and counting leading bytes shared by every
-entry; if the sorted run mixes shapes, the count is bounded by the shortest value.
+sorted run**. The encoder records both the length of the prefix (`common_value_prefix`) and
+its bytes (`value_prefix[..common_value_prefix]`) in the descriptor, so the reader
+reconstructs entry *i*'s full value as `descriptor.value_prefix || value_tail_i` without any
+out-of-band state. For fixed-shape values (e.g. `TagIndexLeafEntry`'s 32-byte value following
+`tag_id`) this is the natural common prefix — typically a few bytes of `store_kind` plus
+zeroed padding when most entries in a leaf share the same store kind. For **variable-shape
+values** (notably §7.1's `LeafEntry`, where the body is either an inline assertion array
+sized by `header & 0x7FFF` or a 16 B `BlockRef` for the spill case), the common prefix can
+only cover bytes that exist *and* are identical in every variant — in practice the 2-byte
+`header`'s discriminator bits (`is_spill`) are not shared, so `common_value_prefix = 0` is
+the typical setting for `LeafEntry`. Format selection (§1.5.4) computes the prefix during
+full compaction by scanning the merged sorted run's values and counting leading bytes shared
+by every entry; if the sorted run mixes shapes, the count is bounded by the shortest value.
+Single-entry sorted runs may set the prefix to the full value length without harm because
+the bytes are persisted in the descriptor.
 
 **Format selection.** Full compaction (§1.5.4) computes an optimal format for the merged sorted run
 by scanning the key distribution: `max − min` for each field gives the minimum bit width.

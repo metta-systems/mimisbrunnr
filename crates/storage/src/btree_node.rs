@@ -155,14 +155,15 @@ pub struct FieldFormat {
 const_assert_eq!(core::mem::size_of::<FieldFormat>(), 16);
 
 /// Variable-size sorted-run key-format descriptor. The struct itself is the
-/// 8-byte fixed header; the trailing `[FieldFormat; nr_fields]` array is
-/// addressed by [`SortedRunKeyFormat::fields`]. IMPL §1.5.6.
+/// 8-byte fixed header; the on-disk wire form continues with
+/// `[FieldFormat; nr_fields]` immediately followed by `common_value_prefix`
+/// raw bytes carrying the elided value prefix. IMPL §1.5.6.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct SortedRunKeyFormat {
     pub nr_fields: u8,           // [0..1]   1..=8
-    pub key_header_bytes: u8,    // [1..2]   1..=4
-    pub common_value_prefix: u8, // [2..3]   0..=24
+    pub key_header_bytes: u8,    // [1..2]   0..=4
+    pub common_value_prefix: u8, // [2..3]   0..=255
     pub _pad: u8,                // [3..4]
     pub sum_bit_width: u32,      // [4..8]   total packed-key bits incl. header
 }
@@ -170,15 +171,22 @@ pub struct SortedRunKeyFormat {
 const_assert_eq!(core::mem::size_of::<SortedRunKeyFormat>(), 8);
 
 impl SortedRunKeyFormat {
-    /// Total size of this descriptor including the trailing field array.
+    /// Total on-disk size of this descriptor including the trailing field
+    /// array and the `common_value_prefix` byte tail.
     pub fn total_size(&self) -> usize {
         let nr = { self.nr_fields } as usize;
-        core::mem::size_of::<Self>() + nr * core::mem::size_of::<FieldFormat>()
+        let prefix = { self.common_value_prefix } as usize;
+        core::mem::size_of::<Self>() + nr * core::mem::size_of::<FieldFormat>() + prefix
     }
 
-    /// Parse the descriptor and the trailing field array out of `bytes`,
-    /// returning the descriptor and a slice of `FieldFormat` records.
-    pub fn parse(bytes: &[u8]) -> Result<(Self, Vec<FieldFormat>), StorageError> {
+    /// Parse the descriptor, the trailing field array, and the elided
+    /// `value_prefix` bytes out of `bytes`. The returned `Vec<u8>` has length
+    /// `head.common_value_prefix` and carries the bytes that were elided from
+    /// every per-entry value tail; readers reconstruct each full value as
+    /// `value_prefix || value_tail_i`.
+    pub fn parse(
+        bytes: &[u8],
+    ) -> Result<(Self, Vec<FieldFormat>, Vec<u8>), StorageError> {
         let head_size = core::mem::size_of::<Self>();
         if bytes.len() < head_size {
             return Err(StorageError::BufferTooSmall {
@@ -188,22 +196,34 @@ impl SortedRunKeyFormat {
         }
         let head: Self = *bytemuck::from_bytes(&bytes[..head_size]);
         let nr = { head.nr_fields } as usize;
-        let total = head_size + nr * core::mem::size_of::<FieldFormat>();
+        let prefix_len = { head.common_value_prefix } as usize;
+        let fields_end = head_size + nr * core::mem::size_of::<FieldFormat>();
+        let total = fields_end + prefix_len;
         if bytes.len() < total {
             return Err(StorageError::BufferTooSmall {
                 need: total,
                 have: bytes.len(),
             });
         }
-        let fields_bytes = &bytes[head_size..total];
-        let fields: Vec<FieldFormat> = bytemuck::cast_slice::<u8, FieldFormat>(fields_bytes).to_vec();
-        Ok((head, fields))
+        let fields_bytes = &bytes[head_size..fields_end];
+        let fields: Vec<FieldFormat> =
+            bytemuck::cast_slice::<u8, FieldFormat>(fields_bytes).to_vec();
+        let value_prefix = bytes[fields_end..total].to_vec();
+        Ok((head, fields, value_prefix))
     }
 
-    /// Serialise the descriptor and field array into `out`.
-    pub fn serialise(&self, fields: &[FieldFormat], out: &mut Vec<u8>) {
+    /// Serialise the descriptor, field array, and elided `value_prefix` bytes
+    /// into `out`. The caller must ensure `value_prefix.len() ==
+    /// self.common_value_prefix`.
+    pub fn serialise(&self, fields: &[FieldFormat], value_prefix: &[u8], out: &mut Vec<u8>) {
+        debug_assert_eq!(
+            value_prefix.len(),
+            { self.common_value_prefix } as usize,
+            "serialise: value_prefix length must match descriptor",
+        );
         out.extend_from_slice(bytemuck::bytes_of(self));
         out.extend_from_slice(bytemuck::cast_slice(fields));
+        out.extend_from_slice(value_prefix);
     }
 }
 
@@ -274,12 +294,40 @@ mod tests {
             FieldFormat { bit_width: 8, flags: 0, _pad0: 0, base: 0, _pad1: 0 },
             FieldFormat { bit_width: 16, flags: FIELD_FORMAT_FLAG_SIGNED, _pad0: 0, base: 100, _pad1: 0 },
         ];
+        let prefix = [0xDE, 0xAD, 0xBE, 0xEF];
         let mut buf = Vec::new();
-        head.serialise(&fields, &mut buf);
-        let (parsed, parsed_fields) = SortedRunKeyFormat::parse(&buf).unwrap();
+        head.serialise(&fields, &prefix, &mut buf);
+        assert_eq!(buf.len(), head.total_size());
+        let (parsed, parsed_fields, parsed_prefix) = SortedRunKeyFormat::parse(&buf).unwrap();
         assert_eq!({ parsed.nr_fields }, 2);
         assert_eq!(parsed_fields.len(), 2);
         let f1_base = { parsed_fields[1].base };
         assert_eq!(f1_base, 100);
+        assert_eq!(parsed_prefix, prefix);
+    }
+
+    #[test]
+    fn key_format_zero_prefix_is_empty_tail() {
+        let head = SortedRunKeyFormat {
+            nr_fields: 1,
+            key_header_bytes: 0,
+            common_value_prefix: 0,
+            _pad: 0,
+            sum_bit_width: 32,
+        };
+        let fields = vec![FieldFormat {
+            bit_width: 32,
+            flags: 0,
+            _pad0: 0,
+            base: 0,
+            _pad1: 0,
+        }];
+        let mut buf = Vec::new();
+        head.serialise(&fields, &[], &mut buf);
+        assert_eq!(buf.len(), 8 + 16);
+        let (_parsed, parsed_fields, parsed_prefix) =
+            SortedRunKeyFormat::parse(&buf).unwrap();
+        assert_eq!(parsed_fields.len(), 1);
+        assert!(parsed_prefix.is_empty());
     }
 }

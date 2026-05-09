@@ -1,17 +1,20 @@
 //! IMPL §1.5.6 packed-key codec.
 //!
 //! A sorted run's keys are decomposed into a sequence of fixed-count `u64`
-//! fields (plus an optional 1..=4 byte per-key header). For each field we
+//! fields (plus an optional 0..=4 byte per-key header). For each field we
 //! record `(bit_width, base, flags)` in a [`SortedRunKeyFormat`] descriptor;
 //! per-key encoding writes only `bit_width[i]` bits of `(field[i] - base[i])`
-//! into a tightly packed bit stream. Values share a leading `common_value_prefix`
-//! of bytes that is recorded once in the descriptor and elided from each
-//! per-entry value tail.
+//! into a tightly packed bit stream. Values share a leading
+//! `common_value_prefix` of bytes that is recorded once in the descriptor
+//! (both as a length and as the actual prefix bytes — see the trailing
+//! `value_prefix` slot) and elided from each per-entry value tail.
 //!
 //! The wire layout of a packed sorted-run payload is:
 //!
 //! ```text
-//! [SortedRunKeyFormat (8 + nr_fields * 16 bytes)]
+//! [SortedRunKeyFormat head (8 bytes)]
+//! [FieldFormat * nr_fields                       (16 bytes each)]
+//! [value_prefix bytes                            (common_value_prefix bytes)]
 //! [packed_key_0 | value_tail_0 | packed_key_1 | value_tail_1 | ...]
 //! ```
 //!
@@ -19,9 +22,9 @@
 //! bytes long, where `sum_data_bit_width` is the sum of every field's
 //! `bit_width` (i.e. the descriptor's `sum_bit_width` minus the per-key
 //! header bits — `sum_bit_width` is informational only). Each `value_tail_i`
-//! is `value_size - common_value_prefix` bytes long; the encoder elides the
-//! leading `common_value_prefix` bytes of the original value (which by
-//! construction match the descriptor's recorded prefix).
+//! is `value_size - common_value_prefix` bytes long; the decoder
+//! reconstructs entry *i*'s full value as `value_prefix || value_tail_i`
+//! without any caller-supplied state.
 //!
 //! ## Critical invariant — direct compare on packed bytes
 //!
@@ -264,11 +267,9 @@ impl PackableKey for (u32, u32) {
 
 // ---------- Format selection ----------
 
-const MAX_VALUE_PREFIX: usize = 24;
-
 /// Inspect a sorted slice of `(K, V)` and choose the most-compact
-/// [`SortedRunKeyFormat`] (descriptor head + field array) that can encode
-/// every entry without overflow.
+/// [`SortedRunKeyFormat`] (descriptor head + field array + value prefix)
+/// that can encode every entry without overflow.
 ///
 /// For each field `i`:
 ///
@@ -276,18 +277,23 @@ const MAX_VALUE_PREFIX: usize = 24;
 /// - `bit_width[i] = ceil(log2(max - min + 1))` (and `0` when `max == min`)
 ///
 /// `common_value_prefix` is computed by counting leading bytes that are
-/// bit-for-bit identical across every entry's value, capped at 24 (per
-/// spec). The cap also bounds the prefix at the shortest value's length.
+/// bit-for-bit identical across every entry's value, bounded by the
+/// shortest value's length and by the `u8` representable range
+/// (`0..=255`). The matching prefix bytes themselves are returned as the
+/// third tuple element so callers can persist them in the descriptor's
+/// trailing `value_prefix` slot (IMPL §1.5.6).
 ///
 /// **Edge cases:**
 ///
 /// - Empty input returns an all-zero descriptor with the trait-derived
-///   `nr_fields` / `key_header_bytes`. Encode then becomes a no-op.
+///   `nr_fields` / `key_header_bytes` and an empty prefix. Encode then
+///   becomes a no-op.
 /// - Single entry returns `bit_width = 0` for every field; one entry
-///   encodes as zero packed bits.
+///   encodes as zero packed bits with the entire value (capped at 255 B)
+///   captured in the prefix.
 pub fn select_format<K: PackableKey, V: AsRef<[u8]>>(
     entries: &[(K, V)],
-) -> Result<(SortedRunKeyFormat, Vec<FieldFormat>), PackError> {
+) -> Result<(SortedRunKeyFormat, Vec<FieldFormat>, Vec<u8>), PackError> {
     let nr = K::nr_fields();
     if nr == 0 || nr > 8 {
         return Err(PackError::TooManyFields(nr));
@@ -351,10 +357,10 @@ pub fn select_format<K: PackableKey, V: AsRef<[u8]>>(
         });
     }
 
-    // Common value prefix: count leading bytes shared across every entry.
-    // Capped at MAX_VALUE_PREFIX and at the shortest value length.
-    let common_prefix = if entries.is_empty() {
-        0u8
+    // Common value prefix: count leading bytes shared across every entry,
+    // bounded by the shortest value length and the u8 representable range.
+    let (common_prefix_len, prefix_bytes) = if entries.is_empty() {
+        (0u8, Vec::new())
     } else {
         let first = entries[0].1.as_ref();
         let max_len = entries
@@ -362,7 +368,7 @@ pub fn select_format<K: PackableKey, V: AsRef<[u8]>>(
             .map(|(_, v)| v.as_ref().len())
             .min()
             .unwrap_or(0)
-            .min(MAX_VALUE_PREFIX);
+            .min(u8::MAX as usize);
         let mut count = 0usize;
         'outer: for (j, &b) in first.iter().enumerate().take(max_len) {
             for (_, v) in entries.iter().skip(1) {
@@ -372,17 +378,17 @@ pub fn select_format<K: PackableKey, V: AsRef<[u8]>>(
             }
             count = j + 1;
         }
-        count as u8
+        (count as u8, first[..count].to_vec())
     };
 
     let head = SortedRunKeyFormat {
         nr_fields: nr as u8,
         key_header_bytes: header_bytes as u8,
-        common_value_prefix: common_prefix,
+        common_value_prefix: common_prefix_len,
         _pad: 0,
         sum_bit_width,
     };
-    Ok((head, fields))
+    Ok((head, fields, prefix_bytes))
 }
 
 // ---------- Bit packing helpers ----------
@@ -463,9 +469,13 @@ fn bytes_per_key(head: &SortedRunKeyFormat, fields: &[FieldFormat]) -> usize {
 
 /// Encode a sorted run's entries under the given format. Output is the
 /// payload bytes that go into a sorted run's payload region (after the
-/// `SortedRunHeader`). The format itself is laid out at the **start** of the
-/// payload (before the per-key data) so the decoder can read it without
-/// out-of-band state.
+/// `SortedRunHeader`). The format descriptor (header + fields +
+/// `value_prefix`) is laid out at the **start** of the payload so the
+/// decoder can read it without out-of-band state.
+///
+/// `value_prefix.len()` must equal `head.common_value_prefix`, and every
+/// entry's value must begin with exactly those bytes. The encoder strips
+/// those leading bytes from each value tail.
 ///
 /// **Variable-size values are not supported in R1a-pack.** Every entry's
 /// value must have the same length; otherwise [`PackError::Malformed`] is
@@ -474,6 +484,7 @@ pub fn encode_packed_run<K: PackableKey, V: AsRef<[u8]>>(
     entries: &[(K, V)],
     head: &SortedRunKeyFormat,
     fields: &[FieldFormat],
+    value_prefix: &[u8],
 ) -> Result<Vec<u8>, PackError> {
     let nr = K::nr_fields();
     if fields.len() != nr {
@@ -483,10 +494,14 @@ pub fn encode_packed_run<K: PackableKey, V: AsRef<[u8]>>(
     }
     let header_bytes = { head.key_header_bytes } as usize;
     let prefix = { head.common_value_prefix } as usize;
+    if value_prefix.len() != prefix {
+        return Err(PackError::InvalidPrefix(value_prefix.len()));
+    }
 
-    // Pre-allocate output. The format descriptor goes first.
+    // Pre-allocate output. The format descriptor goes first (head + fields +
+    // value_prefix tail).
     let mut out = Vec::new();
-    head.serialise(fields, &mut out);
+    head.serialise(fields, value_prefix, &mut out);
 
     if entries.is_empty() {
         return Ok(out);
@@ -504,9 +519,8 @@ pub fn encode_packed_run<K: PackableKey, V: AsRef<[u8]>>(
     }
     // Verify the recorded common prefix actually matches every value.
     if prefix > 0 {
-        let template = &entries[0].1.as_ref()[..prefix];
-        for (_, v) in entries.iter().skip(1) {
-            if &v.as_ref()[..prefix] != template {
+        for (_, v) in entries.iter() {
+            if &v.as_ref()[..prefix] != value_prefix {
                 return Err(PackError::Malformed(
                     "encode: common_value_prefix does not match every value",
                 ));
@@ -578,34 +592,25 @@ pub fn encode_packed_run<K: PackableKey, V: AsRef<[u8]>>(
 
 // ---------- Decoder ----------
 
+/// Output of [`decode_packed_run`]: per-entry `(key, value)` pairs (with
+/// values fully reconstructed including the elided prefix), plus the
+/// parsed format descriptor and field array.
+pub type DecodedRun<K> = (Vec<(K, Vec<u8>)>, SortedRunKeyFormat, Vec<FieldFormat>);
+
 /// Decode a packed sorted-run payload.
 ///
 /// `value_size` is the *total* per-entry value size in bytes, before
 /// prefix elision. `entry_count` matches `SortedRunHeader.entry_count`.
-/// `prefix_template` (if `Some`) is a verified match for the descriptor's
-/// `common_value_prefix` bytes; if `None`, the decoder reads the prefix
-/// from the descriptor's recorded bytes by reconstructing zero-bytes (which
-/// is wrong) — callers should pass `Some(prefix)` derived from the very
-/// first entry's value if they need to reconstruct full values. A
-/// convenience for the common case where the descriptor is the only source
-/// of truth: pass `prefix_template: None` and the decoder returns values
-/// with the prefix replaced by zero bytes; callers that round-trip via
-/// [`encode_packed_run`] preserve full values via the
-/// [`decode_packed_run_with_prefix`] helper below.
 ///
-/// In practice [`BtreeRegion`] passes the prefix template forwarded from
-/// the descriptor along with the very first entry's reconstruction; this
-/// works because the encoder asserts that every entry's first
-/// `common_value_prefix` bytes match the same template.
-/// Output triple of [`decode_packed_run`].
-pub type DecodedRun<K> = (Vec<(K, Vec<u8>)>, SortedRunKeyFormat, Vec<FieldFormat>);
-
+/// The descriptor's `value_prefix` tail is read directly from the payload
+/// and prepended to each entry's value tail, so reconstruction needs no
+/// out-of-band state.
 pub fn decode_packed_run<K: PackableKey>(
     payload: &[u8],
     value_size: usize,
     entry_count: u32,
 ) -> Result<DecodedRun<K>, PackError> {
-    let (head, fields) = SortedRunKeyFormat::parse(payload)
+    let (head, fields, value_prefix) = SortedRunKeyFormat::parse(payload)
         .map_err(|_| PackError::Malformed("decode: format header truncated"))?;
     let nr = { head.nr_fields } as usize;
     if nr != K::nr_fields() {
@@ -618,6 +623,7 @@ pub fn decode_packed_run<K: PackableKey>(
     if prefix > value_size {
         return Err(PackError::InvalidPrefix(prefix));
     }
+    debug_assert_eq!(value_prefix.len(), prefix);
     let value_tail_size = value_size - prefix;
     let body_size = bytes_per_key(&head, &fields);
 
@@ -654,10 +660,10 @@ pub fn decode_packed_run<K: PackableKey>(
         // Value tail.
         let value_tail = &entries_bytes[cursor..cursor + value_tail_size];
         cursor += value_tail_size;
-        // Reconstruct full value: leading prefix bytes are zero-filled here
-        // (the caller can patch them via `prefix_template` post-hoc).
+        // Reconstruct full value: prefix bytes from the descriptor, then
+        // the per-entry value tail.
         let mut full_value = Vec::with_capacity(value_size);
-        full_value.resize(prefix, 0u8);
+        full_value.extend_from_slice(&value_prefix);
         full_value.extend_from_slice(value_tail);
 
         let key = K::from_components(h, &field_vals)?;
@@ -665,27 +671,6 @@ pub fn decode_packed_run<K: PackableKey>(
     }
 
     Ok((out, head, fields))
-}
-
-/// Convenience: decode then patch the leading `common_value_prefix` bytes of
-/// every value with `prefix_template`. Returns an error if the template
-/// length differs from the descriptor's recorded prefix length.
-pub fn decode_packed_run_with_prefix<K: PackableKey>(
-    payload: &[u8],
-    value_size: usize,
-    entry_count: u32,
-    prefix_template: &[u8],
-) -> Result<Vec<(K, Vec<u8>)>, PackError> {
-    let (mut entries, head, _fields) =
-        decode_packed_run::<K>(payload, value_size, entry_count)?;
-    let prefix = { head.common_value_prefix } as usize;
-    if prefix_template.len() != prefix {
-        return Err(PackError::InvalidPrefix(prefix_template.len()));
-    }
-    for (_, v) in entries.iter_mut() {
-        v[..prefix].copy_from_slice(prefix_template);
-    }
-    Ok(entries)
 }
 
 // ---------- Compare on packed bytes ----------
@@ -931,9 +916,10 @@ mod tests {
     #[test]
     fn select_format_empty() {
         let entries: Vec<(u64, Vec<u8>)> = Vec::new();
-        let (head, fields) = select_format(&entries).unwrap();
+        let (head, fields, prefix) = select_format(&entries).unwrap();
         assert_eq!({ head.nr_fields }, 1);
         assert_eq!({ head.common_value_prefix }, 0);
+        assert!(prefix.is_empty());
         assert_eq!(fields.len(), 1);
         assert_eq!({ fields[0].bit_width }, 0);
         assert_eq!({ fields[0].base }, 0);
@@ -942,7 +928,7 @@ mod tests {
     #[test]
     fn select_format_single_entry_zero_widths() {
         let entries: Vec<(u64, Vec<u8>)> = vec![(42u64, vec![1, 2, 3])];
-        let (_head, fields) = select_format(&entries).unwrap();
+        let (_head, fields, _prefix) = select_format(&entries).unwrap();
         assert_eq!({ fields[0].bit_width }, 0);
         assert_eq!({ fields[0].base }, 42);
     }
@@ -953,7 +939,7 @@ mod tests {
         for i in 0u64..255 {
             entries.push((i, vec![]));
         }
-        let (_head, fields) = select_format(&entries).unwrap();
+        let (_head, fields, _prefix) = select_format(&entries).unwrap();
         // Range 0..=254 -> bit_width = 8.
         assert_eq!({ fields[0].bit_width }, 8);
         assert_eq!({ fields[0].base }, 0);
@@ -965,7 +951,7 @@ mod tests {
             (0u64, vec![]),
             (u64::MAX, vec![]),
         ];
-        let (_head, fields) = select_format(&entries).unwrap();
+        let (_head, fields, _prefix) = select_format(&entries).unwrap();
         assert_eq!({ fields[0].bit_width }, 64);
         assert_eq!({ fields[0].base }, 0);
     }
@@ -977,7 +963,7 @@ mod tests {
             ((1u64, 7u32), vec![]),
             ((100u64, 7u32), vec![]),
         ];
-        let (_head, fields) = select_format(&entries).unwrap();
+        let (_head, fields, _prefix) = select_format(&entries).unwrap();
         assert_eq!({ fields[1].bit_width }, 0);
         assert_eq!({ fields[1].base }, 7);
         // Field 0 spans 0..=100 — bit_width = 7.
@@ -991,7 +977,7 @@ mod tests {
             (2u64, vec![0xAB, 0xCD, 0x03, 0x04]),
             (3u64, vec![0xAB, 0xCD, 0x05, 0x06]),
         ];
-        let (head, _fields) = select_format(&entries).unwrap();
+        let (head, _fields, _prefix) = select_format(&entries).unwrap();
         assert_eq!({ head.common_value_prefix }, 2);
     }
 
@@ -1001,19 +987,37 @@ mod tests {
             (1u64, vec![0x01, 0xCD]),
             (2u64, vec![0x02, 0xCD]),
         ];
-        let (head, _fields) = select_format(&entries).unwrap();
+        let (head, _fields, _prefix) = select_format(&entries).unwrap();
         assert_eq!({ head.common_value_prefix }, 0);
     }
 
     #[test]
-    fn select_format_value_prefix_capped_at_24() {
+    fn select_format_value_prefix_capped_at_u8_max() {
+        // Two identical 300-byte values share their full content. The
+        // descriptor's `common_value_prefix` is a u8, so the prefix is
+        // capped at 255 even though all 300 bytes match.
+        let v = vec![0xAA; 300];
+        let entries: Vec<(u64, Vec<u8>)> = vec![
+            (1u64, v.clone()),
+            (2u64, v.clone()),
+        ];
+        let (head, _fields, prefix) = select_format(&entries).unwrap();
+        assert_eq!({ head.common_value_prefix }, u8::MAX);
+        assert_eq!(prefix.len(), u8::MAX as usize);
+    }
+
+    #[test]
+    fn select_format_long_shared_prefix_below_cap() {
+        // 64-byte shared values: prefix is now captured in full (no
+        // artificial 24-byte cap as in earlier R1 iterations).
         let v = vec![0xAA; 64];
         let entries: Vec<(u64, Vec<u8>)> = vec![
             (1u64, v.clone()),
             (2u64, v.clone()),
         ];
-        let (head, _fields) = select_format(&entries).unwrap();
-        assert_eq!({ head.common_value_prefix }, MAX_VALUE_PREFIX as u8);
+        let (head, _fields, prefix) = select_format(&entries).unwrap();
+        assert_eq!({ head.common_value_prefix }, 64);
+        assert_eq!(prefix.len(), 64);
     }
 
     // --- encode/decode round-trips ---
@@ -1023,19 +1027,13 @@ mod tests {
         let entries: Vec<((u64, u32), Vec<u8>)> = (0u64..50)
             .map(|i| ((i * 3, 7u32), vec![0xAA, 0xBB, (i & 0xff) as u8, 0]))
             .collect();
-        let (head, fields) = select_format(&entries).unwrap();
-        let payload = encode_packed_run(&entries, &head, &fields).unwrap();
+        let (head, fields, prefix) = select_format(&entries).unwrap();
+        let payload = encode_packed_run(&entries, &head, &fields, &prefix).unwrap();
 
-        let prefix_len = { head.common_value_prefix } as usize;
-        let prefix_template = entries[0].1[..prefix_len].to_vec();
         let value_size = 4;
-        let decoded = decode_packed_run_with_prefix::<(u64, u32)>(
-            &payload,
-            value_size,
-            entries.len() as u32,
-            &prefix_template,
-        )
-        .unwrap();
+        let (decoded, _head, _fields) =
+            decode_packed_run::<(u64, u32)>(&payload, value_size, entries.len() as u32)
+                .unwrap();
         assert_eq!(decoded.len(), entries.len());
         for (orig, dec) in entries.iter().zip(decoded.iter()) {
             assert_eq!(orig.0, dec.0);
@@ -1046,8 +1044,8 @@ mod tests {
     #[test]
     fn encode_empty() {
         let entries: Vec<(u64, Vec<u8>)> = Vec::new();
-        let (head, fields) = select_format(&entries).unwrap();
-        let payload = encode_packed_run(&entries, &head, &fields).unwrap();
+        let (head, fields, prefix) = select_format(&entries).unwrap();
+        let payload = encode_packed_run(&entries, &head, &fields, &prefix).unwrap();
         // Just the format header.
         assert_eq!(payload.len(), head.total_size());
     }
@@ -1066,18 +1064,11 @@ mod tests {
                 )
             })
             .collect();
-        let (head, fields) = select_format(&entries).unwrap();
+        let (head, fields, prefix) = select_format(&entries).unwrap();
         assert_eq!({ head.key_header_bytes }, 1);
-        let payload = encode_packed_run(&entries, &head, &fields).unwrap();
-        let prefix_len = { head.common_value_prefix } as usize;
-        let prefix_template = entries[0].1[..prefix_len].to_vec();
-        let decoded = decode_packed_run_with_prefix::<TestKey>(
-            &payload,
-            4,
-            entries.len() as u32,
-            &prefix_template,
-        )
-        .unwrap();
+        let payload = encode_packed_run(&entries, &head, &fields, &prefix).unwrap();
+        let (decoded, _head, _fields) =
+            decode_packed_run::<TestKey>(&payload, 4, entries.len() as u32).unwrap();
         for (orig, dec) in entries.iter().zip(decoded.iter()) {
             assert_eq!(orig.0, dec.0);
             assert_eq!(orig.1, dec.1);
@@ -1105,9 +1096,9 @@ mod tests {
 
         let entries: Vec<((u64, u32), Vec<u8>)> =
             keys.iter().map(|k| (*k, vec![])).collect();
-        let (head, fields) = select_format(&entries).unwrap();
+        let (head, fields, prefix) = select_format(&entries).unwrap();
         let body_size = bytes_per_key(&head, &fields);
-        let payload = encode_packed_run(&entries, &head, &fields).unwrap();
+        let payload = encode_packed_run(&entries, &head, &fields, &prefix).unwrap();
         let entries_start = head.total_size();
         let value_tail_size = 0;
         let stride = body_size + value_tail_size;
@@ -1141,9 +1132,9 @@ mod tests {
             let entries = vec![(*a, vec![]), (*b, vec![])];
             let mut sorted = entries.clone();
             sorted.sort_by_key(|x| x.0);
-            let (head, fields) = select_format(&sorted).unwrap();
+            let (head, fields, prefix) = select_format(&sorted).unwrap();
             let body_size = bytes_per_key(&head, &fields);
-            let payload = encode_packed_run(&sorted, &head, &fields).unwrap();
+            let payload = encode_packed_run(&sorted, &head, &fields, &prefix).unwrap();
             let start = head.total_size();
             let stride = body_size;
             let p0 = &payload[start..start + body_size];
@@ -1159,7 +1150,7 @@ mod tests {
     #[test]
     fn check_fit_in_range_returns_fits() {
         let entries: Vec<(u64, Vec<u8>)> = vec![(0u64, vec![]), (255u64, vec![])];
-        let (head, fields) = select_format(&entries).unwrap();
+        let (head, fields, _prefix) = select_format(&entries).unwrap();
         let r = check_fit::<u64>(&head, &fields, &100u64).unwrap();
         assert!(matches!(r, FormatFit::Fits));
     }
@@ -1167,7 +1158,7 @@ mod tests {
     #[test]
     fn check_fit_overflow_returns_promotion() {
         let entries: Vec<(u64, Vec<u8>)> = vec![(0u64, vec![]), (255u64, vec![])];
-        let (head, fields) = select_format(&entries).unwrap();
+        let (head, fields, _prefix) = select_format(&entries).unwrap();
         let r = check_fit::<u64>(&head, &fields, &10_000u64).unwrap();
         match r {
             FormatFit::NeedsPromotion(_new_head, new_fields) => {
@@ -1181,7 +1172,7 @@ mod tests {
     #[test]
     fn check_fit_below_base_returns_promotion() {
         let entries: Vec<(u64, Vec<u8>)> = vec![(100u64, vec![]), (200u64, vec![])];
-        let (head, fields) = select_format(&entries).unwrap();
+        let (head, fields, _prefix) = select_format(&entries).unwrap();
         let r = check_fit::<u64>(&head, &fields, &50u64).unwrap();
         match r {
             FormatFit::NeedsPromotion(_, new_fields) => {
@@ -1196,10 +1187,10 @@ mod tests {
     #[test]
     fn encode_field_overflow_errors() {
         let mut entries: Vec<(u64, Vec<u8>)> = vec![(0u64, vec![]), (10u64, vec![])];
-        let (head, fields) = select_format(&entries).unwrap();
+        let (head, fields, prefix) = select_format(&entries).unwrap();
         // Now sneak a key whose field exceeds the format.
         entries.push((1_000u64, vec![]));
-        let err = encode_packed_run(&entries, &head, &fields).unwrap_err();
+        let err = encode_packed_run(&entries, &head, &fields, &prefix).unwrap_err();
         assert!(matches!(err, PackError::FieldOverflow { .. }));
     }
 
@@ -1267,9 +1258,9 @@ mod tests {
         // bytes per entry; payload is just the format descriptor + value
         // tails (or none if values empty).
         let entries: Vec<(u64, Vec<u8>)> = vec![(7u64, vec![]); 5];
-        let (head, fields) = select_format(&entries).unwrap();
+        let (head, fields, prefix) = select_format(&entries).unwrap();
         assert_eq!({ fields[0].bit_width }, 0);
-        let payload = encode_packed_run(&entries, &head, &fields).unwrap();
+        let payload = encode_packed_run(&entries, &head, &fields, &prefix).unwrap();
         assert_eq!(payload.len(), head.total_size());
     }
 
@@ -1286,16 +1277,42 @@ mod tests {
                 (i, v)
             })
             .collect();
-        let (head, fields) = select_format(&entries).unwrap();
+        let (head, fields, prefix) = select_format(&entries).unwrap();
         assert_eq!({ head.common_value_prefix }, 4);
-        let payload = encode_packed_run(&entries, &head, &fields).unwrap();
-        let decoded =
-            decode_packed_run_with_prefix::<u64>(&payload, 6, entries.len() as u32, &prefix_template)
-                .unwrap();
+        assert_eq!(prefix, prefix_template);
+        let payload = encode_packed_run(&entries, &head, &fields, &prefix).unwrap();
+        // Decoder reads the prefix bytes directly from the descriptor;
+        // no caller-supplied template is needed.
+        let (decoded, _head, _fields) =
+            decode_packed_run::<u64>(&payload, 6, entries.len() as u32).unwrap();
         for (orig, dec) in entries.iter().zip(decoded.iter()) {
             assert_eq!(orig.0, dec.0);
             assert_eq!(orig.1, dec.1);
         }
+    }
+
+    // --- single-entry round-trip (the C1 spec amendment guarantee) ---
+
+    /// Single-entry sorted runs are the case where `select_format` saturates
+    /// `common_value_prefix` to the value's full length: every byte is
+    /// trivially shared. Pre-amendment, this stripped the entire value with
+    /// no on-disk record of the prefix; the reader couldn't reconstruct.
+    /// Post-amendment, the descriptor's `value_prefix` slot carries the
+    /// bytes and the reader rebuilds the value byte-exact.
+    #[test]
+    fn single_entry_run_round_trips_byte_exact() {
+        let entries: Vec<(u64, Vec<u8>)> = vec![(42u64, vec![0xCA, 0xFE, 0xBA, 0xBE])];
+        let (head, fields, prefix) = select_format(&entries).unwrap();
+        // For one entry every byte is "shared" — the encoder lifts the full
+        // value into the prefix.
+        assert_eq!({ head.common_value_prefix }, 4);
+        assert_eq!(prefix, vec![0xCA, 0xFE, 0xBA, 0xBE]);
+        let payload = encode_packed_run(&entries, &head, &fields, &prefix).unwrap();
+        let (decoded, _head, _fields) =
+            decode_packed_run::<u64>(&payload, 4, 1).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].0, 42);
+        assert_eq!(decoded[0].1, vec![0xCA, 0xFE, 0xBA, 0xBE]);
     }
 
     // --- variable-size values rejected ---
@@ -1307,8 +1324,8 @@ mod tests {
             (1u64, vec![1, 2]),
         ];
         // select_format won't reject; encoder will.
-        let (head, fields) = select_format(&entries).unwrap();
-        let err = encode_packed_run(&entries, &head, &fields).unwrap_err();
+        let (head, fields, prefix) = select_format(&entries).unwrap();
+        let err = encode_packed_run(&entries, &head, &fields, &prefix).unwrap_err();
         assert!(matches!(err, PackError::Malformed(_)));
     }
 
@@ -1362,7 +1379,7 @@ mod tests {
             }
         }
         let entries: Vec<(SignedKey, Vec<u8>)> = vec![(SignedKey, vec![])];
-        let (_head, fields) = select_format(&entries).unwrap();
+        let (_head, fields, _prefix) = select_format(&entries).unwrap();
         assert!({ fields[0].flags } & FIELD_FORMAT_FLAG_SIGNED != 0);
         assert!({ fields[1].flags } & FIELD_FORMAT_FLAG_MSB_FIRST != 0);
     }

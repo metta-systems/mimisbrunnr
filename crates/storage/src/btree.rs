@@ -761,8 +761,9 @@ impl BtreeRegion {
         K: pack::PackableKey,
         V: AsRef<[u8]>,
     {
-        let (head, fields) = pack::select_format(&run.entries)?;
-        let payload = pack::encode_packed_run(&run.entries, &head, &fields)?;
+        let (head, fields, value_prefix) = pack::select_format(&run.entries)?;
+        let payload =
+            pack::encode_packed_run(&run.entries, &head, &fields, &value_prefix)?;
         let _ = value_size; // value_size is encoded in the entries' length; recorded for symmetry.
         let mut header = SortedRunHeader {
             magic: SORTED_RUN_MAGIC,
@@ -884,10 +885,10 @@ impl BtreeRegion {
     }
 
     /// Read a region whose sorted runs may be a mix of packed-key and CBOR
-    /// encodings. The caller supplies the fixed `value_size` (in bytes) and
-    /// the expected `prefix_template` for packed runs (passed to the
-    /// decoder so full values can be reconstructed). CBOR runs ignore both
-    /// arguments.
+    /// encodings. The caller supplies the fixed `value_size` (in bytes);
+    /// the per-run descriptor's `value_prefix` slot carries the elided
+    /// prefix bytes so callers no longer need to provide one. CBOR runs
+    /// ignore `value_size`.
     ///
     /// Use this rather than [`Self::read`] when the tree was written with
     /// the packed codec for any of its runs.
@@ -896,7 +897,6 @@ impl BtreeRegion {
         offset: u64,
         kind: BtreeKind,
         value_size: usize,
-        prefix_template: &[u8],
     ) -> Result<LoadedNode<K, V>, StorageError>
     where
         K: pack::PackableKey + DeserializeOwned + Ord + Clone,
@@ -954,12 +954,8 @@ impl BtreeRegion {
             let entries: Vec<(K, V)> = if flags & SORTED_RUN_FLAG_PACKED_KEYS != 0 {
                 // Packed path.
                 let entry_count = { run_header.entry_count };
-                let decoded = pack::decode_packed_run_with_prefix::<K>(
-                    &payload,
-                    value_size,
-                    entry_count,
-                    prefix_template,
-                )?;
+                let (decoded, _head, _fields) =
+                    pack::decode_packed_run::<K>(&payload, value_size, entry_count)?;
                 decoded
                     .into_iter()
                     .map(|(k, v)| (k, V::from(v)))
