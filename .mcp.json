@@ -2,12 +2,26 @@
   "mcpServers": {
     "haft": {
       "command": "haft",
-      "args": [
-        "serve"
-      ],
+      "args": ["serve"],
       "env": {
         "HAFT_PROJECT_ROOT": "${PWD:-.}"
       }
+    },
+    "pathfinder": {
+      "command": "mcp-rtk",
+      "args": ["--", "pathfinder-mcp", "${PWD:-.}"]
+    },
+    "reasonkitthink": {
+      "command": "mcp-rtk",
+      "args": ["--", "reasonkit-think-mcp"]
+    },
+    "mneme": {
+      "command": "mcp-rtk",
+      "args": ["--", "mneme", "run"]
+    },
+    "octofs": {
+      "command": "mcp-rtk",
+      "args": ["--", "octofs"]
     }
   }
 }

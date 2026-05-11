@@ -1,0 +1,29 @@
+{
+  "context_servers": {
+    // Needs a skill setup
+    "Pathfinder": {
+      "enabled": true,
+      "source": "custom",
+      "command": "mcp-rtk",
+      "args": ["--", "pathfinder-mcp", "$ZED_PROJECT_ROOT"],
+    },
+    "ReasonKitThink": {
+      "enabled": true,
+      "source": "custom",
+      "command": "mcp-rtk",
+      "args": ["--", "reasonkit-think-mcp"],
+    },
+    "Mneme": {
+      "enabled": true,
+      "source": "custom",
+      "command": "mcp-rtk",
+      "args": ["--", "mneme", "run"],
+    },
+    "OctoFS": {
+      "enabled": true,
+      "source": "custom",
+      "command": "mcp-rtk",
+      "args": ["--", "octofs"],
+    },
+  },
+}
