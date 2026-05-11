@@ -1,44 +1,43 @@
 //! Forward index — `oid → [(Assertion, TagOrigin)]`.
 //!
-//! - On-disk wire structs: [`PackedAssertion`], [`LeafEntry`] (variable
-//!   length: inline assertions or spill-ref). IMPL §7.1.
+//! - On-disk wire structs: [`PackedAssertion`] (16 B), [`LeafEntry`]
+//!   (variable length: inline assertions or spill-ref). IMPL §7.1.
 //! - In-memory mirror: [`ForwardIndex`] (per IMPL §13:
 //!   `HashMap<u64, Vec<(Assertion, TagOrigin)>>`).
 //!
 //! [`ForwardIndex`] derives `Serialize`/`Deserialize` directly; callers
 //! reach for `ciborium::ser::into_writer` / `ciborium::de::from_reader`.
 //!
-//! ## Persistence (R1b-2)
+//! ## Persistence (R1c-A3.2) — native packed leaf + ForwardOverflow spill
 //!
 //! On disk the index occupies one 256 KiB §1.5 B+ tree region of
-//! [`BtreeKind::Forward`]. The in-memory mirror is materialised into a
-//! single CBOR-encoded sorted run via [`BtreeRegion::write_full`]; reload
-//! goes through [`BtreeRegion::read`]. Keys are raw `u64` oids (sorted
-//! ascending); values are the per-oid `Vec<(Assertion, TagOrigin)>`.
+//! [`BtreeKind::Forward`]. The directory's sorted-run is written via the
+//! `SORTED_RUN_FLAG_PACKED_KEYS` codec (§1.5.6) with the 2-field key
+//! `(oid, snapshot)` and `value_size_kind = VALUE_SIZE_KIND_VARINT`
+//! (forced, even for single-entry runs) — the value tail is the §7.1
+//! `LeafEntry` byte image minus the key bytes (a 2 B `header` plus either
+//! the inline `[PackedAssertion; total]` body or a 16 B `BlockRef` spill
+//! ref).
 //!
-//! Two reasons we use the CBOR sorted-run path here rather than the
-//! §1.5.6 packed-key codec:
+//! Objects whose assertion count exceeds [`LEAF_ENTRY_INLINE_SPILL_THRESHOLD`]
+//! (8) flush to a chain of [`ForwardOverflowRegion`] blocks within a fixed
+//! offset *overflow area* whose extent is supplied by the engine. Each
+//! region holds up to 16 379 `PackedAssertion`s and chains via a trailing
+//! `BlockRef` slot.
 //!
-//! - **Variable-length values.** IMPL §7.1's [`LeafEntry`] is variable-
-//!   width (`header` bitfield + either an inline `[PackedAssertion;
-//!   total]` body or a 16-byte `BlockRef` spill_ref). The packed codec
-//!   currently assumes a fixed `value_size`, so the spec-mandated
-//!   §7.1 encoding can't ride on `BtreeRegion::write_full_packed` as-is.
-//! - **Snapshot threading.** IMPL §7.1's key is `(oid, snapshot)` with the
-//!   snapshot field part of the separator, but R6 hasn't shipped — every
-//!   snapshot is implicitly 0 today.
-//!
-//! TODO(rewrite-phase-R1d): once R1c lands the storage-side
-//! `force_prefix_zero` / variable-value-size knobs and R6 lands snapshots,
-//! switch to the native §7.1 encoding (`(oid, snapshot)` packed key,
-//! `LeafEntry` variable-length body, ForwardOverflow spill chain).
+//! Per IMPL §11.2 the on-disk key is `(oid, snapshot)`; snapshots are
+//! deferred to R6 so every key carries `snapshot = 0` today. The field is
+//! on-disk now so R6 won't need a layout break.
 
 use std::collections::HashMap;
 
 use {
     bytemuck::{Pod, Zeroable},
-    mimisbrunnr_storage::{BlobRef, BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
-    mimisbrunnr_types::{Assertion, ObjectId, TagId, TagOrigin, Value},
+    mimisbrunnr_storage::{
+        BLOCK_SIZE, BlobRef, BlockDevice, BlockRef, BtreeKind, BtreeNodeHeader, BtreeRegion,
+        FieldHints, LoadedNode, PackError, PackableKey, SortedRun,
+    },
+    mimisbrunnr_types::{Assertion, ObjectId, TagId, TagOrigin, Value, value_hash},
     serde::{Deserialize, Serialize},
     static_assertions::const_assert_eq,
 };
@@ -65,42 +64,32 @@ pub const PACKED_ASSERTION_ORIGIN_DIRECT: u8 = 0;
 /// `PackedAssertion::origin = Materialized` discriminant.
 pub const PACKED_ASSERTION_ORIGIN_MATERIALIZED: u8 = 1;
 
-/// Size in bytes of [`PackedAssertion`] — 1 + 1 + 2 + 4 + 4 = 12 B.
-pub const PACKED_ASSERTION_SIZE: usize = 12;
+/// Size in bytes of [`PackedAssertion`] — 1 + 1 + 2 + 4 + 8 = 16 B.
+pub const PACKED_ASSERTION_SIZE: usize = 16;
 
 /// On-disk packed assertion. IMPL §7.1.
 ///
-/// Layout (12 bytes, naturally aligned within a `LeafEntry`):
+/// Layout (16 bytes, naturally aligned within a `LeafEntry`):
 ///
 /// ```text
 /// [0..1]   kind   (Tag=0, Attr=1, Relation=2)
 /// [1..2]   origin (Direct=0, Materialized=1)
 /// [2..4]   _pad
 /// [4..8]   a — tag id (Tag/Attr) or predicate (Relation)
-/// [8..12]  b — value_hash low 32 bits (Attr), target oid low 32 bits
-///             (Relation), 0 (Tag)
+/// [8..16]  b — value_hash (Attr), target oid (Relation), 0 (Tag)
 /// ```
-///
-/// **Note on `b`.** The IMPLEMENTATION.md §7.1 spec lists `b: u64`. To keep the
-/// fixed entry width equal to the spec-pinned 12-byte total used elsewhere in
-/// the codebase (`PackedAssertion = 12 B`, see size assertion below), this
-/// in-memory wire form stores the lower 32 bits of the value_hash / target;
-/// the engine carries the full 64-bit form alongside via the `(Assertion,
-/// TagOrigin)` pair when round-tripping. This is an explicit trade-off
-/// between the spec text (which separately lists 12 B and the `u64 b`
-/// formulation) — see *Spec ambiguities resolved* in the rewrite report.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct PackedAssertion {
-    pub kind: u8,    // [0..1]
-    pub origin: u8,  // [1..2]
-    pub _pad: u16,   // [2..4]
-    pub a: u32,      // [4..8]
-    pub b: u32,      // [8..12]
+    pub kind: u8,   // [0..1]
+    pub origin: u8, // [1..2]
+    pub _pad: u16,  // [2..4]
+    pub a: u32,     // [4..8]
+    pub b: u64,     // [8..16]
 }
 
 const_assert_eq!(core::mem::size_of::<PackedAssertion>(), PACKED_ASSERTION_SIZE);
-// computed: 1 (kind) + 1 (origin) + 2 (_pad) + 4 (a) + 4 (b) = 12
+// computed: 1 (kind) + 1 (origin) + 2 (_pad) + 4 (a) + 8 (b) = 16
 
 impl PackedAssertion {
     /// Build a `PackedAssertion` from the in-memory (`Assertion`, `TagOrigin`)
@@ -129,14 +118,14 @@ impl PackedAssertion {
                 origin: origin_byte,
                 _pad: 0,
                 a: key.raw(),
-                b: (value_hash & 0xffff_ffff) as u32,
+                b: value_hash,
             },
             Assertion::Relation { predicate, target } => Self {
                 kind: PACKED_ASSERTION_KIND_RELATION,
                 origin: origin_byte,
                 _pad: 0,
                 a: predicate.raw(),
-                b: (target.to_u64() & 0xffff_ffff) as u32,
+                b: target.to_u64(),
             },
         }
     }
@@ -154,16 +143,21 @@ impl PackedAssertion {
         }
     }
 
-    /// Convert back to the logical pair, given the auxiliary data needed for
-    /// `Attr` / `Relation` entries.
+    /// Convert back to the logical pair. The full `Relation` target is
+    /// recovered from `b` (now 64-bit; A3.2). For `Attr` entries the
+    /// actual `Value` is **not** recoverable from the wire form (only
+    /// its `value_hash` lives on disk); callers either supply it via
+    /// `attr_value` or accept the `Value::Int(0)` placeholder. R6's
+    /// value-spill table will round-trip the full `Value` via the
+    /// `value_hash` index.
     pub fn to_logical(
         &self,
         attr_value: Option<Value>,
-        relation_target: Option<ObjectId>,
     ) -> Result<(Assertion, TagOrigin), IndexError> {
         let origin = self.origin()?;
         let kind = { self.kind };
         let a = { self.a };
+        let b = { self.b };
         let assertion = match kind {
             PACKED_ASSERTION_KIND_TAG => Assertion::Tag(TagId::new(a)),
             PACKED_ASSERTION_KIND_ATTR => Assertion::Attr {
@@ -172,7 +166,7 @@ impl PackedAssertion {
             },
             PACKED_ASSERTION_KIND_RELATION => Assertion::Relation {
                 predicate: TagId::new(a),
-                target: relation_target.unwrap_or(ObjectId::from_u64(0)),
+                target: ObjectId::from_u64(b),
             },
             other => return Err(IndexError::InvalidAssertionKind(other)),
         };
@@ -485,91 +479,349 @@ impl ForwardIndex {
     }
 
     // ----------------------------------------------------------------
-    // R1b-2: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // R1c-A3.2: §1.5 B+ tree persistence (packed-codec native leaf +
+    // chained ForwardOverflow regions per §7.2).
     // ----------------------------------------------------------------
 
-    /// Build a [`LoadedNode`] containing every entry as a single CBOR sorted
-    /// run sorted by `(oid, snapshot)`. The node uses [`BtreeKind::Forward`]
-    /// and the spec's 18-bit (256 KiB) region size.
+    /// Write the in-memory state to disk under the A3.2 layout:
     ///
-    /// Per IMPL §11.2 the on-disk key is `(oid, snapshot)`; snapshots are
-    /// deferred to R6 so every key carries `snapshot = 0` today. The field
-    /// is preserved on disk so R6 won't need a layout break.
-    pub fn to_loaded_node(&self) -> LoadedNode<ForwardIndexKey, ForwardIndexValue> {
-        let mut entries: Vec<(ForwardIndexKey, ForwardIndexValue)> = self
-            .entries
-            .iter()
-            .map(|(oid, v)| {
-                (
-                    ForwardIndexKey {
-                        oid: *oid,
-                        snapshot: 0,
-                    },
-                    ForwardIndexValue(v.clone()),
-                )
-            })
-            .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mut node: LoadedNode<ForwardIndexKey, ForwardIndexValue> =
-            LoadedNode::new(BtreeKind::Forward, 0, REGION_SIZE_LOG2);
-        if !entries.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, entries);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        node
-    }
-
-    /// Restore the in-memory state from a [`LoadedNode`] read via
-    /// [`BtreeRegion::read`].
-    pub fn from_loaded_node(
-        node: &LoadedNode<ForwardIndexKey, ForwardIndexValue>,
-    ) -> Result<Self, IndexError> {
-        let mut entries: HashMap<u64, Vec<(Assertion, TagOrigin)>> = HashMap::new();
-        for (k, v) in node.merge_iter() {
-            // Snapshot != 0 won't appear until R6 lands snapshot-aware reads.
-            // Until then, collapse every entry onto the (snapshot=0) view by
-            // taking the last writer for each oid.
-            entries.insert(k.oid, v.0.clone());
-        }
-        Ok(Self { entries })
-    }
-
-    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
-    /// on `device`. Replaces the region wholesale via
-    /// [`BtreeRegion::write_full`].
+    /// - `dir_offset` is the byte offset of the §1.5 directory region.
+    /// - `overflow_area_offset` is the byte offset of slot 0 of the
+    ///   forward-overflow region area. Spilled per-object assertion lists
+    ///   are written into this area as 256 KiB
+    ///   [`ForwardOverflowRegion`] blocks chained via a trailing
+    ///   `next_page: BlockRef` slot.
+    /// - `overflow_area_cap_regions` is the maximum number of overflow
+    ///   regions permitted; flush errors with
+    ///   [`IndexError::OverflowAreaExhausted`] if a chain would overflow it.
+    ///
+    /// Returns the count of overflow regions written so callers can
+    /// record the live extent (and for tests).
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
-        offset: u64,
-    ) -> Result<(), IndexError> {
-        let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, ForwardIndexKey, ForwardIndexValue>(
-            device, offset, &mut node,
-        )?;
-        Ok(())
+        dir_offset: u64,
+        overflow_area_offset: u64,
+        overflow_area_cap_regions: usize,
+    ) -> Result<usize, IndexError> {
+        // 1. Sort by oid for a monotonic packed sorted run.
+        let mut sorted: Vec<(u64, &Vec<(Assertion, TagOrigin)>)> =
+            self.entries.iter().map(|(k, v)| (*k, v)).collect();
+        sorted.sort_by_key(|e| e.0);
+
+        let mut leaves: Vec<(ForwardIndexKey, ForwardIndexValue)> =
+            Vec::with_capacity(sorted.len());
+        let mut next_region_slot: usize = 0;
+
+        // 2. For each (oid, asserts), pack assertions, then either write
+        //    the inline body or spill to an overflow chain.
+        for (oid, asserts) in sorted {
+            let packed: Vec<PackedAssertion> = asserts
+                .iter()
+                .map(|(a, o)| {
+                    // §7.1: `b` carries the value_hash for Attr; we use a
+                    // zero SipHash key here. R6 will wire the per-pool
+                    // value-spill table's key.
+                    let h = match a {
+                        Assertion::Attr { value, .. } => value_hash(value, &[0u8; 16]),
+                        _ => 0,
+                    };
+                    PackedAssertion::from_logical(a, *o, h)
+                })
+                .collect();
+
+            if packed.len() > LEAF_ENTRY_TOTAL_MASK as usize {
+                return Err(IndexError::AssertionCountOverflow { count: packed.len() });
+            }
+
+            if packed.len() <= LEAF_ENTRY_INLINE_SPILL_THRESHOLD {
+                // Inline body: 2 B header + 16 B × total assertions.
+                let header = (packed.len() as u16) & LEAF_ENTRY_TOTAL_MASK;
+                let mut tail =
+                    Vec::with_capacity(2 + packed.len() * PACKED_ASSERTION_SIZE);
+                tail.extend_from_slice(&header.to_le_bytes());
+                for pa in &packed {
+                    tail.extend_from_slice(bytemuck::bytes_of(pa));
+                }
+                leaves.push((
+                    ForwardIndexKey { oid, snapshot: 0 },
+                    ForwardIndexValue(tail),
+                ));
+            } else {
+                // Spill: write overflow chain, embed head BlockRef in the
+                // leaf entry.
+                let head_ref = write_overflow_chain(
+                    device,
+                    overflow_area_offset,
+                    overflow_area_cap_regions,
+                    &mut next_region_slot,
+                    &packed,
+                )?;
+                let header =
+                    ((packed.len() as u16) & LEAF_ENTRY_TOTAL_MASK) | LEAF_ENTRY_SPILL_FLAG;
+                let mut tail = Vec::with_capacity(2 + core::mem::size_of::<BlockRef>());
+                tail.extend_from_slice(&header.to_le_bytes());
+                tail.extend_from_slice(bytemuck::bytes_of(&head_ref));
+                leaves.push((
+                    ForwardIndexKey { oid, snapshot: 0 },
+                    ForwardIndexValue(tail),
+                ));
+            }
+        }
+
+        // 3. Build the LoadedNode + single sorted run, then flush via the
+        //    forced-VARINT packed codec.
+        let mut node: LoadedNode<ForwardIndexKey, ForwardIndexValue> =
+            LoadedNode::new(BtreeKind::Forward, 0, REGION_SIZE_LOG2);
+        if !leaves.is_empty() {
+            let run = SortedRun::from_sorted(0, 0, leaves);
+            node.sorted_runs.push(run);
+            node.header.sorted_run_count = 1;
+        }
+        // `value_size` is informational under VARINT; pass an upper bound
+        // for symmetry with the FIXED-mode call sites.
+        let max_value_size = 2 + LEAF_ENTRY_INLINE_SPILL_THRESHOLD * PACKED_ASSERTION_SIZE;
+        BtreeRegion::write_full_packed_force_varint::<
+            D,
+            ForwardIndexKey,
+            ForwardIndexValue,
+        >(device, dir_offset, &mut node, max_value_size)?;
+
+        Ok(next_region_slot)
     }
 
-    /// Read the in-memory state from the 256 KiB region at byte `offset` on
-    /// `device`. An all-zero region is treated as "empty index" and returns
-    /// [`Self::default`].
+    /// Read the in-memory state from disk. Reads the directory at
+    /// `dir_offset` and, for each leaf entry whose `header` carries
+    /// [`LEAF_ENTRY_SPILL_FLAG`], walks the [`ForwardOverflowRegion`]
+    /// chain rooted at the embedded `BlockRef`.
+    ///
+    /// An all-zero directory region is treated as "empty index" and
+    /// returns [`Self::default`].
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
-        offset: u64,
+        dir_offset: u64,
     ) -> Result<Self, IndexError> {
-        // Probe the first 8 bytes — a fresh (all-zero) region has no magic.
         let mut probe = [0u8; 8];
-        device.read_at(offset, &mut probe)?;
+        device.read_at(dir_offset, &mut probe)?;
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, ForwardIndexKey, ForwardIndexValue>(
+        let max_value_size = 2 + LEAF_ENTRY_INLINE_SPILL_THRESHOLD * PACKED_ASSERTION_SIZE;
+        let node = BtreeRegion::read_packed::<D, ForwardIndexKey, ForwardIndexValue>(
             device,
-            offset,
+            dir_offset,
             BtreeKind::Forward,
+            max_value_size,
         )?;
-        Self::from_loaded_node(&node)
+
+        let mut entries: HashMap<u64, Vec<(Assertion, TagOrigin)>> = HashMap::new();
+        for (k, v) in node.merge_iter() {
+            let bytes: &[u8] = v.as_ref();
+            if bytes.len() < 2 {
+                return Err(IndexError::BufferTooSmall {
+                    need: 2,
+                    have: bytes.len(),
+                });
+            }
+            let header = u16::from_le_bytes([bytes[0], bytes[1]]);
+            let total = (header & LEAF_ENTRY_TOTAL_MASK) as usize;
+            let is_spill = (header & LEAF_ENTRY_SPILL_FLAG) != 0;
+            let body = &bytes[2..];
+
+            let packed: Vec<PackedAssertion> = if is_spill {
+                let need = core::mem::size_of::<BlockRef>();
+                if body.len() < need {
+                    return Err(IndexError::BufferTooSmall { need, have: body.len() });
+                }
+                let head_ref: BlockRef = *bytemuck::from_bytes(&body[..need]);
+                read_overflow_chain(device, head_ref, total)?
+            } else {
+                let need = total * PACKED_ASSERTION_SIZE;
+                if body.len() < need {
+                    return Err(IndexError::BufferTooSmall { need, have: body.len() });
+                }
+                (0..total)
+                    .map(|i| {
+                        let off = i * PACKED_ASSERTION_SIZE;
+                        *bytemuck::from_bytes::<PackedAssertion>(
+                            &body[off..off + PACKED_ASSERTION_SIZE],
+                        )
+                    })
+                    .collect()
+            };
+
+            let assertions: Result<Vec<_>, IndexError> =
+                packed.iter().map(|pa| pa.to_logical(None)).collect();
+            entries.insert(k.oid, assertions?);
+        }
+        Ok(Self { entries })
+    }
+}
+
+// ---------- ForwardOverflowRegion + chain helpers ----------
+
+/// Per IMPL §7.2: number of `PackedAssertion`s a single overflow region
+/// can hold. With `PackedAssertion = 16 B` and the trailing `next_page`
+/// BlockRef occupying the last 16 B of a 256 KiB region, the body fits
+/// `(262 144 − 64 − 16) / 16 = 16 379` entries.
+pub const FORWARD_OVERFLOW_REGION_CAPACITY: usize = 16_379;
+
+/// 256 KiB region size.
+pub const FORWARD_OVERFLOW_REGION_SIZE: usize = 256 * 1024;
+/// Byte offset of the trailing `next_page: BlockRef` slot.
+const FORWARD_OVERFLOW_NEXT_PAGE_OFFSET: usize =
+    FORWARD_OVERFLOW_REGION_SIZE - core::mem::size_of::<BlockRef>();
+/// Byte offset of the first `PackedAssertion` entry (right after the 64-B
+/// `BtreeNodeHeader`).
+const FORWARD_OVERFLOW_ENTRIES_OFFSET: usize = 64;
+
+const_assert_eq!(
+    FORWARD_OVERFLOW_REGION_CAPACITY * PACKED_ASSERTION_SIZE
+        + FORWARD_OVERFLOW_ENTRIES_OFFSET
+        + core::mem::size_of::<BlockRef>(),
+    FORWARD_OVERFLOW_REGION_SIZE
+);
+
+/// Split `packed` into up to
+/// [`FORWARD_OVERFLOW_REGION_CAPACITY`]-sized chunks, write each as a
+/// [`BtreeKind::ForwardOverflow`] region in the overflow area, and chain
+/// them via the trailing `next_page` slot. Returns the head region's
+/// `BlockRef`.
+fn write_overflow_chain<D: BlockDevice>(
+    device: &D,
+    area_offset: u64,
+    cap_regions: usize,
+    next_slot: &mut usize,
+    packed: &[PackedAssertion],
+) -> Result<BlockRef, IndexError> {
+    debug_assert!(!packed.is_empty());
+    let chunks: Vec<&[PackedAssertion]> =
+        packed.chunks(FORWARD_OVERFLOW_REGION_CAPACITY).collect();
+
+    let needed_end = *next_slot + chunks.len();
+    if needed_end > cap_regions {
+        return Err(IndexError::OverflowAreaExhausted {
+            needed: needed_end,
+            cap: cap_regions,
+        });
+    }
+
+    let first_slot = *next_slot;
+    let assigned: Vec<usize> = (first_slot..first_slot + chunks.len()).collect();
+    *next_slot = first_slot + chunks.len();
+
+    // Write tail-first so each region knows its successor's BlockRef.
+    let mut next_link = BlockRef::zeroed();
+    for (chunk_idx, &chunk) in chunks.iter().enumerate().rev() {
+        let slot = assigned[chunk_idx];
+        let byte_offset = area_offset + (slot as u64) * FORWARD_OVERFLOW_REGION_SIZE as u64;
+        write_overflow_region(device, byte_offset, chunk, next_link)?;
+        next_link = block_ref_at(byte_offset);
+    }
+
+    let head_offset = area_offset + (assigned[0] as u64) * FORWARD_OVERFLOW_REGION_SIZE as u64;
+    Ok(block_ref_at(head_offset))
+}
+
+fn write_overflow_region<D: BlockDevice>(
+    device: &D,
+    byte_offset: u64,
+    entries: &[PackedAssertion],
+    next_page: BlockRef,
+) -> Result<(), IndexError> {
+    debug_assert!(entries.len() <= FORWARD_OVERFLOW_REGION_CAPACITY);
+    let mut buf = vec![0u8; FORWARD_OVERFLOW_REGION_SIZE];
+
+    // Header (64 B): kind = ForwardOverflow, payload_used = len * 16,
+    // positional (sorted_run_count = 0).
+    let mut header =
+        BtreeNodeHeader::new(BtreeKind::ForwardOverflow, 1, 0, REGION_SIZE_LOG2);
+    header.payload_used = (entries.len() * PACKED_ASSERTION_SIZE) as u32;
+    buf[..core::mem::size_of::<BtreeNodeHeader>()].copy_from_slice(header.as_bytes());
+
+    // Entries.
+    for (i, pa) in entries.iter().enumerate() {
+        let off = FORWARD_OVERFLOW_ENTRIES_OFFSET + i * PACKED_ASSERTION_SIZE;
+        buf[off..off + PACKED_ASSERTION_SIZE].copy_from_slice(bytemuck::bytes_of(pa));
+    }
+
+    // Trailing next_page link.
+    buf[FORWARD_OVERFLOW_NEXT_PAGE_OFFSET..]
+        .copy_from_slice(bytemuck::bytes_of(&next_page));
+
+    device.write_at(byte_offset, &buf)?;
+    Ok(())
+}
+
+/// Walk a `ForwardOverflow` chain rooted at `head`, concatenating each
+/// region's live `PackedAssertion` slice. The chain must yield exactly
+/// `expected_total` entries — fewer means truncation, more means the leaf
+/// entry's `total` slot drifted from the chain's `payload_used` sum.
+fn read_overflow_chain<D: BlockDevice>(
+    device: &D,
+    head: BlockRef,
+    expected_total: usize,
+) -> Result<Vec<PackedAssertion>, IndexError> {
+    let mut out: Vec<PackedAssertion> = Vec::with_capacity(expected_total);
+    let mut cur = head;
+    let zero = BlockRef::zeroed();
+    let mut guard = 0usize;
+    while cur != zero {
+        guard += 1;
+        if guard > expected_total / FORWARD_OVERFLOW_REGION_CAPACITY + 2 {
+            return Err(IndexError::CorruptOverflowChain("chain exceeds expected length"));
+        }
+        let offset = (cur.block_no as u64) * BLOCK_SIZE as u64;
+        let mut buf = vec![0u8; FORWARD_OVERFLOW_REGION_SIZE];
+        device.read_at(offset, &mut buf)?;
+
+        let header = BtreeNodeHeader::parse(&buf)?;
+        let header_kind = { header.pre.kind };
+        if header_kind != BtreeKind::ForwardOverflow as u16 {
+            return Err(IndexError::CorruptOverflowChain(
+                "non-ForwardOverflow region in chain",
+            ));
+        }
+        let payload_used = { header.payload_used } as usize;
+        if !payload_used.is_multiple_of(PACKED_ASSERTION_SIZE) {
+            return Err(IndexError::CorruptOverflowChain(
+                "payload_used not a multiple of PackedAssertion size",
+            ));
+        }
+        let live_count = payload_used / PACKED_ASSERTION_SIZE;
+        if live_count > FORWARD_OVERFLOW_REGION_CAPACITY {
+            return Err(IndexError::CorruptOverflowChain(
+                "payload_used exceeds region capacity",
+            ));
+        }
+        for i in 0..live_count {
+            let off = FORWARD_OVERFLOW_ENTRIES_OFFSET + i * PACKED_ASSERTION_SIZE;
+            let pa: PackedAssertion =
+                *bytemuck::from_bytes(&buf[off..off + PACKED_ASSERTION_SIZE]);
+            out.push(pa);
+        }
+
+        // Read trailing next_page link.
+        let next: BlockRef = *bytemuck::from_bytes(&buf[FORWARD_OVERFLOW_NEXT_PAGE_OFFSET..]);
+        cur = next;
+    }
+    if out.len() != expected_total {
+        return Err(IndexError::CorruptOverflowChain(
+            "chain entry count != leaf entry total",
+        ));
+    }
+    Ok(out)
+}
+
+/// Construct a `BlockRef` pointing at the 4 KiB block whose byte offset
+/// is `byte_offset`. `generation = 1` is the R1c-D1 placeholder; D3 will
+/// bump generation per allocation.
+fn block_ref_at(byte_offset: u64) -> BlockRef {
+    BlockRef {
+        disk_id: 0,
+        _pad: 0,
+        block_no: (byte_offset / BLOCK_SIZE as u64) as u32,
+        generation: 1,
     }
 }
 
@@ -588,15 +840,102 @@ pub struct ForwardIndexKey {
     pub snapshot: u32,
 }
 
-/// B+ tree value for the forward index: the per-oid `(Assertion, TagOrigin)`
-/// list. Variable-shape — relies on the CBOR run codec.
-///
-/// **No `Eq` derive.** [`Assertion`] embeds [`Value::Float(f64)`], and `f64`
-/// cannot implement `Eq` (NaN ≠ NaN). `BtreeRegion::{write_full, read}` only
-/// require `Serialize` / `DeserializeOwned + Clone` on the value, so dropping
-/// `Eq` is safe.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ForwardIndexValue(pub Vec<(Assertion, TagOrigin)>);
+const FORWARD_INDEX_KEY_HINTS: [FieldHints; 2] =
+    [FieldHints::unsigned(), FieldHints::unsigned()];
+
+impl PackableKey for ForwardIndexKey {
+    fn nr_fields() -> usize {
+        2
+    }
+    fn key_header_bytes() -> usize {
+        0
+    }
+    fn field_hints() -> &'static [FieldHints] {
+        &FORWARD_INDEX_KEY_HINTS
+    }
+    fn field_values(&self, out: &mut [u64]) {
+        out[0] = self.oid;
+        out[1] = self.snapshot as u64;
+    }
+    fn from_components(_header: u32, fields: &[u64]) -> Result<Self, PackError> {
+        if fields.len() != 2 {
+            return Err(PackError::Malformed("ForwardIndexKey: wrong field count"));
+        }
+        if fields[1] > u32::MAX as u64 {
+            return Err(PackError::Malformed("ForwardIndexKey: snapshot overflow"));
+        }
+        Ok(Self {
+            oid: fields[0],
+            snapshot: fields[1] as u32,
+        })
+    }
+}
+
+/// B+ tree value for the forward index: the §7.1 `LeafEntry` value tail —
+/// 2 B `header` followed by either an inline `[PackedAssertion; total]`
+/// body or a 16 B spill `BlockRef`. Stored as raw bytes so the packed
+/// codec can write the variable-length tail directly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ForwardIndexValue(pub Vec<u8>);
+
+impl AsRef<[u8]> for ForwardIndexValue {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Vec<u8>> for ForwardIndexValue {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
+}
+
+// `ForwardIndexValue` needs `Serialize + Deserialize + Clone` to satisfy
+// the `BtreeRegion::read_packed` bounds (the CBOR fallback path). We
+// always write packed runs via `write_full_packed_force_varint` so the
+// CBOR codec is never exercised for this type.
+impl Serialize for ForwardIndexValue {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ForwardIndexValue {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let bytes: Vec<u8> = serde_bytes_helper::deserialize_bytes(de)?;
+        Ok(Self(bytes))
+    }
+}
+
+mod serde_bytes_helper {
+    use serde::de::{Error, SeqAccess, Visitor};
+
+    pub fn deserialize_bytes<'de, D: serde::Deserializer<'de>>(
+        de: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("byte string")
+            }
+            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                Ok(v.to_vec())
+            }
+            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(v)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+        de.deserialize_bytes(V)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -612,9 +951,9 @@ mod tests {
     }
 
     #[test]
-    fn packed_assertion_size_is_12() {
-        // computed: 1 (kind) + 1 (origin) + 2 (_pad) + 4 (a) + 4 (b) = 12
-        assert_eq!(core::mem::size_of::<PackedAssertion>(), 12);
+    fn packed_assertion_size_is_16() {
+        // computed: 1 (kind) + 1 (origin) + 2 (_pad) + 4 (a) + 8 (b) = 16
+        assert_eq!(core::mem::size_of::<PackedAssertion>(), 16);
     }
 
     #[test]
@@ -630,7 +969,7 @@ mod tests {
         let pa = PackedAssertion::from_logical(&a, TagOrigin::Direct, 0);
         assert_eq!({ pa.kind }, PACKED_ASSERTION_KIND_TAG);
         assert_eq!({ pa.a }, 42);
-        let (back, origin) = pa.to_logical(None, None).unwrap();
+        let (back, origin) = pa.to_logical(None).unwrap();
         assert_eq!(back, a);
         assert_eq!(origin, TagOrigin::Direct);
     }
@@ -646,9 +985,9 @@ mod tests {
         let pa = PackedAssertion::from_logical(&a, TagOrigin::Materialized, h);
         assert_eq!({ pa.kind }, PACKED_ASSERTION_KIND_ATTR);
         assert_eq!({ pa.a }, 7);
-        // Low 32 bits of value_hash preserved.
-        assert_eq!({ pa.b }, (h & 0xffff_ffff) as u32);
-        let (back, origin) = pa.to_logical(Some(v.clone()), None).unwrap();
+        // Full 64-bit value_hash preserved.
+        assert_eq!({ pa.b }, h);
+        let (back, origin) = pa.to_logical(Some(v.clone())).unwrap();
         if let Assertion::Attr { key, value } = back {
             assert_eq!(key, tag(7));
             assert_eq!(value, v);
@@ -660,7 +999,9 @@ mod tests {
 
     #[test]
     fn packed_assertion_round_trip_relation() {
-        let target = oid(0xDEAD_BEEF);
+        // Use a non-trivial 64-bit oid (top 16 bits = node id, low 48 =
+        // local) to confirm the full target round-trips through `b: u64`.
+        let target = ObjectId::from_u64(0xDEAD_BEEF_CAFE_BABE);
         let a = Assertion::Relation {
             predicate: tag(13),
             target,
@@ -668,7 +1009,9 @@ mod tests {
         let pa = PackedAssertion::from_logical(&a, TagOrigin::Direct, 0);
         assert_eq!({ pa.kind }, PACKED_ASSERTION_KIND_RELATION);
         assert_eq!({ pa.a }, 13);
-        let (back, origin) = pa.to_logical(None, Some(target)).unwrap();
+        // Full 64-bit target oid preserved.
+        assert_eq!({ pa.b }, target.to_u64());
+        let (back, origin) = pa.to_logical(None).unwrap();
         assert_eq!(back, a);
         assert_eq!(origin, TagOrigin::Direct);
     }
@@ -824,27 +1167,48 @@ mod tests {
         assert_eq!(fi.object_count(), 0);
     }
 
-    // ----- B+ tree region round-trip (R1b-2) -----
+    // ----- B+ tree region round-trip (R1c-A3.2 native path) -----
 
     use mimisbrunnr_storage::FileBlockDevice;
     use tempfile::TempDir;
 
+    // Test layout: directory at offset 0 (256 KiB §1.5 region); overflow
+    // area starts at 256 KiB with capacity for 8 regions (2 MiB worth).
+    // Device is 8 MiB, comfortably more than the layout needs.
+    const TEST_DIR_OFFSET: u64 = 0;
+    const TEST_OVERFLOW_AREA_OFFSET: u64 = 256 * 1024;
+    const TEST_OVERFLOW_AREA_REGIONS: usize = 8;
+
     fn fresh_device() -> (TempDir, FileBlockDevice) {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("forward_index.bin");
-        let dev = FileBlockDevice::open(&path, 1 << 20).unwrap();
+        // 8 MiB — directory (256 KiB) + overflow area (2 MiB) + margin.
+        let dev = FileBlockDevice::open(&path, 8 << 20).unwrap();
         (dir, dev)
+    }
+
+    fn flush(idx: &ForwardIndex, dev: &FileBlockDevice) -> Result<usize, IndexError> {
+        idx.flush_to_region(
+            dev,
+            TEST_DIR_OFFSET,
+            TEST_OVERFLOW_AREA_OFFSET,
+            TEST_OVERFLOW_AREA_REGIONS,
+        )
+    }
+
+    fn load(dev: &FileBlockDevice) -> Result<ForwardIndex, IndexError> {
+        ForwardIndex::load_from_region(dev, TEST_DIR_OFFSET)
     }
 
     #[test]
     fn forward_region_round_trip_empty_returns_default() {
         let (_dir, dev) = fresh_device();
-        let idx = ForwardIndex::load_from_region(&dev, 0).unwrap();
+        let idx = load(&dev).unwrap();
         assert_eq!(idx.object_count(), 0);
     }
 
     #[test]
-    fn forward_region_round_trip_preserves_assertions() {
+    fn forward_region_round_trip_inline_only() {
         let (_dir, dev) = fresh_device();
         let mut fi = ForwardIndex::new();
         fi.add_assertion(oid(1), Assertion::Tag(tag(10)), TagOrigin::Direct);
@@ -866,8 +1230,9 @@ mod tests {
             TagOrigin::Direct,
         );
 
-        fi.flush_to_region(&dev, 0).unwrap();
-        let back = ForwardIndex::load_from_region(&dev, 0).unwrap();
+        let pages = flush(&fi, &dev).unwrap();
+        assert_eq!(pages, 0, "no spills for inline-only fixture");
+        let back = load(&dev).unwrap();
 
         assert_eq!(back.object_count(), 3);
         let a1 = back.assertions_of(oid(1));
@@ -879,21 +1244,82 @@ mod tests {
         assert!(matches!(&a2[0].0, Assertion::Attr { .. }));
         let a3 = back.assertions_of(oid(3));
         assert_eq!(a3.len(), 1);
-        assert!(matches!(&a3[0].0, Assertion::Relation { .. }));
+        // Relation target should round-trip exactly (b: u64 carries the
+        // full ObjectId).
+        if let Assertion::Relation { predicate, target } = &a3[0].0 {
+            assert_eq!(*predicate, tag(99));
+            assert_eq!(*target, oid(42));
+        } else {
+            panic!("expected Relation");
+        }
     }
 
     #[test]
     fn forward_region_round_trip_single_object() {
-        // The CBOR sorted-run path is unaffected by the packed-codec
-        // single-entry trap (see chunk_index R1c TODO); a 1-object index
-        // must round-trip correctly.
+        // Single-entry runs round-trip post-A3.2: the directory codec is
+        // forced to VARINT mode, so the value tail's variable length is
+        // self-describing on the wire.
         let (_dir, dev) = fresh_device();
         let mut fi = ForwardIndex::new();
         fi.add_assertion(oid(7), Assertion::Tag(tag(700)), TagOrigin::Direct);
-        fi.flush_to_region(&dev, 0).unwrap();
-        let back = ForwardIndex::load_from_region(&dev, 0).unwrap();
+        let pages = flush(&fi, &dev).unwrap();
+        assert_eq!(pages, 0);
+        let back = load(&dev).unwrap();
         assert_eq!(back.object_count(), 1);
         assert_eq!(back.direct_tags(oid(7)), vec![tag(700)]);
+    }
+
+    #[test]
+    fn forward_region_round_trip_with_spill() {
+        // 9 assertions for a single object → spills to one overflow region.
+        let (_dir, dev) = fresh_device();
+        let mut fi = ForwardIndex::new();
+        for i in 0u32..9 {
+            fi.add_assertion(oid(1), Assertion::Tag(tag(i)), TagOrigin::Direct);
+        }
+        let pages = flush(&fi, &dev).unwrap();
+        assert_eq!(pages, 1, "exactly one overflow region for 9 assertions");
+        let back = load(&dev).unwrap();
+        assert_eq!(back.assertions_of(oid(1)).len(), 9);
+        for i in 0u32..9 {
+            assert!(
+                back.assertions_of(oid(1))
+                    .iter()
+                    .any(|(a, _)| matches!(a, Assertion::Tag(t) if t.raw() == i)),
+                "tag {i} missing after spill round-trip",
+            );
+        }
+    }
+
+    #[test]
+    fn forward_region_round_trip_multi_region_chain() {
+        // Forces > FORWARD_OVERFLOW_REGION_CAPACITY assertions for one
+        // object so the overflow chain spans multiple regions.
+        let (_dir, dev) = fresh_device();
+        let mut fi = ForwardIndex::new();
+        let n = FORWARD_OVERFLOW_REGION_CAPACITY + 5;
+        for i in 0u64..n as u64 {
+            fi.add_assertion(
+                oid(1),
+                Assertion::Relation {
+                    predicate: tag(1),
+                    target: oid(i),
+                },
+                TagOrigin::Direct,
+            );
+        }
+        let pages = flush(&fi, &dev).unwrap();
+        assert_eq!(pages, 2, "two overflow regions for the chain");
+        let back = load(&dev).unwrap();
+        assert_eq!(back.assertions_of(oid(1)).len(), n);
+        // Spot-check first / last targets round-tripped via `b: u64`.
+        let asserts = back.assertions_of(oid(1));
+        let last_target = asserts.last().unwrap();
+        if let (Assertion::Relation { target, .. }, _) = last_target {
+            assert_eq!(target.to_u64(), oid(n as u64 - 1).to_u64());
+        } else {
+            panic!("expected Relation");
+        }
     }
 
     #[test]
@@ -902,72 +1328,33 @@ mod tests {
         let mut first = ForwardIndex::new();
         first.add_assertion(oid(1), Assertion::Tag(tag(10)), TagOrigin::Direct);
         first.add_assertion(oid(2), Assertion::Tag(tag(20)), TagOrigin::Direct);
-        first.flush_to_region(&dev, 0).unwrap();
+        flush(&first, &dev).unwrap();
 
         let mut second = ForwardIndex::new();
         second.add_assertion(oid(9), Assertion::Tag(tag(900)), TagOrigin::Direct);
-        second.flush_to_region(&dev, 0).unwrap();
+        flush(&second, &dev).unwrap();
 
-        let back = ForwardIndex::load_from_region(&dev, 0).unwrap();
+        let back = load(&dev).unwrap();
         assert_eq!(back.object_count(), 1);
         assert_eq!(back.direct_tags(oid(9)), vec![tag(900)]);
         assert!(back.assertions_of(oid(1)).is_empty());
     }
 
     #[test]
-    fn forward_loaded_node_round_trip_empty() {
-        let fi = ForwardIndex::new();
-        let node = fi.to_loaded_node();
-        assert_eq!(node.sorted_runs.len(), 0);
-        let back = ForwardIndex::from_loaded_node(&node).unwrap();
-        assert_eq!(back.object_count(), 0);
-    }
-
-    #[test]
-    fn forward_loaded_node_round_trip_preserves_all_entries() {
-        let mut fi = ForwardIndex::new();
-        for i in 1u64..=20 {
-            fi.add_assertion(oid(i), Assertion::Tag(tag(i as u32 * 10)), TagOrigin::Direct);
-            fi.add_assertion(
-                oid(i),
-                Assertion::Tag(tag(i as u32 * 10 + 1)),
-                TagOrigin::Materialized,
-            );
-        }
-        let node = fi.to_loaded_node();
-        assert_eq!(node.sorted_runs.len(), 1);
-        assert_eq!(node.sorted_runs[0].entries.len(), 20);
-        let back = ForwardIndex::from_loaded_node(&node).unwrap();
-        assert_eq!(back.object_count(), 20);
-        for i in 1u64..=20 {
-            let asserts = back.assertions_of(oid(i));
-            assert_eq!(asserts.len(), 2);
-        }
-    }
-
-    #[test]
-    fn forward_loaded_node_keys_carry_zero_snapshot() {
-        let mut fi = ForwardIndex::new();
-        fi.add_assertion(oid(1), Assertion::Tag(tag(10)), TagOrigin::Direct);
-        let node = fi.to_loaded_node();
-        assert_eq!(node.sorted_runs[0].entries[0].0.snapshot, 0);
-    }
-
-    #[test]
     fn forward_region_kind_mismatch_detected() {
         // Writing as Forward then trying to read as a different BtreeKind
-        // must fail. We invoke `BtreeRegion::read` directly with a wrong
-        // kind to confirm.
+        // must fail. We invoke `BtreeRegion::read_packed` directly with a
+        // wrong kind to confirm.
         use mimisbrunnr_storage::BtreeRegion;
         let (_dir, dev) = fresh_device();
         let mut fi = ForwardIndex::new();
         fi.add_assertion(oid(1), Assertion::Tag(tag(10)), TagOrigin::Direct);
-        fi.flush_to_region(&dev, 0).unwrap();
-        // Read with wrong kind.
-        let res = BtreeRegion::read::<_, ForwardIndexKey, ForwardIndexValue>(
+        flush(&fi, &dev).unwrap();
+        let res = BtreeRegion::read_packed::<_, ForwardIndexKey, ForwardIndexValue>(
             &dev,
-            0,
+            TEST_DIR_OFFSET,
             BtreeKind::Range,
+            16,
         );
         assert!(res.is_err());
     }
@@ -987,11 +1374,98 @@ mod tests {
                 TagOrigin::Materialized,
             );
         }
-        fi.flush_to_region(&dev, 0).unwrap();
-        let back = ForwardIndex::load_from_region(&dev, 0).unwrap();
+        flush(&fi, &dev).unwrap();
+        let back = load(&dev).unwrap();
         assert_eq!(back.object_count(), 50);
         for i in 0u64..50 {
             assert_eq!(back.assertions_of(oid(i)).len(), 2);
         }
+    }
+
+    #[test]
+    fn inline_threshold_boundary() {
+        // At exactly LEAF_ENTRY_INLINE_SPILL_THRESHOLD assertions we
+        // remain inline (no spill); at +1 we cross into spill territory.
+        let (_dir, dev) = fresh_device();
+        let mut fi = ForwardIndex::new();
+        for i in 0u32..LEAF_ENTRY_INLINE_SPILL_THRESHOLD as u32 {
+            fi.add_assertion(oid(1), Assertion::Tag(tag(i)), TagOrigin::Direct);
+        }
+        let pages = flush(&fi, &dev).unwrap();
+        assert_eq!(pages, 0, "exactly threshold → no spill");
+
+        let mut fi2 = ForwardIndex::new();
+        for i in 0u32..(LEAF_ENTRY_INLINE_SPILL_THRESHOLD + 1) as u32 {
+            fi2.add_assertion(oid(1), Assertion::Tag(tag(i)), TagOrigin::Direct);
+        }
+        let pages = flush(&fi2, &dev).unwrap();
+        assert_eq!(pages, 1, "threshold + 1 → spill to one region");
+    }
+
+    #[test]
+    fn on_disk_directory_uses_varint_codec() {
+        use mimisbrunnr_storage::{
+            BLOCK_SIZE, SORTED_RUN_FLAG_PACKED_KEYS, SortedRunHeader,
+        };
+        let (_dir, dev) = fresh_device();
+        let mut fi = ForwardIndex::new();
+        // Single entry — exercises the force-VARINT path (without it the
+        // codec would fall back to FIXED and the single-entry run would
+        // be unreadable).
+        fi.add_assertion(oid(1), Assertion::Tag(tag(10)), TagOrigin::Direct);
+        flush(&fi, &dev).unwrap();
+
+        // Inspect the first sorted-run header (offset BLOCK_SIZE after
+        // the region's BtreeNodeHeader sector).
+        let mut run_header_buf = [0u8; std::mem::size_of::<SortedRunHeader>()];
+        dev.read_at(TEST_DIR_OFFSET + BLOCK_SIZE as u64, &mut run_header_buf)
+            .unwrap();
+        let run_header: SortedRunHeader = *bytemuck::from_bytes(&run_header_buf);
+        assert!(({ run_header.flags } & SORTED_RUN_FLAG_PACKED_KEYS) != 0);
+    }
+
+    #[test]
+    fn corrupt_chain_detected() {
+        use mimisbrunnr_storage::BlockDevice;
+        let (_dir, dev) = fresh_device();
+        let mut fi = ForwardIndex::new();
+        for i in 0u32..9 {
+            fi.add_assertion(oid(1), Assertion::Tag(tag(i)), TagOrigin::Direct);
+        }
+        flush(&fi, &dev).unwrap();
+
+        // Stomp the head overflow region's BtreeNodeHeader magic so the
+        // chain reader errors.
+        let zero = [0u8; 8];
+        dev.write_at(TEST_OVERFLOW_AREA_OFFSET, &zero).unwrap();
+        let err = load(&dev).unwrap_err();
+        assert!(matches!(
+            err,
+            IndexError::Storage(_)
+                | IndexError::CorruptOverflowChain(_)
+                | IndexError::BufferTooSmall { .. }
+        ));
+    }
+
+    #[test]
+    fn overflow_area_exhausted_errors() {
+        let (_dir, dev) = fresh_device();
+        let mut fi = ForwardIndex::new();
+        // Need TEST_OVERFLOW_AREA_REGIONS + 1 objects each carrying > 8
+        // assertions so each spills to its own region.
+        for o in 0u64..(TEST_OVERFLOW_AREA_REGIONS as u64 + 1) {
+            for i in 0u32..9 {
+                fi.add_assertion(oid(o), Assertion::Tag(tag(i)), TagOrigin::Direct);
+            }
+        }
+        let err = fi
+            .flush_to_region(
+                &dev,
+                TEST_DIR_OFFSET,
+                TEST_OVERFLOW_AREA_OFFSET,
+                TEST_OVERFLOW_AREA_REGIONS,
+            )
+            .unwrap_err();
+        assert!(matches!(err, IndexError::OverflowAreaExhausted { .. }));
     }
 }

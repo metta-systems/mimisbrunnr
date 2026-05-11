@@ -62,4 +62,14 @@ pub enum IndexError {
     /// scale: 1 024 pages per A3.3 layout).
     #[error("tag bitmap area exhausted: needed page slot {needed}, cap {cap}")]
     BitmapAreaExhausted { needed: usize, cap: usize },
+
+    /// A `ForwardOverflow` chain (§7.2) terminated unexpectedly — either
+    /// `next_page` was zeroed mid-chain or a region's `payload_used`
+    /// disagreed with the leaf entry's `total` slot.
+    #[error("forward-overflow chain corrupt: {0}")]
+    CorruptOverflowChain(&'static str),
+
+    /// Forward-overflow region area ran beyond its cap (R1c-A3.2 layout).
+    #[error("forward overflow area exhausted: needed region slot {needed}, cap {cap}")]
+    OverflowAreaExhausted { needed: usize, cap: usize },
 }

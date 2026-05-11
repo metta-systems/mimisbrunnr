@@ -50,9 +50,10 @@ const FMT_BOOTSTRAP_BUCKETS: u32 = 64;
 const FMT_WAL_OFFSET: u64 = 64 * 1024; // 64 KiB
 const FMT_WAL_SIZE: u64 = 1024 * 1024; // 1 MiB
 const FMT_INDEX_ZONE_OFFSET: u64 = FMT_WAL_OFFSET + FMT_WAL_SIZE; // ~1.0625 MiB
-// 16 MiB — fits R1c-A3.3 layout (3 MiB of fixed-offset regions +
-// 1 MiB legacy blob + 4 MiB tag bitmap area + comfort margin).
-const FMT_INDEX_ZONE_SIZE: u64 = 16 * 1024 * 1024;
+// 32 MiB — fits R1c-A3.2 layout (3 MiB of fixed-offset directory
+// regions + 1 MiB legacy CBOR blob + 4 MiB tag bitmap area + 8 MiB
+// forward-overflow area + comfort margin).
+const FMT_INDEX_ZONE_SIZE: u64 = 32 * 1024 * 1024;
 const FMT_METADATA_ZONE_OFFSET: u64 = FMT_INDEX_ZONE_OFFSET + FMT_INDEX_ZONE_SIZE;
 const FMT_METADATA_ZONE_SIZE: u64 = 4 * 1024 * 1024;
 const FMT_BLOB_ZONE_OFFSET: u64 = FMT_METADATA_ZONE_OFFSET + FMT_METADATA_ZONE_SIZE;

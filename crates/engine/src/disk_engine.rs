@@ -120,6 +120,14 @@ pub(crate) const LEGACY_CBOR_BLOB_OFFSET: u64 = 3072 * 1024;
 pub(crate) const TAG_BITMAP_AREA_OFFSET: u64 = 4 * 1024 * 1024;
 /// Number of 4 KiB `TagBitmapPage` slots in the tag bitmap area.
 pub(crate) const TAG_BITMAP_AREA_PAGES: usize = 1024;
+/// ForwardIndex per-object `ForwardOverflowRegion` chains (R1c-A3.2)
+/// live in this area. Sits after the tag bitmap area. Each slot holds
+/// one 256 KiB `ForwardOverflowRegion`, chained via the trailing
+/// `next_page: BlockRef` slot. Sized to
+/// [`FORWARD_OVERFLOW_AREA_REGIONS`] regions (8 MiB).
+pub(crate) const FORWARD_OVERFLOW_AREA_OFFSET: u64 = 8 * 1024 * 1024;
+/// Number of 256 KiB slots in the forward-overflow area.
+pub(crate) const FORWARD_OVERFLOW_AREA_REGIONS: usize = 32;
 /// 256 KiB region size — matches `Superblock.btree_node_size_log2 = 18`.
 #[allow(dead_code)] // referenced in size assertions / future dynamic layout work.
 pub(crate) const REGION_SIZE: u64 = 256 * 1024;
@@ -499,14 +507,14 @@ impl DiskEngine {
         let zone_offset = { self.superblock.index_zone.offset };
         let zone_length = { self.superblock.index_zone.length };
 
-        // Sanity-check zone is large enough for the new layout. R1c-A3.3
-        // adds the tag bitmap area after the legacy blob, so the zone
-        // needs space for both.
-        let tag_bitmap_area_end =
-            TAG_BITMAP_AREA_OFFSET + (TAG_BITMAP_AREA_PAGES as u64) * 4096;
-        if zone_length < tag_bitmap_area_end {
+        // Sanity-check zone is large enough for the new layout. R1c-A3.2
+        // adds the forward-overflow area after the tag bitmap area, so
+        // the zone needs space for both.
+        let forward_overflow_area_end = FORWARD_OVERFLOW_AREA_OFFSET
+            + (FORWARD_OVERFLOW_AREA_REGIONS as u64) * 256 * 1024;
+        if zone_length < forward_overflow_area_end {
             return Err(EngineError::NotImplemented(
-                "index zone too small for R1c-A3.3 layout (needs ≥ 7.25 MiB for directory regions + tag bitmap area)",
+                "index zone too small for R1c-A3.2 layout (needs ≥ 16 MiB for directory regions + tag bitmap area + forward overflow area)",
             ));
         }
 
@@ -526,7 +534,12 @@ impl DiskEngine {
             .map_err(EngineError::from)?;
         self.engine
             .forward_index
-            .flush_to_region(dev, block_ref_offset(&active.forward_index_root))
+            .flush_to_region(
+                dev,
+                block_ref_offset(&active.forward_index_root),
+                zone_offset + FORWARD_OVERFLOW_AREA_OFFSET,
+                FORWARD_OVERFLOW_AREA_REGIONS,
+            )
             .map_err(EngineError::from)?;
         // TagIndex needs a bitmap-area reservation in addition to the
         // directory region. The bitmap area is fixed at

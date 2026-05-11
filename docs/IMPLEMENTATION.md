@@ -1703,6 +1703,13 @@ The merge — a single `header` field rather than separate `count` and `spill` �
 per `LeafEntry` and removes the "either count or spill_count is zero" implicit invariant of
 the previous two-field form.
 
+The directory's sorted-run encoding sets `SORTED_RUN_FLAG_PACKED_KEYS` with the 2-field
+key `(oid, snapshot)` and `value_size_kind = VALUE_SIZE_KIND_VARINT` (§1.5.6), since the
+`LeafEntry` value tail is variable-length: 2 B `header` followed by either a
+`[PackedAssertion; total]` inline body (sized `16 × total` bytes) or a 16 B spill
+`BlockRef`. The codec's per-entry varint length prefix adds 1–2 B per leaf entry —
+dwarfed by the savings over the CBOR fallback for this shape.
+
 ```rust
 struct PackedAssertion {                     // 16 bytes (not key-packed; values stay byte-aligned)
     kind: u8,                                // 0=Tag, 1=Attr, 2=Relation
@@ -1729,9 +1736,26 @@ before §1.5.4 triggers full compaction. Smaller objects pack denser: 4 assertio
 ### 7.2 Spill
 
 Objects with more than 8 assertions store a `BlockRef` to a `ForwardOverflow` region (also a
-256 KiB large-node region; positional, no sorted runs — single rewrite on growth). Each overflow
-region holds up to 16 379 × `PackedAssertion` (262 144 B − 64 B header − 16 B trailing chain
-`BlockRef` = 262 064 B / 16 B). Further overflow chains via the trailing `BlockRef` slot.
+256 KiB large-node region; positional, no sorted runs — single rewrite on growth). Each
+overflow region holds up to 16 379 × `PackedAssertion` and chains to the next via a fixed
+trailing `BlockRef` slot.
+
+```rust
+#[repr(C, packed)]
+struct ForwardOverflowRegion {               // 262 144 B = 256 KiB
+    header:    BtreeNodeHeader,              //      [0..64]      kind = ForwardOverflow;
+                                             //                   payload_used = live_count × 16
+    entries:   [PackedAssertion; 16_379],    //     [64..262_128] 16 379 × 16 B = 262 064 B
+    next_page: BlockRef,                     // [262_128..262_144] ZERO = tail of chain
+}
+```
+
+The region is **positional**, not a sorted-run §1.5 node — `BtreeNodeHeader.payload_used`
+records `live_count × 16` so partially-filled tail regions are unambiguous. The `next_page`
+link sits at the fixed offset `262 128` regardless of `payload_used`. Reconstruction of an
+object's full assertion list walks the chain, consuming up to `payload_used / 16` entries
+per region, until the leaf entry's `total` is exhausted; the tail region's `next_page` must
+equal `BlockRef::zeroed()` for a consistent chain — a mismatch signals format corruption.
 
 ### 7.3 Sorted-run behaviour
 

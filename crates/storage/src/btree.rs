@@ -761,7 +761,23 @@ impl BtreeRegion {
         K: pack::PackableKey,
         V: AsRef<[u8]>,
     {
-        let (head, fields, value_prefix) = pack::select_format(&run.entries)?;
+        Self::encode_run_packed_with_hint(run, value_size, false)
+    }
+
+    /// Variant of [`Self::encode_run_packed`] that lets callers force
+    /// VARINT mode for runs whose value shape is variable-length. See
+    /// [`pack::select_format_with_hint`] for rationale.
+    fn encode_run_packed_with_hint<K, V>(
+        run: &SortedRun<K, V>,
+        value_size: usize,
+        force_varint: bool,
+    ) -> Result<(SortedRunHeader, Vec<u8>), StorageError>
+    where
+        K: pack::PackableKey,
+        V: AsRef<[u8]>,
+    {
+        let (head, fields, value_prefix) =
+            pack::select_format_with_hint(&run.entries, force_varint)?;
         let payload =
             pack::encode_packed_run(&run.entries, &head, &fields, &value_prefix)?;
         let _ = value_size; // value_size is encoded in the entries' length; recorded for symmetry.
@@ -792,11 +808,48 @@ impl BtreeRegion {
         K: pack::PackableKey,
         V: AsRef<[u8]>,
     {
+        Self::write_full_packed_with_hint(device, offset, node, value_size, false)
+    }
+
+    /// Variant of [`Self::write_full_packed`] that forces VARINT mode for
+    /// every sorted run. Use this when the value shape is logically
+    /// variable-length (e.g. IMPL §7.1's `LeafEntry` body); see
+    /// [`pack::select_format_with_hint`] for rationale.
+    ///
+    /// `value_size` is recorded for symmetry with the auto-detect path
+    /// but is ignored at encode time — VARINT mode emits the per-entry
+    /// length on the wire — and ignored at decode time by `read_packed`
+    /// for the same reason.
+    pub fn write_full_packed_force_varint<D: BlockDevice, K, V>(
+        device: &D,
+        offset: u64,
+        node: &mut LoadedNode<K, V>,
+        value_size: usize,
+    ) -> Result<(), StorageError>
+    where
+        K: pack::PackableKey,
+        V: AsRef<[u8]>,
+    {
+        Self::write_full_packed_with_hint(device, offset, node, value_size, true)
+    }
+
+    fn write_full_packed_with_hint<D: BlockDevice, K, V>(
+        device: &D,
+        offset: u64,
+        node: &mut LoadedNode<K, V>,
+        value_size: usize,
+        force_varint: bool,
+    ) -> Result<(), StorageError>
+    where
+        K: pack::PackableKey,
+        V: AsRef<[u8]>,
+    {
         let region_size = Self::region_size(&node.header);
         let mut cursor: u64 = BLOCK_SIZE as u64;
 
         for run in &node.sorted_runs {
-            let (run_header, payload) = Self::encode_run_packed(run, value_size)?;
+            let (run_header, payload) =
+                Self::encode_run_packed_with_hint(run, value_size, force_varint)?;
             let run_total = std::mem::size_of::<SortedRunHeader>() as u64 + payload.len() as u64;
             if cursor + run_total > region_size {
                 return Err(StorageError::RegionFull {

@@ -298,6 +298,24 @@ impl PackableKey for (u32, u32) {
 pub fn select_format<K: PackableKey, V: AsRef<[u8]>>(
     entries: &[(K, V)],
 ) -> Result<(SortedRunKeyFormat, Vec<FieldFormat>, Vec<u8>), PackError> {
+    select_format_with_hint(entries, false)
+}
+
+/// Variant of [`select_format`] that lets the caller force VARINT mode.
+///
+/// When `force_varint` is `true` the returned descriptor's
+/// `value_size_kind` is always [`VALUE_SIZE_KIND_VARINT`], regardless of
+/// whether the values happen to share a length. This is the right choice
+/// for values whose logical shape is variable-length (e.g. IMPL §7.1's
+/// `LeafEntry`, which switches between an inline `[PackedAssertion; N]`
+/// body and a 16 B `BlockRef` spill ref): without the hint, the default
+/// auto-detection forces FIXED for single-entry runs, and the FIXED
+/// decoder needs the caller to know the value size up-front — which we
+/// don't, in the variable-shape case.
+pub fn select_format_with_hint<K: PackableKey, V: AsRef<[u8]>>(
+    entries: &[(K, V)],
+    force_varint: bool,
+) -> Result<(SortedRunKeyFormat, Vec<FieldFormat>, Vec<u8>), PackError> {
     let nr = K::nr_fields();
     if nr == 0 || nr > 8 {
         return Err(PackError::TooManyFields(nr));
@@ -386,8 +404,12 @@ pub fn select_format<K: PackableKey, V: AsRef<[u8]>>(
     };
 
     // Mode selection: fixed if every value has the same length (the common
-    // case), varint otherwise. Empty input → fixed (degenerate).
-    let value_size_kind = if entries.len() < 2 {
+    // case), varint otherwise. Empty input → fixed (degenerate). The
+    // caller may force VARINT for value types whose logical shape is
+    // variable-length (see [`select_format_with_hint`]'s docs).
+    let value_size_kind = if force_varint && !entries.is_empty() {
+        VALUE_SIZE_KIND_VARINT
+    } else if entries.len() < 2 {
         VALUE_SIZE_KIND_FIXED
     } else {
         let first_len = entries[0].1.as_ref().len();

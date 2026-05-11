@@ -47,6 +47,7 @@ pub use {
         pack::{
             FieldHints, FormatFit, FormatPromoteEvent, PackError, PackableKey, check_fit,
             compare_packed_keys, decode_packed_run, encode_packed_run, select_format,
+            select_format_with_hint,
         },
         should_compact,
     },
