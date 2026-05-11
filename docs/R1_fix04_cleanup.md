@@ -6,6 +6,20 @@ work.
 
 Prerequisite: Tiers 1–3 land first.
 
+## Status (2026-05-11)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| **D4** Retire the legacy `MIXI` CBOR blob | ❌ Not started | Still carries `path_contexts_bytes`, `oplog_bytes`, scalars, transient `blobs` map. |
+| **F1** `ChunkEntrySerde.length` field | ✅ Folded into A3.1 | Wire form is now the spec's `ChunkIndexLeafEntry` byte image. |
+| **F4** Doubly-serialized POD bytes in CBOR runs | 🟡 Partial | A2-leaf / A1 / A3.1 / A3.2 / A3.3 dropped their CBOR wrappers. Bucket-alloc / backpointer / freespace still CBOR-wrap PODs (pending E1 / E2). |
+| **F5** Newtype proxy explosion | 🟡 Partial | `Chunk*`, `Forward*`, `Kv*` proxies now carry the spec wire form (not removed but no longer R1b-flavoured). Still pending after Tier 3 lands. |
+| **F6** `BTREE_NODE_FLAG_HEAD_OF_CHAIN` ChunkList | ❌ Not started | Scoped under R4 (real blob zone). |
+| **F7** `BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS` recovery | ❌ Not started | Folded into Tier 3 B2. |
+| **F8** `EngineError::CborEncode` reused for non-CBOR | ❌ Not started | Watch + ontology still lose error context. |
+| **F9** `Engine.next_tag_id` vs ontology allocator | ❌ Not started | Two sources of truth for tag-id allocation. |
+| **F10** `BtreeRegion::read` hard-fails on packed-keys flag | ❌ Not started | Today callers must pre-pick `read` vs `read_packed`. |
+
 ---
 
 ## D4. Retire the legacy `MIXI` CBOR blob

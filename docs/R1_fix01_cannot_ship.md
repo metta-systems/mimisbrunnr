@@ -6,22 +6,41 @@ spec recovery / sync / migration paths cannot be built on top.
 Audit refs: see chat audit dated 2026-05-06 (project memory
 `project_r1b_progress.md`); IMPLEMENTATION.md sections noted inline.
 
+## Status (2026-05-11)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| **D2** Bucket allocator wiring | ✅ Done | `BucketAllocator` API in `crates/storage/src/allocator.rs`, 8 unit tests. |
+| **D1** `RootPointer.*_root` populated | ✅ Done (MVP) | Seeded at create + every commit; trees stay at fixed offsets across commits (COW deferred to Tier 3 D3). |
+| **A2** ObjectTable / LocationTable radix | 🟡 Leaf-only done | Multi-level (inner nodes, descent, COW write path) deferred to Tier 3 D3. |
+| **A1** KvIndex extendible hash | ✅ Done | Native §9.1 layout with per-pool R1c caps (gated on D3 for full spec capacity). |
+| **A4** OntologyRoot subtree split | ✅ Done (reframed) | Spec amended to single image-per-snapshot model; matches the rare-update / fully-load workload. |
+
 ## Dependency order
 
 Execute strictly top-down. Each step lands a self-contained piece that the
 next builds on.
 
 ```
-D2 (bucket allocator wiring)
-    └── D1 (RootPointer.*_root population)
-            └── A2 (ObjectTable / LocationTable positional radix)
-            └── A1 (KvIndex extendible hash)
-            └── A4 (OntologyRoot 4-subtree split)
+D2 (bucket allocator wiring)                    [DONE]
+    └── D1 (RootPointer.*_root population)      [DONE — MVP]
+            └── A2 (positional radix)            [LEAF DONE — multi-level → Tier 3 D3]
+            └── A1 (KvIndex extendible hash)     [DONE]
+            └── A4 (Ontology — single image)     [DONE]
 ```
 
 ---
 
-## D2. Bucket allocator wiring for B+ tree regions  (foundation)
+## D2. Bucket allocator wiring for B+ tree regions  (foundation) — ✅ DONE
+
+**Status (2026-05-07):** `crates/storage/src/allocator.rs` ships
+`BucketAllocator { alloc, free, validate, seed_freelist,
+block_ref_offset }` per IMPL §12.1 / §12.3. New `StorageError`
+variants: `AllocatorExhausted`, `StaleBlockRef`, `CrossDiskBlockRef`,
+`FreeOfUnallocatedBucket`. 8 unit tests pass. See
+`memory/project_r1c_progress.md`.
+
+The notes below are the original plan retained for reference.
 
 **Spec:** IMPL §12.1 (buckets), §12.2 (`BucketAllocEntry`), §12.3 (generation-checked
 pointers), §1.5.4 step 1 ("allocate a fresh region in a new bucket via the standard
@@ -127,7 +146,23 @@ buckets.
 
 ---
 
-## D1. Populate `RootPointer.*_root` BlockRef fields  (depends on D2)
+## D1. Populate `RootPointer.*_root` BlockRef fields  (depends on D2) — ✅ DONE (MVP)
+
+**Status (2026-05-07):** `disk_engine.rs:create()` seeds RootPointer
+slots with `BlockRef`s computed from each tree's existing fixed offset
+and calls `superblock.commit_root` to flip the active root. Every
+`commit()` re-seeds the slots (heals pre-D1 pools).
+`save_index_state` reads each tree's offset from `RootPointer.X_root`
+and writes there; `load_all_regions` reads each tree from its slot
+(`BlockRef::ZERO` → `default()`). 3 new integration tests; see
+`memory/project_r1c_progress.md`.
+
+**Deliberately deferred under D1** (lifted by Tier 3 D3 + COW):
+- Free old root pointers after commit — trees stay at fixed offsets.
+- Read-time `generation` validation — generation never bumps under D1.
+- COW reallocation — each commit overwrites in place.
+
+The notes below are the original plan retained for reference.
 
 **Spec:** IMPL §2.2. RootPointer carries 22 BlockRef slots (lines 580–609).
 Atomic commit step 5 flips the active root.
@@ -297,7 +332,36 @@ helpers in `crates/meta/src/radix.rs` exist (`oid_to_radix_path`,
 
 ---
 
-## A1. KvIndex extendible hash  (depends on D1, D2)
+## A1. KvIndex extendible hash  (depends on D1, D2) — ✅ DONE
+
+**Status (2026-05-07):**
+- `crates/index/src/kv_directory.rs` — 4 KiB `KvDirectoryBlock`
+  (header + global_depth + bucket_count + 252 × BlockRef +
+  spillover_root + CRC). 6 unit tests.
+- `crates/index/src/kv_bucket.rs` — 4 KiB `KvBucketBlock` (header +
+  local_depth + entry_count + 144 × { tag_id, value_hash,
+  bitmap_ref } + CRC). 5 unit tests.
+- `crates/index/src/tag_bitmap_page.rs` — 4 KiB `TagBitmapPage`
+  (header + bitmap_len + bitmap bytes + CRC). Reused by TagIndex
+  (A3.3) and now KvIndex.
+- `KvIndex::flush_to_region` / `load_from_region` write the native
+  extendible-hash layout: directory at slot 0, buckets in slots
+  `1..=bucket_count`, bitmap pages in trailing slots.
+- End-to-end test `kv_index_on_disk_uses_native_extendible_hash_layout`
+  validates spec BlockKind discriminants on disk.
+
+**Caps gated on Tier 3 D3:**
+- Single-region layout (1 directory + buckets + bitmap pages all in
+  the 256 KiB `kv_index_root`). Practical entry cap ~62 at
+  `global_depth=0`; full spec capacity (~9 000) needs sub-bucket
+  allocation to move bitmap pages out of the region.
+- `global_depth ≤ 7` (inline directory only); spillover region
+  unimplemented.
+- Live bucket-split-on-overflow not yet wired — `select_global_depth`
+  picks from total entry count at flush time. Live splits land
+  alongside D3.
+
+The notes below are the original plan retained for reference.
 
 **Spec:** IMPL §9.1. `KvDirectory` (4 KiB block, kind=`KvHashDirectory`,
 inline 252 `BlockRef` slots, `global_depth ≤ 7`). Spillover at
@@ -357,7 +421,23 @@ region with sorted-run entries. The `KvHashDirectoryHeader` and
 
 ---
 
-## A4. OntologyRoot 4-subtree split  (depends on D1, D2)
+## A4. OntologyRoot 4-subtree split  (depends on D1, D2) — ✅ DONE (REFRAMED)
+
+**Status (2026-05-09):** The spec was amended to a **single
+image-per-snapshot** model rather than four sub-trees. The original
+4-subtree design didn't match the actual workload (ontology is
+rarely updated, fully loaded into RAM at mount, batch-rewritten on
+every checkpoint) — IMPL §10.1 now describes the single-image
+persistence shape.
+
+`crates/ontology/src/state.rs` ships `OntologyState::flush_to_region`
+/ `load_from_region` against `BtreeKind::Ontology`, writing the
+entire `OntologyImage` (CBOR) as one sorted-run entry per snapshot.
+`RootPointer.ontology_root` points at this region directly (no 4 KiB
+envelope block).
+
+The notes below are the original 4-subtree plan, retained for
+reference but **superseded** by the spec amendment.
 
 **Spec:** IMPL §10.1.
 

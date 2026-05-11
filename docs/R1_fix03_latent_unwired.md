@@ -8,6 +8,19 @@ exist but production never invokes them. The §1.5 *operational* model
 Prerequisite: Tier 1 ships first. These items lift performance from "every
 commit rewrites every region" to spec's "tens of KB per flush".
 
+## Status (2026-05-11)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| **B1** Wire `append_sorted_run` into production flush | ❌ Not started | Every commit still goes through `write_full`. |
+| **B2** Wire `should_compact` / `compact` into commit | ❌ Not started | Storage-side machinery exists; engine never invokes it. |
+| **B3** Long-lived `LoadedNode` with cached `merged_view` | ❌ Not started | Folded into B1. |
+| **B4** Populate `BtreeNodeHeader.min_key` / `max_key` | ❌ Not started | Required before multi-level descent (A2 multi-level). |
+| **B5** `LoadedNode.pin: JournalPin` | ❌ Not started | WAL trim could orphan pending journal entries today. |
+| **D3** Bucket alignment for B+ tree regions | ❌ Not started | **Unblocks A2 multi-level and lifts the A1/A3.2 region caps.** |
+| **D5** Checkpoint cadence driver thread | ❌ Not started | Commits run synchronously on the mutation path. |
+| **E1, E2** Per-disk roots for bucket alloc / freespace LRU | ❌ Not started | Currently pool-scoped with `disk_id` in the key. |
+
 ---
 
 ## B1. Wire `append_sorted_run` into the production flush path
