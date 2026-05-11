@@ -1,30 +1,31 @@
 //! `TagBitmapPage` 4 KiB block — IMPL §8.2.
 //!
-//! Holds a single roaring bitmap as the value-side of a KV index entry
-//! (§9.1) or a tag-directory entry (§8.1). One page per
-//! `(tag_id, value_hash)` or `(tag_id, store_kind)` pair.
+//! Holds a slice of a roaring bitmap's portable serialisation. Bitmaps that
+//! fit in one page set `next_page = BlockRef::ZERO` and carry the full
+//! image in `bitmap_bytes[..bitmap_len]`. Larger bitmaps split the image
+//! across a chain of pages linked via `next_page`; reconstruction
+//! concatenates each page's `bitmap_bytes[..bitmap_len]` slice in chain
+//! order and feeds the result to `roaring::RoaringBitmap::deserialize_from`.
 //!
 //! ```text
-//! [0..32]    BlockHeader  (kind = TagBitmapPage, magic = "MIMR")
-//! [32..36]   bitmap_len   u32     (length of the roaring byte image, 0..=4056)
-//! [36..4092] bitmap_bytes [u8; 4056]   (roaring byte image; trailing zeroed)
-//! [4092..4096] crc        u32     (CRC32C over bytes [0..4092] with crc=0)
+//! [0..32]      BlockHeader   (kind = TagBitmapPage, magic = "MIMR")
+//! [32..36]     bitmap_len    u32        (bytes carried in *this* page, 0..=4036)
+//! [36..52]     next_page     BlockRef   (16 B; ZERO = tail of chain)
+//! [52..4088]   bitmap_bytes  [u8; 4036]
+//! [4088..4092] _pad          [u8; 4]
+//! [4092..4096] crc           u32        (CRC32C over bytes [0..4092] with crc=0)
 //! ```
 //!
-//! Total = 4 096 B = 4 KiB. Maximum payload = 4 056 B per page; bitmaps
-//! larger than that need chained pages (TODO when TagIndex's §8.2 work
-//! lands; KvIndex won't hit this in practice).
-//!
-//! ## R1c-A1 scope
-//!
-//! - Single-page bitmaps only. Chained pages tracked under
-//!   `TODO(rewrite-phase-A3.3)`.
-//! - Reused by both KvIndex (today, A1) and TagIndex (future, A3.3).
+//! Used by both KvIndex (§9.1; one page per `(tag_id, value_hash)`, always
+//! `next_page == ZERO` because typical KV bitmaps fit in a single page) and
+//! TagIndex (§8.1; one chain per tag, the head reachable via the directory
+//! leaf's `store_root`).
 
 use {
     bytemuck::{Pod, Zeroable},
     mimisbrunnr_storage::{
-        BLOCK_PREAMBLE_MAGIC_BLOCK, BLOCK_SIZE, BlockDevice, BlockHeader, BlockKind, block_crc,
+        BLOCK_PREAMBLE_MAGIC_BLOCK, BLOCK_SIZE, BlockDevice, BlockHeader, BlockKind, BlockRef,
+        block_crc,
     },
     roaring::RoaringBitmap,
     static_assertions::const_assert_eq,
@@ -33,29 +34,35 @@ use {
 /// 4 KiB.
 pub const TAG_BITMAP_PAGE_SIZE: usize = BLOCK_SIZE;
 
-/// Maximum bitmap byte payload in a single page (4 056 B).
-pub const TAG_BITMAP_PAGE_MAX_BYTES: usize = TAG_BITMAP_PAGE_SIZE - 32 - 4 - 4;
+/// Maximum bitmap byte payload in a single page (4 036 B). Reduced from
+/// 4 056 B in v1 to make room for the `next_page: BlockRef` chain slot
+/// (16 B) and trailing alignment pad (4 B).
+pub const TAG_BITMAP_PAGE_MAX_BYTES: usize = 4036;
 
 /// Format-version slot.
 pub const TAG_BITMAP_PAGE_FORMAT_VERSION: u16 = 1;
 
 const HEADER_SIZE: usize = 32;
-const BITMAP_LEN_OFFSET: usize = HEADER_SIZE;
-const BITMAP_BYTES_OFFSET: usize = BITMAP_LEN_OFFSET + 4;
-const CRC_OFFSET: usize = TAG_BITMAP_PAGE_SIZE - 4;
+const BITMAP_LEN_OFFSET: usize = HEADER_SIZE;                          // 32
+const NEXT_PAGE_OFFSET: usize = BITMAP_LEN_OFFSET + 4;                 // 36
+const BITMAP_BYTES_OFFSET: usize = NEXT_PAGE_OFFSET + 16;              // 52
+const PAD_OFFSET: usize = BITMAP_BYTES_OFFSET + TAG_BITMAP_PAGE_MAX_BYTES; // 4088
+const CRC_OFFSET: usize = TAG_BITMAP_PAGE_SIZE - 4;                    // 4092
 
-const_assert_eq!(BITMAP_LEN_OFFSET, 32);
-const_assert_eq!(BITMAP_BYTES_OFFSET, 36);
+const_assert_eq!(NEXT_PAGE_OFFSET, 36);
+const_assert_eq!(BITMAP_BYTES_OFFSET, 52);
+const_assert_eq!(PAD_OFFSET, 4088);
 const_assert_eq!(CRC_OFFSET, 4092);
-const_assert_eq!(BITMAP_BYTES_OFFSET + TAG_BITMAP_PAGE_MAX_BYTES, CRC_OFFSET);
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct TagBitmapPage {
-    pub header: BlockHeader,                          // [0..32]
-    pub bitmap_len: u32,                              // [32..36]
-    pub bitmap_bytes: [u8; TAG_BITMAP_PAGE_MAX_BYTES], // [36..4092]
-    pub crc: u32,                                     // [4092..4096]
+    pub header: BlockHeader,                           // [0..32]
+    pub bitmap_len: u32,                               // [32..36]
+    pub next_page: BlockRef,                           // [36..52]
+    pub bitmap_bytes: [u8; TAG_BITMAP_PAGE_MAX_BYTES], // [52..4088]
+    pub _pad: [u8; 4],                                 // [4088..4092]
+    pub crc: u32,                                      // [4092..4096]
 }
 
 const_assert_eq!(core::mem::size_of::<TagBitmapPage>(), TAG_BITMAP_PAGE_SIZE);
@@ -88,7 +95,10 @@ pub enum TagBitmapPageError {
 }
 
 impl TagBitmapPage {
-    /// Build a page carrying the serialised bitmap of `bm`.
+    /// Build a single-page bitmap (`next_page = BlockRef::ZERO`). Fails if
+    /// the serialised bitmap exceeds the single-page payload cap; callers
+    /// expecting larger bitmaps should construct a chain via
+    /// [`Self::from_bytes_chunk`].
     pub fn from_bitmap(bm: &RoaringBitmap) -> Result<Self, TagBitmapPageError> {
         let mut bytes = Vec::with_capacity(bm.serialized_size());
         bm.serialize_into(&mut bytes)
@@ -96,22 +106,35 @@ impl TagBitmapPage {
         if bytes.len() > TAG_BITMAP_PAGE_MAX_BYTES {
             return Err(TagBitmapPageError::Oversize { got: bytes.len() });
         }
+        Ok(Self::from_bytes_chunk(&bytes, BlockRef::zeroed()))
+    }
+
+    /// Build a single page carrying `chunk_bytes` (≤ `TAG_BITMAP_PAGE_MAX_BYTES`)
+    /// with the supplied `next_page` link. Used by the chain writer in
+    /// `TagIndex` to lay out one slice of a longer roaring image per page.
+    pub fn from_bytes_chunk(chunk_bytes: &[u8], next_page: BlockRef) -> Self {
+        debug_assert!(chunk_bytes.len() <= TAG_BITMAP_PAGE_MAX_BYTES);
         let header = BlockHeader::new(
             BlockKind::TagBitmapPage,
             TAG_BITMAP_PAGE_FORMAT_VERSION,
             (TAG_BITMAP_PAGE_SIZE - HEADER_SIZE - 4) as u32,
         );
         let mut bitmap_bytes = [0u8; TAG_BITMAP_PAGE_MAX_BYTES];
-        bitmap_bytes[..bytes.len()].copy_from_slice(&bytes);
-        Ok(Self {
+        bitmap_bytes[..chunk_bytes.len()].copy_from_slice(chunk_bytes);
+        Self {
             header,
-            bitmap_len: bytes.len() as u32,
+            bitmap_len: chunk_bytes.len() as u32,
+            next_page,
             bitmap_bytes,
+            _pad: [0; 4],
             crc: 0,
-        })
+        }
     }
 
-    /// Decode the carried bitmap.
+    /// Decode the carried bitmap. Only valid on a single-page bitmap (i.e.
+    /// `next_page == BlockRef::ZERO`); for chained bitmaps use
+    /// `TagIndex`'s chain reader, which concatenates each page's
+    /// `bitmap_bytes[..bitmap_len]` slice before deserialising.
     pub fn to_bitmap(&self) -> Result<RoaringBitmap, TagBitmapPageError> {
         let len = { self.bitmap_len } as usize;
         if len > TAG_BITMAP_PAGE_MAX_BYTES {
@@ -119,6 +142,17 @@ impl TagBitmapPage {
         }
         RoaringBitmap::deserialize_from(&self.bitmap_bytes[..len])
             .map_err(|e| TagBitmapPageError::Roaring(e.to_string()))
+    }
+
+    /// Borrow this page's carried bitmap-byte slice.
+    pub fn bitmap_slice(&self) -> &[u8] {
+        let len = { self.bitmap_len } as usize;
+        &self.bitmap_bytes[..len.min(TAG_BITMAP_PAGE_MAX_BYTES)]
+    }
+
+    /// `next_page` link, or `BlockRef::ZERO` on the tail page.
+    pub fn next_link(&self) -> BlockRef {
+        self.next_page
     }
 
     pub fn recompute_crc(&mut self) {

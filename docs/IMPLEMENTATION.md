@@ -1816,21 +1816,32 @@ Roaring bitmaps stay on the **4 KiB block format** (not 256 KiB nodes) because:
 - Bitmaps are referenced as opaque blobs from the directory; their internal format is a stable
   external standard (Apache Lucene + the `roaring` crate).
 
-We adopt the **Roaring portable serialization spec** framed inside `BlockHeader`-prefixed pages:
+We adopt the **Roaring portable serialization spec** as the on-the-wire bitmap image, split
+across a singly-linked chain of `BlockHeader`-prefixed 4 KiB pages. Each `TagBitmapPage`
+carries a slice of the full roaring byte image plus a `next_page` pointer (zero on the tail):
 
-```
-TagBitmap (one or more 4 KiB blocks):
-  BlockHeader { kind = TagBitmapPage, format_version = 1 }
-  PortableRoaringHeader (cookie, container count, ...)
-  Container directory (4 bytes per container: key + cardinality)
-  Container offsets (4 bytes each, since v1.4 of portable spec)
-  Containers (array, run-length, or bitmap, 4 KiB-aligned each)
-  trailing CRC32C
+```rust
+#[repr(C, packed)]
+struct TagBitmapPage {                       // 4 096 bytes
+    header:       BlockHeader,               //    [0..32]   kind = TagBitmapPage
+    bitmap_len:   u32,                       //   [32..36]   bytes carried in this page
+                                             //               (0..=4036)
+    next_page:    BlockRef,                  //   [36..52]   ZERO = tail of chain
+    bitmap_bytes: [u8; 4036],                //   [52..4088] roaring portable bytes;
+                                             //               trailing bytes zeroed
+    _pad:         [u8; 4],                   // [4088..4092]
+    crc:          u32,                       // [4092..4096] CRC32C over [0..4092]
+}
 ```
 
-Containers larger than ~64 KiB span multiple consecutive blocks; the directory records the
-absolute block_no of each container so they can be loaded individually. For small bitmaps that
-fit in one block, the directory and containers are co-located.
+Bitmaps that fit in a single page set `next_page = BlockRef::ZERO` and carry the full
+portable image in `bitmap_bytes[..bitmap_len]`. Larger bitmaps split the portable image
+across N pages in order: page *i* holds `image[i_start..i_end]`, the head page is the one
+reachable via the tag-directory leaf's `store_root`, and the chain terminates at the page
+whose `next_page` is zero. Reconstruction concatenates each page's
+`bitmap_bytes[..bitmap_len]` slice in chain order and feeds the result to
+`roaring::RoaringBitmap::deserialize_from`. Per-page payload cap is 4 036 B, so an N-page
+chain holds up to 4 036 × N bytes of roaring image.
 
 ### 8.3 Ordered & ranked stores
 

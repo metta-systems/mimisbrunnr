@@ -46,4 +46,20 @@ pub enum IndexError {
     /// Underlying storage error (B+ tree region read/write).
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+
+    /// Flush attempted on a `TagStore` variant whose native on-disk shape
+    /// (§8.3 OrderedStore / RankedStore root blocks) isn't implemented
+    /// yet. A3.3 ships Simple-only; A3.4/A3.5 will lift this.
+    #[error("tag store kind {0} is not yet supported by the native flush path")]
+    UnsupportedStoreKind(u8),
+
+    /// A tag's membership bitmap holds > 2³² entries and can't fit the
+    /// 32-bit `cardinality` slot in `TagIndexLeafEntry` (§8.1).
+    #[error("tag cardinality {0} exceeds u32::MAX")]
+    CardinalityOverflow(u64),
+
+    /// Tag-bitmap-page chain ran beyond the bitmap-area cap (smoke-test
+    /// scale: 1 024 pages per A3.3 layout).
+    #[error("tag bitmap area exhausted: needed page slot {needed}, cap {cap}")]
+    BitmapAreaExhausted { needed: usize, cap: usize },
 }

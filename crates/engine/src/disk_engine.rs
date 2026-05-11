@@ -112,6 +112,14 @@ pub(crate) const FREESPACE_LRU_REGION_OFFSET: u64 = 2816 * 1024;
 /// See [`CHUNK_INDEX_REGION_OFFSET`]. Shifted from 2.5 MiB to 3.0 MiB
 /// by R1b-4.
 pub(crate) const LEGACY_CBOR_BLOB_OFFSET: u64 = 3072 * 1024;
+/// TagIndex per-tag `TagBitmapPage` chains (R1c-A3.3) live in this area.
+/// Sits after the legacy CBOR blob (which is sized for up to ~1 MiB of
+/// path-context / oplog / subscriptions metadata); each 4 KiB slot here
+/// holds one bitmap-page chain link. Sized to [`TAG_BITMAP_AREA_PAGES`]
+/// pages (4 MiB) — comfortably more than smoke-test workloads need.
+pub(crate) const TAG_BITMAP_AREA_OFFSET: u64 = 4 * 1024 * 1024;
+/// Number of 4 KiB `TagBitmapPage` slots in the tag bitmap area.
+pub(crate) const TAG_BITMAP_AREA_PAGES: usize = 1024;
 /// 256 KiB region size — matches `Superblock.btree_node_size_log2 = 18`.
 #[allow(dead_code)] // referenced in size assertions / future dynamic layout work.
 pub(crate) const REGION_SIZE: u64 = 256 * 1024;
@@ -491,10 +499,14 @@ impl DiskEngine {
         let zone_offset = { self.superblock.index_zone.offset };
         let zone_length = { self.superblock.index_zone.length };
 
-        // Sanity-check zone is large enough for the new layout.
-        if zone_length < LEGACY_CBOR_BLOB_OFFSET {
+        // Sanity-check zone is large enough for the new layout. R1c-A3.3
+        // adds the tag bitmap area after the legacy blob, so the zone
+        // needs space for both.
+        let tag_bitmap_area_end =
+            TAG_BITMAP_AREA_OFFSET + (TAG_BITMAP_AREA_PAGES as u64) * 4096;
+        if zone_length < tag_bitmap_area_end {
             return Err(EngineError::NotImplemented(
-                "index zone too small for R1b-4 layout (needs ≥ 3.0 MiB before the legacy blob)",
+                "index zone too small for R1c-A3.3 layout (needs ≥ 7.25 MiB for directory regions + tag bitmap area)",
             ));
         }
 
@@ -516,9 +528,17 @@ impl DiskEngine {
             .forward_index
             .flush_to_region(dev, block_ref_offset(&active.forward_index_root))
             .map_err(EngineError::from)?;
+        // TagIndex needs a bitmap-area reservation in addition to the
+        // directory region. The bitmap area is fixed at
+        // `zone_offset + TAG_BITMAP_AREA_OFFSET` (R1c-A3.3 layout).
         self.engine
             .tag_index
-            .flush_to_region(dev, block_ref_offset(&active.tag_index_root))
+            .flush_to_region(
+                dev,
+                block_ref_offset(&active.tag_index_root),
+                zone_offset + TAG_BITMAP_AREA_OFFSET,
+                TAG_BITMAP_AREA_PAGES,
+            )
             .map_err(EngineError::from)?;
         self.engine
             .range_index

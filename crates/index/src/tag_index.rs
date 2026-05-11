@@ -2,49 +2,46 @@
 //!
 //! On disk:
 //!
-//! - [`TagIndexLeafEntry`] (48 B, IMPL §8.1) is the directory leaf entry.
-//! - The `TagBitmapPage` / `SequencePage` / `RankedPage` block-framing
-//!   shapes (IMPL §8.2, §8.3) live inside `BlockHeader`-prefixed 4 KiB
-//!   blocks; this crate only owns the bitmap-store metadata and the
-//!   roaring portable bytes — the block envelope itself is in
-//!   `mimisbrunnr-storage`.
+//! - The directory is a §1.5 B+ tree region of [`BtreeKind::TagDirectory`]
+//!   with the 2-field packed key `(tag_id, snapshot)` and a 40 B value tail
+//!   ([`TagIndexValue`]) per entry. Together with the key bytes the value
+//!   reproduces the spec's 48 B [`TagIndexLeafEntry`] image.
+//! - The directory entry's `store_root: BlockRef` points at the head
+//!   [`TagBitmapPage`](crate::TagBitmapPage) of a singly-linked chain
+//!   carrying the tag's roaring bitmap.
 //!
 //! In memory:
 //!
 //! - [`TagIndex`] = `HashMap<TagId, TagStore>` per IMPL §13.
 //!
-//! ## Persistence (R1b-3)
+//! ## Persistence (R1c-A3.3) — Simple stores only
 //!
-//! On disk the tag-directory level occupies one 256 KiB §1.5 B+ tree
-//! region of [`BtreeKind::TagDirectory`]. The in-memory mirror is
-//! materialised into a single CBOR-encoded sorted run via
-//! [`BtreeRegion::write_full`]; reload goes through [`BtreeRegion::read`].
-//! Keys are raw `TagId` (`u32`) sorted ascending; values are the per-tag
-//! [`TagStore`] (variable-shape — Simple bitmap, Ordered = bitmap +
-//! sequence, Ranked = bitmap + scored entries; plus the embedded
-//! roaring bitmap is itself variable-length).
-//!
-//! Variable-shape values preclude the §1.5.6 packed-key codec: it
-//! requires every entry's value to share the same byte length. Until
-//! R1a-pack-2 grows variable-size value support, TagIndex flushes
-//! through the CBOR run codec.
-//!
-//! TODO(rewrite-phase-R1d): once R1c lands variable-value-size support
-//! and the storage layer offers the §8.1 `TagIndexLeafEntry` / §8.2
-//! `TagBitmapPage` / §8.3 `SequencePage`/`RankedPage` block-framing path,
-//! switch to native encoding so the per-tag bitmap pages live in their
-//! own 4 KiB blocks (rather than inline in the directory's CBOR payload).
+//! - Directory: native packed sorted run, `value_size_kind = FIXED`,
+//!   40 B per value tail.
+//! - Bitmap pages: linked chain of 4 KiB `TagBitmapPage`s allocated
+//!   sequentially within a per-pool *bitmap area* whose absolute byte
+//!   offset is supplied by the engine. Each page holds ≤ 4 036 B of the
+//!   tag's roaring portable serialisation; chains terminate at the page
+//!   with `next_page == BlockRef::zeroed()`.
+//! - Ordered / Ranked stores: flush returns
+//!   [`IndexError::UnsupportedStoreKind`]; A3.4 / A3.5 will land the
+//!   §8.3 `OrderedStore` / `RankedStore` root-block paths.
 
 use std::collections::HashMap;
 
 use {
     bytemuck::{Pod, Zeroable},
-    mimisbrunnr_storage::{BlockDevice, BlockRef, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
+    mimisbrunnr_storage::{
+        BLOCK_SIZE, BlockDevice, BlockRef, BtreeKind, BtreeRegion, FieldHints, LoadedNode,
+        PackError, PackableKey, SortedRun,
+    },
     mimisbrunnr_types::{ObjectId, TagId},
     roaring::RoaringBitmap,
     serde::{Deserialize, Serialize},
     static_assertions::const_assert_eq,
 };
+
+use crate::tag_bitmap_page::{TAG_BITMAP_PAGE_MAX_BYTES, TagBitmapPage};
 
 use crate::{error::IndexError, tag_store::TagStore};
 
@@ -123,6 +120,100 @@ const_assert_eq!(
 );
 // computed: 8 (last_modify_lsn) + 16 (store_root) + 4 (tag_id) + 4 (snapshot)
 // + 4 (cardinality) + 4 (generation) + 1 (store_kind) + 7 (_pad) = 48
+
+// ---------- TagIndexValue (40 B value tail) ----------
+
+/// Size in bytes of [`TagIndexValue`]'s on-disk byte image (40 = the spec's
+/// 48 B [`TagIndexLeafEntry`] minus the 8 B `(tag_id, snapshot)` packed
+/// key).
+pub const TAG_INDEX_VALUE_SIZE: usize = 40;
+
+/// Fixed-size 40-byte value tail for the [`TagIndex`] B+ tree. Together
+/// with the 2-field packed key `(tag_id, snapshot)` (§1.5.6) this
+/// reproduces the spec's 48 B [`TagIndexLeafEntry`] layout. Field order
+/// matches the leaf entry sans the two key fields.
+///
+/// ```text
+/// [0..8]   last_modify_lsn u64
+/// [8..24]  store_root      BlockRef (16 B)   ← head TagBitmapPage
+/// [24..28] cardinality     u32  (members count, ≤ u32::MAX)
+/// [28..32] generation      u32  (bumped on bitmap rewrite)
+/// [32..33] store_kind      u8
+/// [33..40] _pad            [u8; 7]
+/// ```
+#[repr(C, packed)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
+pub struct TagIndexValue {
+    pub last_modify_lsn: u64, // [0..8]
+    pub store_root: BlockRef, // [8..24]
+    pub cardinality: u32,     // [24..28]
+    pub generation: u32,      // [28..32]
+    pub store_kind: u8,       // [32..33]
+    pub _pad: [u8; 7],        // [33..40]
+}
+
+const_assert_eq!(core::mem::size_of::<TagIndexValue>(), TAG_INDEX_VALUE_SIZE);
+
+impl AsRef<[u8]> for TagIndexValue {
+    fn as_ref(&self) -> &[u8] {
+        bytemuck::bytes_of(self)
+    }
+}
+
+impl From<Vec<u8>> for TagIndexValue {
+    fn from(v: Vec<u8>) -> Self {
+        let mut buf = [0u8; TAG_INDEX_VALUE_SIZE];
+        let n = v.len().min(TAG_INDEX_VALUE_SIZE);
+        buf[..n].copy_from_slice(&v[..n]);
+        *bytemuck::from_bytes(&buf)
+    }
+}
+
+// `TagIndexValue` needs `Serialize + Deserialize` to satisfy the
+// `BtreeRegion::read_packed` bounds (the CBOR fallback path). We always
+// write packed runs so the CBOR codec is never exercised for this type.
+impl Serialize for TagIndexValue {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_bytes(self.as_ref())
+    }
+}
+
+impl<'de> Deserialize<'de> for TagIndexValue {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let bytes: Vec<u8> = serde_bytes_helper::deserialize_bytes(de)?;
+        Ok(Self::from(bytes))
+    }
+}
+
+mod serde_bytes_helper {
+    use serde::de::{Error, SeqAccess, Visitor};
+
+    pub fn deserialize_bytes<'de, D: serde::Deserializer<'de>>(
+        de: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("byte string")
+            }
+            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                Ok(v.to_vec())
+            }
+            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(v)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+        de.deserialize_bytes(V)
+    }
+}
 
 // ---------- TagIndex (in-memory mirror) ----------
 
@@ -275,85 +366,258 @@ impl TagIndex {
     }
 
     // ----------------------------------------------------------------
-    // R1b-2: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // R1c-A3.3: §1.5 B+ tree persistence (packed-codec native leaf +
+    // chained TagBitmapPages).
     // ----------------------------------------------------------------
 
-    /// Build a [`LoadedNode`] containing every entry as a single CBOR
-    /// sorted run, sorted by `(tag_id, snapshot)`. The node uses
-    /// [`BtreeKind::TagDirectory`] and the spec's 18-bit (256 KiB) region
-    /// size.
-    ///
-    /// Per IMPL §11.2 the on-disk key is `(tag_id, snapshot)`; snapshots
-    /// are deferred to R6 so every key written today carries `snapshot = 0`.
-    /// The field is on-disk now so the layout doesn't break when R6 lands.
-    pub fn to_loaded_node(&self) -> LoadedNode<TagIndexKey, TagStore> {
-        let mut entries: Vec<(TagIndexKey, TagStore)> = self
-            .stores
-            .iter()
-            .map(|(k, v)| {
-                (
-                    TagIndexKey {
-                        tag_id: k.raw(),
-                        snapshot: 0,
-                    },
-                    v.clone(),
-                )
-            })
-            .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mut node: LoadedNode<TagIndexKey, TagStore> =
-            LoadedNode::new(BtreeKind::TagDirectory, 0, REGION_SIZE_LOG2);
-        if !entries.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, entries);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        node
-    }
-
-    /// Restore the in-memory state from a [`LoadedNode`] read via
-    /// [`BtreeRegion::read`].
-    pub fn from_loaded_node(node: &LoadedNode<TagIndexKey, TagStore>) -> Result<Self, IndexError> {
+    /// Restore the in-memory state from a [`LoadedNode`] of native leaf
+    /// entries plus a function that resolves each `store_root` BlockRef
+    /// to a [`TagStore::Simple`] bitmap. Tests use this directly; the
+    /// production path goes through [`Self::load_from_region`].
+    pub fn from_leaf_entries<F>(
+        entries: &[(TagIndexKey, TagIndexValue)],
+        mut resolve_bitmap: F,
+    ) -> Result<Self, IndexError>
+    where
+        F: FnMut(BlockRef) -> Result<RoaringBitmap, IndexError>,
+    {
         let mut stores: HashMap<TagId, TagStore> = HashMap::new();
-        for (k, v) in node.merge_iter() {
-            // Snapshot != 0 won't appear until R6 lands snapshot-aware reads.
-            stores.insert(TagId::new(k.tag_id), v.clone());
+        for (k, v) in entries {
+            // R1c-A3.3 only persists Simple; non-Simple flushes errored at
+            // write time, so any on-disk leaf must be Simple.
+            if v.store_kind != TagStoreKind::Simple as u8 {
+                return Err(IndexError::UnsupportedStoreKind(v.store_kind));
+            }
+            let bm = resolve_bitmap(v.store_root)?;
+            stores.insert(TagId::new(k.tag_id), TagStore::Simple(bm));
         }
         Ok(Self { stores })
     }
 
-    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
-    /// on `device`. Replaces the region wholesale via
-    /// [`BtreeRegion::write_full`].
+    /// Write the in-memory state to disk under the A3.3 layout:
+    ///
+    /// - `dir_offset` is the byte offset of the §1.5 directory region.
+    /// - `bitmap_area_offset` is the byte offset of the start of the
+    ///   bitmap-page area; pages are allocated sequentially from slot 0.
+    /// - `bitmap_area_cap_pages` is the maximum number of 4 KiB pages
+    ///   permitted in the bitmap area; flush errors with
+    ///   [`IndexError::BitmapAreaExhausted`] when a chain would overflow it.
+    ///
+    /// Returns the count of bitmap pages written so callers can record
+    /// the live extent.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
-        offset: u64,
-    ) -> Result<(), IndexError> {
-        let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, TagIndexKey, TagStore>(device, offset, &mut node)?;
-        Ok(())
+        dir_offset: u64,
+        bitmap_area_offset: u64,
+        bitmap_area_cap_pages: usize,
+    ) -> Result<usize, IndexError> {
+        // 1. Sort entries by (tag_id, snapshot) so the packed sorted run is
+        //    monotonic.
+        let mut sorted: Vec<(TagId, &TagStore)> =
+            self.stores.iter().map(|(k, v)| (*k, v)).collect();
+        sorted.sort_by_key(|(t, _)| t.raw());
+
+        // 2. Reject Ordered/Ranked stores up front (S2: A3.3 ships
+        //    Simple-only; A3.4/A3.5 will lift this).
+        for (_, store) in &sorted {
+            match store {
+                TagStore::Simple(_) => {}
+                TagStore::Ordered { .. } => {
+                    return Err(IndexError::UnsupportedStoreKind(
+                        TagStoreKind::Ordered as u8,
+                    ));
+                }
+                TagStore::Ranked { .. } => {
+                    return Err(IndexError::UnsupportedStoreKind(
+                        TagStoreKind::Ranked as u8,
+                    ));
+                }
+            }
+        }
+
+        // 3. Walk Simple stores, write each bitmap chain into the bitmap
+        //    area, and build the corresponding leaf-value record.
+        let mut leaves: Vec<(TagIndexKey, TagIndexValue)> = Vec::with_capacity(sorted.len());
+        let mut next_page_slot: usize = 0;
+        for (tag, store) in sorted {
+            let bitmap = match store {
+                TagStore::Simple(b) => b,
+                _ => unreachable!("validated above"),
+            };
+
+            let cardinality = u32::try_from(bitmap.len())
+                .map_err(|_| IndexError::CardinalityOverflow(bitmap.len()))?;
+
+            let store_root = write_bitmap_chain(
+                device,
+                bitmap_area_offset,
+                bitmap_area_cap_pages,
+                &mut next_page_slot,
+                bitmap,
+            )?;
+
+            leaves.push((
+                TagIndexKey {
+                    tag_id: tag.raw(),
+                    snapshot: 0,
+                },
+                TagIndexValue {
+                    last_modify_lsn: 0, // R1c stub; engine wires LSN later.
+                    store_root,
+                    cardinality,
+                    generation: 1, // bumped on rewrite (R1c stub).
+                    store_kind: TagStoreKind::Simple as u8,
+                    _pad: [0; 7],
+                },
+            ));
+        }
+
+        // 4. Write the directory's sorted run via the packed codec.
+        let mut node: LoadedNode<TagIndexKey, TagIndexValue> =
+            LoadedNode::new(BtreeKind::TagDirectory, 0, REGION_SIZE_LOG2);
+        if !leaves.is_empty() {
+            let run = SortedRun::from_sorted(0, 0, leaves);
+            node.sorted_runs.push(run);
+            node.header.sorted_run_count = 1;
+        }
+        BtreeRegion::write_full_packed::<D, TagIndexKey, TagIndexValue>(
+            device,
+            dir_offset,
+            &mut node,
+            TAG_INDEX_VALUE_SIZE,
+        )?;
+
+        Ok(next_page_slot)
     }
 
-    /// Read the in-memory state from the 256 KiB region at byte `offset` on
-    /// `device`. An all-zero region is treated as "empty index" and returns
-    /// [`Self::default`].
+    /// Read the in-memory state from disk. Reads the directory at
+    /// `dir_offset`, then for each leaf entry walks the
+    /// [`TagBitmapPage`] chain rooted at `store_root` to reconstruct the
+    /// membership bitmap.
+    ///
+    /// An all-zero directory region is treated as "empty index" and
+    /// returns [`Self::default`].
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
-        offset: u64,
+        dir_offset: u64,
     ) -> Result<Self, IndexError> {
         let mut probe = [0u8; 8];
-        device.read_at(offset, &mut probe)?;
+        device.read_at(dir_offset, &mut probe)?;
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, TagIndexKey, TagStore>(
+        let node = BtreeRegion::read_packed::<D, TagIndexKey, TagIndexValue>(
             device,
-            offset,
+            dir_offset,
             BtreeKind::TagDirectory,
+            TAG_INDEX_VALUE_SIZE,
         )?;
-        Self::from_loaded_node(&node)
+        let mut entries: Vec<(TagIndexKey, TagIndexValue)> = Vec::new();
+        for (k, v) in node.merge_iter() {
+            entries.push((*k, *v));
+        }
+        Self::from_leaf_entries(&entries, |head| read_bitmap_chain(device, head))
+    }
+}
+
+// ---------- TagBitmapPage chain read/write ----------
+
+/// Serialise `bitmap` to the portable Roaring image and split it across a
+/// linked chain of [`TagBitmapPage`] blocks within the bitmap area. Pages
+/// are appended at sequential slots starting from `*next_slot`; the chain
+/// is terminated by a tail page with `next_page == BlockRef::zeroed()`.
+/// Returns the head page's [`BlockRef`].
+///
+/// `bitmap_area_offset` is the absolute byte offset of slot 0 on `device`;
+/// `cap_pages` is the maximum number of slots in the area.
+fn write_bitmap_chain<D: BlockDevice>(
+    device: &D,
+    bitmap_area_offset: u64,
+    cap_pages: usize,
+    next_slot: &mut usize,
+    bitmap: &RoaringBitmap,
+) -> Result<BlockRef, IndexError> {
+    // 1. Serialise to a contiguous byte image.
+    let mut bytes = Vec::with_capacity(bitmap.serialized_size());
+    bitmap
+        .serialize_into(&mut bytes)
+        .map_err(|e| IndexError::Roaring(e.to_string()))?;
+
+    // 2. Split into 4036-byte chunks. The chain is built tail-first so each
+    //    page knows its successor's BlockRef at write time.
+    let chunks: Vec<&[u8]> = bytes.chunks(TAG_BITMAP_PAGE_MAX_BYTES).collect();
+    let chunks = if chunks.is_empty() {
+        // Empty bitmap → single page carrying zero bytes (decoder rebuilds
+        // an empty roaring image).
+        vec![&bytes[..]]
+    } else {
+        chunks
+    };
+
+    let needed_end = *next_slot + chunks.len();
+    if needed_end > cap_pages {
+        return Err(IndexError::BitmapAreaExhausted {
+            needed: needed_end,
+            cap: cap_pages,
+        });
+    }
+
+    // 3. Assign slot indices left-to-right (head first) so the head sits at
+    //    the lowest slot; then write tail-first to fill `next_page` links.
+    let first_slot = *next_slot;
+    let assigned: Vec<usize> = (first_slot..first_slot + chunks.len()).collect();
+    *next_slot = first_slot + chunks.len();
+
+    let mut next_link = BlockRef::zeroed();
+    // Walk chain in reverse: last chunk written first, with next = ZERO.
+    for (chunk_idx, &chunk) in chunks.iter().enumerate().rev() {
+        let slot = assigned[chunk_idx];
+        let byte_offset = bitmap_area_offset + (slot as u64) * BLOCK_SIZE as u64;
+        let mut page = TagBitmapPage::from_bytes_chunk(chunk, next_link);
+        page.write(device, byte_offset)
+            .map_err(|e| IndexError::Roaring(e.to_string()))?;
+        next_link = block_ref_at(byte_offset);
+    }
+
+    // Head sits at `assigned[0]`.
+    let head_offset = bitmap_area_offset + (assigned[0] as u64) * BLOCK_SIZE as u64;
+    Ok(block_ref_at(head_offset))
+}
+
+/// Walk the [`TagBitmapPage`] chain rooted at `head`, concatenate each
+/// page's `bitmap_bytes[..bitmap_len]` slice, and deserialise the result
+/// as a roaring bitmap.
+fn read_bitmap_chain<D: BlockDevice>(
+    device: &D,
+    head: BlockRef,
+) -> Result<RoaringBitmap, IndexError> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut cur = head;
+    let zero = BlockRef::zeroed();
+    while cur != zero {
+        let offset = (cur.block_no as u64) * BLOCK_SIZE as u64;
+        let page = TagBitmapPage::read(device, offset)
+            .map_err(|e| IndexError::Roaring(e.to_string()))?;
+        buf.extend_from_slice(page.bitmap_slice());
+        cur = page.next_link();
+    }
+    if buf.is_empty() {
+        return Ok(RoaringBitmap::new());
+    }
+    RoaringBitmap::deserialize_from(buf.as_slice())
+        .map_err(|e| IndexError::Roaring(e.to_string()))
+}
+
+/// Construct a `BlockRef` pointing at the 4 KiB block whose byte offset is
+/// `byte_offset`. `generation = 1` is the R1c-D1 placeholder; D3 will
+/// bump generation per allocation.
+fn block_ref_at(byte_offset: u64) -> BlockRef {
+    BlockRef {
+        disk_id: 0,
+        _pad: 0,
+        block_no: (byte_offset / BLOCK_SIZE as u64) as u32,
+        generation: 1,
     }
 }
 
@@ -370,6 +634,37 @@ impl TagIndex {
 pub struct TagIndexKey {
     pub tag_id: u32,
     pub snapshot: u32,
+}
+
+const TAG_INDEX_KEY_HINTS: [FieldHints; 2] =
+    [FieldHints::unsigned(), FieldHints::unsigned()];
+
+impl PackableKey for TagIndexKey {
+    fn nr_fields() -> usize {
+        2
+    }
+    fn key_header_bytes() -> usize {
+        0
+    }
+    fn field_hints() -> &'static [FieldHints] {
+        &TAG_INDEX_KEY_HINTS
+    }
+    fn field_values(&self, out: &mut [u64]) {
+        out[0] = self.tag_id as u64;
+        out[1] = self.snapshot as u64;
+    }
+    fn from_components(_header: u32, fields: &[u64]) -> Result<Self, PackError> {
+        if fields.len() != 2 {
+            return Err(PackError::Malformed("TagIndexKey: wrong field count"));
+        }
+        if fields[0] > u32::MAX as u64 || fields[1] > u32::MAX as u64 {
+            return Err(PackError::Malformed("TagIndexKey: field overflow"));
+        }
+        Ok(Self {
+            tag_id: fields[0] as u32,
+            snapshot: fields[1] as u32,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -459,10 +754,17 @@ mod tests {
         assert!(back.contains(t(2), oid(20)));
     }
 
-    // ----- B+ tree region round-trip (R1b-3) -----
+    // ----- B+ tree region round-trip (R1c-A3.3 native path) -----
 
     use mimisbrunnr_storage::FileBlockDevice;
     use tempfile::TempDir;
+
+    // Test layout: directory at offset 0 (256 KiB §1.5 region); bitmap
+    // area starts at 256 KiB with capacity for 32 pages (128 KiB worth).
+    // Device is 1 MiB, comfortably more than the layout needs.
+    const TEST_DIR_OFFSET: u64 = 0;
+    const TEST_BITMAP_AREA_OFFSET: u64 = 256 * 1024;
+    const TEST_BITMAP_AREA_PAGES: usize = 64;
 
     fn fresh_device() -> (TempDir, FileBlockDevice) {
         let dir = TempDir::new().unwrap();
@@ -471,10 +773,23 @@ mod tests {
         (dir, dev)
     }
 
+    fn flush(idx: &TagIndex, dev: &FileBlockDevice) -> Result<usize, IndexError> {
+        idx.flush_to_region(
+            dev,
+            TEST_DIR_OFFSET,
+            TEST_BITMAP_AREA_OFFSET,
+            TEST_BITMAP_AREA_PAGES,
+        )
+    }
+
+    fn load(dev: &FileBlockDevice) -> Result<TagIndex, IndexError> {
+        TagIndex::load_from_region(dev, TEST_DIR_OFFSET)
+    }
+
     #[test]
     fn tag_region_round_trip_empty_returns_default() {
         let (_dir, dev) = fresh_device();
-        let idx = TagIndex::load_from_region(&dev, 0).unwrap();
+        let idx = load(&dev).unwrap();
         assert_eq!(idx.tag_count(), 0);
     }
 
@@ -487,8 +802,9 @@ mod tests {
                 idx.add_member(t(tag_no), oid(tag_no as u64 * 100 + member));
             }
         }
-        idx.flush_to_region(&dev, 0).unwrap();
-        let back = TagIndex::load_from_region(&dev, 0).unwrap();
+        let pages = flush(&idx, &dev).unwrap();
+        assert_eq!(pages, 10, "one bitmap page per tag (small bitmaps)");
+        let back = load(&dev).unwrap();
         assert_eq!(back.tag_count(), 10);
         for tag_no in 1u32..=10 {
             for member in 0u64..(tag_no as u64) {
@@ -502,39 +818,17 @@ mod tests {
 
     #[test]
     fn tag_region_round_trip_single_tag() {
-        // CBOR sorted-run path is unaffected by the packed-codec
-        // single-entry trap (chunk_index R1c TODO).
+        // Single-entry runs round-trip post-C1 (the prefix bytes are
+        // persisted in the descriptor; no template needed).
         let (_dir, dev) = fresh_device();
         let mut idx = TagIndex::new();
         idx.add_member(t(42), oid(100));
         idx.add_member(t(42), oid(200));
-        idx.flush_to_region(&dev, 0).unwrap();
-        let back = TagIndex::load_from_region(&dev, 0).unwrap();
+        flush(&idx, &dev).unwrap();
+        let back = load(&dev).unwrap();
         assert_eq!(back.tag_count(), 1);
         assert!(back.contains(t(42), oid(100)));
         assert!(back.contains(t(42), oid(200)));
-    }
-
-    #[test]
-    fn tag_region_round_trip_preserves_ordered_and_ranked_kinds() {
-        let (_dir, dev) = fresh_device();
-        let mut idx = TagIndex::new();
-        idx.add_member(t(1), oid(10));
-        idx.add_member(t(1), oid(11));
-        idx.upgrade_to_ordered(t(1)).unwrap();
-
-        idx.add_member(t(2), oid(20));
-        idx.upgrade_to_ranked(t(2)).unwrap();
-
-        idx.add_member(t(3), oid(30)); // stays Simple
-
-        idx.flush_to_region(&dev, 0).unwrap();
-        let back = TagIndex::load_from_region(&dev, 0).unwrap();
-        assert_eq!(back.tag_count(), 3);
-        assert!(back.get(t(1)).is_some());
-        assert!(back.contains(t(1), oid(10)));
-        assert!(back.contains(t(2), oid(20)));
-        assert!(back.contains(t(3), oid(30)));
     }
 
     #[test]
@@ -543,45 +837,126 @@ mod tests {
         let mut first = TagIndex::new();
         first.add_member(t(1), oid(10));
         first.add_member(t(2), oid(20));
-        first.flush_to_region(&dev, 0).unwrap();
+        flush(&first, &dev).unwrap();
 
         let mut second = TagIndex::new();
         second.add_member(t(99), oid(900));
-        second.flush_to_region(&dev, 0).unwrap();
+        flush(&second, &dev).unwrap();
 
-        let back = TagIndex::load_from_region(&dev, 0).unwrap();
+        let back = load(&dev).unwrap();
         assert_eq!(back.tag_count(), 1);
         assert!(back.contains(t(99), oid(900)));
         assert!(back.get(t(1)).is_none());
     }
 
     #[test]
-    fn tag_loaded_node_round_trip_empty() {
-        let idx = TagIndex::new();
-        let node = idx.to_loaded_node();
-        assert_eq!(node.sorted_runs.len(), 0);
-        let back = TagIndex::from_loaded_node(&node).unwrap();
-        assert_eq!(back.tag_count(), 0);
-    }
-
-    #[test]
-    fn tag_loaded_node_keys_carry_zero_snapshot() {
-        let mut idx = TagIndex::new();
-        idx.add_member(t(7), oid(42));
-        let node = idx.to_loaded_node();
-        assert_eq!(node.sorted_runs[0].entries[0].0.snapshot, 0);
-        assert_eq!(node.sorted_runs[0].entries[0].0.tag_id, 7);
-    }
-
-    #[test]
-    fn tag_region_kind_mismatch_detected() {
-        use mimisbrunnr_storage::BtreeRegion;
+    fn flush_rejects_ordered_store() {
         let (_dir, dev) = fresh_device();
         let mut idx = TagIndex::new();
         idx.add_member(t(1), oid(10));
-        idx.flush_to_region(&dev, 0).unwrap();
-        let res = BtreeRegion::read::<_, TagIndexKey, TagStore>(&dev, 0, BtreeKind::Range);
-        assert!(res.is_err());
+        idx.upgrade_to_ordered(t(1)).unwrap();
+        let err = flush(&idx, &dev).unwrap_err();
+        assert!(matches!(
+            err,
+            IndexError::UnsupportedStoreKind(k) if k == TagStoreKind::Ordered as u8
+        ));
+    }
+
+    #[test]
+    fn flush_rejects_ranked_store() {
+        let (_dir, dev) = fresh_device();
+        let mut idx = TagIndex::new();
+        idx.add_member(t(1), oid(10));
+        idx.upgrade_to_ranked(t(1)).unwrap();
+        let err = flush(&idx, &dev).unwrap_err();
+        assert!(matches!(
+            err,
+            IndexError::UnsupportedStoreKind(k) if k == TagStoreKind::Ranked as u8
+        ));
+    }
+
+    #[test]
+    fn single_page_bitmap_has_zero_next_link() {
+        // Tag with 100 members → small bitmap → single page → next_page
+        // must be BlockRef::zeroed().
+        let (_dir, dev) = fresh_device();
+        let mut idx = TagIndex::new();
+        for m in 0u64..100 {
+            idx.add_member(t(7), oid(m));
+        }
+        flush(&idx, &dev).unwrap();
+        // Read the head page directly: it's at the start of the bitmap area.
+        let page = TagBitmapPage::read(&dev, TEST_BITMAP_AREA_OFFSET).unwrap();
+        assert_eq!(page.next_link(), BlockRef::zeroed());
+    }
+
+    #[test]
+    fn multi_page_bitmap_chain() {
+        // Force a bitmap large enough to need multiple pages. A dense
+        // population produces a roaring image around 8 KiB+ for ~50k oids.
+        let (_dir, dev) = fresh_device();
+        let mut idx = TagIndex::new();
+        for m in 0u64..50_000 {
+            idx.add_member(t(1), oid(m));
+        }
+        let pages = flush(&idx, &dev).unwrap();
+        assert!(pages >= 2, "expected multi-page chain, got {pages}");
+
+        // Walk the chain manually to verify linkage.
+        let mut chain_len = 0usize;
+        let mut cur = BlockRef {
+            disk_id: 0,
+            _pad: 0,
+            block_no: (TEST_BITMAP_AREA_OFFSET / BLOCK_SIZE as u64) as u32,
+            generation: 1,
+        };
+        let zero = BlockRef::zeroed();
+        while cur != zero {
+            let page = TagBitmapPage::read(&dev, (cur.block_no as u64) * BLOCK_SIZE as u64)
+                .unwrap();
+            chain_len += 1;
+            cur = page.next_link();
+            assert!(chain_len <= TEST_BITMAP_AREA_PAGES, "infinite loop guard");
+        }
+        assert_eq!(chain_len, pages);
+
+        // Round-trip preserves membership.
+        let back = load(&dev).unwrap();
+        for m in 0u64..50_000 {
+            assert!(back.contains(t(1), oid(m)), "missing member {m}");
+        }
+    }
+
+    #[test]
+    fn bitmap_area_exhausted_errors() {
+        let (_dir, dev) = fresh_device();
+        let mut idx = TagIndex::new();
+        // Each tag with even one member writes 1 page. Cap is small.
+        for tag_no in 0..(TEST_BITMAP_AREA_PAGES + 1) as u32 {
+            idx.add_member(t(tag_no), oid(0));
+        }
+        let err = idx
+            .flush_to_region(&dev, TEST_DIR_OFFSET, TEST_BITMAP_AREA_OFFSET, TEST_BITMAP_AREA_PAGES)
+            .unwrap_err();
+        assert!(matches!(err, IndexError::BitmapAreaExhausted { .. }));
+    }
+
+    #[test]
+    fn on_disk_directory_uses_packed_codec() {
+        use mimisbrunnr_storage::{SORTED_RUN_FLAG_PACKED_KEYS, SortedRunHeader};
+        let (_dir, dev) = fresh_device();
+        let mut idx = TagIndex::new();
+        idx.add_member(t(1), oid(10));
+        idx.add_member(t(2), oid(20));
+        flush(&idx, &dev).unwrap();
+
+        // Read the first sorted-run header off disk (offset = dir_offset
+        // + BLOCK_SIZE), assert the packed-keys flag is set.
+        let mut run_header_buf = [0u8; std::mem::size_of::<SortedRunHeader>()];
+        dev.read_at(TEST_DIR_OFFSET + BLOCK_SIZE as u64, &mut run_header_buf)
+            .unwrap();
+        let run_header: SortedRunHeader = *bytemuck::from_bytes(&run_header_buf);
+        assert!(({ run_header.flags } & SORTED_RUN_FLAG_PACKED_KEYS) != 0);
     }
 
     #[test]
@@ -593,8 +968,8 @@ mod tests {
                 idx.add_member(t(i), oid(i as u64 * 100 + member));
             }
         }
-        idx.flush_to_region(&dev, 0).unwrap();
-        let back = TagIndex::load_from_region(&dev, 0).unwrap();
+        flush(&idx, &dev).unwrap();
+        let back = load(&dev).unwrap();
         assert_eq!(back.tag_count(), 50);
         for i in 0u32..50 {
             assert!(back.contains(t(i), oid(i as u64 * 100)));
