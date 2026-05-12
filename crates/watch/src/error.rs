@@ -1,5 +1,6 @@
 //! Errors raised by the watch / subscription engine.
 
+use mimisbrunnr_storage::StorageError;
 use mimisbrunnr_types::SubscriptionId;
 use thiserror::Error;
 
@@ -16,4 +17,8 @@ pub enum WatchError {
 
     #[error("roaring bitmap codec error: {0}")]
     Bitmap(String),
+
+    /// Underlying storage error (B+ tree region read/write).
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
 }

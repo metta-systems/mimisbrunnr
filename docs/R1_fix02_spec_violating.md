@@ -21,7 +21,7 @@ shape for the trees these items refine.
 | **A3.3** TagIndex `TagIndexLeafEntry` + `TagBitmapPage` | 🟡 Simple only | Simple stores + chained bitmap pages done. `OrderedStore` / `RankedStore` defer to A3.4 / A3.5. |
 | **A3.4** TagIndex `OrderedStore` | ❌ Not started | `SequencePage` 4 KiB envelope. |
 | **A3.5** TagIndex `RankedStore` | ❌ Not started | `RankedPage` 4 KiB envelope. |
-| **A5** SubscriptionEngine per-sub key | ❌ Not started | Currently single-entry `(snapshot=0, PersistedEngine)` blob. |
+| **A5** SubscriptionEngine per-sub key | ✅ Done | Per-record packed key `(SubscriptionId, snapshot)` + CBOR VARINT value tail. `cached_result` bitmap stays inline (externalization → post-D3). |
 | **F2** PackedAssertion `b: u64` | ✅ Done | Folded into A3.2. |
 | **F3** RangeIndex 4-field key with `oid` in key | ❌ Not started | Currently 3-field key with oids buried in bitmap value. |
 
@@ -306,7 +306,30 @@ not implemented at all.
 
 ---
 
-## A5. SubscriptionEngine per-subscription B+ tree key
+## A5. SubscriptionEngine per-subscription B+ tree key — ✅ DONE
+
+**Status (2026-05-11):**
+- One sorted-run entry per subscription. Key
+  `SubscriptionsKey { id: u64, snapshot: u32 }` (`PackableKey`,
+  snapshot=0 until R6); value is the CBOR-serialised `PersistedSub`
+  (spec's `SubscriptionRecord`) under `VALUE_SIZE_KIND_VARINT`.
+- `SubscriptionEngine::{flush_to_region, load_from_region}` use
+  `write_full_packed_force_varint` / `read_packed`. `to_loaded_node`
+  / `from_loaded_node` shape changed to `LoadedNode<SubscriptionsKey,
+  SubscriptionsValue>`.
+- `next_id` no longer persisted — rederived as `max(loaded_ids)` on
+  boot (pre-bump allocator: the field equals the last-assigned id,
+  not the next unused one).
+- `cached_result` roaring bitmap stays inline in the CBOR record.
+  Externalization to a §8.2 `TagBitmap` chain (the spec's target
+  form) is deferred to post-D3 alongside the rest of the sub-bucket
+  allocation work.
+- `WatchError::Storage(#[from] StorageError)` added.
+- Tests: empty pool, single sub, 50 subs, `next_id` derivation
+  (pre-bump semantics), empty-pool `next_id == 0`, VARINT codec
+  verification, kind-mismatch detection, `PackableKey` round-trip.
+
+The notes below are the original plan retained for reference.
 
 **Spec:** IMPL §10.2. `key = (SubscriptionId u64, snapshot u32) → SubscriptionRecord (CBOR)`.
 One sorted-run entry per subscription.
@@ -377,5 +400,5 @@ not buried in a per-key bitmap value.
 3. **A3.1** (ChunkIndex native leaf — simplest fixed-size leaf). — ✅ DONE
 4. **A3.3** (TagIndex + TagBitmapPage — biggest payoff, biggest scope). — ✅ Simple done
 5. **A3.2** (ForwardIndex — depends on C2 for variable-size values). — ✅ DONE
-6. **A5 + F3** (per-key promotions in subscriptions and range index). — ❌ next up
+6. **A5 + F3** (per-key promotions in subscriptions and range index). — A5 ✅, F3 ❌ next up
 7. **A3.4 + A3.5** (TagIndex `OrderedStore` / `RankedStore`). — ❌ after A5/F3

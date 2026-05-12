@@ -143,7 +143,7 @@ spec-mandated wire form, the corresponding proxy disappears:
 | `BucketAllocKey`           | E1 (per-disk: key reduces to `u32`) |
 | `FreespaceLruKey`          | E2 |
 | `PersistedState`           | A4 (split into TagDefRecord + DAG pages + module manifest) |
-| `PersistedEngine`/`PersistedSub` | A5 (per-subscription becomes the entry value) |
+| `PersistedEngine` (removed in A5) / `PersistedSub` (renamed conceptually to `SubscriptionRecord`; type kept) | A5 ✅ Done — `PersistedSub` is now the per-record value form. |
 | `DagSnapshot`              | A4 (replaced by `ImplicationDagPages`) |
 
 ### Verification gate

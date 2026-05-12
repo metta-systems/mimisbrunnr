@@ -5,25 +5,33 @@
 //! (Phase 5) wires the executor and the WAL replay logic; this crate is
 //! purely the in-memory bookkeeping.
 //!
-//! ## Persistence (R1b-9)
+//! ## Persistence (R1c-A5)
 //!
 //! On disk the engine occupies one 256 KiB §1.5 B+ tree region of
-//! [`BtreeKind::Subscriptions`]. The whole [`PersistedEngine`]
-//! (`next_id` plus the sorted subscription list with their cached
-//! roaring-bitmap results) is materialised into a single CBOR-encoded
-//! sorted-run entry keyed by `u32 snapshot` (always `0` today; R6 will
-//! populate older snapshots).
+//! [`BtreeKind::Subscriptions`]. The directory holds one sorted-run
+//! entry per subscription, keyed by `(SubscriptionId, snapshot)`
+//! (§1.5.6 packed) with the value tail being the CBOR-serialised
+//! [`PersistedSub`] (the spec's `SubscriptionRecord`) under
+//! `VALUE_SIZE_KIND_VARINT`. `next_id` is not persisted — it's
+//! re-derived at load time from `max(loaded_ids) + 1`.
 //!
-//! TODO(rewrite-phase-R1d): replace the single-entry blob with the IMPL
-//! §10.2 native per-subscription shape — a sorted run keyed by
-//! `(SubscriptionId, snapshot)` with one [`PersistedSub`] per entry, so
-//! mutating a single subscription doesn't rewrite the whole region.
+//! `cached_result` rides inline in the record's CBOR for R1c. The
+//! spec-target externalization (a `BlockRef` into a §8.2 `TagBitmap`
+//! chain) is deferred to post-Tier 3 D3 — once sub-bucket allocation
+//! is live, per-subscription bitmap pages can be allocated cheaply
+//! without competing with the fixed-offset tag-bitmap-area cap.
+//!
+//! TODO(post-D3): externalize `cached_result` to a `TagBitmap`
+//! chain so per-sub cursor mutations don't rewrite the bitmap bytes.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use mimisbrunnr_index::RoaringBitmap;
 use mimisbrunnr_ontology::OntologyState;
-use mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun};
+use mimisbrunnr_storage::{
+    BlockDevice, BtreeKind, BtreeRegion, FieldHints, LoadedNode, PackError, PackableKey,
+    SortedRun,
+};
 use mimisbrunnr_types::{
     ChangeInterest, HybridTimestamp, NodeId, ObjectId, Query, SubscriptionId, SubscriptionState,
     TagId, WatchEvent,
@@ -410,71 +418,102 @@ impl SubscriptionEngine {
     pub fn tick(&mut self, _now_ns: i64) {}
 
     // ------------------------------------------------------------------
-    // CBOR persistence (placeholder for the §10.2 B+ tree).
+    // Persistence (IMPL §10.2 / R1c-A5).
     // ------------------------------------------------------------------
 
-    /// Serialise the durable engine state. Skips the in-memory
-    /// `pending_events` queue (DESIGN §11.5: pending events are recovered by
-    /// WAL replay, not by replaying a snapshot).
+    /// Serialise the durable engine state as a single CBOR blob. Kept
+    /// for callers / tests that want a single-buffer image of the
+    /// engine (e.g. snapshot transport). The on-disk persistence path
+    /// goes through [`Self::flush_to_region`].
+    ///
+    /// Skips the in-memory `pending_events` queue (DESIGN §11.5:
+    /// pending events are recovered by WAL replay, not by replaying a
+    /// snapshot).
     pub fn serialise(&self) -> Result<Vec<u8>, WatchError> {
-        let snap = self.snapshot()?;
+        let records = self.snapshot_records()?;
         let mut buf = Vec::new();
-        ciborium::ser::into_writer(&snap, &mut buf)
+        ciborium::ser::into_writer(&records, &mut buf)
             .map_err(|e| WatchError::CborEncode(e.to_string()))?;
         Ok(buf)
     }
 
-    /// Restore from a CBOR snapshot.
+    /// Restore from a CBOR list-of-records produced by
+    /// [`Self::serialise`]. `next_id` is rederived from the maximum
+    /// loaded id + 1.
     pub fn deserialise(bytes: &[u8]) -> Result<Self, WatchError> {
-        let snap: PersistedEngine = ciborium::de::from_reader(bytes)
+        let records: Vec<PersistedSub> = ciborium::de::from_reader(bytes)
             .map_err(|e| WatchError::CborDecode(e.to_string()))?;
-        snap.into_engine()
+        Self::from_records(records)
     }
 
-    // ----------------------------------------------------------------
-    // R1b-9: §1.5 B+ tree persistence (single-entry CBOR run).
-    // ----------------------------------------------------------------
+    /// Build a [`LoadedNode`] with one sorted-run entry per
+    /// subscription, sorted by id. Used by the §1.5 B+ tree flush
+    /// path (and by tests that want the underlying node shape).
+    pub fn to_loaded_node(
+        &self,
+    ) -> Result<LoadedNode<SubscriptionsKey, SubscriptionsValue>, WatchError> {
+        let records = self.snapshot_records()?;
+        let mut entries: Vec<(SubscriptionsKey, SubscriptionsValue)> =
+            Vec::with_capacity(records.len());
+        for rec in records {
+            let mut bytes = Vec::new();
+            ciborium::ser::into_writer(&rec, &mut bytes)
+                .map_err(|e| WatchError::CborEncode(e.to_string()))?;
+            entries.push((
+                SubscriptionsKey {
+                    id: rec.id,
+                    snapshot: 0,
+                },
+                SubscriptionsValue(bytes),
+            ));
+        }
+        entries.sort_by_key(|(k, _)| (k.id, k.snapshot));
 
-    /// Build a [`LoadedNode`] containing a single sorted-run entry
-    /// `(snapshot=0, PersistedEngine)`. The node uses
-    /// [`BtreeKind::Subscriptions`] and the spec's 18-bit (256 KiB)
-    /// region size.
-    pub fn to_loaded_node(&self) -> Result<LoadedNode<u32, PersistedEngine>, WatchError> {
-        let snap = self.snapshot()?;
-        let entries = vec![(0u32, snap)];
-
-        let mut node: LoadedNode<u32, PersistedEngine> =
+        let mut node: LoadedNode<SubscriptionsKey, SubscriptionsValue> =
             LoadedNode::new(BtreeKind::Subscriptions, 0, REGION_SIZE_LOG2);
-        let run = SortedRun::from_sorted(0, 0, entries);
-        node.sorted_runs.push(run);
-        node.header.sorted_run_count = 1;
+        if !entries.is_empty() {
+            let run = SortedRun::from_sorted(0, 0, entries);
+            node.sorted_runs.push(run);
+            node.header.sorted_run_count = 1;
+        }
         Ok(node)
     }
 
-    /// Restore the in-memory state from a [`LoadedNode`] read via
-    /// [`BtreeRegion::read`]. Picks the entry under `snapshot = 0`; an
-    /// empty node returns the default.
+    /// Restore the in-memory state from a [`LoadedNode`] of
+    /// per-record entries. Empty node → [`Self::default`].
     pub fn from_loaded_node(
-        node: &LoadedNode<u32, PersistedEngine>,
+        node: &LoadedNode<SubscriptionsKey, SubscriptionsValue>,
     ) -> Result<Self, WatchError> {
-        for (k, v) in node.merge_iter() {
-            if *k == 0 {
-                return v.clone().into_engine();
+        let mut records: Vec<PersistedSub> = Vec::new();
+        for (_, v) in node.merge_iter() {
+            let bytes: &[u8] = v.as_ref();
+            if bytes.is_empty() {
+                continue;
             }
+            let rec: PersistedSub = ciborium::de::from_reader(bytes)
+                .map_err(|e| WatchError::CborDecode(e.to_string()))?;
+            records.push(rec);
         }
-        Ok(Self::default())
+        Self::from_records(records)
     }
 
-    /// Write the in-memory state as a fresh 256 KiB region at byte
-    /// `offset` on `device`.
+    /// Write the in-memory state to a fresh 256 KiB region at byte
+    /// `offset` on `device`. One sorted-run entry per subscription,
+    /// keyed by `(SubscriptionId, snapshot)` via the §1.5.6 packed
+    /// codec; CBOR value tails ride under `VALUE_SIZE_KIND_VARINT`.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
         offset: u64,
     ) -> Result<(), WatchError> {
         let mut node = self.to_loaded_node()?;
-        BtreeRegion::write_full::<D, u32, PersistedEngine>(device, offset, &mut node)
-            .map_err(|e| WatchError::CborEncode(e.to_string()))?;
+        // value_size is informational under VARINT; pass 0 since the
+        // codec reads the per-entry length from the wire.
+        BtreeRegion::write_full_packed_force_varint::<
+            D,
+            SubscriptionsKey,
+            SubscriptionsValue,
+        >(device, offset, &mut node, 0)?;
         Ok(())
     }
 
@@ -486,22 +525,23 @@ impl SubscriptionEngine {
         offset: u64,
     ) -> Result<Self, WatchError> {
         let mut probe = [0u8; 8];
-        device
-            .read_at(offset, &mut probe)
-            .map_err(|e| WatchError::CborDecode(e.to_string()))?;
+        device.read_at(offset, &mut probe)?;
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, u32, PersistedEngine>(
+        let node = BtreeRegion::read_packed::<D, SubscriptionsKey, SubscriptionsValue>(
             device,
             offset,
             BtreeKind::Subscriptions,
-        )
-        .map_err(|e| WatchError::CborDecode(e.to_string()))?;
+            0,
+        )?;
         Self::from_loaded_node(&node)
     }
 
-    fn snapshot(&self) -> Result<PersistedEngine, WatchError> {
+    /// Build the sorted list of per-subscription records. Each record
+    /// is CBOR-serialised on flush; sorting is by id (deterministic
+    /// on-disk order, irrespective of `HashMap` iteration).
+    fn snapshot_records(&self) -> Result<Vec<PersistedSub>, WatchError> {
         let mut subs: Vec<PersistedSub> = Vec::with_capacity(self.subscriptions.len());
         for sub in self.subscriptions.values() {
             let mut bitmap_bytes = Vec::with_capacity(sub.cached_result.serialized_size());
@@ -521,10 +561,41 @@ impl SubscriptionEngine {
             });
         }
         subs.sort_by_key(|s| s.id);
-        Ok(PersistedEngine {
-            next_id: self.next_id,
-            subscriptions: subs,
-        })
+        Ok(subs)
+    }
+
+    /// Reconstruct an engine from a record list. `next_id` is rederived
+    /// as `max(ids)` (or `0` on an empty list); [`Self::register`]
+    /// pre-bumps before use, so `next_id` ends up equal to the
+    /// **last assigned id** rather than the next unused one. See
+    /// IMPL §10.2.
+    fn from_records(records: Vec<PersistedSub>) -> Result<Self, WatchError> {
+        let next_id = records.iter().map(|r| r.id).max().unwrap_or(0);
+        let mut engine = SubscriptionEngine {
+            next_id,
+            ..SubscriptionEngine::default()
+        };
+        for rec in records {
+            let cached_result = RoaringBitmap::deserialize_from(rec.cached_result.as_slice())
+                .map_err(|e| WatchError::Bitmap(e.to_string()))?;
+            for tag in extract_tags(&rec.query) {
+                engine.tag_to_subs.entry(tag).or_default().push(rec.id);
+            }
+            let sub = Subscription {
+                id: rec.id,
+                name: rec.name,
+                query: rec.query,
+                interest: rec.interest,
+                cursor: rec.cursor,
+                state: rec.state,
+                retention: rec.retention,
+                debounce_ms: rec.debounce_ms,
+                cached_result,
+            };
+            engine.subscriptions.insert(rec.id, sub);
+            engine.pending_events.insert(rec.id, VecDeque::new());
+        }
+        Ok(engine)
     }
 }
 
@@ -613,24 +684,126 @@ fn walk_with_ontology(query: &Query, ontology: &OntologyState, out: &mut BTreeSe
 }
 
 // -------------------------------------------------------------------------
-// CBOR persistence shapes.
+// On-disk wire types (IMPL §10.2).
 // -------------------------------------------------------------------------
 
-/// Serialised snapshot of the engine. Public because it appears in the
-/// R1b-9 [`SubscriptionEngine::to_loaded_node`] /
-/// [`SubscriptionEngine::from_loaded_node`] signatures; callers normally
-/// only use those indirectly via `flush_to_region` / `load_from_region`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PersistedEngine {
-    /// Next subscription id to allocate.
-    pub next_id: SubscriptionId,
-    /// Subscriptions sorted by id.
-    pub subscriptions: Vec<PersistedSub>,
+/// B+ tree key for the subscriptions directory: `(SubscriptionId,
+/// snapshot)` per IMPL §10.2.
+///
+/// Snapshots are deferred to R6; every key written today carries
+/// `snapshot = 0`. The field is on-disk now so R6 won't need a layout
+/// break.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct SubscriptionsKey {
+    pub id: u64,
+    pub snapshot: u32,
 }
 
-/// Serialised single subscription. Mirrors [`Subscription`] modulo the
-/// roaring-bitmap proxy (`cached_result` carries the
-/// `RoaringBitmap::serialize_into` byte image).
+const SUBSCRIPTIONS_KEY_HINTS: [FieldHints; 2] =
+    [FieldHints::unsigned(), FieldHints::unsigned()];
+
+impl PackableKey for SubscriptionsKey {
+    fn nr_fields() -> usize {
+        2
+    }
+    fn key_header_bytes() -> usize {
+        0
+    }
+    fn field_hints() -> &'static [FieldHints] {
+        &SUBSCRIPTIONS_KEY_HINTS
+    }
+    fn field_values(&self, out: &mut [u64]) {
+        out[0] = self.id;
+        out[1] = self.snapshot as u64;
+    }
+    fn from_components(_header: u32, fields: &[u64]) -> Result<Self, PackError> {
+        if fields.len() != 2 {
+            return Err(PackError::Malformed("SubscriptionsKey: wrong field count"));
+        }
+        if fields[1] > u32::MAX as u64 {
+            return Err(PackError::Malformed("SubscriptionsKey: snapshot overflow"));
+        }
+        Ok(Self {
+            id: fields[0],
+            snapshot: fields[1] as u32,
+        })
+    }
+}
+
+/// B+ tree value tail for the subscriptions directory: the CBOR
+/// byte image of a [`PersistedSub`] (the spec's `SubscriptionRecord`).
+/// Variable-length, written under `VALUE_SIZE_KIND_VARINT`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubscriptionsValue(pub Vec<u8>);
+
+impl AsRef<[u8]> for SubscriptionsValue {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<Vec<u8>> for SubscriptionsValue {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
+}
+
+// `SubscriptionsValue` needs `Serialize + Deserialize + Clone` to
+// satisfy the `BtreeRegion::read_packed` bounds (its CBOR fallback
+// path). We always write packed runs via
+// `write_full_packed_force_varint`, so the CBOR codec is never
+// exercised for this type.
+impl Serialize for SubscriptionsValue {
+    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for SubscriptionsValue {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let bytes: Vec<u8> = serde_bytes_helper::deserialize_bytes(de)?;
+        Ok(Self(bytes))
+    }
+}
+
+mod serde_bytes_helper {
+    use serde::de::{Error, SeqAccess, Visitor};
+
+    pub fn deserialize_bytes<'de, D: serde::Deserializer<'de>>(
+        de: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("byte string")
+            }
+            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                Ok(v.to_vec())
+            }
+            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(v)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(b) = seq.next_element::<u8>()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+        de.deserialize_bytes(V)
+    }
+}
+
+/// Per-subscription on-disk record (the spec's
+/// `SubscriptionRecord`). Serialised via CBOR into the
+/// [`SubscriptionsValue`] byte tail. Mirrors [`Subscription`] modulo
+/// the roaring-bitmap proxy (`cached_result` carries the
+/// `RoaringBitmap::serialize_into` byte image; externalization to a
+/// §8.2 `TagBitmap` is post-D3 work).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSub {
     /// Subscription id.
@@ -649,39 +822,10 @@ pub struct PersistedSub {
     pub retention: Retention,
     /// Debounce window in milliseconds (`None` = no debounce).
     pub debounce_ms: Option<u32>,
-    /// Raw roaring-bitmap bytes (its built-in serializer handles run-length
-    /// containers etc. — using CBOR's array-of-u32 would balloon the size).
+    /// Raw roaring-bitmap bytes (its built-in serializer handles
+    /// run-length containers etc. — CBOR's array-of-u32 would balloon
+    /// the size).
     pub cached_result: Vec<u8>,
-}
-
-impl PersistedEngine {
-    fn into_engine(self) -> Result<SubscriptionEngine, WatchError> {
-        let mut engine = SubscriptionEngine {
-            next_id: self.next_id,
-            ..SubscriptionEngine::default()
-        };
-        for ps in self.subscriptions {
-            let cached_result = RoaringBitmap::deserialize_from(ps.cached_result.as_slice())
-                .map_err(|e| WatchError::Bitmap(e.to_string()))?;
-            for tag in extract_tags(&ps.query) {
-                engine.tag_to_subs.entry(tag).or_default().push(ps.id);
-            }
-            let sub = Subscription {
-                id: ps.id,
-                name: ps.name,
-                query: ps.query,
-                interest: ps.interest,
-                cursor: ps.cursor,
-                state: ps.state,
-                retention: ps.retention,
-                debounce_ms: ps.debounce_ms,
-                cached_result,
-            };
-            engine.subscriptions.insert(ps.id, sub);
-            engine.pending_events.insert(ps.id, VecDeque::new());
-        }
-        Ok(engine)
-    }
 }
 
 // -------------------------------------------------------------------------
@@ -1050,7 +1194,7 @@ mod tests {
         assert!(e.tag_to_subs.get(&car).unwrap().contains(&id));
     }
 
-    // ----- B+ tree region round-trip (R1b-9) -----
+    // ----- B+ tree region round-trip (R1c-A5 native path) -----
 
     use mimisbrunnr_storage::FileBlockDevice;
     use tempfile::TempDir;
@@ -1155,5 +1299,157 @@ mod tests {
         let back = SubscriptionEngine::load_from_region(&dev, 0).unwrap();
         assert_eq!(back.subscriptions.len(), 1);
         assert_eq!(back.subscriptions[&id].name, "fresh");
+    }
+
+    #[test]
+    fn watch_region_round_trip_many_subs() {
+        let (_dir, dev) = fresh_device();
+        let mut e = fresh();
+        for i in 1..=50u32 {
+            e.register(
+                format!("sub-{i}"),
+                Query::HasTag(t(i)),
+                ChangeInterest::ALL,
+                Retention::default(),
+                RoaringBitmap::new(),
+                i as u64,
+            );
+        }
+        e.flush_to_region(&dev, 0).unwrap();
+        let back = SubscriptionEngine::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.subscriptions.len(), 50);
+        // next_id should equal the last assigned id (50; pre-bump
+        // allocator semantics).
+        assert_eq!(back.next_id, 50);
+        // Inverted tag index reconstructed for every sub.
+        for i in 1..=50u32 {
+            assert!(
+                back.tag_to_subs.get(&t(i)).is_some_and(|v| v.contains(&(i as u64))),
+                "sub-{i} missing from inverted index",
+            );
+        }
+    }
+
+    #[test]
+    fn watch_region_next_id_derived_from_max() {
+        // Pre-bump allocator semantics: next_id == last assigned id,
+        // not last + 1. After load, the next register() bumps to
+        // max + 1.
+        let (_dir, dev) = fresh_device();
+        let mut e = fresh();
+        e.register(
+            "a".into(),
+            Query::HasTag(t(1)),
+            ChangeInterest::ALL,
+            Retention::default(),
+            RoaringBitmap::new(),
+            0,
+        );
+        e.register(
+            "b".into(),
+            Query::HasTag(t(2)),
+            ChangeInterest::ALL,
+            Retention::default(),
+            RoaringBitmap::new(),
+            0,
+        );
+        assert_eq!(e.next_id, 2);
+        e.flush_to_region(&dev, 0).unwrap();
+        let mut back = SubscriptionEngine::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.next_id, 2, "derived from max(ids)");
+        let id3 = back.register(
+            "c".into(),
+            Query::HasTag(t(3)),
+            ChangeInterest::ALL,
+            Retention::default(),
+            RoaringBitmap::new(),
+            0,
+        );
+        assert_eq!(id3, 3, "next register allocates max+1");
+    }
+
+    #[test]
+    fn watch_region_empty_pool_next_id_zero() {
+        let (_dir, dev) = fresh_device();
+        let e = SubscriptionEngine::load_from_region(&dev, 0).unwrap();
+        assert_eq!(e.next_id, 0);
+        let mut e = e;
+        let first_id = e.register(
+            "first".into(),
+            Query::HasTag(t(1)),
+            ChangeInterest::ALL,
+            Retention::default(),
+            RoaringBitmap::new(),
+            0,
+        );
+        assert_eq!(first_id, 1);
+    }
+
+    #[test]
+    fn watch_region_uses_varint_codec() {
+        use mimisbrunnr_storage::{
+            BLOCK_SIZE, SORTED_RUN_FLAG_PACKED_KEYS,
+        };
+        let (_dir, dev) = fresh_device();
+        let mut e = fresh();
+        // Single subscription — exercises the force-VARINT path
+        // (without it the codec would fall back to FIXED and the
+        // single-entry run would be unreadable for variable-length
+        // CBOR values).
+        e.register(
+            "only".into(),
+            Query::HasTag(t(7)),
+            ChangeInterest::ALL,
+            Retention::default(),
+            RoaringBitmap::new(),
+            0,
+        );
+        e.flush_to_region(&dev, 0).unwrap();
+
+        // SortedRunHeader layout: [magic u32 | seq u32 | journal_seq u64
+        // | entry_count u32 | payload_length u32 | flags u32 | crc u32].
+        // We only need the `flags` field at offset 24.
+        let mut buf = [0u8; 32];
+        dev.read_at(BLOCK_SIZE as u64, &mut buf).unwrap();
+        let flags = u32::from_le_bytes(buf[24..28].try_into().unwrap());
+        assert!((flags & SORTED_RUN_FLAG_PACKED_KEYS) != 0);
+    }
+
+    #[test]
+    fn watch_region_kind_mismatch_detected() {
+        // Writing as Subscriptions then trying to read as a different
+        // BtreeKind must fail.
+        use mimisbrunnr_storage::BtreeRegion;
+        let (_dir, dev) = fresh_device();
+        let mut e = fresh();
+        e.register(
+            "x".into(),
+            Query::HasTag(t(1)),
+            ChangeInterest::ALL,
+            Retention::default(),
+            RoaringBitmap::new(),
+            0,
+        );
+        e.flush_to_region(&dev, 0).unwrap();
+        let res =
+            BtreeRegion::read_packed::<_, SubscriptionsKey, SubscriptionsValue>(
+                &dev,
+                0,
+                BtreeKind::Range,
+                0,
+            );
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn subscriptions_key_packable_round_trip() {
+        let k = SubscriptionsKey {
+            id: 0xDEAD_BEEF_CAFE_BABE,
+            snapshot: 0,
+        };
+        let mut fields = [0u64; 2];
+        k.field_values(&mut fields);
+        let recovered = SubscriptionsKey::from_components(0, &fields).unwrap();
+        assert_eq!(recovered, k);
     }
 }
