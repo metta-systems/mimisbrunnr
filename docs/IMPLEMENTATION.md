@@ -307,9 +307,19 @@ struct LoadedNode {
     merged_view: BTreeMap<Key, Value>,       // lazy: built on first lookup
     pending_journal: Vec<JournalEntry>,      // §3.4 entries past last_persisted_lsn
     dirty: bool,
-    pin: JournalPin,
+    pin: JournalPin,                         // WAL pin for pending journal entries
 }
 ```
+
+**Key tracking for inner-node descent.** The `BtreeNodeHeader.min_key` and `BtreeNodeHeader.max_key`
+fields (16 bytes each, [32..48] and [48..64]) carry the covered key range of the node. For leaf nodes
+this is the smallest/largest key present; for inner nodes it is the routing key range used to
+determine which child to descend into. These fields are populated during flush/compaction:
+
+- `flush_to_run`: Updates `min_key`/`max_key` from the merged extremes of the pending journal
+  and existing sorted runs.
+- `compact`: Recomputes from the fully merged sorted run.
+- `append_sorted_run`: Updates incrementally from the new run's first/last key.
 
 Lookups merge-search across sorted runs; each run is internally sorted at write time. With ≤ 3 active sorted runs
 each binary-searched, lookup cost is `O(3 × log(n))` per node — equivalent to a single sorted

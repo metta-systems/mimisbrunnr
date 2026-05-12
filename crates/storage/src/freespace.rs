@@ -84,10 +84,8 @@ pub const FREESPACE_LRU_KEY_SIZE: usize = 7;
 // the `u16` and `u32` fields are unaligned.
 impl PartialEq for FreespaceLruKey {
     fn eq(&self, other: &Self) -> bool {
-        let (a_band, a_disk, a_bucket) =
-            (self.fragmentation_band, self.disk_id, self.bucket_no);
-        let (b_band, b_disk, b_bucket) =
-            (other.fragmentation_band, other.disk_id, other.bucket_no);
+        let (a_band, a_disk, a_bucket) = (self.fragmentation_band, self.disk_id, self.bucket_no);
+        let (b_band, b_disk, b_bucket) = (other.fragmentation_band, other.disk_id, other.bucket_no);
         a_band == b_band && a_disk == b_disk && a_bucket == b_bucket
     }
 }
@@ -102,18 +100,15 @@ impl PartialOrd for FreespaceLruKey {
 
 impl Ord for FreespaceLruKey {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        let (a_band, a_disk, a_bucket) =
-            (self.fragmentation_band, self.disk_id, self.bucket_no);
-        let (b_band, b_disk, b_bucket) =
-            (other.fragmentation_band, other.disk_id, other.bucket_no);
+        let (a_band, a_disk, a_bucket) = (self.fragmentation_band, self.disk_id, self.bucket_no);
+        let (b_band, b_disk, b_bucket) = (other.fragmentation_band, other.disk_id, other.bucket_no);
         (a_band, a_disk, a_bucket).cmp(&(b_band, b_disk, b_bucket))
     }
 }
 
 impl core::hash::Hash for FreespaceLruKey {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        let (band, disk, bucket) =
-            (self.fragmentation_band, self.disk_id, self.bucket_no);
+        let (band, disk, bucket) = (self.fragmentation_band, self.disk_id, self.bucket_no);
         band.hash(state);
         disk.hash(state);
         bucket.hash(state);
@@ -238,23 +233,27 @@ impl FreespaceLru {
     /// entry was present.
     pub fn remove(&mut self, fragmentation_band: u8, disk_id: u16, bucket_no: u32) -> bool {
         self.entries
-            .remove(&FreespaceLruKey::new(fragmentation_band, disk_id, bucket_no))
+            .remove(&FreespaceLruKey::new(
+                fragmentation_band,
+                disk_id,
+                bucket_no,
+            ))
             .is_some()
     }
 
     /// `true` iff `(band, disk_id, bucket_no)` is present.
     pub fn contains(&self, fragmentation_band: u8, disk_id: u16, bucket_no: u32) -> bool {
-        self.entries
-            .contains_key(&FreespaceLruKey::new(fragmentation_band, disk_id, bucket_no))
+        self.entries.contains_key(&FreespaceLruKey::new(
+            fragmentation_band,
+            disk_id,
+            bucket_no,
+        ))
     }
 
     /// Iterate over every key with the given fragmentation band, in
     /// ascending `(disk_id, bucket_no)` order. The allocator fast path
     /// uses this with `band == 0`; copygc uses it with high bands.
-    pub fn iter_band(
-        &self,
-        fragmentation_band: u8,
-    ) -> impl Iterator<Item = &FreespaceLruKey> {
+    pub fn iter_band(&self, fragmentation_band: u8) -> impl Iterator<Item = &FreespaceLruKey> {
         let lo = FreespaceLruKey::new(fragmentation_band, 0, 0);
         let hi = FreespaceLruKey::new(fragmentation_band, u16::MAX, u32::MAX);
         self.entries
@@ -289,11 +288,8 @@ impl FreespaceLru {
         let entries: Vec<(FreespaceLruKey, Empty)> =
             self.entries.keys().map(|k| (*k, Empty)).collect();
 
-        let mut node: LoadedNode<FreespaceLruKey, Empty> = LoadedNode::new(
-            BtreeKind::FreespaceLru,
-            0,
-            FREESPACE_LRU_REGION_SIZE_LOG2,
-        );
+        let mut node: LoadedNode<FreespaceLruKey, Empty> =
+            LoadedNode::new(BtreeKind::FreespaceLru, 0, FREESPACE_LRU_REGION_SIZE_LOG2);
         if !entries.is_empty() {
             let run = SortedRun::from_sorted(0, 0, entries);
             node.sorted_runs.push(run);
@@ -316,11 +312,11 @@ impl FreespaceLru {
     /// `offset` on `device`.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
-        device: &D,
+        device: &mut D,
         offset: u64,
     ) -> Result<(), StorageError> {
         let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, FreespaceLruKey, Empty>(device, offset, &mut node)?;
+        BtreeRegion::write_full(device, offset, &mut node)?;
         Ok(())
     }
 
@@ -328,7 +324,7 @@ impl FreespaceLru {
     /// `offset` on `device`. An all-zero region returns
     /// [`Self::default`].
     pub fn load_from_region<D: BlockDevice>(
-        device: &D,
+        device: &mut D,
         offset: u64,
     ) -> Result<Self, StorageError> {
         let mut probe = [0u8; 8];
@@ -336,11 +332,9 @@ impl FreespaceLru {
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, FreespaceLruKey, Empty>(
-            device,
-            offset,
-            BtreeKind::FreespaceLru,
-        )?;
+        let node = BtreeRegion::read_as_loaded_node::<
+            FreespaceLruKey, Empty
+        >(device, offset)?;
         Ok(Self::from_loaded_node(&node))
     }
 }
@@ -349,8 +343,7 @@ impl FreespaceLru {
 mod tests {
     use super::*;
 
-    use crate::file_device::FileBlockDevice;
-    use tempfile::TempDir;
+    use {crate::file_device::FileBlockDevice, tempfile::TempDir};
 
     fn fresh_device() -> (TempDir, FileBlockDevice) {
         let dir = TempDir::new().unwrap();

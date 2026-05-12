@@ -39,10 +39,12 @@ pub enum StorageError {
     #[error("device too small: need {need} bytes, have {have}")]
     DeviceTooSmall { need: u64, have: u64 },
 
-    #[error(
-        "offset {offset} + length {length} exceeds device capacity {capacity}"
-    )]
-    OutOfBounds { offset: u64, length: u64, capacity: u64 },
+    #[error("offset {offset} + length {length} exceeds device capacity {capacity}")]
+    OutOfBounds {
+        offset: u64,
+        length: u64,
+        capacity: u64,
+    },
 
     #[error("no valid superblock copy found")]
     NoValidSuperblock,
@@ -75,15 +77,16 @@ pub enum StorageError {
     StaleBlockRef { expected: u64, actual: u64 },
 
     /// `BlockRef.disk_id` doesn't match the allocator's disk.
-    #[error(
-        "cross-disk BlockRef: expected disk {expected_disk}, got {got_disk}"
-    )]
-    CrossDiskBlockRef {
-        expected_disk: u16,
-        got_disk: u16,
-    },
+    #[error("cross-disk BlockRef: expected disk {expected_disk}, got {got_disk}")]
+    CrossDiskBlockRef { expected_disk: u16, got_disk: u16 },
 
     /// Free called on a bucket that has no live `BucketAllocEntry`.
     #[error("free of unallocated bucket {bucket_no}")]
     FreeOfUnallocatedBucket { bucket_no: u32 },
+}
+
+impl From<serde_cbor::error::Error> for StorageError {
+    fn from(err: serde_cbor::error::Error) -> Self {
+        StorageError::CborDecode(err.to_string())
+    }
 }

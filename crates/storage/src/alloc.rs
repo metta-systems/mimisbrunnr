@@ -179,10 +179,7 @@ impl core::hash::Hash for BucketAllocKey {
 impl BucketAllocKey {
     /// Construct a new key.
     pub const fn new(disk_id: u16, bucket_no: u32) -> Self {
-        Self {
-            disk_id,
-            bucket_no,
-        }
+        Self { disk_id, bucket_no }
     }
 }
 
@@ -316,21 +313,15 @@ impl BucketAllocTable {
     /// single-disk view because the in-memory `BucketAllocTable` is
     /// pool-scoped — callers pass `disk_id = 0` until R1d splits the
     /// allocator per-disk.
-    pub fn to_loaded_node(
-        &self,
-        disk_id: u16,
-    ) -> LoadedNode<BucketAllocKey, BucketAllocEntry> {
+    pub fn to_loaded_node(&self, disk_id: u16) -> LoadedNode<BucketAllocKey, BucketAllocEntry> {
         let entries: Vec<(BucketAllocKey, BucketAllocEntry)> = self
             .entries
             .iter()
             .map(|(bucket_no, e)| (BucketAllocKey::new(disk_id, *bucket_no), *e))
             .collect();
 
-        let mut node: LoadedNode<BucketAllocKey, BucketAllocEntry> = LoadedNode::new(
-            BtreeKind::BucketAlloc,
-            0,
-            BUCKET_ALLOC_REGION_SIZE_LOG2,
-        );
+        let mut node: LoadedNode<BucketAllocKey, BucketAllocEntry> =
+            LoadedNode::new(BtreeKind::BucketAlloc, 0, BUCKET_ALLOC_REGION_SIZE_LOG2);
         if !entries.is_empty() {
             let run = SortedRun::from_sorted(0, 0, entries);
             node.sorted_runs.push(run);
@@ -345,9 +336,7 @@ impl BucketAllocTable {
     /// R1b-4 ignores the wire `disk_id`: the in-memory table is
     /// pool-wide, indexed only by `bucket_no`. R1d will split per-disk
     /// and use the full key.
-    pub fn from_loaded_node(
-        node: &LoadedNode<BucketAllocKey, BucketAllocEntry>,
-    ) -> Self {
+    pub fn from_loaded_node(node: &LoadedNode<BucketAllocKey, BucketAllocEntry>) -> Self {
         let mut entries: BTreeMap<u32, BucketAllocEntry> = BTreeMap::new();
         for (k, v) in node.merge_iter() {
             // Drop disk_id for now; R1d will key the in-memory map by
@@ -364,21 +353,19 @@ impl BucketAllocTable {
     /// key. Pool-scoped callers pass `0` until R1d.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
-        device: &D,
+        device: &mut D,
         offset: u64,
         disk_id: u16,
     ) -> Result<(), StorageError> {
         let mut node = self.to_loaded_node(disk_id);
-        BtreeRegion::write_full::<D, BucketAllocKey, BucketAllocEntry>(
-            device, offset, &mut node,
-        )?;
+        BtreeRegion::write_full(device, offset, &mut node)?;
         Ok(())
     }
 
     /// Read the in-memory state from the 256 KiB region at byte `offset`
     /// on `device`. An all-zero region returns [`Self::default`].
     pub fn load_from_region<D: BlockDevice>(
-        device: &D,
+        device: &mut D,
         offset: u64,
     ) -> Result<Self, StorageError> {
         let mut probe = [0u8; 8];
@@ -386,11 +373,9 @@ impl BucketAllocTable {
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, BucketAllocKey, BucketAllocEntry>(
-            device,
-            offset,
-            BtreeKind::BucketAlloc,
-        )?;
+        let node = BtreeRegion::read_as_loaded_node::<
+            BucketAllocKey, BucketAllocEntry
+        >(device, offset)?;
         Ok(Self::from_loaded_node(&node))
     }
 }
@@ -450,8 +435,7 @@ mod tests {
 
     // ----- B+ tree region round-trip (R1b-4) -----
 
-    use crate::file_device::FileBlockDevice;
-    use tempfile::TempDir;
+    use {crate::file_device::FileBlockDevice, tempfile::TempDir};
 
     fn fresh_device() -> (TempDir, FileBlockDevice) {
         let dir = TempDir::new().unwrap();
@@ -511,11 +495,7 @@ mod tests {
         t.insert(99, entry(7, BucketDataType::Wal, BUCKET_FLAG_NEEDS_DISCARD));
         t.insert(
             100,
-            entry(
-                42,
-                BucketDataType::Metadata,
-                BUCKET_FLAG_PINNED_BY_SNAPSHOT,
-            ),
+            entry(42, BucketDataType::Metadata, BUCKET_FLAG_PINNED_BY_SNAPSHOT),
         );
 
         t.flush_to_region(&dev, 0, 0).unwrap();

@@ -48,12 +48,12 @@ const POOL_STATE_ROOT_FORMAT_VERSION: u16 = 1;
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct PoolStateRoot {
-    pub header: BlockHeader,        // [0..32]    kind = PoolStateRoot
-    pub disk_count: u32,            // [32..36]
-    pub cluster_node_count: u32,    // [36..40]
+    pub header: BlockHeader,     // [0..32]    kind = PoolStateRoot
+    pub disk_count: u32,         // [32..36]
+    pub cluster_node_count: u32, // [36..40]
     pub inline_disks: [DiskDescriptorOnDisk; POOL_STATE_ROOT_INLINE_DISKS], // [40..3112]
     pub _reserved: [u8; POOL_STATE_ROOT_RESERVED], // [3112..4092]
-    pub crc: u32,                   // [4092..4096]   CRC32C of bytes [0..4092]
+    pub crc: u32,                // [4092..4096]   CRC32C of bytes [0..4092]
 }
 
 const_assert_eq!(core::mem::size_of::<PoolStateRoot>(), POOL_STATE_ROOT_SIZE);
@@ -186,10 +186,8 @@ impl PoolStateRoot {
 pub fn disks_overflow_to_loaded_node(
     overflow: &[DiskDescriptorOnDisk],
 ) -> LoadedNode<u16, DiskDescriptorOnDisk> {
-    let mut entries: Vec<(u16, DiskDescriptorOnDisk)> = overflow
-        .iter()
-        .map(|d| ({ d.disk_id }, *d))
-        .collect();
+    let mut entries: Vec<(u16, DiskDescriptorOnDisk)> =
+        overflow.iter().map(|d| ({ d.disk_id }, *d)).collect();
     entries.sort_by_key(|(k, _)| *k);
 
     let mut node: LoadedNode<u16, DiskDescriptorOnDisk> = LoadedNode::new(
@@ -217,18 +215,18 @@ pub fn disks_overflow_from_loaded_node(
 /// `offset` on `device`.
 pub fn flush_disks_overflow_to_region<D: BlockDevice>(
     overflow: &[DiskDescriptorOnDisk],
-    device: &D,
+    device: &mut D,
     offset: u64,
 ) -> Result<(), PoolError> {
     let mut node = disks_overflow_to_loaded_node(overflow);
-    BtreeRegion::write_full::<D, u16, DiskDescriptorOnDisk>(device, offset, &mut node)?;
+    BtreeRegion::write_full::<u16, DiskDescriptorOnDisk>(device, offset, &mut node)?;
     Ok(())
 }
 
 /// Read the overflow descriptor list from the 256 KiB region at byte
 /// `offset` on `device`. An all-zero region returns `Vec::new()`.
 pub fn load_disks_overflow_from_region<D: BlockDevice>(
-    device: &D,
+    device: &mut D,
     offset: u64,
 ) -> Result<Vec<DiskDescriptorOnDisk>, PoolError> {
     let mut probe = [0u8; 8];
@@ -236,11 +234,7 @@ pub fn load_disks_overflow_from_region<D: BlockDevice>(
     if probe.iter().all(|&b| b == 0) {
         return Ok(Vec::new());
     }
-    let node = BtreeRegion::read::<D, u16, DiskDescriptorOnDisk>(
-        device,
-        offset,
-        BtreeKind::DiskDescriptors,
-    )?;
+    let node = BtreeRegion::read_as_loaded_node::<u16, DiskDescriptorOnDisk>(device, offset)?;
     Ok(disks_overflow_from_loaded_node(&node))
 }
 
@@ -366,10 +360,10 @@ mod tests {
 
     // ----- B+ tree region round-trip (R1b-11, disks_overflow) -----
 
-    use super::{
-        flush_disks_overflow_to_region, load_disks_overflow_from_region,
+    use {
+        super::{flush_disks_overflow_to_region, load_disks_overflow_from_region},
+        tempfile::TempDir,
     };
-    use tempfile::TempDir;
 
     fn fresh_overflow_device() -> (TempDir, FileBlockDevice) {
         let dir = TempDir::new().unwrap();

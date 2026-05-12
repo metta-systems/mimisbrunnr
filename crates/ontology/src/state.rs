@@ -16,9 +16,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun};
-use mimisbrunnr_types::{ModuleId, StoragePolicy, TagDefinition, TagId, TagRelation};
-use serde::{Deserialize, Serialize};
+use {
+    mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
+    mimisbrunnr_types::{ModuleId, StoragePolicy, TagDefinition, TagId, TagRelation},
+    serde::{Deserialize, Serialize},
+};
 
 use crate::{
     error::{OntologyError, StorageAxis},
@@ -346,11 +348,7 @@ impl OntologyState {
     /// Resolve effective storage policy for an object given its tag set
     /// (DESIGN §3.5). For each axis, picks the unique most-derived tag
     /// declaring it; falls back to `default` per axis.
-    pub fn resolve_policy(
-        &self,
-        object_tags: &[TagId],
-        default: &StoragePolicy,
-    ) -> StoragePolicy {
+    pub fn resolve_policy(&self, object_tags: &[TagId], default: &StoragePolicy) -> StoragePolicy {
         let mut chunking = default.chunking;
         let mut compression = default.compression;
         let mut encryption = default.encryption;
@@ -439,9 +437,7 @@ impl OntologyState {
             let mut declaring: Vec<TagId> = self
                 .tags
                 .iter()
-                .filter_map(|(id, def)| {
-                    def.storage.as_ref().filter(|p| predicate(p)).map(|_| *id)
-                })
+                .filter_map(|(id, def)| def.storage.as_ref().filter(|p| predicate(p)).map(|_| *id))
                 .collect();
             declaring.sort(); // deterministic conflict reporting
             for (i, &a) in declaring.iter().enumerate() {
@@ -523,9 +519,7 @@ impl OntologyState {
     /// [`BtreeRegion::read`]. Picks the latest entry (highest snapshot
     /// key) so newly-installed images shadow older ones; an empty node
     /// returns the default.
-    pub fn from_loaded_node(
-        node: &LoadedNode<u32, OntologyImage>,
-    ) -> Result<Self, OntologyError> {
+    pub fn from_loaded_node(node: &LoadedNode<u32, OntologyImage>) -> Result<Self, OntologyError> {
         let mut latest: Option<(u32, OntologyImage)> = None;
         for (k, v) in node.merge_iter() {
             if latest.as_ref().is_none_or(|(prev_k, _)| *k >= *prev_k) {
@@ -542,11 +536,11 @@ impl OntologyState {
     /// `offset` on `device`.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
-        device: &D,
+        device: &mut D,
         offset: u64,
     ) -> Result<(), OntologyError> {
         let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, u32, OntologyImage>(device, offset, &mut node)
+        BtreeRegion::write_full::<u32, OntologyImage>(device, offset, &mut node)
             .map_err(|e| OntologyError::Cbor(e.to_string()))?;
         Ok(())
     }
@@ -555,7 +549,7 @@ impl OntologyState {
     /// `offset` on `device`. An all-zero region returns
     /// [`Self::default`].
     pub fn load_from_region<D: BlockDevice>(
-        device: &D,
+        device: &mut D,
         offset: u64,
     ) -> Result<Self, OntologyError> {
         let mut probe = [0u8; 8];
@@ -565,12 +559,8 @@ impl OntologyState {
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, u32, OntologyImage>(
-            device,
-            offset,
-            BtreeKind::Ontology,
-        )
-        .map_err(|e| OntologyError::Cbor(e.to_string()))?;
+        let node = BtreeRegion::read_as_loaded_node::<u32, OntologyImage>(device, offset)
+            .map_err(|e| OntologyError::Cbor(e.to_string()))?;
         Self::from_loaded_node(&node)
     }
 
@@ -848,10 +838,13 @@ mod tests {
             "x",
             vec![
                 label_with_storage("file", compress_only(9)),
-                label_with_storage("binary", StoragePolicy {
-                    compression: Some(CompressionAlgo::Lz4),
-                    ..Default::default()
-                }),
+                label_with_storage(
+                    "binary",
+                    StoragePolicy {
+                        compression: Some(CompressionAlgo::Lz4),
+                        ..Default::default()
+                    },
+                ),
             ],
             &[("binary", "file")],
         );
@@ -983,8 +976,7 @@ mod tests {
 
     // ----- B+ tree region round-trip (R1b-8) -----
 
-    use mimisbrunnr_storage::FileBlockDevice;
-    use tempfile::TempDir;
+    use {mimisbrunnr_storage::FileBlockDevice, tempfile::TempDir};
 
     fn fresh_device() -> (TempDir, FileBlockDevice) {
         let dir = TempDir::new().unwrap();
@@ -1074,7 +1066,12 @@ mod tests {
         let mut alloc = IdAllocator::new();
         let m = module_with_relations(
             "core",
-            vec![label("active"), label("discontinued"), label("usb-c"), label("electronics")],
+            vec![
+                label("active"),
+                label("discontinued"),
+                label("usb-c"),
+                label("electronics"),
+            ],
             &[],
             &[
                 ("active", TagRelation::MutuallyExclusive, "discontinued"),
@@ -1087,8 +1084,16 @@ mod tests {
         let discontinued = state.names["discontinued"];
         let usb_c = state.names["usb-c"];
         let electronics = state.names["electronics"];
-        assert!(state.relations.contains(&(active, TagRelation::MutuallyExclusive, discontinued)));
-        assert!(state.relations.contains(&(usb_c, TagRelation::Requires, electronics)));
+        assert!(
+            state
+                .relations
+                .contains(&(active, TagRelation::MutuallyExclusive, discontinued))
+        );
+        assert!(
+            state
+                .relations
+                .contains(&(usb_c, TagRelation::Requires, electronics))
+        );
 
         let rec = &state.installed_modules["core"];
         assert_eq!(rec.installed_relations.len(), 2);
@@ -1134,7 +1139,12 @@ mod tests {
             .install(
                 module_with_relations(
                     "core",
-                    vec![label("active"), label("discontinued"), label("laptop"), label("notebook")],
+                    vec![
+                        label("active"),
+                        label("discontinued"),
+                        label("laptop"),
+                        label("notebook"),
+                    ],
                     &[],
                     &[
                         ("active", TagRelation::MutuallyExclusive, "discontinued"),
@@ -1152,8 +1162,14 @@ mod tests {
         let discontinued = back.names["discontinued"];
         let laptop = back.names["laptop"];
         let notebook = back.names["notebook"];
-        assert!(back.relations.contains(&(active, TagRelation::MutuallyExclusive, discontinued)));
-        assert!(back.relations.contains(&(laptop, TagRelation::Alias, notebook)));
+        assert!(
+            back.relations
+                .contains(&(active, TagRelation::MutuallyExclusive, discontinued))
+        );
+        assert!(
+            back.relations
+                .contains(&(laptop, TagRelation::Alias, notebook))
+        );
         assert_eq!(back.installed_modules["core"].installed_relations.len(), 2);
     }
 

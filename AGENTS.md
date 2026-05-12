@@ -16,7 +16,7 @@ The goal is to **always leave the repository in a "new empty change" state** aft
 
 ### Skill
 
-ALWAYS load the `jj-vcs` skill when starting any programming task. Do not rely on general knowledge for jj workflow or message format — the skill contains the required policies. Load it early, not just before `jj describe`.
+ALWAYS load the [`jj-vcs`](.claude/skills/jj-vcs/SKILL.md) skill when starting any programming task. Do not rely on general knowledge for jj workflow or message format — the skill contains the required policies. Load it early, not just before `jj describe`.
 
 ### Common Commands Reference
 
@@ -32,7 +32,7 @@ Use Mneme MCP to keep long term memory base and consult it if necessary.
 
 ## Communication Style
 
-Do not ask prompting questions like "What do you think?" or "Which variant do you prefer?". While reviewing give user space for thinking - lay out the information and stop. User will continue when they're ready.
+Do not ask prompting questions like "What do you think?" or "Which variant do you prefer?" or "What would you like to work on next?". While reviewing give user space for thinking - lay out the information and stop. User will continue when they're ready.
 
 ## Remote Server Administration
 
@@ -48,7 +48,7 @@ This concerns ANY changes through SSH - even "obvious" or "safe" ones.
 
 ## Pathfinder Tool Routing
 
-Semantic navigation tools. Workflows and deep details: `docs/agent_directives/skills/pathfinder/SKILL.md`.
+Semantic navigation tools. Workflows and deep details: `.claude/skills/pathfinder/SKILL.md`.
 
 ### Pre-Flight
 
@@ -99,3 +99,8 @@ When `references_truncated` or `dependencies_truncated` is true, increase the co
 ### Fallback
 
 If Pathfinder unavailable → use built-in tools (`Read`, `Grep`, `Glob`). Do not block.
+
+## Token compression
+
+Run command line tools through "rtk" executable - it will compress the token output making it more readable for the agent and you won't need to add "tail" or "grep" calls - it will be easier to find focused results in the output.
+Just prefix "rtk " to any command line you are going to launch.

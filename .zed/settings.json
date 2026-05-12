@@ -1,29 +1,27 @@
 {
   "context_servers": {
-    // Needs a skill setup
     "Pathfinder": {
-      "enabled": true,
-      "source": "custom",
-      "command": "mcp-rtk",
-      "args": ["--", "pathfinder-mcp", "$ZED_PROJECT_ROOT"],
+      "command": "pathfinder-mcp",
+      "args": ["."],
     },
     "ReasonKitThink": {
-      "enabled": true,
-      "source": "custom",
-      "command": "mcp-rtk",
-      "args": ["--", "reasonkit-think-mcp"],
+      "command": "reasonkit-think-mcp",
+      "args": [],
     },
     "Mneme": {
-      "enabled": true,
-      "source": "custom",
-      "command": "mcp-rtk",
-      "args": ["--", "mneme", "run"],
+      "command": "mneme",
+      "args": ["run"],
     },
     "OctoFS": {
-      "enabled": true,
-      "source": "custom",
+      "command": "octofs",
+      "args": [],
+    },
+    "Haft": {
       "command": "mcp-rtk",
-      "args": ["--", "octofs"],
+      "args": ["--", "haft", "serve"],
+      "env": {
+        "HAFT_PROJECT_ROOT": "$ZED_PROJECT_ROOT",
+      },
     },
   },
 }

@@ -28,6 +28,7 @@ mod dirty;
 mod entry;
 mod error;
 mod header;
+mod pin;
 mod ring;
 
 pub use {
@@ -46,5 +47,6 @@ pub use {
     },
     error::WalError,
     header::{WAL_HEADER_FORMAT_VERSION, WalHeader},
+    pin::JournalPin,
     ring::{Wal, WalEntry, WalIter},
 };
