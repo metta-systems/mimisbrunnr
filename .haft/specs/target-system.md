@@ -26,6 +26,13 @@ terms:
   - Ontology
   - Pool
 target_refs: []
+doc_refs:
+  - "DESIGN#1"
+  - "DESIGN#2"
+  - "DESIGN#3"
+  - "DESIGN#10"
+  - "IMPLEMENTATION#5"
+  - "IMPLEMENTATION#11"
 evidence_required:
   - kind: E2E
     description: brunnr create + mimir tag + mimir query round-trip retrieves the expected ObjectId set without any path argument
@@ -81,6 +88,12 @@ terms:
   - Pool
   - Assertion
 target_refs: []
+doc_refs:
+  - "DESIGN#1"
+  - "DESIGN#1.1"
+  - "DESIGN#10"
+  - "DESIGN#12"
+  - "IMPLEMENTATION#11"
 evidence_required:
   - kind: manual
     description: a fresh Metta install boots with Mímisbrunnr mounted as the default storage type for user-mode processes (system services and end-user apps), with no extra operator step required
@@ -146,6 +159,18 @@ target_refs:
   - "admissibility:user-mode-callers-via-mimir-api-and-fuse"
   - "deontics:maintainers-operators-app-authors"
   - "evidence:workspace-tests-e2e-roundtrip-convergence-api-review"
+doc_refs:
+  - "DESIGN#2"
+  - "DESIGN#3"
+  - "DESIGN#5"
+  - "DESIGN#6"
+  - "DESIGN#7"
+  - "DESIGN#8"
+  - "DESIGN#9"
+  - "DESIGN#10"
+  - "DESIGN#11"
+  - "DESIGN#12"
+  - "IMPLEMENTATION#11"
 evidence_required:
   - kind: L1
     description: workspace `cargo test --workspace` passes across all 17 crates
