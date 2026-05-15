@@ -5,7 +5,8 @@
       "Bash(rtk ls *)",
       "Bash(rtk wc *)",
       "Bash(rtk cargo *)",
-      "Bash(rtk grep *)"
+      "Bash(rtk grep *)",
+      "Bash(haft spec *)"
     ]
   },
   "enableAllProjectMcpServers": true,
