@@ -8,6 +8,10 @@ _Mímisbrunnr is the well at the root of Yggdrasil that holds all knowledge and 
 
 ---
 
+https://futurism.com/the-byte/gen-z-kids-file-systems
+
+---
+
 ## 1. Design Philosophy
 
 Mímisbrunnr abandons hierarchical directories entirely. There are no folders, no paths, no tree structure. Every object (file) exists in a flat space and is discoverable through **associative queries** over its metadata — tags, attributes, relations, and ontological inference.
@@ -577,7 +581,7 @@ struct ObjectLocation {         // 48 bytes
 struct ReplicaRef {             // 8 bytes — bucket-relative, mirrors §6.2's BackpointerKey
     disk_id: u16,               // [0..2]
     sector_offset: u16,         // [2..4]   4 KiB sector within bucket
-    bucket_no: u32,              // [4..8]   bucket within disk
+    bucket_no: u32,             // [4..8]   bucket within disk
 }
 ```
 
@@ -812,10 +816,10 @@ enum CompressionAlgo { None, Zstd(i32 /* level 1-22 */), Lz4 }
 
 enum EncryptionMode {
     None,
-    Hctr2 { object_id: u64 },    // wide-block, length-preserving (blob zone)
-    Xts,                          // narrow-block, length-preserving (metadata/index zones)
-    AesGcm,                       // authenticated; nonce = 64-bit LSN || 32-bit zero (WAL)
-    ChaCha20Poly1305,             // network/sync messages
+    Hctr2 { object_id: u64 },   // wide-block, length-preserving (blob zone)
+    Xts,                        // narrow-block, length-preserving (metadata/index zones)
+    AesGcm,                     // authenticated; nonce = 64-bit LSN || 32-bit zero (WAL)
+    ChaCha20Poly1305,           // network/sync messages
 }
 
 struct TransformPipeline {
@@ -1181,7 +1185,9 @@ Object: vesper-kernel-binary
 
   path-context:rpi4-sdcard
     unix-path="/boot/kernel8.img"
-    unix-mode=0o755  unix-uid=0  unix-gid=0
+    unix-mode=0o755
+    unix-uid=0
+    unix-gid=0
 
   path-context:debian-package
     unix-path="usr/lib/vesper/kernel"
@@ -1204,8 +1210,7 @@ objects exist in Mímisbrunnr.
 
 ### 12.3 Storage
 
-Path projections reuse the existing tag/attribute machinery — there is no bespoke
-`PathContext` data structure on disk:
+Path projections reuse the existing tag/attribute machinery:
 
 - **Membership** in a context: the object carries the `unix-path-context:<name>` tag.
 - **Path** in a context: an `Attr(unix-path, Value::Scoped { context: tag, inner: Text(...) })`
@@ -1272,7 +1277,7 @@ struct MimisbrunnrFs {
 
 ### 12.7 Multiple Projections
 
-The same objects serve all projections simultaneously — no file copying. A kernel binary has a project-tree path, an install path, a package path, and a TFTP debug path, all referring to the same (or different, for stripped vs debug) blob.
+The same objects serve all projections simultaneously — no file copying. A kernel binary has a project-tree path, an install path, a package path, and a TFTP debug path, all referring to the same blob.
 
 Core principle: **Unix paths are a projection, not the truth.** Like projecting a 3D model onto a 2D blueprint.
 
@@ -1286,10 +1291,10 @@ The `systems.metta.dev` ontology demonstrates how rich domain structure maps to 
 
 |Dimension|Examples|
 |---|---|
-|**Project identity**|`project=vesper`, `component=kernel`, `workspace=metta-systems`|
+|**Project identity**|`workspace=metta-systems`, `project=vesper`, `component=kernel`|
 |**File role**|`source`, `generated`, `implementation`, `test`, `object`, `executable`, `bundle`|
 |**Language**|`lang=rust`, `lang=c`, `lang=asm`|
-|**Build configuration**|`profile=release`, `target=aarch64-unknown-none`, `opt-level=2`, `lto`|
+|**Build configuration**|`profile=release`, `target=aarch64-unknown-none`, `opt-level=2`, `lto=fat`|
 |**Lifecycle**|`current`, `stale`, `dirty`, `released`, `pinned`|
 |**Derivation**|`derived-from→`, `links→`, `bundles→`|
 
@@ -1325,7 +1330,7 @@ The `systems.metta.dev` ontology demonstrates how rich domain structure maps to 
   generated AND stale AND NOT pinned
 
 "What have I been working on this week?"
-  source AND modified > 7-days-ago → distinct(project)
+  source AND modified AFTER 7-days-ago → distinct(project)
 ```
 
 ### 13.4 Build Integration
@@ -1349,7 +1354,7 @@ ObjectRecord lookup (disk):              ~50 μs
 
 ```
 Location table → extent:                 ~1 μs (cached)
-HCTR2 decrypt (AES-NI):                 ~50 μs/MB
+HCTR2 decrypt (AES-NI):                  ~50 μs/MB
 Zstd decompress:                         ~80 μs/MB
 NVMe sequential read:                    ~200 μs/MB
 ```
@@ -1456,51 +1461,51 @@ Index state is currently persisted as CBOR (length-prefixed) in the index zone �
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                        CLIENT LAYER                              │
-│   CLI (mimir/brunnr) │ Library API │ Optional FUSE shim         │
+│   CLI (mimir/brunnr) │ Library API │ Optional FUSE shim          │
 └────────────────────────────┬─────────────────────────────────────┘
                              │
 ┌────────────────────────────▼─────────────────────────────────────┐
 │                       QUERY ENGINE (Mímir)                       │
-│   Parser → Planner → Set Executor (bitmap algebra) → Facets     │
+│   Parser → Planner → Set Executor (bitmap algebra) → Facets      │
 └───────┬───────────────┬──────────────┬───────────────────────────┘
         │               │              │
-┌───────▼───────┐ ┌─────▼──────┐ ┌────▼──────────┐
-│  ONTOLOGY     │ │ INDEX LAYER│ │ METADATA      │
-│               │ │ (RAM +WAL) │ │ LAYER         │
-│ Module system │ │            │ │               │
-│ Implication   │ │ Tag Bitmap │ │ Object Table  │
-│ DAG           │ │ KV Index   │ │ Location Table│
-│ Materializer  │ │ Range B+   │ │               │
-│               │ │ Forward Idx│ │               │
-└───────┬───────┘ └─────┬──────┘ └────┬──────────┘
-        │               │             │
+┌───────▼───────┐ ┌─────▼───────┐ ┌────▼──────────┐
+│  ONTOLOGY     │ │ INDEX LAYER │ │ METADATA      │
+│               │ │ (RAM +WAL)  │ │ LAYER         │
+│ Module system │ │             │ │               │
+│ Implication   │ │ Tag Bitmap  │ │ Object Table  │
+│ DAG           │ │ KV Index    │ │ Location Table│
+│ Materializer  │ │ Range B+    │ │               │
+│               │ │ Forward Idx │ │               │
+└───────┬───────┘ └─────┬───────┘ └────┬──────────┘
+        │               │              │
 ┌───────▼───────────────▼──────────────▼───────────────────────────┐
-│                    SUBSCRIPTION ENGINE                          │
-│   Inverted sub index │ Match cache │ Catch-up │ Batch/debounce  │
+│                    SUBSCRIPTION ENGINE                           │
+│   Inverted sub index │ Match cache │ Catch-up │ Batch/debounce   │
 ├──────────────────────────────────────────────────────────────────┤
 │                    TRANSFORM PIPELINE                            │
-│   BLAKE3 → Compress (Zstd/LZ4) → Pad → Encrypt                  │
-│   (HCTR2 blobs / XTS metadata / GCM WAL / ChaCha sync)         │
+│   BLAKE3 → Compress (Zstd/LZ4) → Pad → Encrypt                   │
+│   (HCTR2 blobs / XTS metadata / GCM WAL / ChaCha sync)           │
 ├──────────────────────────────────────────────────────────────────┤
-│                 PLACEMENT & TIERING ENGINE                        │
+│                 PLACEMENT & TIERING ENGINE                       │
 │   Pin/Prefer/Replicate/Colocate/AutoTier rules                   │
 │   Tag queries → ideal tier → migration planner → allocator       │
 ├──────────────────────────────────────────────────────────────────┤
-│                   TRANSACTION LAYER                               │
+│                   TRANSACTION LAYER                              │
 │   WAL (64MB circular, mirrored) → Checkpoint → Recovery          │
 │   Extended oplog retention for dormant subscriptions             │
 ├──────────────────────────────────────────────────────────────────┤
-│                     POOL MANAGER                                  │
+│                     POOL MANAGER                                 │
 │   Topology │ Rebalancer │ Resilverer │ Health Monitor            │
 ├──────────────────────────────────────────────────────────────────┤
-│                   PHYSICAL STORAGE                                │
-│   NVMe (Hot) │ SSD (Warm) │ HDD (Cold) │ S3/SFTP (Glacier)     │
+│                   PHYSICAL STORAGE                               │
+│   NVMe (Hot) │ SSD (Warm) │ HDD (Cold) │ S3/SFTP (Glacier)       │
 ├──────────────────────────────────────────────────────────────────┤
-│                  CLUSTER SYNC LAYER                               │
-│   SyncOps (HLC) ←→ Bitmap deltas ←→ Blob hydration             │
-│   Node A ◄──► Node B ◄──► Hub ◄──► Node C                      │
+│                  CLUSTER SYNC LAYER                              │
+│   SyncOps (HLC) ←→ Bitmap deltas ←→ Blob hydration               │
+│   Node A ◄──► Node B ◄──► Hub ◄──► Node C                        │
 ├──────────────────────────────────────────────────────────────────┤
-│                UNIX INTEROP LAYER                                 │
+│                UNIX INTEROP LAYER                                │
 │   Path contexts │ Projections │ FUSE bridge │ Tarball export     │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -1521,7 +1526,7 @@ Index state is currently persisted as CBOR (length-prefixed) in the index zone �
 |Resilver time|∝ pool size|N/A|∝ affected data only|
 |Disk add rebalance|None (new writes only)|None|Semantic migration|
 |Cluster search|Not supported|Not supported|Full metadata on every node|
-|Redundancy|Per-vdev, uniform|RAID layer|Per-object (tag:"critical" → 3×)|
+|Redundancy|Per-vdev, uniform|RAID layer|Per-object (tag:"critical" → 3× redundancy)|
 |Schema extensibility|None|None|Ontology modules (install/upgrade/scrub)|
 |Unix compatibility|Native|Native|Path projections + FUSE bridge|
 
