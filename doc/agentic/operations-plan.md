@@ -99,7 +99,7 @@ These touch disjoint code and can run whenever their prerequisites hold:
 - **Journal flags:** [JOURNAL5](journal-implementation-plan.md), [JOURNAL6](journal-implementation-plan.md).
 - **Query and SQL:** [QUERY1](query-implementation-plan.md)–[QUERY8](query-implementation-plan.md) (QUERY5 after INDEX2).
 - **Subscriptions:** [SUBSCRIPTION3](subscriptions-implementation-plan.md)–[SUBSCRIPTION6](subscriptions-implementation-plan.md).
-- **Ontology:** [ONTOLOGY3](ontology-implementation-plan.md), [ONTOLOGY4](ontology-implementation-plan.md).
+- **Ontology:** [ONTOLOGY3](ontology-implementation-plan.md), [ONTOLOGY4](ontology-implementation-plan.md), [ONTOLOGY5](ontology-implementation-plan.md); [ONTOLOGY6](ontology-implementation-plan.md), then [ONTOLOGY7](ontology-implementation-plan.md), then [ONTOLOGY8](ontology-implementation-plan.md) and [ONTOLOGY9](ontology-implementation-plan.md).
 - **Pool:** [POOL1](pool-implementation-plan.md), [POOL3](pool-implementation-plan.md), [POOL4](pool-implementation-plan.md), [POOL5](pool-implementation-plan.md).
 - **Unix and FUSE:** [UNIX2](unix-implementation-plan.md)–[UNIX6](unix-implementation-plan.md).
 - **Zone growth:** [ENGINE9](engine-implementation-plan.md).
