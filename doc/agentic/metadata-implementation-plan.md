@@ -16,4 +16,8 @@ Design: [metadata-design.md](metadata-design.md) · Decisions: [metadata-decisio
 
 - [ ] **METADATA5 — Overflow record encode, decode and chain walk.** Payload encoder and decoder, the `OverflowAttr` variants (inline and spilled), and chain navigation across 4 KiB blocks with `BLOCK_FLAG_CONTINUATION` (METADATA-DESIGN§1.2), so objects with more than four tags or any attributes keep them in their record's overflow chain. Prerequisites: [SPEC3](specification-implementation-plan.md), [ALLOCATION1](allocation-implementation-plan.md). Acceptance: an object with 20 tags and inline and spilled attributes round-trips through write, reopen and read.
 
+## Deletion
+
+- [ ] **METADATA6 — Blob reclaim and tombstone expiry.** Deletion keeps the location record until reclaim; reclaim moves the record to `BlobReclaim`, frees direct extents or decrements chunk references and clears the location in one commit; expiry moves it to `Cleared` and zeroes the rest (METADATA-DESIGN "Object deletion"). On a single node the peer-watermark condition is vacuous and only the grace period applies. Prerequisites: [BLOB1](blob-implementation-plan.md), [ENGINE5](engine-implementation-plan.md), METADATA-D3. Acceptance: delete an object, reopen: it is `Tombstoned` with its extents still allocated; after the grace period reclaim frees them and expiry clears the record; the id is never handed out again.
+
 Backpointer engine wiring: [ENGINE5](engine-implementation-plan.md). Replica population: [BLOB5](blob-implementation-plan.md).

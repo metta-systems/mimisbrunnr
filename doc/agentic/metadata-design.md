@@ -25,6 +25,52 @@ Object records and locations are positional: `oid_local` addresses a slot in a c
 - ObjectIds are never recycled (SPECIFICATION-DESIGN§7.3).
 - A record read returns exactly the committed 128 B image.
 
+## Object deletion
+
+### Why ids are never recycled
+
+An `ObjectId` is referenced from every tag bitmap the object is in, the forward index, its object and location records, the chunk index, ordered-collection sequences, peers' copies of all of these, and sync ops still in flight. If id 42 were reused while a peer had not yet seen the deletion, tags meant for the new 42 would land on the old 42's state. A node's 48-bit local sequence holds 2⁴⁸ ≈ 2.8 × 10¹⁴ ids; at 1 000 creates per second that lasts about 8 900 years, so ids are never reused (SPECIFICATION-DESIGN§7.3). `ObjectRecord.generation` remains as insurance should reuse ever be introduced.
+
+### Phases
+
+Deletion walks `ObjectRecord.state` (`ObjectState`, discriminants pinned: `Active = 0`, `Tombstoned = 1`, `BlobReclaim = 2`, `Cleared = 3`) through the four phases of SPECIFICATION-DESIGN§7.1:
+
+1. **Tombstone.** `state = Tombstoned`, `modified_ns` = deletion time; the `DeleteObject` WAL entry and oplog op are written and subscribers get `Deleted`. The object is invisible to queries from here on. O(1).
+2. **Index cleanup.** The forward entry lists exactly what to undo, so cost is O(assertions on the object), not O(tags in the pool): each `Tag` leaves its bitmap and, for `Ordered` / `Ranked` stores, its sequence; each `Attr` leaves the KV and range indexes; each `Relation` leaves the relation indexes; then the forward entry goes. Twenty tags are about 2 µs, so the work is not parallelised.
+3. **Blob reclaim**, once every peer has seen the deletion (step 4's watermark condition): `state = BlobReclaim`; a direct blob's extents are freed through the allocator (ALLOCATION-DESIGN§1), a chunked blob's chunk references are decremented and chunks reaching zero are freed (INDEX-DESIGN§4.3), and the location record is cleared. Waiting protects a peer still hydrating the blob, and freeing in the same commit that clears the location keeps a crash from leaving a committed location that points at freed space.
+4. **Tombstone expiry**, when every peer's sync watermark is past the deletion and the minimum grace period has elapsed (SPECIFICATION-DESIGN§7.2): `state = Cleared` and the rest of the record is zeroed. The slot stays allocated and the id is not reused; accumulation of cleared slots is [METADATA-D1](metadata-decisions.md).
+
+`Engine::delete_object` performs phases 1 and 2 together, synchronously, and removes the location record immediately without freeing extents; phases 3 and 4 do not exist yet ([METADATA6](metadata-implementation-plan.md), [METADATA-D3](metadata-decisions.md)).
+
+### Deletion and cluster sync
+
+Ops are applied in HLC order, so a deletion and a concurrent mutation resolve deterministically (SPECIFICATION-DESIGN§7.4):
+
+| Time | Event |
+|---|---|
+| 0 | A creates 42 and tags it `music` |
+| 1 | B learns about 42 |
+| 2 | A deletes 42 |
+| 3 | B, not yet aware, tags 42 `favorite` |
+| 4 | B receives the deletion |
+| 5 | A receives B's tag op |
+
+- A mutation op for a tombstoned object whose timestamp is **earlier** than the deletion was valid when issued: it is dropped as stale. Applied in HLC order it would have been undone by the deletion anyway.
+- A mutation op **later** than the deletion (step 3 above) should not occur under correct HLC propagation; it is dropped and logged as a conflict naming the origin node.
+- An op earlier than the deletion that is applied before the deletion arrives is simply undone by it: the tag existed briefly, then went with the object.
+
+The full per-assertion conflict rules are [CLUSTER-D2](cluster-decisions.md).
+
+### Deleting a tag
+
+Deleting a tag is cheaper than deleting objects: its bitmap is the member list. Each member's forward entry drops the `Tag` assertion, the bitmap goes, the ontology drops the tag, and one sync op records the deletion. Member objects are untouched — deleting a playlist removes the grouping, not the music (SPECIFICATION-DESIGN§7.5). The per-object tag count is [METADATA-D2](metadata-decisions.md); removing a module's tags is the Purge policy (ONTOLOGY-DESIGN "Removal and scrub policies", [ontology-design.md](ontology-design.md)).
+
+### Rejected alternatives
+
+- **A `Deleted { deleted_at, tombstone_expires }` state variant.** The state is the pinned `u8` discriminant; the deletion time is `modified_ns`, and expiry is computed, not stored.
+- **Offline object-table compaction that remaps ids**, with every bitmap, forward entry, sequence, relation and chunk reference rewritten and a cluster-wide epoch bump. Ids are never remapped; sparsity is [METADATA-D1](metadata-decisions.md).
+- **Generation-tagged references (`ObjectRef { id, generation }`) in sync ops and collection sequences.** Without id reuse a bare `ObjectId` is unambiguous.
+
 ## Format specification
 
 The numbered sections below are the normative on-disk and algorithmic specification for this scope; [format-design.md](format-design.md) lists every scope's sections in format order.
