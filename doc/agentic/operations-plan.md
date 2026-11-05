@@ -97,7 +97,7 @@ These touch disjoint code and can run whenever their prerequisites hold:
 
 - **Encryption:** [ENCRYPTION1](encryption-implementation-plan.md)–[ENCRYPTION4](encryption-implementation-plan.md), [ENCRYPTION6](encryption-implementation-plan.md) any time; [ENCRYPTION5](encryption-implementation-plan.md) after BLOB1.
 - **Journal flags:** [JOURNAL5](journal-implementation-plan.md), [JOURNAL6](journal-implementation-plan.md).
-- **Query and SQL:** [QUERY1](query-implementation-plan.md)–[QUERY8](query-implementation-plan.md) (QUERY5 after INDEX2).
+- **Query and SQL:** [QUERY1](query-implementation-plan.md)–[QUERY10](query-implementation-plan.md) (QUERY5 after INDEX2; QUERY6 and QUERY9 after QUERY7; QUERY10 after QUERY4 and QUERY-D2).
 - **Subscriptions:** [SUBSCRIPTION3](subscriptions-implementation-plan.md)–[SUBSCRIPTION6](subscriptions-implementation-plan.md).
 - **Ontology:** [ONTOLOGY3](ontology-implementation-plan.md), [ONTOLOGY4](ontology-implementation-plan.md), [ONTOLOGY5](ontology-implementation-plan.md); [ONTOLOGY6](ontology-implementation-plan.md), then [ONTOLOGY7](ontology-implementation-plan.md), then [ONTOLOGY8](ontology-implementation-plan.md) and [ONTOLOGY9](ontology-implementation-plan.md).
 - **Pool:** [POOL1](pool-implementation-plan.md), [POOL3](pool-implementation-plan.md), [POOL4](pool-implementation-plan.md), [POOL5](pool-implementation-plan.md).

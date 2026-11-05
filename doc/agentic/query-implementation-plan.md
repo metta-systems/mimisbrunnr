@@ -12,6 +12,8 @@ Design: [query-design.md](query-design.md) · Decisions: [query-decisions.md](qu
 ## SQL
 
 - [ ] **QUERY5 — `ORDER BY`** through ordered collections. Prerequisite: [INDEX2](index-implementation-plan.md).
-- [ ] **QUERY6 — `GROUP BY` beyond `COUNT(*)`, and `HAVING`.**
-- [ ] **QUERY7 — Multi-column projections and `SELECT DISTINCT`.**
-- [ ] **QUERY8 — `LIKE` with internal wildcards** (`'mid%dle'`, `_`).
+- [ ] **QUERY6 — `GROUP BY` beyond `COUNT(*)`, and `HAVING`.** Groups by intersecting the result with each KV-index bitmap of the group key; `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(DISTINCT attr)` (QUERY-DESIGN "Post-operations"). Prerequisite: QUERY7. Acceptance: `SELECT artist, COUNT(*), AVG(bpm) FROM objects WHERE tag = 'electronic' GROUP BY artist HAVING COUNT(*) > 5` matches a hand-computed result.
+- [ ] **QUERY7 — Multi-column projections and `SELECT DISTINCT`.** `SqlOutput` gains rows of attribute values read from the forward index.
+- [ ] **QUERY8 — `LIKE` with internal wildcards** (`'mid%dle'`, `_`), as a post-filter over the pushed-down result when no index answers it.
+- [ ] **QUERY9 — `ORDER BY` an attribute.** Range-index walk when the attribute is range-indexed, otherwise forward-index fetch and sort; bounded heap under `LIMIT`. Prerequisite: QUERY7. Acceptance: `ORDER BY year DESC LIMIT 3` over indexed and unindexed attributes returns the same order as a full sort.
+- [ ] **QUERY10 — Relation traversal and transitive closure in SQL.** Prerequisites: QUERY4, QUERY-D2. Acceptance: the provenance query from the software-development example (ONTOLOGY-DESIGN "Example module", [ontology-design.md](ontology-design.md)) returns the image's full input set.
