@@ -29,16 +29,20 @@ The numbered sections below are the normative on-disk and algorithmic specificat
 ## 1. Heterogeneous Value Encoding
 
 `Value` (the contents of attributes) is the only data type whose shape varies enough that fixed
-binary layout is wasteful. It is encoded as **CBOR** with a fixed tag scheme:
+binary layout is wasteful. It is encoded as positional **CBOR** (FORMAT-DESIGN§1.6): a
+two-element array of an integer type tag and the payload, or three elements for `Scoped`:
 
 ```
-Value ::= 0  Text(string)                // CBOR major-type 3
-        | 1  Int(i64)                    // CBOR major-type 0/1
-        | 2  Float(f64)                  // CBOR major-type 7
-        | 3  Timestamp(i64)
-        | 4  Blob(bytes)                 // CBOR major-type 2; large blobs spilled — see below
-        | 5  Scoped { context: TagId, inner: Box<Value> }  // INDEX-DESIGN§1.3 — scoped attribute value
+Value ::= [0, text]                      // Text(string)      payload: CBOR major type 3
+        | [1, int]                       // Int(i64)          payload: CBOR major type 0/1
+        | [2, float]                     // Float(f64)        payload: CBOR major type 7, 64-bit
+        | [3, int]                       // Timestamp(i64)    payload: CBOR major type 0/1
+        | [4, bytes]                     // Blob(bytes)       payload: CBOR major type 2; large values spill — see below
+        | [5, context, inner]            // Scoped { context: TagId (u32), inner: Value }  INDEX-DESIGN§1.3
 ```
+
+Integers use the shortest CBOR form; a float is always written as a 64-bit CBOR float, so one
+`Value` has exactly one encoding. `encode(v)` below means this encoding.
 
 `Scoped` is the canonical way to carry "this attribute applies in the context of tag *C*" —
 e.g. an object's `unix-path` value scoped by a `unix-path-context:rpi4-sdcard` tag. It is
@@ -56,8 +60,8 @@ unix-path projection use case.
 
 ### 1.2 Value hash for KV index
 
-`value_hash(v) = SipHash-2-4(domain="mimir-kv", type_tag || cbor_encode(v))` truncated to 64 bits.
-The type_tag prefix prevents `Int(42)` from colliding with `Text("42")`. SipHash is keyed by a
+`value_hash(v) = SipHash-2-4(domain="mimir-kv", encode(v))` truncated to 64 bits. The type tag
+at the head of `encode(v)` keeps `Int(42)` from colliding with `Text("42")`. SipHash is keyed by a
 per-pool secret (stored in superblock-adjacent metadata, not the superblock itself) to defeat hash
 flooding.
 
@@ -66,7 +70,7 @@ flooding.
 `Value::Scoped { context, inner }` lets the same attribute key carry different values under
 different scopes without inflating the tag namespace. The hash and comparison rules are:
 
-- `value_hash(Scoped { context, inner }) = SipHash-2-4(... || type_tag(5) || context || cbor(inner))`.
+- `value_hash(Scoped { context, inner })` is the same function over `[5, context, inner]`.
   Two scoped values with the same `context` and equal inner values hash identically; differing
   contexts hash differently. KV equality lookups against a scoped attribute key (e.g. "find every
   object whose `unix-path` value is `Scoped(rpi4, "/boot/vesper")`") are therefore exact hash hits.

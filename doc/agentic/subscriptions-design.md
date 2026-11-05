@@ -106,7 +106,7 @@ The subscription directory is a BTREE-DESIGN§1 B+ tree region of
 `BtreeKind::Subscriptions` with one leaf entry per subscription. The
 2-field packed key `(SubscriptionId, snapshot)` (BTREE-DESIGN§1.6) lets the
 codec pack the typical "one snapshot dominates" case to near-zero
-bits. The value tail is the CBOR-serialised `SubscriptionRecord`,
+bits. The value tail is the positional-CBOR `SubscriptionRecord`,
 persisted via `VALUE_SIZE_KIND_VARINT` (BTREE-DESIGN§1.6) — query ASTs and
 retention configs are heterogeneous so per-entry value lengths vary.
 
@@ -117,9 +117,10 @@ struct SubscriptionsKey {
     snapshot: u32,                            // SnapshotId (SNAPSHOTS-DESIGN§1)
 }
 
-// Sorted-run value tail — variable-length CBOR.
-#[derive(Serialize, Deserialize)]
-struct SubscriptionRecord {                   // CBOR; ~100–400 B typical
+// Sorted-run value tail — positional CBOR (FORMAT-DESIGN§1.6): an array
+// of these fields in this order.
+struct SubscriptionRecord {                   // ~100–400 B typical
+    version:       u16,                       //   schema version (FORMAT-DESIGN§1.6)
     name:          String,                    //   human label
     query:         Query,                     //   subscription's predicate AST
     interest:      ChangeInterest,            //   add/remove/update mask

@@ -243,11 +243,12 @@ new ontology version under a new snapshot id appends one new entry; older snapsh
 to see the prior image. Compaction folds away images for snapshots that are no longer
 referenced.
 
-`OntologyImage` (CBOR):
+`OntologyImage` is positional CBOR (FORMAT-DESIGN§1.6): an array of the fields below in this
+order, element 0 being its schema version; nested structs and enums are positional too.
 
 ```text
 OntologyImage {
-  format_version: u16,
+  format_version: u16,                          // schema version (FORMAT-DESIGN§1.6)
   modules:        Vec<ModuleRecord>,            // install bookkeeping (id, version, name,
                                                 //   installed_tags, installed_implications, …)
   tags:           Vec<TagDefinition>,           // id, name, semantics (incl. value_type and

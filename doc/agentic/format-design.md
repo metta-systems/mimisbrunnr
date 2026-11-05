@@ -23,7 +23,8 @@ Goals:
    snapshot-aware btrees. Creation is O(1); diffs are set differences over the snapshot tree's
    ancestor relation, driving cluster sync.
 5. **No JSON on disk.** Fixed binary layouts everywhere they fit. CBOR (RFC 8949) only where the
-   shape is genuinely heterogeneous (ontology module manifests, attribute `Value`s).
+   shape is genuinely heterogeneous (attribute `Value`s, query ASTs, the ontology image), and
+   then positional and versioned (FORMAT-DESIGN§1.6).
 
 ---
 
@@ -181,6 +182,35 @@ checksums.
 ### 1.5 Large node format
 
 Specified in [BTREE-DESIGN§1](btree-design.md#1-large-node-format).
+
+### 1.6 Records with variable parts, and CBOR
+
+**Binary records.** A structure whose fields are known from its kind is a binary record, never
+CBOR: a fixed `#[repr(C)]` head (FORMAT-DESIGN§1.1) followed by at most one variable part — an
+array of fixed records whose count is in the head, or a byte string whose `u32` length is in the
+head, zero-padded to a multiple of 8. WAL payloads (JOURNAL-DESIGN§1.3) are the main user.
+
+**CBOR.** CBOR is reserved for genuinely heterogeneous data: attribute `Value`s
+(INDEX-DESIGN§1), query ASTs (subscription records, placement-rule parameters) and the ontology
+image (ONTOLOGY-DESIGN§1). It is **positional**:
+
+- A struct is a CBOR array of its fields in the order its format section pins; no field names
+  reach the disk.
+- An enum is a CBOR array `[variant_index, fields…]` with the variant indices pinned by its
+  format section; no variant names reach the disk.
+- A CBOR map appears only where the data itself is a map (its keys are data, not field names).
+- Integers use the shortest CBOR form (RFC 8949 §4.2.1 preferred serialisation), so equal
+  values always encode to equal bytes.
+
+**Versioning.** Every top-level CBOR record persisted outside the WAL — an ontology image, a
+subscription record, a placement rule — is an array whose element 0 is a `u16` schema version.
+Fields are only ever appended. A reader decodes every version up to its own, supplying each
+field an older version lacks from the default its format section documents; a version newer
+than the reader knows is a defined error, governed by the FORMAT-DESIGN§15 feature flags.
+Rewriting a record always writes the current version, so records migrate in place as they are
+rewritten (FORMAT-DESIGN§15.4). Values nested inside a record (`Value`, a query AST) are
+versioned by that record; a `Value`'s own extension point is its type tag. WAL payloads are
+versioned by `WalEntryHeader.format_version` instead (JOURNAL-DESIGN§1.2).
 
 ## 2. Superblock and Atomic Root
 

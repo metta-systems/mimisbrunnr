@@ -9,6 +9,10 @@ Design: [query-design.md](query-design.md) · Decisions: [query-decisions.md](qu
 - [ ] **QUERY3 — `Ne` through a per-attribute-key bitmap** instead of a tag-index union universe. Prerequisite: QUERY-D1.
 - [ ] **QUERY4 — `Related` through a reverse relation index.** Prerequisite: QUERY-D1.
 
+## Encoding
+
+- [ ] **QUERY11 — Positional `Query` encoding.** `Query` and `CmpOp` encode as the positional CBOR pinned by SPEC25 (variant index first, `Value` operands through INDEX9), replacing the derived `Serialize` wherever a query reaches the disk. Prerequisites: [SPEC25](specification-implementation-plan.md), [INDEX9](index-implementation-plan.md). Acceptance: fixed expected bytes for one query of every variant; decode rejects an unknown variant index with a defined error.
+
 ## SQL
 
 - [ ] **QUERY5 — `ORDER BY`** through ordered collections. Prerequisite: [INDEX2](index-implementation-plan.md).

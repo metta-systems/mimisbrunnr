@@ -9,6 +9,8 @@ Design: [index-design.md](index-design.md) · Decisions: [index-decisions.md](in
 - [ ] **INDEX3 — Tag index `RankedStore`.** 4 KiB `RankedPage` envelope and chain; flush no longer returns `UnsupportedStoreKind` for ranked tags.
 - [ ] **INDEX7 — Value-spill table.** Values over the inline limit spill into the `BtreeKind::ValueSpill` tree keyed by `value_hash` (INDEX-DESIGN§1.1), rooted at `RootPointer.value_spill_root`; the forward index recovers an `Attr`'s full `Value` through it instead of the `Value::Int(0)` placeholder. Acceptance: an attribute with a 200-byte text value round-trips through the forward index after reopen.
 
+- [ ] **INDEX9 — Positional `Value` encoding.** `crates/types` encodes `Value` as INDEX-DESIGN§1 pins (`[tag, payload]`, `[5, context, inner]`, shortest integers, 64-bit floats) with hand-written CBOR in place of the derived `Serialize`, and computes `value_hash` over that encoding (INDEX-DESIGN§1.2); the same module provides the positional-CBOR helpers (array framing, variant index, leading schema version, defaults for missing trailing fields) that FORMAT-DESIGN§1.6 records use. Acceptance: fixed expected bytes for one value of every variant and for nested-`Scoped` rejection; `value_hash` matches recorded vectors; KV lookups and forward-index attributes round-trip through reopen.
+
 ## Capacity
 
 - [ ] **INDEX8 — Tag bitmaps beyond one page.** A tag whose roaring image exceeds one `TagBitmapPage` (4 036 bytes) is written as a `next_page` chain (INDEX-DESIGN§3.2) instead of failing with `TagBitmapPageError::Oversize`. Acceptance: a tag on 20 000 objects with scattered ids round-trips through flush and reopen; a corrupted middle page fails with the defined error.

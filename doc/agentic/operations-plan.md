@@ -33,20 +33,20 @@ Steps 1–7 replace the prototype's shortcuts with the specified binary formats 
 
 Each fixes a layout that later steps write; decide them first.
 
-- [OPERATIONS-D6](operations-decisions.md) — how structs that stay CBOR are encoded, and which fixed-shape payloads leave CBOR.
 - [OPERATIONS-D4](operations-decisions.md) — checksum algorithm.
 - [INDEX-D1](index-decisions.md) — object ids in bitmaps.
 - [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes.
 - [ALLOCATION-D1](allocation-decisions.md) — sub-bucket regions.
 - [ENGINE-D1](engine-decisions.md) — oplog persistence.
+
 ### 2. Binary formats that need no new allocation
 
-Independent of each other; any order.
+Independent of each other unless an order is given.
 
+- **Encodings** (FORMAT-DESIGN§1.6): [SPEC25](specification-implementation-plan.md) and [INDEX9](index-implementation-plan.md) first; then [JOURNAL8](journal-implementation-plan.md) (binary WAL payloads), [QUERY11](query-implementation-plan.md) and [ONTOLOGY10](ontology-implementation-plan.md); after QUERY11, [SUBSCRIPTION7](subscriptions-implementation-plan.md) and [POOL5](pool-implementation-plan.md) (native placement-rules tree).
 - [SPEC24](specification-implementation-plan.md) — no packed on-disk structs.
 - [JOURNAL7](journal-implementation-plan.md) — one checksum algorithm (after OPERATIONS-D4).
 - [POOL3](pool-implementation-plan.md), then [POOL7](pool-implementation-plan.md) — pool state through the root pointer; pool assembled from its devices, no `pool.toml`.
-- [POOL5](pool-implementation-plan.md) — native placement-rules tree.
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
 - [INDEX1](index-implementation-plan.md) — four-field range key.
 - [INDEX2](index-implementation-plan.md), [INDEX3](index-implementation-plan.md) — ordered and ranked tag stores.

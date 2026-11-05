@@ -156,7 +156,7 @@ Encryption inputs (cipher details: ENCRYPTION-DESIGN§1):
   authenticates magic, op_kind, format_version, flags, lsn, timestamp, and payload_length,
   preventing header-swap attacks. `payload_crc` is excluded because it is computed *after* the
   GCM call (over the ciphertext that GCM produces) and so cannot be an input to it.
-- **Plaintext**: CBOR-encoded payload, optionally zstd-compressed first when
+- **Plaintext**: the op's binary payload record (JOURNAL-DESIGN§1.3), optionally zstd-compressed first when
   `WAL_ENTRY_FLAG_COMPRESSED` is also set. Order is *compress, then encrypt* — never the
   reverse, since GCM ciphertext is incompressible.
 
@@ -164,7 +164,7 @@ In encrypted mode `payload_crc` is CRC32C over the ciphertext (computed post-GCM
 without the key can still validate I/O integrity via the two CRCs; readers with the key
 additionally authenticate via the GCM tag.
 
-**Write order.** (1) serialise CBOR → (2) optional zstd compress → (3) AES-256-GCM encrypt with
+**Write order.** (1) write the payload record → (2) optional zstd compress → (3) AES-256-GCM encrypt with
 the AAD-and-nonce above → (4) compute `payload_crc` over ciphertext, fill in `WalEntryHeader` →
 (5) compute trailing framing CRC over the assembled bytes → (6) issue a single sequential write
 to the WAL ring.
@@ -173,15 +173,29 @@ to the WAL ring.
 entry on mismatch — torn write or media corruption. (2) verify `payload_crc` over ciphertext
 (also key-free). (3) if `WAL_ENTRY_FLAG_ENCRYPTED`: AES-256-GCM-decrypt with header[0..36] as
 AAD and the LSN-derived nonce; reject on tag mismatch (tampering or wrong key). (4) if
-`WAL_ENTRY_FLAG_COMPRESSED`: zstd-decompress. (5) parse CBOR.
+`WAL_ENTRY_FLAG_COMPRESSED`: zstd-decompress. (5) read the payload record for `op_kind`.
 
-CBOR is acceptable here because:
-- WAL entries are written once and read once during replay (not random access).
-- Op payloads are heterogeneous (`AddTag` vs `WriteBlob` differ wildly in size and shape).
-- CBOR's deterministic encoding mode gives stable byte-for-byte serialisation, important for
-  AEAD authentication (re-encoding must produce identical bytes for the tag to verify).
+Payloads are binary records (FORMAT-DESIGN§1.6), not CBOR: every op's shape is known from
+`op_kind`, so a record carries no field names or type information, its bytes are fixed by its
+field values alone (what AEAD authentication needs), and replay reads fields in place. The only
+CBOR inside a WAL payload is an attribute `Value` (INDEX-DESIGN§1). A WAL entry is versioned
+by `WalEntryHeader.format_version`; the WAL is replayed and trimmed, never migrated in place.
 
-### 1.3 WAL op payloads (CBOR schemas)
+### 1.3 WAL op payloads
+
+Each listing below is normative for its op's payload record, laid out by the FORMAT-DESIGN§1.6
+record rules:
+
+- Fixed-size fields in the listed order, each at its natural alignment, with explicit zero
+  padding; the fixed head is padded to a multiple of 8 bytes. `BlockRef` is its 16-byte image
+  (ENGINE-DESIGN§1.2); `[T; N]` is N consecutive `T`.
+- A variable part follows the head, at most one per op: an array of fixed records (`[T; N]`
+  with N not fixed by the type) is a `u32` count in the head and the records after it; a byte
+  string (`bytes`, `String`, a packed key) is a `u32` length in the head and the bytes after
+  it, zero-padded to a multiple of 8; `Value` is a `u32` length and its CBOR encoding.
+  `Option<String>` uses length `u32::MAX` for `None`.
+- `payload_length` covers the head, the variable part and its padding; a reader rejects a
+  payload whose length disagrees with its head.
 
 ```rust
 CreateObject     : { oid: u64, generation: u32, created_ns: i64 }

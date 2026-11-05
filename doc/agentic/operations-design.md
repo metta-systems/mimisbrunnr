@@ -99,7 +99,7 @@ Workspace-level evidence (`just test`, `just clippy`) backs every claim: a regre
 |---|---|
 | Concurrency | Sync only: blocking I/O, no async runtime; `std::thread` only in `std`-gated code. |
 | `std` | Library crates are `#![no_std]` + `alloc`; host-only parts sit behind a default `std` feature. Dependencies are taken with `default-features = false` where they offer it. |
-| Structured on-disk data | CBOR via `ciborium`; deterministic encoding where AEAD authenticates it. |
+| Structured on-disk data | Binary records where the shape is known from the kind (WAL payloads included); positional, versioned CBOR via `ciborium` only for heterogeneous data (FORMAT-DESIGN§1.6). |
 | JSON | Never on disk; allowed in CLI output, logs and test fixtures. |
 | TOML | Human-edited configuration only (`pool.toml`, ontology modules). |
 | Content hash | BLAKE3. |
@@ -147,7 +147,7 @@ Logical types live in `mimisbrunnr-types`; each on-disk wire struct lives in the
 7. Borrow fields in place; no `read_unaligned`, no copying fields out to dodge alignment.
 8. Zero-copy and compact (FORMAT-DESIGN goal 1): a reader can borrow the struct, or a slice of them, in place from a mapped or read sector with `bytemuck::try_from_bytes` / `try_cast_slice`; no fixed-shape data on a read hot path goes through CBOR.
 
-Variable-shape data (CBOR values, module manifests, WAL payloads, placement rule parameters) uses `serde` derives with `ciborium`.
+Records with a variable part (WAL payloads) are a fixed head plus one array or byte string, encoded by hand (FORMAT-DESIGN§1.6). Heterogeneous data (`Value`, query ASTs, the ontology image, subscription records, placement-rule values) is positional CBOR with a leading schema version, through the `crates/types` helpers; derived `serde` field-name encodings never reach the disk.
 
 ## CRC and magic
 
