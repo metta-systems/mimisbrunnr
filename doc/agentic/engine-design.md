@@ -87,8 +87,11 @@ struct Superblock {                          // 4096 bytes total
     default_chunking_threshold: u64,         // [1112..1120] objects ≤ this size are never
                                              //              chunked regardless of policy
     default_chunking: ChunkParamsRecord,     // [1120..1136] 16 B (INDEX-DESIGN§4.3)
+    value_hash_secret: [u8; 16],             // [1136..1152] SipHash-2-4 key of value_hash
+                                             //              (INDEX-DESIGN§1.2); identical in
+                                             //              every member's superblock
 
-    _reserved: [u8; 2956],                   // [1136..4092] zeroed, available for future fields
+    _reserved: [u8; 2940],                   // [1152..4092] zeroed, available for future fields
     // trailing CRC32C at [4092..4096] lives inside BlockHeader's frame
 }
 

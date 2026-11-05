@@ -35,7 +35,7 @@ Each fixes a layout that later steps write; decide them first.
 
 - [OPERATIONS-D4](operations-decisions.md) — checksum algorithm.
 - [INDEX-D1](index-decisions.md) — object ids in bitmaps.
-- [INDEX-D2](index-decisions.md), [INDEX-D3](index-decisions.md) — where the `value_hash` secret lives; equality lookups under hash collisions.
+- [INDEX-D3](index-decisions.md) — equality lookups under hash collisions.
 - [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes.
 - [ALLOCATION-D1](allocation-decisions.md) — sub-bucket regions.
 - [ENGINE-D1](engine-decisions.md) — oplog persistence.
@@ -109,7 +109,7 @@ Independent of each other unless an order is given.
 
 ### 10. Cluster sync
 
-[CLUSTER1](cluster-implementation-plan.md) through [CLUSTER5](cluster-implementation-plan.md), [CLUSTER7](cluster-implementation-plan.md) (after CLUSTER-D5), then [CLUSTER6](cluster-implementation-plan.md).
+[CLUSTER1](cluster-implementation-plan.md) through [CLUSTER5](cluster-implementation-plan.md), [CLUSTER7](cluster-implementation-plan.md), then [CLUSTER6](cluster-implementation-plan.md).
 
 ### Parallel tracks
 

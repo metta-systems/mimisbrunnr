@@ -61,9 +61,12 @@ unix-path projection use case.
 ### 1.2 Value hash for KV index
 
 `value_hash(v) = SipHash-2-4(domain="mimir-kv", encode(v))` truncated to 64 bits. The type tag
-at the head of `encode(v)` keeps `Int(42)` from colliding with `Text("42")`. SipHash is keyed by a
-per-pool secret (stored in superblock-adjacent metadata, not the superblock itself) to defeat hash
-flooding.
+at the head of `encode(v)` keeps `Int(42)` from colliding with `Text("42")`. SipHash-2-4 is keyed
+by a 16-byte per-pool secret to defeat hash flooding: random bytes generated when the pool is
+created, stored as `Superblock.value_hash_secret` (ENGINE-DESIGN§1.1) identically in every
+member's superblock, and never changed, since every stored hash depends on it. The secret is
+local to the pool: `value_hash` never appears in data sent to other nodes
+([cluster-design.md](cluster-design.md)).
 
 ### 1.3 Scoped values
 

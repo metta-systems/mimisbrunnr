@@ -16,6 +16,7 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, and co
 - Snapshot diffs are the unit of sync; sync waits for [snapshots-design.md](snapshots-design.md).
 - Ordering across nodes uses `HybridTimestamp` (SPECIFICATION-DESIGN§10.4).
 - ObjectIds carry the writing node's `NodeId` in their top 16 bits.
+- **`value_hash` stays on its node.** Each pool hashes attribute values with its own secret (INDEX-DESIGN§1.2). Sync payloads carry attribute values, never `value_hash`; a receiver hashes them with its own secret. Bitmap-delta sync covers tag bitmaps only; KV index state converges through the assertion ops. No key is distributed between nodes.
 
 ## Format specification
 
