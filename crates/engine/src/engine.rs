@@ -566,7 +566,7 @@ impl Engine {
         &mut self,
         module: OntologyModule,
     ) -> Result<InstallResult, EngineError> {
-        let mut alloc = IdAllocator::starting_at(self.next_tag_id);
+        let mut alloc = IdAllocator::starting_at(self.next_free_tag_id());
         let res = self.ontology.install(module, &mut alloc)?;
         let max_id = self
             .ontology
@@ -585,13 +585,22 @@ impl Engine {
         self.ontology.names.get(name).copied()
     }
 
+    /// Lowest tag id above every id the ontology holds. `next_tag_id` alone
+    /// is not enough: it restarts at 1 when a pool is reopened, while the
+    /// ontology loads every previously allocated id. TODO(ONTOLOGY1): one
+    /// allocator, owned by `OntologyState`.
+    fn next_free_tag_id(&self) -> u32 {
+        let highest_existing = self.ontology.tags.keys().map(|tag| tag.raw()).max().unwrap_or(0);
+        self.next_tag_id.max(highest_existing + 1)
+    }
+
     /// Register an ad-hoc Label tag if absent. Returns the tag's id.
     pub fn register_tag(&mut self, name: &str) -> TagId {
         if let Some(existing) = self.resolve_tag_name(name) {
             return existing;
         }
-        let id = TagId::new(self.next_tag_id);
-        self.next_tag_id = self.next_tag_id.saturating_add(1);
+        let id = TagId::new(self.next_free_tag_id());
+        self.next_tag_id = id.raw().saturating_add(1);
         let def = TagDefinition {
             id,
             name: name.into(),

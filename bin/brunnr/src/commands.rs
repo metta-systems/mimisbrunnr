@@ -407,11 +407,13 @@ pub fn cmd_mount(
     );
 
     let mount_root = if let Some(ctx) = context {
+        // Context membership tags are named `unix-path-context:<name>`
+        // (SPECIFICATION-DESIGN§12.2).
         let tag_id = leaked
             .engine
             .ontology
             .names
-            .get(ctx)
+            .get(&format!("unix-path-context:{ctx}"))
             .copied()
             .filter(|tid| leaked.engine.path_contexts.projections.contains_key(tid))
             .ok_or_else(|| {

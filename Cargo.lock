@@ -3040,7 +3040,9 @@ dependencies = [
  "log",
  "mimisbrunnr",
  "rand 0.10.0",
+ "serde",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

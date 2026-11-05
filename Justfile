@@ -7,13 +7,18 @@
 
 # ── Configuration ────────────────────────────────────────────────────
 
-pool_dir   := justfile_directory() / ".demo-pool"
-pool_toml  := pool_dir / "pool.toml"
-fuse_dir   := justfile_directory() / "crates"
-fuse_ctx   := "mimisbrunnr-types-src"
-mimir      := "cargo run --quiet --bin mimir -- --pool " + pool_toml
-brunnr     := "cargo run --quiet --bin brunnr --"
-populate   := "cargo run --quiet --bin populate -- --pool " + pool_toml
+pool_dir    := justfile_directory() / ".demo-pool"
+pool_toml   := pool_dir / "pool.toml"
+disk_bytes  := "134217728"  # 128 MiB per disk
+# Importing all of `crates/` overflows the WAL ring before mimir's single
+# commit (no checkpoint cadence yet, JOURNAL4); the types crate fits.
+fuse_dir    := justfile_directory() / "crates" / "types"
+fuse_ctx    := "mimisbrunnr-types-src"
+fuse_mount  := "/tmp/mbrunnr-test"
+mimir       := "cargo run --quiet --bin mimir -- --pool " + pool_toml
+brunnr      := "cargo run --quiet --bin brunnr --"
+brunnr_fuse := "cargo run --quiet --features brunnr/fuse --bin brunnr --"
+populate    := "cargo run --quiet --bin populate -- --pool " + pool_toml
 
 _default:
     @just --list
@@ -40,44 +45,34 @@ pool-create:
     set -euo pipefail
     rm -rf "{{pool_dir}}"
     mkdir -p "{{pool_dir}}"
-    {{brunnr}} create \
-        "{{pool_dir}}/nvme.mbrunnr" \
-        "{{pool_dir}}/ssd.mbrunnr" \
-        "{{pool_dir}}/hdd.mbrunnr" \
-        --size-mib 128 \
-        --tier hot --tier warm --tier cold
+    {{brunnr}} create --config "{{pool_toml}}" \
+        "{{pool_dir}}/nvme.mbrunnr:tier=hot:media=nvme:capacity={{disk_bytes}}" \
+        "{{pool_dir}}/ssd.mbrunnr:tier=warm:media=ssd:capacity={{disk_bytes}}" \
+        "{{pool_dir}}/hdd.mbrunnr:tier=cold:media=hdd:capacity={{disk_bytes}}"
 
-# Show pool status — zone layout, capacities, checkpoint LSN
+# Show pool status — disks, tiers, capacities, checkpoint LSN
 pool-status:
-    {{brunnr}} status \
-        "{{pool_dir}}/nvme.mbrunnr" \
-        "{{pool_dir}}/ssd.mbrunnr" \
-        "{{pool_dir}}/hdd.mbrunnr"
+    {{brunnr}} status --config "{{pool_toml}}"
 
 # Add a fourth disk to the pool
 pool-add-disk:
-    {{brunnr}} add-disk \
+    {{brunnr}} add-disk --config "{{pool_toml}}" \
         "{{pool_dir}}/archive.mbrunnr" \
-        --pool-disk "{{pool_dir}}/nvme.mbrunnr" \
-        --size-mib 128 \
-        --tier glacier
+        --tier glacier \
+        --media hdd \
+        --capacity {{disk_bytes}}
 
 # Show status after adding a disk
-pool-status-after-add:
-    {{brunnr}} status \
-        "{{pool_dir}}/nvme.mbrunnr" \
-        "{{pool_dir}}/ssd.mbrunnr" \
-        "{{pool_dir}}/hdd.mbrunnr" \
-        "{{pool_dir}}/archive.mbrunnr"
+pool-status-after-add: pool-status
 
 # ── Ontology Setup (mimir) ──────────────────────────────────────────
 
-# Load ontology from TOML module file
+# Install the demo ontology module
 ontology-load:
-    @echo "=== Loading ontology module ==="
-    {{mimir}} ontology load demo-data/demo-labels.toml
+    @echo "=== Installing ontology module ==="
+    {{mimir}} ontology install demo-data/demo-labels.toml
 
-# List all registered tags and their implications
+# List installed ontology modules
 ontology-list:
     @echo "=== Ontology ==="
     {{mimir}} ontology list
@@ -85,9 +80,9 @@ ontology-list:
 # Full ontology setup
 ontology-setup: ontology-load ontology-list
 
-# ── Object Operations (mimir) ───────────────────────────────────────
+# ── Object Operations (populate) ─────────────────────────────────────
 
-# Use manifest to create objects and tag them — simulates adding music tracks
+# Create the music-collection objects (and generated content) from the manifest
 populate-objects:
     {{populate}} demo-data/demo-objects.toml
 
@@ -98,49 +93,32 @@ run-queries:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    echo ""
-    echo "=== Query: all electronic ==="
-    {{mimir}} query "electronic"
+    run() {
+        echo ""
+        echo "=== Query: $1 ==="
+        {{mimir}} query "$2"
+    }
 
-    echo ""
-    echo "=== Query: electronic AND ambient ==="
-    {{mimir}} query "electronic AND ambient"
-
-    echo ""
-    echo "=== Query: all favorites ==="
-    {{mimir}} query "favorite"
-
-    echo ""
-    echo "=== Query: electronic AND NOT ambient (non-ambient electronic) ==="
-    {{mimir}} query "electronic AND NOT ambient"
-
-    echo ""
-    echo "=== Query: electronic AND NOT discontinued ==="
-    {{mimir}} query "electronic AND NOT discontinued"
-
-    echo ""
-    echo "=== Query: all media (tests implication: electronic→media, rock→media, etc.) ==="
-    {{mimir}} query "media"
-
-    echo ""
-    echo "=== Query: artist=\"Aphex Twin\" ==="
-    {{mimir}} query 'artist="Aphex Twin"'
-
-    echo ""
-    echo "=== Query: year=1998 ==="
-    {{mimir}} query "year:1998"
+    run "all electronic" '(tag electronic)'
+    run "electronic AND ambient" '(and (tag electronic) (tag ambient))'
+    run "all favorites" '(tag favorite)'
+    run "electronic AND NOT ambient" '(and (tag electronic) (not (tag ambient)))'
+    run "electronic AND NOT discontinued" '(and (tag electronic) (not (tag discontinued)))'
+    run "all media (implication: electronic→media, rock→media, …)" '(isa media)'
+    run 'artist = "Aphex Twin"' '(attr artist = "Aphex Twin")'
+    run "year = 1998" '(attr year = 1998)'
 
 # ── Object Inspection ────────────────────────────────────────────────
 
-# Show info on each object — all assertions, direct and materialized
+# Show info on the manifest's six explicit objects — direct and materialized assertions
 inspect-objects:
     #!/usr/bin/env bash
     set -euo pipefail
 
-    for i in 0 1 2 3 4 5; do
+    for i in 1 2 3 4 5 6; do
         echo ""
-        echo "=== Object $i ==="
-        {{mimir}} info --object $i
+        echo "=== Object obj:$i ==="
+        {{mimir}} info "obj:$i"
     done
 
 # ── Untagging ────────────────────────────────────────────────────────
@@ -151,26 +129,26 @@ demo-untag:
     set -euo pipefail
 
     echo "=== Before untag: favorites ==="
-    {{mimir}} query "favorite"
+    {{mimir}} query '(tag favorite)'
 
     echo ""
-    echo "=== Removing 'favorite' from object 2 (Pink Floyd) ==="
-    {{mimir}} untag --object 2 favorite
+    echo "=== Removing 'favorite' from obj:3 (Pink Floyd) ==="
+    {{mimir}} untag obj:3 favorite
 
     echo ""
     echo "=== After untag: favorites ==="
-    {{mimir}} query "favorite"
+    {{mimir}} query '(tag favorite)'
 
 # ── Project Import ───────────────────────────────────────────────────
 
-# Import the mimisbrunnr source tree as a path projection
-# Note: project tree is in same process as import (context is in-memory for now)
+# Import the mimisbrunnr-types source tree as a path projection
 import-source:
     #!/usr/bin/env bash
     set -euo pipefail
 
     echo "=== Importing source tree ==="
-    {{mimir}} project import {{fuse_dir}} --context {{fuse_ctx}}
+    {{mimir}} project create-context {{fuse_ctx}}
+    {{mimir}} project import "{{fuse_dir}}" --context {{fuse_ctx}}
 
 # ── Full Demo ────────────────────────────────────────────────────────
 
@@ -180,11 +158,13 @@ demo: build pool-create pool-status ontology-setup populate-objects run-queries 
     @echo "═══════════════════════════════════════════════════"
     @echo "  Demo complete! Pool is at: {{pool_dir}}"
     @echo "  Try running queries yourself:"
-    @echo "    {{mimir}} query \"electronic AND ambient\""
-    @echo "    {{mimir}} info --object 0"
+    @echo "    {{mimir}} query '(and (tag electronic) (tag ambient))'"
+    @echo "    {{mimir}} info obj:1"
     @echo "    {{mimir}} ontology list"
+    @echo "    {{mimir}} sql"
     @echo "═══════════════════════════════════════════════════"
 
+# Populate the demo pool and open the interactive SQL REPL
 demo-sql: build pool-create ontology-setup populate-objects
     @echo ""
     @echo "═══════════════════════════════════════════════════"
@@ -192,21 +172,22 @@ demo-sql: build pool-create ontology-setup populate-objects
     @echo "═══════════════════════════════════════════════════"
     {{mimir}} sql
 
+# Populate the demo pool and mount the imported source tree via FUSE (needs macFUSE / libfuse)
 demo-fuse: build pool-create ontology-setup populate-objects import-source && demo-fuse-unmount
     @echo ""
     @echo "═══════════════════════════════════════════════════"
-    @echo " cd /tmp/mbrunnr-test and cd and ls around"
+    @echo " cd {{fuse_mount}} and cd and ls around"
     @echo "═══════════════════════════════════════════════════"
     @echo ""
     # - `RUST_LOG=mimisbrunnr_engine=trace` — just engine operations
     # - `RUST_LOG=mimisbrunnr_fuse=trace` — just FUSE calls
     # - `RUST_LOG=mimisbrunnr_storage::file_device=trace` — just physical I/O
     # Mount it as a FUSE filesystem
-    -env RUST_LOG=trace,mimisbrunnr_fuse=info,fuser=info {{brunnr}} mount-unix /tmp/mbrunnr-test --pool {{pool_toml}} --context {{fuse_ctx}}
+    -env RUST_LOG=trace,mimisbrunnr_fuse=info,fuser=info {{brunnr_fuse}} mount-unix "{{fuse_mount}}" --config "{{pool_toml}}" --context {{fuse_ctx}}
 
 # Unmount after exiting FUSE driver
 demo-fuse-unmount:
-    diskutil unmount /tmp/mbrunnr-test
+    {{brunnr}} unmount "{{fuse_mount}}"
 
 # Clean up demo artifacts
 clean-demo:

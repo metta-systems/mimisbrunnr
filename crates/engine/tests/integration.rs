@@ -440,6 +440,37 @@ fn disk_engine_create_open_round_trip_preserves_tag() {
 }
 
 #[test]
+fn tag_ids_never_reused_after_reopen() {
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+    let (car, vehicle) = install_car_vehicle(&mut de.engine);
+    de.commit().unwrap();
+    drop(de);
+
+    let mut de = DiskEngine::open(&cfg_path).unwrap();
+    let adhoc = de.engine.register_tag("adhoc");
+    assert_ne!(adhoc, car);
+    assert_ne!(adhoc, vehicle);
+    de.engine
+        .install_ontology_module(OntologyModule {
+            id: "extra".into(),
+            version: "0.1".into(),
+            name: "extra".into(),
+            tags: vec![label("boat")],
+            implications: vec![],
+            relations: vec![],
+        })
+        .unwrap();
+    let boat = de.engine.resolve_tag_name("boat").unwrap();
+    assert!(![car, vehicle, adhoc].contains(&boat));
+    // Earlier names still resolve to their original ids.
+    assert_eq!(de.engine.resolve_tag_name("car"), Some(car));
+    assert_eq!(de.engine.resolve_tag_name("vehicle"), Some(vehicle));
+}
+
+#[test]
 fn disk_engine_read_blob_round_trips_in_memory() {
     let tmp = TempDir::new().unwrap();
     let (cfg, cfg_path) = small_pool(&tmp);

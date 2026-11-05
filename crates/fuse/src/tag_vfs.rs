@@ -911,6 +911,19 @@ mod tests {
     }
 
     #[test]
+    fn ctx_root_inode_reroots_at_registered_context() {
+        let (state, tag_index, kv_index, forward_index, ctx_mgr, ctx_tag) =
+            build_state_with_ctx();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
+        let context_root = vfs.ctx_root_inode(ctx_tag).unwrap();
+        let names: Vec<String> = vfs.readdir(context_root).into_iter().map(|(name, _)| name).collect();
+        assert!(names.contains(&"boot".to_string()), "{names:?}");
+        assert!(names.contains(&"etc".to_string()), "{names:?}");
+        let electronic = state.names["electronic"];
+        assert_eq!(vfs.ctx_root_inode(electronic), None, "not a context");
+    }
+
+    #[test]
     fn ctx_root_readdir_lists_contexts() {
         let (state, tag_index, kv_index, forward_index, ctx_mgr, _ctx_tag) =
             build_state_with_ctx();

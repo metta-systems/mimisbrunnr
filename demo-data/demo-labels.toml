@@ -1,3 +1,8 @@
+[module]
+id = "systems.metta.demo-labels"
+version = "0.1.0"
+name = "Demo music labels"
+
 [[tags]]
 name = "electronic"
 semantics = "label"

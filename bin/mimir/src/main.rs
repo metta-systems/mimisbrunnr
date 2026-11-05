@@ -79,6 +79,13 @@ enum Commands {
     /// Run a query against the pool.
     Query(QueryArgs),
 
+    /// Run a SQL statement, or start an interactive SQL REPL when none is
+    /// given (statements end with `;`; `.help` lists commands).
+    Sql {
+        /// SQL SELECT statement. Omit to enter the REPL.
+        query: Option<String>,
+    },
+
     /// Faceted exploration around `<tag>`.
     Explore {
         tag: String,
@@ -279,6 +286,19 @@ fn run<W: Write>(
                 commands::run_query_sql(engine, out, &query, explain)?;
             } else {
                 commands::run_query_sexpr(engine, out, &query, explain)?;
+            }
+            Ok(false)
+        }
+
+        Commands::Sql { query } => {
+            match query {
+                Some(sql) => commands::run_query_sql(engine, out, &sql, false)?,
+                None => commands::run_sql_repl(
+                    engine,
+                    io::stdin().lock(),
+                    out,
+                    &mut io::stderr().lock(),
+                )?,
             }
             Ok(false)
         }

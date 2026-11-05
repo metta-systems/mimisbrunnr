@@ -76,9 +76,9 @@ enum Commands {
 
     /// Mount a single path-context subtree (feature = "fuse").
     ///
-    /// This currently mounts the *entire* filesystem; the requested context
-    /// appears under `<mountpoint>/ctx/<context>`. Subtree-only mounts:
-    /// TODO(UNIX7).
+    /// The mount root is the context's directory: `<mountpoint>/<path>` is the
+    /// object projected at `<path>` in `<context>` (as created by
+    /// `mimir project create-context <context>`).
     MountUnix {
         /// Mount point.
         mountpoint: PathBuf,

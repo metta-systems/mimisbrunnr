@@ -1,10 +1,16 @@
 //! `populate` — batch object generator for performance / functional testing.
 //!
-//! Given a config that describes how many objects to create and what tags /
-//! attributes / blob payloads to apply, populates a Mímisbrunnr pool with
-//! synthetic data. See `commands.rs` for the testable helpers.
+//! Two modes:
+//!
+//! - **Manifest** (`populate --pool <pool.toml> <manifest.toml>`): install
+//!   the manifest's ontology modules, create its explicit objects and generate
+//!   synthetic content objects. See `manifest.rs` for the format.
+//! - **Synthetic** (no manifest): create `--count` objects with tags,
+//!   attributes and blob payloads drawn from the `--*-pool` options. See
+//!   `commands.rs` for the testable helpers.
 
 mod commands;
+mod manifest;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,12 +25,20 @@ use crate::commands::{
 #[derive(Parser, Debug)]
 #[command(
     name = "populate",
-    about = "Batch-populate Mímisbrunnr objects with synthetic data"
+    about = "Batch-populate Mímisbrunnr objects from a manifest or with synthetic data"
 )]
 struct Cli {
     /// Path to the pool's `pool.toml`.
     #[arg(long)]
     pool: PathBuf,
+
+    /// Population manifest (TOML). When given, the synthetic-data options
+    /// other than `--seed` are ignored.
+    manifest: Option<PathBuf>,
+
+    /// Manifest mode: suppress per-object output.
+    #[arg(short, long)]
+    quiet: bool,
 
     /// Number of objects to create.
     #[arg(long, default_value_t = 1000)]
@@ -75,6 +89,26 @@ fn main() -> ExitCode {
     env_logger::init();
 
     let cli = Cli::parse();
+
+    if let Some(manifest_path) = &cli.manifest {
+        return match manifest::run_manifest(&cli.pool, manifest_path, cli.seed, cli.quiet) {
+            Ok(report) => {
+                println!(
+                    "populate: {} module(s), {} objects, {} tags, {} attrs, {} blob bytes",
+                    report.modules_installed,
+                    report.objects,
+                    report.tags_applied,
+                    report.attrs_set,
+                    report.blob_bytes,
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("populate: error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     let blob_distribution = match parse_blob_distribution(&cli.blob_distribution) {
         Ok(b) => b,

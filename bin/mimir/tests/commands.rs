@@ -270,6 +270,41 @@ fn query_sql_returns_same_set_as_sexpr() {
 }
 
 #[test]
+fn sql_repl_runs_multiline_statements_and_survives_errors() {
+    let f = Fixture::new();
+    let mut engine = f.open();
+    let oid = create_one(&mut engine);
+    commands::run_tag(
+        &mut engine,
+        &mut Cursor::new(Vec::new()),
+        &format!("obj:{}", oid.local_seq()),
+        &["electronic".into()],
+    )
+    .unwrap();
+
+    let input = ".help\n\
+                 SELECT * FROM objects\n  WHERE tag = 'electronic';\n\
+                 SELECT bogus;\n\
+                 .tags\n\
+                 SELECT COUNT(*) FROM objects WHERE tag = 'electronic';\n\
+                 .quit\n\
+                 SELECT * FROM objects WHERE tag = 'electronic';\n";
+    let mut prompts = Vec::new();
+    let out = capture(|w| {
+        commands::run_sql_repl(&mut engine, Cursor::new(input), w, &mut prompts).unwrap();
+    });
+
+    assert!(out.contains(".schema"), "help listed: {out}");
+    assert!(out.contains("(1 row)"), "multi-line statement ran: {out}");
+    assert!(out.contains("error: sql:"), "bad statement reported: {out}");
+    assert!(out.contains("electronic Label"), ".tags listed: {out}");
+    assert_eq!(out.matches("count=1").count(), 1, "statement after the error ran: {out}");
+    assert_eq!(out.matches("(1 row)").count(), 1, "nothing ran after .quit: {out}");
+    let prompts = String::from_utf8(prompts).unwrap();
+    assert!(prompts.contains("sql> ") && prompts.contains("  -> "), "{prompts}");
+}
+
+#[test]
 fn query_explain_does_not_execute() {
     let f = Fixture::new();
     let mut engine = f.open();

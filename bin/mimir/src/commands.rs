@@ -269,6 +269,97 @@ pub fn run_query_sql<W: Write>(
     Ok(())
 }
 
+/// `mimir sql` with no statement — interactive SQL REPL.
+///
+/// Reads statements from `input` (terminated by `;`, possibly spanning
+/// lines) and runs each through [`run_query_sql`]. Dot-commands at the start
+/// of a statement: `.help`, `.quit`, `.tables`, `.tags`, `.schema`. Prompts go
+/// to `prompt`, so piping SQL into the REPL keeps `out` clean. A failing
+/// statement prints its error and the REPL continues.
+pub fn run_sql_repl<R: std::io::BufRead, W: Write, P: Write>(
+    engine: &mut DiskEngine,
+    input: R,
+    out: &mut W,
+    prompt: &mut P,
+) -> CommandResult {
+    writeln!(prompt, "mimir sql — type SQL statements ending with `;`, or .help")?;
+    let mut statement = String::new();
+    let mut lines = input.lines();
+    loop {
+        write!(prompt, "{}", if statement.is_empty() { "sql> " } else { "  -> " })?;
+        prompt.flush()?;
+        let Some(line) = lines.next() else { break };
+        let line = line?;
+        let trimmed = line.trim();
+
+        if statement.is_empty() {
+            match trimmed {
+                "" => continue,
+                ".quit" | ".exit" | ".q" => break,
+                ".help" | ".h" => {
+                    write_sql_help(out)?;
+                    continue;
+                }
+                ".tables" => {
+                    writeln!(out, "objects  (the only table — every object in the pool)")?;
+                    continue;
+                }
+                ".tags" | ".schema" => {
+                    let attributes_only = trimmed == ".schema";
+                    let mut definitions: Vec<_> = engine.engine.ontology.tags.values().collect();
+                    definitions.sort_by(|left, right| left.name.cmp(&right.name));
+                    for definition in definitions {
+                        let is_attribute =
+                            matches!(definition.semantics, TagSemantics::Attribute { .. });
+                        if !attributes_only || is_attribute {
+                            writeln!(out, "  {} {:?}", definition.name, definition.semantics)?;
+                        }
+                    }
+                    continue;
+                }
+                dot if dot.starts_with('.') => {
+                    writeln!(out, "unknown command {dot}; try .help")?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        statement.push_str(&line);
+        statement.push('\n');
+        if statement.trim_end().ends_with(';') {
+            let sql = statement.trim().trim_end_matches(';').trim().to_string();
+            statement.clear();
+            if sql.is_empty() {
+                continue;
+            }
+            if let Err(error) = run_query_sql(engine, out, &sql, false) {
+                writeln!(out, "error: {error}")?;
+            }
+        }
+    }
+    writeln!(prompt)?;
+    Ok(())
+}
+
+fn write_sql_help<W: Write>(out: &mut W) -> CommandResult {
+    writeln!(out, "Commands:")?;
+    writeln!(out, "  .help     Show this help")?;
+    writeln!(out, "  .quit     Exit the REPL")?;
+    writeln!(out, "  .tables   List tables")?;
+    writeln!(out, "  .tags     List registered tags")?;
+    writeln!(out, "  .schema   List attribute tags and their value types")?;
+    writeln!(out)?;
+    writeln!(out, "Statements (see `mimisbrunnr-sql` for the full surface):")?;
+    writeln!(out, "  SELECT * FROM objects WHERE tag = 'electronic';")?;
+    writeln!(out, "  SELECT * FROM objects WHERE tag IN ('rock', 'jazz');")?;
+    writeln!(out, "  SELECT * FROM objects WHERE artist = 'Aphex Twin';")?;
+    writeln!(out, "  SELECT * FROM objects WHERE year >= 1990 AND NOT tag = 'favorite';")?;
+    writeln!(out, "  SELECT * FROM objects WHERE isa('media') LIMIT 10;")?;
+    writeln!(out, "  SELECT COUNT(*) FROM objects WHERE tag = 'ambient';")?;
+    Ok(())
+}
+
 /// `mimir explore <tag>` — faceted breakdown of objects carrying `tag`.
 pub fn run_explore<W: Write>(
     engine: &mut DiskEngine,
