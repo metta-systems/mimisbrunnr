@@ -31,6 +31,16 @@ Options:
 
 (a) is the shortest path to storing multi-megabyte objects and keeps reads zero-copy (one contiguous aligned extent per object); its cost is that space is reclaimed only after ENGINE3. Device writes (game saves) work under (a) as appends.
 
+## OPERATIONS-D6 — CBOR encoding shape and scope
+
+`ciborium` with `serde` derives writes every struct as a CBOR map keyed by its field-name strings, and every enum variant by name. Where CBOR is on disk this repeats names like `"oid"` and `"tag"` in every record: WAL op payloads (JOURNAL-DESIGN§1.3, about 30 op structs, most fixed-shape, such as `AddTag { oid, tag }`), the ontology image (ONTOLOGY-DESIGN§1), subscription records (SUBSCRIPTIONS-DESIGN§1), attribute `Value`s (INDEX-DESIGN§1 already specifies integer type tags 0–5, but `crates/types/src/value.rs` derives `Serialize`, so variants are written by name), the oplog, and the placement-rule list. That conflicts with the compactness requirement (FORMAT-DESIGN goal 1). Options, combinable:
+
+- **(a) Fixed-shape payloads leave CBOR.** WAL ops whose fields are all fixed-size become `#[repr(C)]` POD records, read in place; CBOR stays only for the genuinely heterogeneous ones (query ASTs, module images, `Value`).
+- **(b) Positional CBOR.** Structs that stay CBOR encode as arrays (or integer-keyed maps) and enum variants as integers, with the field order pinned in the format section, so no names reach the disk.
+- **(c) Status quo**, named maps.
+
+A change rewrites JOURNAL-DESIGN§1.3 and the CBOR schemas in the other format sections; the resulting plan items follow the decision. Shapes [JOURNAL7](journal-implementation-plan.md) (same entry layout pass) and [INDEX7](index-implementation-plan.md).
+
 ## Future work
 
 - None recorded.

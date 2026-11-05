@@ -19,9 +19,13 @@ Design: [engine-design.md](engine-design.md) · Decisions: [engine-decisions.md]
 - [ ] **ENGINE7 — Derive counters at boot.** `next_oid_local` from the object table, `last_applied_lsn` from the latest checkpoint; `next_tag_id` via [ONTOLOGY1](ontology-implementation-plan.md).
 - [ ] **ENGINE8 — Delete the legacy blob.** Remove `IndexBlob`, `INDEX_BLOB_MAGIC`, `LEGACY_CBOR_BLOB_OFFSET`, `read_index_blob`, `apply_index_blob`, `build_index_blob`. Prerequisites: ENGINE6, ENGINE7, [UNIX1](unix-implementation-plan.md), [BLOB6](blob-implementation-plan.md). Acceptance: format, insert tags, objects and a path context, commit, reopen: all state survives with no `MIXI` blob on disk.
 
+## Superblock
+
+- [ ] **ENGINE11 — Typed chunking defaults in the superblock.** `Superblock.default_chunking` is the INDEX-DESIGN§4.3 `ChunkParamsRecord` instead of 16 opaque bytes (`crates/storage/src/superblock.rs`); the struct lives in `crates/storage`, below both the superblock and the chunk list; `brunnr create` writes the format-time default and the write path reads it. Acceptance: a pool created with explicit chunking defaults reports them after reopen; the superblock byte image and its size assertion are unchanged.
+
 ## Device target
 
-- [ ] **ENGINE10 — `no_std` engine.** The engine and the crates below it build for `aarch64-unknown-none-softfloat` with default features off: `#![no_std]` + `alloc`, `hashbrown` or `BTreeMap` for `HashMap`, dependencies with `default-features = false`, `FileBlockDevice`, `PoolConfig` TOML, the module TOML loader and `petgraph` behind `std`. A single-disk pool opens from a `BlockDevice` and its superblock without `pool.toml`, through an offset view when the pool lives in a partition. A `just` recipe builds the `no_std` set. Prerequisites: OPERATIONS-D4, [BLOB2](blob-implementation-plan.md). Acceptance: a host test builds a partitioned SD-card image, writes `doom1.wad` into the pool partition with the `std` tools, opens it through the `no_std` API over a 512-byte-sector `BlockDevice` and reads the exact bytes by query.
+- [ ] **ENGINE10 — `no_std` engine.** The engine and the crates below it build for `aarch64-unknown-none-softfloat` with default features off: `#![no_std]` + `alloc`, `hashbrown` or `BTreeMap` for `HashMap`, dependencies with `default-features = false`, `FileBlockDevice`, the module TOML loader and `petgraph` behind `std`. The pool opens from the device set the caller supplies ([POOL7](pool-implementation-plan.md)). A `just` recipe builds the `no_std` set. Prerequisites: [JOURNAL7](journal-implementation-plan.md), POOL7, ENGINE8. Acceptance: a host test builds a partitioned SD-card image, writes `doom1.wad` into the pool partition with the `std` tools, opens it through the `no_std` API over a 512-byte-sector `BlockDevice` and reads the exact bytes by query.
 
 ## Zone growth
 

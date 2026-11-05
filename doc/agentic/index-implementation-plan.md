@@ -11,6 +11,7 @@ Design: [index-design.md](index-design.md) · Decisions: [index-decisions.md](in
 
 ## Capacity
 
+- [ ] **INDEX8 — Tag bitmaps beyond one page.** A tag whose roaring image exceeds one `TagBitmapPage` (4 036 bytes) is written as a `next_page` chain (INDEX-DESIGN§3.2) instead of failing with `TagBitmapPageError::Oversize`. Acceptance: a tag on 20 000 objects with scattered ids round-trips through flush and reopen; a corrupted middle page fails with the defined error.
 - [ ] **INDEX4 — KV index full capacity.** Live bucket split on overflow, directory doubling, spillover region for `global_depth ≥ 8`, bitmap pages allocated outside the directory region (current practical cap ≈ 62 entries at `global_depth = 0`). Prerequisite: [ALLOCATION1](allocation-implementation-plan.md). Acceptance: 1 000 entries grow the directory monotonically; a split re-inserts correctly; `global_depth ≥ 8` allocates spillover; every bitmap survives reload.
 
 ## Bitmap representation

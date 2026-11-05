@@ -13,4 +13,8 @@ Design: [journal-design.md](journal-design.md) · Decisions: [journal-decisions.
 - [ ] **JOURNAL5 — Compressed WAL entries.** `WAL_ENTRY_FLAG_COMPRESSED` is accepted on append and replay (zstd, compress before encrypt). Acceptance: compressed entries round-trip through replay.
 - [ ] **JOURNAL6 — WAL mirroring across hot disks.** Prerequisite: JOURNAL-D1.
 
+## Checksums
+
+- [ ] **JOURNAL7 — One checksum algorithm.** The WAL header and entries, blocks, regions, sorted runs, root pointers and superblocks all use the algorithm OPERATIONS-D4 selects, through one `no_std` implementation; the WAL's `crc32fast` (CRC-32 IEEE) goes, and so does `crc32c` if it is not the selected implementation. Prerequisite: OPERATIONS-D4. Acceptance: one checksum function in `crates/`; a flipped byte in each checksummed structure fails with its crate's defined error.
+
 Encrypted WAL entries: [ENCRYPTION3](encryption-implementation-plan.md).
