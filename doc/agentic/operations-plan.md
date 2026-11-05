@@ -39,8 +39,6 @@ Each fixes a layout that later steps write; decide them first.
 - [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes.
 - [ALLOCATION-D1](allocation-decisions.md) — sub-bucket regions.
 - [ENGINE-D1](engine-decisions.md) — oplog persistence.
-- [OPERATIONS-D5](operations-decisions.md) — blob path ahead of copy-on-write commit.
-
 ### 2. Binary formats that need no new allocation
 
 Independent of each other; any order.

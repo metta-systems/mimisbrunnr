@@ -17,20 +17,6 @@ Block, region, sorted-run, root-pointer and superblock checksums are CRC32C thro
 
 Criteria: error detection over 4 KiB blocks and 256 KiB regions, cost per byte on the device with and without the CRC instructions, `no_std` availability, header slot width (a width change is a format break). The choice fixes one algorithm for every checksum, the WAL included. Blocks [ENGINE10](engine-implementation-plan.md).
 
-## OPERATIONS-D5 — Blob path ahead of copy-on-write commit
-
-Object content does not reach the blob zone today: `DiskEngine` keeps every object's bytes in an in-memory `HashMap`, serialised into the legacy CBOR blob in the index zone (about 1 MiB of room at the minimum index-zone size), rewritten on every commit and loaded whole at mount. A 4 MiB file does not fit. Writing content to the blob zone is [BLOB1](blob-implementation-plan.md) (allocate space in the blob zone, write the bytes, record `ObjectLocation`, journal `WriteBlob` with the real extent) and reading it back [BLOB2](blob-implementation-plan.md).
-
-BLOB1 is sequenced after [ENGINE3](engine-implementation-plan.md), copy-on-write commit, which itself waits on [ALLOCATION1](allocation-implementation-plan.md) (sub-bucket regions, behind ALLOCATION-D1), [ENGINE1](engine-implementation-plan.md) and the B+ tree items. The reason: freeing and reusing blob space is only crash-safe once the allocator state, the location table and the root pointer commit atomically; the index regions are written in place at fixed offsets today, so a crash in the middle of a commit could leave a bucket marked free while a committed location still points into it.
-
-Options:
-
-- **(a) Append-only blob zone now.** BLOB1/BLOB2 land before ENGINE3 with a bump pointer: content is appended at the zone's high-water mark, 4 KiB-aligned and contiguous per object; the high-water mark is committed with the root; nothing in the blob zone is freed or reused until ENGINE3 and [METADATA6](metadata-implementation-plan.md). A crash before commit leaks only the uncommitted tail. Deletion leaves space allocated. The `BucketAllocator` takes over the blob zone with ENGINE3.
-- **(b) Use the `BucketAllocator` now** with the in-place commit, journalling each allocation in the `WriteBlob` entry so replay can repair allocator state. Frees become possible earlier, with the crash window above to close by replay logic that ENGINE3 later replaces.
-- **(c) Keep the current order**: content stays in the legacy blob until ENGINE3 lands.
-
-(a) is the shortest path to storing multi-megabyte objects and keeps reads zero-copy (one contiguous aligned extent per object); its cost is that space is reclaimed only after ENGINE3. Device writes (game saves) work under (a) as appends.
-
 ## OPERATIONS-D6 — CBOR encoding shape and scope
 
 `ciborium` with `serde` derives writes every struct as a CBOR map keyed by its field-name strings, and every enum variant by name. Where CBOR is on disk this repeats names like `"oid"` and `"tag"` in every record: WAL op payloads (JOURNAL-DESIGN§1.3, about 30 op structs, most fixed-shape, such as `AddTag { oid, tag }`), the ontology image (ONTOLOGY-DESIGN§1), subscription records (SUBSCRIPTIONS-DESIGN§1), attribute `Value`s (INDEX-DESIGN§1 already specifies integer type tags 0–5, but `crates/types/src/value.rs` derives `Serialize`, so variants are written by name), the oplog, and the placement-rule list. That conflicts with the compactness requirement (FORMAT-DESIGN goal 1). Options, combinable:

@@ -12,6 +12,7 @@ Object content lives in blob-zone buckets, located through `ObjectLocation`, wri
 ## Selected design
 
 - **Write:** allocate a blob bucket, append the transformed bytes, journal `WriteBlob` with the real extent, record `ObjectLocation` and its backpointer.
+- **Blob space comes only from the bucket allocator under copy-on-write commit.** Allocator state, locations and the root pointer commit atomically, so freed blob space is never reused while a committed location still points into it. There is no interim append-only or replay-repaired allocation path.
 - **Read:** `DiskEngine::read_blob` walks `ObjectLocation`, reads the extent and inverts the pipeline.
 - **Chunked objects:** follow the JOURNAL-DESIGN§1.3.1 WAL sequence (`ChunkInsertBatch`, `ChunkListAppend`, `ChunkListReplace`, `ChunkListShrink`, `ChunkObjectFinalize`). Chunk lists are positional 256 KiB regions; the head region carries `BTREE_NODE_FLAG_HEAD_OF_CHAIN` and a `ChunkParamsRecord` after the header, and tail regions chain by a trailing `BlockRef`.
 - The chunking decision is made at write time from the resolved storage policy ([ontology-design.md](ontology-design.md)).

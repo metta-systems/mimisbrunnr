@@ -13,7 +13,7 @@ The WAL is the durability point for every mutation; B+ tree pages are flushed la
 
 - **Journal pins.** Each `LoadedNode` holds one `JournalPin { lsn_min, lsn_max, count }` over its pending journal. The checkpoint advances `read_cursor` only to `min(checkpoint_lsn, lowest live lsn_min)`.
 - **`JournalPin` lives in `mimisbrunnr-storage`**, beside `LoadedNode`; `mimisbrunnr-wal` depends on storage and uses that type. One definition only.
-- **Checkpoint cadence** is driven by WAL fill level (JOURNAL-DESIGN§1.4 thresholds), accumulated dirty bytes and elapsed time (30 s), on a `std::thread` driver (sync-only contract: no async runtime). `commit()` remains as a forced flush for tests and foreground sync points.
+- **Checkpoint cadence** is driven by WAL fill level (JOURNAL-DESIGN§1.4 thresholds), accumulated dirty bytes and elapsed time (30 s). The engine exposes `checkpoint` and a query of which band is due; it starts no thread. The embedder drives it — a `std`-gated helper thread on the host, the filesystem server's own thread or event loop on Vesper (sync-only contract: no async runtime). `commit()` remains as a forced flush for tests and foreground sync points.
 - **`FormatPromote`** (`WalOpKind::FormatPromote = 30`) journals a sorted-run format widening before the widened run is written; replay re-applies it before decoding later runs.
 - Compression and encryption flags on WAL entries follow JOURNAL-DESIGN§1.2: compress, then encrypt ([encryption-design.md](encryption-design.md)).
 
