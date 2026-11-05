@@ -40,7 +40,7 @@ Deletion walks `ObjectRecord.state` (`ObjectState`, discriminants pinned: `Activ
 3. **Blob reclaim**, once every peer has seen the deletion (step 4's watermark condition): `state = BlobReclaim`; a direct blob's extents are freed through the allocator (ALLOCATION-DESIGN§1), a chunked blob's chunk references are decremented and chunks reaching zero are freed (INDEX-DESIGN§4.3), and the location record is cleared. Waiting protects a peer still hydrating the blob, and freeing in the same commit that clears the location keeps a crash from leaving a committed location that points at freed space.
 4. **Tombstone expiry**, when every peer's sync watermark is past the deletion and the minimum grace period has elapsed (SPECIFICATION-DESIGN§7.2): `state = Cleared` and the rest of the record is zeroed. The slot stays allocated and the id is not reused; accumulation of cleared slots is [METADATA-D1](metadata-decisions.md).
 
-`Engine::delete_object` performs phases 1 and 2 together, synchronously, and removes the location record immediately without freeing extents; phases 3 and 4 do not exist yet ([METADATA6](metadata-implementation-plan.md), [METADATA-D3](metadata-decisions.md)).
+When phase 2 runs is [METADATA-D3](metadata-decisions.md); phases 3 and 4 are [METADATA6](metadata-implementation-plan.md).
 
 ### Deletion and cluster sync
 

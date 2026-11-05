@@ -44,7 +44,7 @@ HasTag(source) ∧ HasAttr(lang = rust) ∧ HasAttr(year > 2023)   tag index, KV
   → project name                                               forward index
 ```
 
-### Implemented surface
+### Surface
 
 ```sql
 SELECT * FROM objects WHERE tag = 'electronic';
@@ -59,7 +59,7 @@ SELECT * FROM objects WHERE tag = 'song' LIMIT 100 OFFSET 50;
 SELECT COUNT(*) FROM objects WHERE tag = 'electronics';
 ```
 
-`objects` is the only table: a schemaless table whose columns are attribute keys, read from the forward index. Mímisbrunnr-specific predicates are functions (`isa`, `related`) so the stock dialect parses them. Results are object ids or a count; everything else returns `SqlError::Unsupported`.
+`objects` is the only table: a schemaless table whose columns are attribute keys, read from the forward index. Mímisbrunnr-specific predicates are functions (`isa`, `related`) so the stock dialect parses them. Statements outside the surface and its planned post-operations return `SqlError::Unsupported`.
 
 ### Post-operations
 

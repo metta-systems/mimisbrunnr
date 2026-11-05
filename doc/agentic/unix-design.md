@@ -37,17 +37,17 @@ vesper (kernel binary)    project=vesper component=kernel executable stripped cu
 
 A debug build is a different object with its own content hash and its own projections (`Scoped(jtag-debug, "/tftp/vesper.elf")`), never a second path on the release object. Every projection of an object serves the same blob; generating a projection copies nothing inside the pool.
 
-**Attribute tags.** The `systems.metta.unix-interop` module declares `unix-path` (attribute, text), `unix-mode`, `unix-uid`, `unix-gid` (attributes, int). A `Scoped` value satisfies an attribute's `value_type` when its inner value does, and its scope must be a `Grouping` tag; this validation is not enforced yet ([UNIX8](unix-implementation-plan.md)).
+**Attribute tags.** The `systems.metta.unix-interop` module declares `unix-path` (attribute, text), `unix-mode`, `unix-uid`, `unix-gid` (attributes, int). A `Scoped` value satisfies an attribute's `value_type` when its inner value does, and its scope must be a `Grouping` tag ([UNIX8](unix-implementation-plan.md)).
 
 **Directories are virtual.** Intermediate directories (`/usr/bin/`) are synthesised from the path set when projecting; no directory objects exist.
 
 ## Export
 
-Export walks a context's members in the order of its `Ordered` tag store (INDEX-DESIGN§3.3), resolves each member's paths and mode/uid/gid as above (mode defaulting to `0o644`), and collects every parent directory of every path. It emits the directories first (`0o755`), then the files. An object with several paths in the context is written once as a regular file at its lexicographically first path and as hardlinks at the others; a target that lacks hardlinks gets copies. A member with no path in the context is an error. `Exporter` (`crates/unix/src/export.rs`) plans and writes a host directory today; archive formats are [UNIX9](unix-implementation-plan.md).
+Export walks a context's members in the order of its `Ordered` tag store (INDEX-DESIGN§3.3), resolves each member's paths and mode/uid/gid as above (mode defaulting to `0o644`), and collects every parent directory of every path. It emits the directories first (`0o755`), then the files. An object with several paths in the context is written once as a regular file at its lexicographically first path and as hardlinks at the others; a target that lacks hardlinks gets copies. A member with no path in the context is an error. Targets are a host directory or an archive ([UNIX9](unix-implementation-plan.md)).
 
 ## Import
 
-Import walks a host tree. Each file's content is hashed (BLAKE3); a file whose content already exists in the pool reuses that object, otherwise a new object is created. The object is tagged with the context and gains `Attr(unix-path, Scoped(context, <relative path>))`, plus scoped mode, uid and gid. With auto-tagging, path and extension conventions add tags such as `lang=rust`, `source`, `test`, `documentation` (the conventions are independent of projection). The report counts created and deduplicated objects. `Importer` (`crates/unix/src/import.rs`) produces the entries; the engine creates one object per file without reading content into the blob store or deduplicating ([UNIX10](unix-implementation-plan.md)).
+Import walks a host tree. Each file's content is hashed (BLAKE3); a file whose content already exists in the pool reuses that object, otherwise a new object is created. The object is tagged with the context and gains `Attr(unix-path, Scoped(context, <relative path>))`, plus scoped mode, uid and gid. With auto-tagging, path and extension conventions add tags such as `lang=rust`, `source`, `test`, `documentation` (the conventions are independent of projection). The report counts created and deduplicated objects. `Importer` (`crates/unix/src/import.rs`) walks the tree; the engine creates the objects ([UNIX10](unix-implementation-plan.md)).
 
 ## FUSE bridge
 
@@ -55,7 +55,7 @@ For tools that need real paths, `brunnr mount-unix --context <name>` mounts one 
 
 ## CLI
 
-Implemented in `bin/mimir`: `mimir project create-context <name> | list-contexts | set-path <oid> <ctx> <path> | tree <ctx> | import <dir> --context <ctx> | export <ctx> -o <out> [--oid <oid>]`, and `brunnr mount-unix`. Further commands and flags are [UNIX-D4](unix-decisions.md).
+Commands: `mimir project create-context <name> | list-contexts | set-path <oid> <ctx> <path> | tree <ctx> | import <dir> --context <ctx> | export <ctx> -o <out> [--oid <oid>]`, and `brunnr mount-unix`. Further commands and flags are [UNIX-D4](unix-decisions.md).
 
 ## Rejected alternatives
 

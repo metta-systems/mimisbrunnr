@@ -10,8 +10,11 @@ cluster-sync layer.
 
 Goals:
 
-1. **Zero-copy access.** A `mmap()` of any zone returns directly castable, naturally aligned
-   structures. No deserialisation step on the hot path.
+1. **Zero-copy, compact access.** The pool is a filesystem read as disk sectors, often mapped as
+   memory pages. A mapping of any zone yields naturally aligned structures a reader borrows in
+   place (`&T`, `&[T]`) — no copy and no deserialisation on the hot path (object lookup, tag and
+   attribute lookup, query evaluation, blob read). Layouts are compact: no framing, padding or
+   indirection a fixed layout can avoid.
 2. **Format evolution.** Every persistent structure carries a version tag and a length so newer
    readers can skip unknown trailing fields and older readers can refuse cleanly.
 3. **Atomic root updates.** Mutations land in the WAL, then in shadowed (alternating) root blocks.

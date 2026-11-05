@@ -137,6 +137,7 @@ Logical types live in `mimisbrunnr-types`; each on-disk wire struct lives in the
 5. Field offsets commented inline as `// [a..b]`.
 6. No `transmute`; use `bytemuck::cast`, `cast_slice`, `from_bytes`.
 7. Copy packed multi-byte fields to a local (`let x = { header.field };`) before use.
+8. Zero-copy and compact (FORMAT-DESIGN goal 1): a reader can borrow the struct, or a slice of them, in place from a mapped or read sector with `bytemuck::try_from_bytes` / `try_cast_slice`; no fixed-shape data on a read hot path goes through CBOR.
 
 Variable-shape data (CBOR values, module manifests, WAL payloads, placement rule parameters) uses `serde` derives with `ciborium`.
 

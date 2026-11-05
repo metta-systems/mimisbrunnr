@@ -13,7 +13,7 @@ A subscription is a saved query plus a cursor; every mutation updates matching s
 
 - **Per-record tree.** One sorted-run entry per subscription: key `(SubscriptionId: u64, snapshot: u32)` through the packed-key codec, value the CBOR `SubscriptionRecord` under `VARINT` value size.
 - **`next_id` is derived at boot** as `max(loaded ids)` (0 when empty); the allocator pre-bumps, so `next_id` equals the last assigned id.
-- **`cached_result`** is inline in the record until sub-bucket allocation exists; it then moves to a §8.2 `TagBitmapPage` chain referenced by `BlockRef`, so a cursor-only change does not rewrite the bitmap.
+- **`cached_result`** is inline in the record until sub-bucket allocation exists; it then moves to an INDEX-DESIGN§3.2 `TagBitmapPage` chain referenced by `BlockRef`, so a cursor-only change does not rewrite the bitmap.
 - Engine mutations call `set_membership` after re-evaluating each affected subscription's query; debounced events flush on `tick`.
 - Format changes are one-way: pools recreate.
 
@@ -45,7 +45,7 @@ The engine keeps an inverted index `tag_to_subs: TagId → [SubscriptionId]` ove
 | yes | yes | `TagAdded` / `TagRemoved` / `ContentChanged`, if the interest mask asks for it |
 | no | no | none |
 
-Object creation and deletion run the same check through `on_object_created` / `on_object_deleted` and report `Created` / `Deleted`. Dormant subscriptions are skipped; their cursor stays where it was. Cost per mutation is a hash lookup, one bitmap probe per listed subscription and a query evaluation only for those (SPECIFICATION-DESIGN§14.4). Today the hooks assume a single-tag query and treat any watched-tag add as entering; full re-evaluation is [SUBSCRIPTION3](subscriptions-implementation-plan.md).
+Object creation and deletion run the same check through `on_object_created` / `on_object_deleted` and report `Created` / `Deleted`. Dormant subscriptions are skipped; their cursor stays where it was. Cost per mutation is a hash lookup, one bitmap probe per listed subscription and a query evaluation only for those (SPECIFICATION-DESIGN§14.4). Full re-evaluation in every hook is [SUBSCRIPTION3](subscriptions-implementation-plan.md).
 
 ## Subscribe, lifecycle and boot
 
@@ -87,7 +87,7 @@ A build system watching sources wants one batch after a save-all, not one event 
 
 ## CLI
 
-Implemented in `bin/mimir`: `mimir watch register <name> <query> | list | drain <name> | unsubscribe <name> | stream <name>`. The intended surface, including catch-up reporting, is [SUBSCRIPTION-D4](subscriptions-decisions.md).
+Commands: `mimir watch register <name> <query> | list | drain <name> | unsubscribe <name> | stream <name>`. The intended surface, including catch-up reporting, is [SUBSCRIPTION-D4](subscriptions-decisions.md).
 
 ## Rejected alternatives
 

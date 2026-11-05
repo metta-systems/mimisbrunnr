@@ -31,7 +31,7 @@ Module management is package management applied to schemas: one app needs some t
 Install is all-or-nothing: `OntologyState::install` snapshots the state and restores it on any error. In order:
 
 1. **Duplicate module** — reinstalling an installed id fails (`ModuleAlreadyInstalled`); upgrade is a separate operation.
-2. **Tag conflicts** — a tag name that already exists with compatible semantics is shared (counted in `tags_skipped`); one with incompatible semantics fails the install, naming both modules and both semantics. Today the loader skips every existing name without comparing semantics ([ONTOLOGY5](ontology-implementation-plan.md)).
+2. **Tag conflicts** — a tag name that already exists with compatible semantics is shared (counted in `tags_skipped`); one with incompatible semantics fails the install, naming both modules and both semantics. ([ONTOLOGY5](ontology-implementation-plan.md))
 3. **Implications** — added by name; an edge that would close a cycle fails the install (`ImplicationDag::add_implication`).
 4. **Relations** — `mutex`, `requires` and `alias` edges by name; unknown names fail the install.
 5. **Storage-policy chain invariant** — SPECIFICATION-DESIGN§3.5.
@@ -51,7 +51,7 @@ An upgrade diffs the installed module against the new version (SPECIFICATION-DES
 | Remove tag that objects carry | Blocked; the report lists the tag and its object count. Proceeds only with `--force`. |
 | Change tag semantics or attribute value type | Blocked; the report carries a migration plan (tag, old semantics, new semantics). Proceeds only with `--force`. |
 
-`OntologyState::upgrade` implements the additive rows and refuses removals and semantics changes outright ([ONTOLOGY8](ontology-implementation-plan.md)).
+Blocked-change reporting and `--force` are [ONTOLOGY8](ontology-implementation-plan.md).
 
 **De-materialisation.** When `A → B` disappears, an object loses `B` only if nothing else still provides it:
 
@@ -72,7 +72,7 @@ Removing a module drops its definitions, implications and relations; what happen
 - **RemoveUnique** — tags no other installed module registered are removed from every object and from the ontology; shared tags stay.
 - **Purge** — every tag the module registered is removed from every object and from the ontology.
 
-Every policy de-materialises the module's implications. `OntologyState::scrub` implements RemoveUnique on the ontology state only, with no object-side effect and no policy choice ([ONTOLOGY9](ontology-implementation-plan.md)).
+Every policy de-materialises the module's implications ([ONTOLOGY9](ontology-implementation-plan.md)).
 
 Orphans as the CLI presents them:
 
@@ -95,7 +95,7 @@ Ontology changes travel inside a `SyncBundle` as its `ontology_delta`, next to t
 
 ### CLI
 
-Implemented in `bin/mimir`: `mimir ontology list | install <file> | remove <module> | orphans | show <tag> | adopt <tag> --into <module>`. Further commands are [ONTOLOGY-D6](ontology-decisions.md).
+Commands: `mimir ontology list | install <file> | remove <module> | orphans | show <tag> | adopt <tag> --into <module>`. Further commands are [ONTOLOGY-D6](ontology-decisions.md).
 
 ### Rejected alternatives
 

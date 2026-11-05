@@ -112,6 +112,15 @@ These apply to every slice and are never plan checkboxes.
 - When clarification is needed, keep the original text and add a separate, clearly labeled status note. Preserving intent does not promote it to approved design.
 - Ask before removing or substantively changing pre-existing design-intent comments. In the final diff audit, check for accidental comment loss and restore it.
 
+## Filesystem representation
+
+Mímisbrunnr is a filesystem: readers see the pool as disk sectors, often mapped as memory pages. Every format design and review checks these two requirements (FORMAT-DESIGN goal 1, `doc/agentic/operations-design.md` "On-disk struct discipline"):
+
+- **Zero-copy reads.** Fixed-shape structures can be used in place: a reader borrows `&T` / `&[T]` straight from a mapped or read sector (`bytemuck::try_from_bytes`, `try_cast_slice`) with no copy and no deserialisation. That means naturally aligned `#[repr(C)]` layouts, alignment no larger than their offset within the 4 KiB block guarantees, records that do not straddle a block boundary unless the format says how, and little-endian fields.
+- **Compact.** No framing, padding or indirection a fixed layout can avoid. CBOR only for genuinely heterogeneous payloads, and never on a read hot path (object lookup, tag or attribute lookup, query evaluation, blob read).
+
+A layout that needs deserialising to answer a lookup, or that a reader cannot borrow in place, is a format decision: name the trade-off when presenting it. These are design-time requirements; "Correctness before representation optimization" below still governs later size tuning.
+
 ## Correctness before representation optimization
 
 - Get identity, durability, crash consistency and spec conformance right first. Do not keep current struct sizes, inline representations or region caps at the expense of a correct design; add fields, records or regions when needed (with format approval).
