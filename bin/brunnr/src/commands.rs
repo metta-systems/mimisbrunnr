@@ -384,7 +384,12 @@ pub fn cmd_mount(
 ) -> Result<(), BrunnrError> {
     use mimisbrunnr_fuse::{ContentProvider, MimisbrunnrFs, MountRoot, TagVfs};
 
-    if !mountpoint.exists() {
+    // macFUSE's FSKit backend creates its own mountpoint (and `/Volumes` is
+    // not writable by ordinary users), so only pre-create it for the kernel
+    // backend.
+    if uses_fskit_backend(mount_options) {
+        log::debug!("FSKit backend: leaving creation of {} to macFUSE", mountpoint.display());
+    } else if !mountpoint.exists() {
         std::fs::create_dir_all(mountpoint)?;
     }
 
@@ -475,6 +480,14 @@ pub fn cmd_mount(
 #[cfg(feature = "fuse")]
 const MACFUSE_KERNEL_DEVICE: &str = "/dev/macfuse0";
 
+/// Whether the mount options select macFUSE's FSKit backend.
+#[cfg(feature = "fuse")]
+pub fn uses_fskit_backend(mount_options: &[String]) -> bool {
+    mount_options
+        .iter()
+        .any(|option| option.split(',').any(|part| part == "backend=fskit"))
+}
+
 /// Likely causes of a macFUSE mount failure. macFUSE's libfuse reports a
 /// failed `mount_macfuse` without an errno, which fuser turns into
 /// "Unspecified Error", so the cause has to be guessed from the host state.
@@ -484,11 +497,8 @@ pub fn macfuse_mount_hint(
     mount_options: &[String],
     mountpoint: &Path,
 ) -> String {
-    let uses_fskit = mount_options
-        .iter()
-        .any(|option| option.split(',').any(|part| part == "backend=fskit"));
     let mut hint = String::new();
-    if uses_fskit {
+    if uses_fskit_backend(mount_options) {
         hint.push_str(
             "\n  hint: FSKit backend requested; enable macFUSE under System Settings → General → \
              Login Items & Extensions → File System Extensions",
@@ -856,6 +866,8 @@ mod tests {
         assert!(macfuse_mount_hint(true, &[], mountpoint).is_empty());
 
         let fskit_options = ["ro,backend=fskit".to_string()];
+        assert!(uses_fskit_backend(&fskit_options));
+        assert!(!uses_fskit_backend(&["debug".to_string()]));
         let fskit_outside_volumes = macfuse_mount_hint(false, &fskit_options, mountpoint);
         assert!(fskit_outside_volumes.contains("File System Extensions"));
         assert!(fskit_outside_volumes.contains("/Volumes"));

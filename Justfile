@@ -14,9 +14,9 @@ disk_bytes  := "134217728"  # 128 MiB per disk
 # commit (no checkpoint cadence yet, JOURNAL4); the types crate fits.
 fuse_dir    := justfile_directory() / "crates" / "types"
 fuse_ctx    := "mimisbrunnr-types-src"
-fuse_mount  := "/tmp/mbrunnr-test"
+fuse_mount  := "/Volumes/mbrunnr-test"
 # Extra mount options, e.g. `just fuse_opts="-o backend=fskit" demo-fuse`.
-fuse_opts   := ""
+fuse_opts   := "-o backend=fskit"
 mimir       := "cargo run --quiet --bin mimir -- --pool " + pool_toml
 brunnr      := "cargo run --quiet --bin brunnr --"
 brunnr_fuse := "cargo run --quiet --features brunnr/fuse --bin brunnr --"
