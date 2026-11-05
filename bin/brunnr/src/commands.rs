@@ -480,6 +480,10 @@ pub fn cmd_mount(
 #[cfg(feature = "fuse")]
 const MACFUSE_KERNEL_DEVICE: &str = "/dev/macfuse0";
 
+/// App bundle that carries macFUSE's FSKit module; launching it registers the module.
+#[cfg(feature = "fuse")]
+const MACFUSE_APP: &str = "/Library/Filesystems/macfuse.fs/Contents/Resources/macfuse.app";
+
 /// Whether the mount options select macFUSE's FSKit backend.
 #[cfg(feature = "fuse")]
 pub fn uses_fskit_backend(mount_options: &[String]) -> bool {
@@ -499,10 +503,13 @@ pub fn macfuse_mount_hint(
 ) -> String {
     let mut hint = String::new();
     if uses_fskit_backend(mount_options) {
-        hint.push_str(
-            "\n  hint: FSKit backend requested; enable macFUSE under System Settings → General → \
-             Login Items & Extensions → File System Extensions",
-        );
+        // MFMount reports an unregistered extension as ENOENT and an unapproved
+        // one as a separate error, but can show neither dialog from a CLI.
+        hint.push_str(&format!(
+            "\n  hint: FSKit backend requested; register macFUSE's file system extension by \
+             launching {MACFUSE_APP} once (`open {MACFUSE_APP}`), then enable macFUSE under \
+             System Settings → General → Login Items & Extensions → File System Extensions"
+        ));
         if !mountpoint.starts_with("/Volumes") {
             hint.push_str(
                 "\n  hint: the FSKit backend may only mount under /Volumes; try a mountpoint there",
@@ -870,6 +877,7 @@ mod tests {
         assert!(!uses_fskit_backend(&["debug".to_string()]));
         let fskit_outside_volumes = macfuse_mount_hint(false, &fskit_options, mountpoint);
         assert!(fskit_outside_volumes.contains("File System Extensions"));
+        assert!(fskit_outside_volumes.contains("open /Library/Filesystems/macfuse.fs"));
         assert!(fskit_outside_volumes.contains("/Volumes"));
         assert!(!fskit_outside_volumes.contains("kernel extension"));
 
