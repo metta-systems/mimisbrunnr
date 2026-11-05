@@ -35,6 +35,7 @@ Each fixes a layout that later steps write; decide them first.
 
 - [OPERATIONS-D4](operations-decisions.md) — checksum algorithm.
 - [INDEX-D1](index-decisions.md) — object ids in bitmaps.
+- [INDEX-D2](index-decisions.md), [INDEX-D3](index-decisions.md) — where the `value_hash` secret lives; equality lookups under hash collisions.
 - [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes.
 - [ALLOCATION-D1](allocation-decisions.md) — sub-bucket regions.
 - [ENGINE-D1](engine-decisions.md) — oplog persistence.
@@ -52,6 +53,7 @@ Independent of each other unless an order is given.
 - [INDEX2](index-implementation-plan.md), [INDEX3](index-implementation-plan.md) — ordered and ranked tag stores.
 - [INDEX7](index-implementation-plan.md) — value-spill table.
 - [INDEX8](index-implementation-plan.md) — tag bitmaps beyond one page.
+- [INDEX10](index-implementation-plan.md) — stored `value_hash` secret; [INDEX11](index-implementation-plan.md) — collision-safe equality lookups.
 - [ENGINE11](engine-implementation-plan.md) — typed chunking defaults in the superblock.
 - [BTREE8](btree-implementation-plan.md) — codec-transparent region read.
 - [ONTOLOGY2](ontology-implementation-plan.md) — storage errors.
@@ -107,13 +109,13 @@ Independent of each other unless an order is given.
 
 ### 10. Cluster sync
 
-[CLUSTER1](cluster-implementation-plan.md) through [CLUSTER6](cluster-implementation-plan.md).
+[CLUSTER1](cluster-implementation-plan.md) through [CLUSTER5](cluster-implementation-plan.md), [CLUSTER7](cluster-implementation-plan.md) (after CLUSTER-D5), then [CLUSTER6](cluster-implementation-plan.md).
 
 ### Parallel tracks
 
 These touch disjoint code and can run whenever their prerequisites hold:
 
-- **Encryption:** [ENCRYPTION1](encryption-implementation-plan.md)–[ENCRYPTION4](encryption-implementation-plan.md), [ENCRYPTION6](encryption-implementation-plan.md) any time; [ENCRYPTION5](encryption-implementation-plan.md) after BLOB1.
+- **Encryption:** [ENCRYPTION1](encryption-implementation-plan.md)–[ENCRYPTION4](encryption-implementation-plan.md) any time; [ENCRYPTION6](encryption-implementation-plan.md) after INDEX10; [ENCRYPTION5](encryption-implementation-plan.md) after BLOB1.
 - **Journal flags:** [JOURNAL5](journal-implementation-plan.md), [JOURNAL6](journal-implementation-plan.md).
 - **Query and SQL:** [QUERY1](query-implementation-plan.md)–[QUERY10](query-implementation-plan.md) (QUERY5 after INDEX2; QUERY6 and QUERY9 after QUERY7; QUERY10 after QUERY4 and QUERY-D2).
 - **Subscriptions:** [SUBSCRIPTION3](subscriptions-implementation-plan.md)–[SUBSCRIPTION6](subscriptions-implementation-plan.md).
