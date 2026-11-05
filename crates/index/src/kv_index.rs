@@ -240,7 +240,7 @@ impl KvIndex {
                 )
             })
             .collect();
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by_key(|(key, _)| *key);
 
         let mut node: LoadedNode<KvIndexKey, KvIndexValue> =
             LoadedNode::new(BtreeKind::KvDirectory, 0, REGION_SIZE_LOG2);

@@ -13,7 +13,6 @@ itertools = { workspace = true }
 log = { workspace = true }
 mimisbrunnr-types = { workspace = true }
 serde = { workspace = true }
-serde_cbor = "0.9"
 smallvec = { workspace = true }
 static_assertions = { workspace = true }
 thiserror = { workspace = true }

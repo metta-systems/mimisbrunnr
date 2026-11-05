@@ -128,7 +128,7 @@ impl TagStore {
             members.insert((oid.to_u64() & 0xffff_ffff) as u32);
             ranked.push((oid, score));
             // Largest score first.
-            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            ranked.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
         }
     }
 

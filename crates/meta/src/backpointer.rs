@@ -69,7 +69,8 @@ impl BackpointerKey {
 impl PartialEq for BackpointerKey {
     fn eq(&self, other: &Self) -> bool {
         let (a_disk, a_bucket, a_sector) = (self.disk_id, self.bucket_no, self.sector_offset);
-        let (b_disk, b_bucket, b_sector) = (other.disk_id, other.bucket_no, other.sector_offset);
+        let (b_disk, b_bucket, b_sector) =
+            (other.disk_id, other.bucket_no, other.sector_offset);
         a_disk == b_disk && a_bucket == b_bucket && a_sector == b_sector
     }
 }
@@ -85,7 +86,8 @@ impl PartialOrd for BackpointerKey {
 impl Ord for BackpointerKey {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
         let (a_disk, a_bucket, a_sector) = (self.disk_id, self.bucket_no, self.sector_offset);
-        let (b_disk, b_bucket, b_sector) = (other.disk_id, other.bucket_no, other.sector_offset);
+        let (b_disk, b_bucket, b_sector) =
+            (other.disk_id, other.bucket_no, other.sector_offset);
         (a_disk, a_bucket, a_sector).cmp(&(b_disk, b_bucket, b_sector))
     }
 }
@@ -349,31 +351,34 @@ impl BackpointerTable {
     /// on `device`.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
-        device: &mut D,
+        device: &D,
         offset: u64,
     ) -> Result<(), MetaError> {
         let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<BackpointerKey, BackpointerValue>(device, offset, &mut node)
-            .map_err(MetaError::from)?;
+        BtreeRegion::write_full::<D, BackpointerKey, BackpointerValue>(
+            device, offset, &mut node,
+        )
+        .map_err(MetaError::from)?;
         Ok(())
     }
 
     /// Read the in-memory state from the 256 KiB region at byte `offset`
     /// on `device`. An all-zero region returns [`Self::default`].
     pub fn load_from_region<D: BlockDevice>(
-        device: &mut D,
+        device: &D,
         offset: u64,
     ) -> Result<Self, MetaError> {
         let mut probe = [0u8; 8];
-        device
-            .read_at(offset, &mut probe)
-            .map_err(MetaError::from)?;
+        device.read_at(offset, &mut probe).map_err(MetaError::from)?;
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node =
-            BtreeRegion::read_as_loaded_node::<BackpointerKey, BackpointerValue>(device, offset)
-                .map_err(MetaError::from)?;
+        let node = BtreeRegion::read::<D, BackpointerKey, BackpointerValue>(
+            device,
+            offset,
+            BtreeKind::Backpointer,
+        )
+        .map_err(MetaError::from)?;
         Ok(Self::from_loaded_node(&node))
     }
 }
@@ -543,7 +548,8 @@ mod tests {
 
     // ----- B+ tree region round-trip -----
 
-    use {mimisbrunnr_storage::FileBlockDevice, tempfile::TempDir};
+    use mimisbrunnr_storage::FileBlockDevice;
+    use tempfile::TempDir;
 
     fn fresh_device() -> (TempDir, FileBlockDevice) {
         let dir = TempDir::new().unwrap();
@@ -552,12 +558,7 @@ mod tests {
         (dir, dev)
     }
 
-    fn make_bp(
-        disk: u16,
-        bucket: u32,
-        sector: u16,
-        kind: OwnerKind,
-    ) -> (BackpointerKey, BackpointerValue) {
+    fn make_bp(disk: u16, bucket: u32, sector: u16, kind: OwnerKind) -> (BackpointerKey, BackpointerValue) {
         let k = BackpointerKey::new(disk, bucket, sector);
         let mut owner_key = [0u8; 16];
         owner_key[0..2].copy_from_slice(&disk.to_le_bytes());

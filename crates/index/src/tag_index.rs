@@ -188,7 +188,9 @@ impl<'de> Deserialize<'de> for TagIndexValue {
 mod serde_bytes_helper {
     use serde::de::{Error, SeqAccess, Visitor};
 
-    pub fn deserialize_bytes<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
+    pub fn deserialize_bytes<'de, D: serde::Deserializer<'de>>(
+        de: D,
+    ) -> Result<Vec<u8>, D::Error> {
         struct V;
         impl<'de> Visitor<'de> for V {
             type Value = Vec<u8>;
@@ -426,7 +428,9 @@ impl TagIndex {
                     ));
                 }
                 TagStore::Ranked { .. } => {
-                    return Err(IndexError::UnsupportedStoreKind(TagStoreKind::Ranked as u8));
+                    return Err(IndexError::UnsupportedStoreKind(
+                        TagStoreKind::Ranked as u8,
+                    ));
                 }
             }
         }
@@ -476,7 +480,12 @@ impl TagIndex {
             node.sorted_runs.push(run);
             node.header.sorted_run_count = 1;
         }
-        BtreeRegion::write_full::<TagIndexKey, TagIndexValue>(device, dir_offset, &mut node)?;
+        BtreeRegion::write_full_packed::<D, TagIndexKey, TagIndexValue>(
+            device,
+            dir_offset,
+            &mut node,
+            TAG_INDEX_VALUE_SIZE,
+        )?;
 
         Ok(next_page_slot)
     }
@@ -489,7 +498,7 @@ impl TagIndex {
     /// An all-zero directory region is treated as "empty index" and
     /// returns [`Self::default`].
     pub fn load_from_region<D: BlockDevice>(
-        device: &mut D,
+        device: &D,
         dir_offset: u64,
     ) -> Result<Self, IndexError> {
         let mut probe = [0u8; 8];
@@ -497,8 +506,12 @@ impl TagIndex {
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node =
-            BtreeRegion::read_as_loaded_node::<TagIndexKey, TagIndexValue>(device, dir_offset)?;
+        let node = BtreeRegion::read_packed::<D, TagIndexKey, TagIndexValue>(
+            device,
+            dir_offset,
+            BtreeKind::TagDirectory,
+            TAG_INDEX_VALUE_SIZE,
+        )?;
         let mut entries: Vec<(TagIndexKey, TagIndexValue)> = Vec::new();
         for (k, v) in node.merge_iter() {
             entries.push((*k, *v));
@@ -583,15 +596,16 @@ fn read_bitmap_chain<D: BlockDevice>(
     let zero = BlockRef::zeroed();
     while cur != zero {
         let offset = (cur.block_no as u64) * BLOCK_SIZE as u64;
-        let page =
-            TagBitmapPage::read(device, offset).map_err(|e| IndexError::Roaring(e.to_string()))?;
+        let page = TagBitmapPage::read(device, offset)
+            .map_err(|e| IndexError::Roaring(e.to_string()))?;
         buf.extend_from_slice(page.bitmap_slice());
         cur = page.next_link();
     }
     if buf.is_empty() {
         return Ok(RoaringBitmap::new());
     }
-    RoaringBitmap::deserialize_from(buf.as_slice()).map_err(|e| IndexError::Roaring(e.to_string()))
+    RoaringBitmap::deserialize_from(buf.as_slice())
+        .map_err(|e| IndexError::Roaring(e.to_string()))
 }
 
 /// Construct a `BlockRef` pointing at the 4 KiB block whose byte offset is
@@ -738,7 +752,8 @@ mod tests {
 
     // ----- B+ tree region round-trip (native path) -----
 
-    use {mimisbrunnr_storage::FileBlockDevice, tempfile::TempDir};
+    use mimisbrunnr_storage::FileBlockDevice;
+    use tempfile::TempDir;
 
     // Test layout: directory at offset 0 (256 KiB BTREE-DESIGN§1 region); bitmap
     // area starts at 256 KiB with capacity for 32 pages (128 KiB worth).
@@ -893,8 +908,8 @@ mod tests {
         };
         let zero = BlockRef::zeroed();
         while cur != zero {
-            let page =
-                TagBitmapPage::read(&dev, (cur.block_no as u64) * BLOCK_SIZE as u64).unwrap();
+            let page = TagBitmapPage::read(&dev, (cur.block_no as u64) * BLOCK_SIZE as u64)
+                .unwrap();
             chain_len += 1;
             cur = page.next_link();
             assert!(chain_len <= TEST_BITMAP_AREA_PAGES, "infinite loop guard");
@@ -917,12 +932,7 @@ mod tests {
             idx.add_member(t(tag_no), oid(0));
         }
         let err = idx
-            .flush_to_region(
-                &dev,
-                TEST_DIR_OFFSET,
-                TEST_BITMAP_AREA_OFFSET,
-                TEST_BITMAP_AREA_PAGES,
-            )
+            .flush_to_region(&dev, TEST_DIR_OFFSET, TEST_BITMAP_AREA_OFFSET, TEST_BITMAP_AREA_PAGES)
             .unwrap_err();
         assert!(matches!(err, IndexError::BitmapAreaExhausted { .. }));
     }

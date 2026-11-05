@@ -27,21 +27,12 @@ The order in which plan items across all scopes should land, by dependency. Task
 
 ## Sequence
 
-### 1. Restore the build
-
-The workspace does not compile: the B+ tree rewrite removed the packed-codec API and stubbed the region read. Several completed markers (btree, index, subscriptions) describe code paths that only work again after this phase.
-
-1. [BTREE1](btree-implementation-plan.md) — restore the packed region API.
-2. [BTREE2](btree-implementation-plan.md) — real `read_as_loaded_node`.
-3. [JOURNAL1](journal-implementation-plan.md) — one `JournalPin`.
-4. [BTREE3](btree-implementation-plan.md) — workspace build, tests and clippy green.
-
-### 2. Plan and process hygiene
+### 1. Plan and process hygiene
 
 1. [TOOLING2](tooling-implementation-plan.md) — `just clippy` lints test targets.
 2. [SPEC1](specification-implementation-plan.md), [SPEC2](specification-implementation-plan.md) — spec free of process language.
 
-### 3. Native layouts that need no new allocation
+### 2. Native layouts that need no new allocation
 
 Independent of each other; any order.
 
@@ -53,7 +44,7 @@ Independent of each other; any order.
 - [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator (after ONTOLOGY-D1).
 - [ALLOCATION2](allocation-implementation-plan.md) — freelist seeding at format time.
 
-### 4. Live tree machinery
+### 3. Live tree machinery
 
 1. [BTREE4](btree-implementation-plan.md) — covered key ranges (after BTREE-D2).
 2. [JOURNAL2](journal-implementation-plan.md) — WAL trim respects pins.
@@ -63,7 +54,7 @@ Independent of each other; any order.
 6. [JOURNAL4](journal-implementation-plan.md) — checkpoint cadence driver.
 7. [SUBSCRIPTION2](subscriptions-implementation-plan.md) — per-subscription COW check.
 
-### 5. Copy-on-write allocation
+### 4. Copy-on-write allocation
 
 1. [ALLOCATION1](allocation-implementation-plan.md) — sub-bucket regions (after ALLOCATION-D1).
 2. [ENGINE3](engine-implementation-plan.md) — COW commit.
@@ -77,34 +68,34 @@ Independent of each other; any order.
 10. [METADATA3](metadata-implementation-plan.md), [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup; [METADATA5](metadata-implementation-plan.md) — overflow records (after SPEC3).
 11. [INDEX6](index-implementation-plan.md) — footprint benchmark.
 
-### 6. Bitmap representation
+### 5. Bitmap representation
 
 [INDEX-D1](index-decisions.md), then [INDEX5](index-implementation-plan.md). Must land before snapshots and cluster sync; may move earlier if large pools are needed sooner.
 
-### 7. Blob zone and legacy blob retirement
+### 6. Blob zone and legacy blob retirement
 
 1. [BLOB1](blob-implementation-plan.md), [BLOB2](blob-implementation-plan.md), [BLOB5](blob-implementation-plan.md).
 2. [ENGINE5](engine-implementation-plan.md) — backpointers in the engine.
 3. [BLOB3](blob-implementation-plan.md), [BLOB4](blob-implementation-plan.md) — chunked objects, selective chunking.
 4. [BLOB6](blob-implementation-plan.md), [UNIX1](unix-implementation-plan.md), [ENGINE6](engine-implementation-plan.md) (after ENGINE-D1), [ENGINE7](engine-implementation-plan.md), then [ENGINE8](engine-implementation-plan.md) — no legacy blob.
 
-### 8. Snapshots
+### 7. Snapshots
 
 [SNAPSHOT1](snapshots-implementation-plan.md) through [SNAPSHOT6](snapshots-implementation-plan.md).
 
-### 9. Reconcile and allocation completeness
+### 8. Reconcile and allocation completeness
 
 [RECONCILE1](reconcile-implementation-plan.md) through [RECONCILE8](reconcile-implementation-plan.md), with [ALLOCATION7](allocation-implementation-plan.md), [ALLOCATION8](allocation-implementation-plan.md) and [POOL6](pool-implementation-plan.md) (disk evacuation); then [POOL2](pool-implementation-plan.md).
 
-### 10. Cluster sync
+### 9. Cluster sync
 
 [CLUSTER1](cluster-implementation-plan.md) through [CLUSTER6](cluster-implementation-plan.md).
 
 ### Parallel tracks
 
-These touch disjoint code and can run whenever their prerequisites hold, after phase 1:
+These touch disjoint code and can run whenever their prerequisites hold:
 
-- **Encryption:** [ENCRYPTION1](encryption-implementation-plan.md)–[ENCRYPTION4](encryption-implementation-plan.md), [ENCRYPTION6](encryption-implementation-plan.md) any time after phase 1; [ENCRYPTION5](encryption-implementation-plan.md) after BLOB1.
+- **Encryption:** [ENCRYPTION1](encryption-implementation-plan.md)–[ENCRYPTION4](encryption-implementation-plan.md), [ENCRYPTION6](encryption-implementation-plan.md) any time; [ENCRYPTION5](encryption-implementation-plan.md) after BLOB1.
 - **Journal flags:** [JOURNAL5](journal-implementation-plan.md), [JOURNAL6](journal-implementation-plan.md).
 - **Query and SQL:** [QUERY1](query-implementation-plan.md)–[QUERY8](query-implementation-plan.md) (QUERY5 after INDEX2).
 - **Subscriptions:** [SUBSCRIPTION3](subscriptions-implementation-plan.md)–[SUBSCRIPTION6](subscriptions-implementation-plan.md).

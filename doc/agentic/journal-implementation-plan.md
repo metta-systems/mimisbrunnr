@@ -2,10 +2,6 @@
 
 Design: [journal-design.md](journal-design.md) · Decisions: [journal-decisions.md](journal-decisions.md) · Order: [operations-plan.md](operations-plan.md)
 
-## Restore the build
-
-- [ ] **JOURNAL1 — One `JournalPin` type.** `JournalPin` is defined twice: `crates/wal/src/pin.rs` and `crates/storage/src/btree.rs`. Keep the storage definition (wal depends on storage), delete `crates/wal/src/pin.rs`, and use the storage type from wal. Part of [BTREE3](btree-implementation-plan.md).
-
 ## Pins and checkpoints
 
 - [ ] **JOURNAL2 — WAL trim respects pins.** `Wal` tracks live pins (`add_pin` / `release_pin` or an equivalent query of the engine's nodes); `checkpoint` advances `read_cursor` only to the lowest live `lsn_min`. Acceptance: push a journal entry without flushing, force a checkpoint, the WAL keeps the entry.

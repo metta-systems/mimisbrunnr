@@ -188,11 +188,11 @@ impl RangeIndex {
     /// [`BtreeRegion::write_full`].
     pub fn flush_to_region<D: BlockDevice>(
         &self,
-        device: &mut D,
+        device: &D,
         offset: u64,
     ) -> Result<(), IndexError> {
         let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<RangeIndexKey, RangeIndexValue>(device, offset, &mut node)?;
+        BtreeRegion::write_full::<D, RangeIndexKey, RangeIndexValue>(device, offset, &mut node)?;
         Ok(())
     }
 
@@ -200,7 +200,7 @@ impl RangeIndex {
     /// `device`. An all-zero region is treated as "empty index" and returns
     /// [`Self::default`].
     pub fn load_from_region<D: BlockDevice>(
-        device: &mut D,
+        device: &D,
         offset: u64,
     ) -> Result<Self, IndexError> {
         let mut probe = [0u8; 8];
@@ -208,8 +208,11 @@ impl RangeIndex {
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node =
-            BtreeRegion::read_as_loaded_node::<RangeIndexKey, RangeIndexValue>(device, offset)?;
+        let node = BtreeRegion::read::<D, RangeIndexKey, RangeIndexValue>(
+            device,
+            offset,
+            BtreeKind::Range,
+        )?;
         Self::from_loaded_node(&node)
     }
 }
@@ -224,7 +227,9 @@ impl RangeIndex {
 /// carries `snapshot = 0`. Sort order is `(tag_id, norm_key, snapshot)`
 /// — the derived `Ord` matches because field order is the same as
 /// declaration order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct RangeIndexKey {
     pub tag_id: u32,
     pub norm_key: NormalisedKey,
@@ -257,8 +262,8 @@ impl Serialize for RoaringBitmapSerde {
 impl<'de> Deserialize<'de> for RoaringBitmapSerde {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         let bytes: Vec<u8> = Vec::deserialize(de)?;
-        let bm =
-            RoaringBitmap::deserialize_from(bytes.as_slice()).map_err(serde::de::Error::custom)?;
+        let bm = RoaringBitmap::deserialize_from(bytes.as_slice())
+            .map_err(serde::de::Error::custom)?;
         Ok(Self(bm))
     }
 }
@@ -319,7 +324,8 @@ mod tests {
 
     // ----- B+ tree region round-trip -----
 
-    use {mimisbrunnr_storage::FileBlockDevice, tempfile::TempDir};
+    use mimisbrunnr_storage::FileBlockDevice;
+    use tempfile::TempDir;
 
     fn fresh_device() -> (TempDir, FileBlockDevice) {
         let dir = TempDir::new().unwrap();
@@ -442,8 +448,11 @@ mod tests {
         let mut idx = RangeIndex::new();
         idx.insert(t(1), &Value::Int(42), 1);
         idx.flush_to_region(&dev, 0).unwrap();
-        let res =
-            BtreeRegion::read::<_, RangeIndexKey, RangeIndexValue>(&dev, 0, BtreeKind::Forward);
+        let res = BtreeRegion::read::<_, RangeIndexKey, RangeIndexValue>(
+            &dev,
+            0,
+            BtreeKind::Forward,
+        );
         assert!(res.is_err());
     }
 }

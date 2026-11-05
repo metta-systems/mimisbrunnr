@@ -726,11 +726,10 @@ pub fn render_json(snap: &PoolSnapshot) -> String {
 }
 
 fn wal_used_percent(h: &WalHeaderView) -> u64 {
-    if h.data_capacity == 0 {
-        0
-    } else {
-        h.used_bytes.saturating_mul(100) / h.data_capacity
-    }
+    h.used_bytes
+        .saturating_mul(100)
+        .checked_div(h.data_capacity)
+        .unwrap_or(0)
 }
 
 fn format_bytes(bytes: u64) -> String {

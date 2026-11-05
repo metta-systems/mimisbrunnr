@@ -53,7 +53,7 @@ impl QueryParser {
         if cursor.pos < tokens.len() {
             return Err(QueryError::Parse {
                 position: cursor.pos,
-                message: format!("trailing token: {:?}", &tokens[cursor.pos]),
+                message: format!("trailing token: {:?}", tokens[cursor.pos]),
             });
         }
         Ok(q)

@@ -16,10 +16,8 @@
 //! snapshot)` with one `PlacementRule` per entry. `RootPointer.placement_rules_root`
 //! refers to this region.
 
-use {
-    mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
-    mimisbrunnr_types::PlacementRule,
-};
+use mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun};
+use mimisbrunnr_types::PlacementRule;
 
 use crate::error::PoolError;
 
@@ -84,18 +82,18 @@ pub fn placement_rules_from_loaded_node(
 /// `device`.
 pub fn flush_placement_rules_to_region<D: BlockDevice>(
     rules: &[PlacementRule],
-    device: &mut D,
+    device: &D,
     offset: u64,
 ) -> Result<(), PoolError> {
     let mut node = placement_rules_to_loaded_node(rules);
-    BtreeRegion::write_full::<u32, Vec<PlacementRule>>(device, offset, &mut node)?;
+    BtreeRegion::write_full::<D, u32, Vec<PlacementRule>>(device, offset, &mut node)?;
     Ok(())
 }
 
 /// Read the rule list from the 256 KiB region at byte `offset` on
 /// `device`. An all-zero region returns `Vec::new()`.
 pub fn load_placement_rules_from_region<D: BlockDevice>(
-    device: &mut D,
+    device: &D,
     offset: u64,
 ) -> Result<Vec<PlacementRule>, PoolError> {
     let mut probe = [0u8; 8];
@@ -103,7 +101,11 @@ pub fn load_placement_rules_from_region<D: BlockDevice>(
     if probe.iter().all(|&b| b == 0) {
         return Ok(Vec::new());
     }
-    let node = BtreeRegion::read_as_loaded_node::<u32, Vec<PlacementRule>>(device, offset)?;
+    let node = BtreeRegion::read::<D, u32, Vec<PlacementRule>>(
+        device,
+        offset,
+        BtreeKind::PlacementRules,
+    )?;
     Ok(placement_rules_from_loaded_node(&node))
 }
 
@@ -150,7 +152,8 @@ mod tests {
 
     // ----- B+ tree region round-trip -----
 
-    use {mimisbrunnr_storage::FileBlockDevice, tempfile::TempDir};
+    use mimisbrunnr_storage::FileBlockDevice;
+    use tempfile::TempDir;
 
     fn fresh_device() -> (TempDir, FileBlockDevice) {
         let dir = TempDir::new().unwrap();

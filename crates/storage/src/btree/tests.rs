@@ -180,6 +180,33 @@ fn loaded_node_lookup_honours_pending_journal_override() {
 }
 
 #[test]
+fn journal_pin_covers_pending_journal_until_flush() {
+    let mut node: LoadedNode<u32, u32> = fresh_node(BtreeKind::Forward);
+    assert!(!node.pin.is_active());
+
+    node.insert(30, 1, 10);
+    node.insert(12, 2, 20);
+    node.insert(41, 3, 30);
+    assert_eq!(
+        node.pin,
+        JournalPin {
+            lsn_min: 12,
+            lsn_max: 41,
+            count: 3
+        }
+    );
+
+    node.flush_to_run().unwrap();
+    assert!(!node.pin.is_active());
+    assert_eq!(node.pin, JournalPin::default());
+
+    // Region reads and compaction produce nodes with nothing pending.
+    node.insert(50, 4, 40);
+    let compacted = compact(&node);
+    assert!(!compacted.pin.is_active());
+}
+
+#[test]
 fn loaded_node_lookup_honours_whiteout() {
     let mut node: LoadedNode<u32, u32> = fresh_node(BtreeKind::Forward);
     node.sorted_runs
