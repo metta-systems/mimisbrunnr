@@ -35,9 +35,9 @@ build:
 test:
     cargo test --workspace
 
-# Run clippy lints
+# Run clippy lints over libraries, binaries and test targets
 clippy:
-    cargo clippy --workspace
+    cargo clippy --workspace --all-targets
 
 # ── Pool Management (brunnr) ─────────────────────────────────────────
 

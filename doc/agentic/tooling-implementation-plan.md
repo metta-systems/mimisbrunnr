@@ -4,7 +4,6 @@ Design: [tooling-design.md](tooling-design.md) · Decisions: [tooling-decisions.
 
 ## Plan hygiene
 
-- [ ] **TOOLING2 — Lint test targets in `just clippy`.** The recipe runs `cargo clippy --workspace` without `--all-targets`; include test targets so the recipe is the full lint gate.
 
 ## Evidence
 

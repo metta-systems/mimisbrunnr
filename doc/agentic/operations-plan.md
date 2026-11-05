@@ -29,8 +29,7 @@ The order in which plan items across all scopes should land, by dependency. Task
 
 ### 1. Plan and process hygiene
 
-1. [TOOLING2](tooling-implementation-plan.md) — `just clippy` lints test targets.
-2. [SPEC1](specification-implementation-plan.md), [SPEC2](specification-implementation-plan.md) — spec free of process language.
+1. [SPEC1](specification-implementation-plan.md), [SPEC2](specification-implementation-plan.md) — spec free of process language.
 
 ### 2. Native layouts that need no new allocation
 

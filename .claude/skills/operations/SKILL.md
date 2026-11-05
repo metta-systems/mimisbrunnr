@@ -171,7 +171,7 @@ A type lives in exactly one crate (`doc/agentic/operations-design.md`); if two c
 
 ## Validate and report
 
-- **Every slice ends with the workspace green**: `just build`, `just test`, `just clippy`, and `cargo clippy --workspace --all-targets` (the recipe skips test targets), plus `cargo build --manifest-path validation/Cargo.toml` when layouts changed. A downstream crate left broken is a failed slice, not deferred work.
+- **Every slice ends with the workspace green**: `just build`, `just test`, `just clippy` (which covers test targets), plus `cargo build --manifest-path validation/Cargo.toml` when layouts changed. A downstream crate left broken is a failed slice, not deferred work.
 - During development narrow to `cargo test -p mimisbrunnr-<crate>`; narrower checks do not imply the workspace passed.
 - Bound long-running commands with timeouts. Report exact commands and results; a command you could not run is a validation blocker, not a pass.
 - Before completion, reconcile the spec sections, `<scope>-design.md`, `<scope>-decisions.md`, the plan, `<scope>-completed.md` and `operations-plan.md` with the code and tests. Documentation alone does not complete an implementation item.
