@@ -6,8 +6,6 @@ Section numbers in item titles from SPEC3 on are sections of the system design (
 
 ## Format specification sections
 
-- [ ] **SPEC1 — Remove process language from SUBSCRIPTIONS-DESIGN§1.** Rewrite the `snapshot = 0 until R6` comment, the "`cached_result` is inlined for R1c" and "Per-sub COW (Tier 3 B1)" paragraphs and the `TODO(post-D3)` note as plain specification of the current format; the remaining work is [SUBSCRIPTION1](subscriptions-implementation-plan.md) and [SUBSCRIPTION2](subscriptions-implementation-plan.md). Sweep every scope's format sections for the same pattern.
-- [ ] **SPEC2 — Align BTREE-DESIGN§1.3 with the code.** The `min_key` / `max_key` paragraph describes behaviour that is not implemented yet; keep it as the specification and make sure no text claims it as current behaviour. Implementation: [BTREE4](btree-implementation-plan.md).
 - [ ] **SPEC21 — Trim implemented struct bodies to byte tables.** For each structure that exists in code with a size assertion and a `validation/` entry, replace the Rust listing in its format section with a field / offset / size / meaning table plus invariants; keep full listings for structures not yet implemented. One scope at a time.
 - [ ] **SPEC22 — Reconcile each scope's summary with its format sections.** The "Selected design" bullets written before the split restate parts of the format sections; cut the overlap so each fact has one home.
 - [ ] **SPEC23 — Merge format conventions with workspace conventions.** FORMAT-DESIGN§1.1–1.4 and the struct-discipline, CRC and magic rules in [operations-design.md](operations-design.md) overlap; keep each rule in one place.

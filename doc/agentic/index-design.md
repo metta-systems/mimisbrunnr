@@ -553,8 +553,8 @@ Chained regions:
     = 262 064 B  ÷ 40 B/entry  = 6 551 entries
 ```
 
-Both shapes pack the same 6 551 entries — the head's `ChunkParamsRecord` lives in space
-that was previously trailing pad, so adding it costs no slots. The head region's first
+Both shapes pack the same 6 551 entries — the head's `ChunkParamsRecord` occupies space that
+is trailing pad in a chained region, so it costs no slots. The head region's first
 entry sits at offset 80 (`64 + 16`); chained regions' first entry sits at offset 64.
 Readers determine which shape they're looking at by inspecting
 `BTREE_NODE_FLAG_HEAD_OF_CHAIN`.

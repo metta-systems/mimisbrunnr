@@ -27,11 +27,7 @@ The order in which plan items across all scopes should land, by dependency. Task
 
 ## Sequence
 
-### 1. Plan and process hygiene
-
-1. [SPEC1](specification-implementation-plan.md), [SPEC2](specification-implementation-plan.md) — spec free of process language.
-
-### 2. Native layouts that need no new allocation
+### 1. Native layouts that need no new allocation
 
 Independent of each other; any order.
 
@@ -43,7 +39,7 @@ Independent of each other; any order.
 - [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator (after ONTOLOGY-D1).
 - [ALLOCATION2](allocation-implementation-plan.md) — freelist seeding at format time.
 
-### 3. Live tree machinery
+### 2. Live tree machinery
 
 1. [BTREE4](btree-implementation-plan.md) — covered key ranges (after BTREE-D2).
 2. [JOURNAL2](journal-implementation-plan.md) — WAL trim respects pins.
@@ -53,7 +49,7 @@ Independent of each other; any order.
 6. [JOURNAL4](journal-implementation-plan.md) — checkpoint cadence driver.
 7. [SUBSCRIPTION2](subscriptions-implementation-plan.md) — per-subscription COW check.
 
-### 4. Copy-on-write allocation
+### 3. Copy-on-write allocation
 
 1. [ALLOCATION1](allocation-implementation-plan.md) — sub-bucket regions (after ALLOCATION-D1).
 2. [ENGINE3](engine-implementation-plan.md) — COW commit.
@@ -67,26 +63,26 @@ Independent of each other; any order.
 10. [METADATA3](metadata-implementation-plan.md), [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup; [METADATA5](metadata-implementation-plan.md) — overflow records (after SPEC3).
 11. [INDEX6](index-implementation-plan.md) — footprint benchmark.
 
-### 5. Bitmap representation
+### 4. Bitmap representation
 
 [INDEX-D1](index-decisions.md), then [INDEX5](index-implementation-plan.md). Must land before snapshots and cluster sync; may move earlier if large pools are needed sooner.
 
-### 6. Blob zone and legacy blob retirement
+### 5. Blob zone and legacy blob retirement
 
 1. [BLOB1](blob-implementation-plan.md), [BLOB2](blob-implementation-plan.md), [BLOB5](blob-implementation-plan.md).
 2. [ENGINE5](engine-implementation-plan.md) — backpointers in the engine; then [METADATA6](metadata-implementation-plan.md) — blob reclaim and tombstone expiry (after METADATA-D3).
 3. [BLOB3](blob-implementation-plan.md), [BLOB4](blob-implementation-plan.md) — chunked objects, selective chunking.
 4. [BLOB6](blob-implementation-plan.md), [UNIX1](unix-implementation-plan.md), [ENGINE6](engine-implementation-plan.md) (after ENGINE-D1), [ENGINE7](engine-implementation-plan.md), then [ENGINE8](engine-implementation-plan.md) — no legacy blob.
 
-### 7. Snapshots
+### 6. Snapshots
 
 [SNAPSHOT1](snapshots-implementation-plan.md) through [SNAPSHOT6](snapshots-implementation-plan.md).
 
-### 8. Reconcile and allocation completeness
+### 7. Reconcile and allocation completeness
 
 [RECONCILE1](reconcile-implementation-plan.md) through [RECONCILE8](reconcile-implementation-plan.md), with [ALLOCATION7](allocation-implementation-plan.md), [ALLOCATION8](allocation-implementation-plan.md) and [POOL6](pool-implementation-plan.md) (disk evacuation); then [POOL2](pool-implementation-plan.md).
 
-### 9. Cluster sync
+### 8. Cluster sync
 
 [CLUSTER1](cluster-implementation-plan.md) through [CLUSTER6](cluster-implementation-plan.md).
 

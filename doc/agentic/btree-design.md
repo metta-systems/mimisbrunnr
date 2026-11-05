@@ -110,9 +110,8 @@ Subsequent bytes after the `BtreeNodeHeader` are a **stream of sorted runs**, ea
 ```rust
 #[repr(C, packed)]
 struct SortedRunHeader {                          // 32 bytes
-    magic: u32,                              // "BSET" (4-byte tag; historical
-                                             //   bcachefs nomenclature retained
-                                             //   as the on-disk magic value)
+    magic: u32,                              // "BSET" (bcachefs's name for a
+                                             //   sorted run)
     seq: u32,                                // monotonic within the region
     journal_seq: u64,                        // newest WAL LSN merged into this sorted run (recovery)
     entry_count: u32,                        // entries in this sorted run
@@ -169,12 +168,13 @@ struct LoadedNode {
 **Key tracking for inner-node descent.** The `BtreeNodeHeader.min_key` and `BtreeNodeHeader.max_key`
 fields (16 bytes each, [32..48] and [48..64]) carry the covered key range of the node. For leaf nodes
 this is the smallest/largest key present; for inner nodes it is the routing key range used to
-determine which child to descend into. These fields are populated during flush/compaction:
+determine which child to descend into. Every write of the node keeps them exact:
 
-- `flush_to_run`: Updates `min_key`/`max_key` from the merged extremes of the pending journal
-  and existing sorted runs.
-- `compact`: Recomputes from the fully merged sorted run.
-- `append_sorted_run`: Updates incrementally from the new run's first/last key.
+- A flush sets them to the extremes of the pending journal entries merged with the existing
+  sorted runs.
+- Full compaction (BTREE-DESIGN§1.4) recomputes them from the single merged run.
+- Appending a sorted run (BTREE-DESIGN§1.2) widens them to cover the new run's first and last
+  key.
 
 Lookups merge-search across sorted runs; each run is internally sorted at write time. With ≤ 3 active sorted runs
 each binary-searched, lookup cost is `O(3 × log(n))` per node — equivalent to a single sorted

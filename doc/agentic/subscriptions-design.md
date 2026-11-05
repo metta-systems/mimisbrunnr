@@ -114,7 +114,7 @@ retention configs are heterogeneous so per-entry value lengths vary.
 // Sorted-run key — 2 fields via SortedRunKeyFormat.
 struct SubscriptionsKey {
     id:       u64,                            // SubscriptionId
-    snapshot: u32,                            // = 0 until R6
+    snapshot: u32,                            // SnapshotId (SNAPSHOTS-DESIGN§1)
 }
 
 // Sorted-run value tail — variable-length CBOR.
@@ -138,23 +138,15 @@ ends up equal to the last assigned id rather than the next unused
 one. This mirrors ENGINE-DESIGN§2's "scalars are derived, not stored" rule for
 `next_oid_local` and `next_tag_id`.
 
-**`cached_result` is inlined for R1c.** The eventual spec-target is to
-externalize the roaring bitmap to a INDEX-DESIGN§3.2 `TagBitmap` chain referenced
-by `BlockRef` — so a cursor-only mutation doesn't rewrite the bitmap
-bytes. R1c keeps the bitmap inline in the CBOR record because (a)
-per-subscription bitmaps are typically small (a handful of oids), and
-(b) externalization needs Tier 3 D3 sub-bucket allocation to avoid
-competing with the fixed-offset INDEX-DESIGN§3.2 tag-bitmap area cap.
+**`cached_result` is inline.** The record carries the serialised roaring
+bitmap of the subscription's current result set. Per-subscription result
+sets are typically small (a handful of objects), so the bitmap costs
+little next to the query AST; the cost is that a change to the cursor
+alone rewrites the bitmap bytes with the rest of the record.
 
-> TODO(SUBSCRIPTION1): replace `cached_result: Vec<u8>` with a
-> `cached_result_root: BlockRef` pointing at a INDEX-DESIGN§3.2 `TagBitmapPage`
-> chain. The wire format break is one-way; pre-D3 pools must
-> recreate.
-
-**Per-sub COW (Tier 3 B1).** Today's flush rewrites the whole
-directory region via `write_full_packed_force_varint`. Once B1 wires
-`append_sorted_run` into the production flush path, cursor-bumping
-one subscription appends a single 1-entry sorted run instead of
-rewriting the region — the per-record key + VARINT value layout is
-exactly what makes that work.
+**One entry per subscription.** Because each subscription is its own
+key with a variable-length value, a change to one subscription is one
+replacement entry: it can be written as a one-entry sorted run appended
+to the region (BTREE-DESIGN§1.2) without rewriting the other
+subscriptions, and full compaction (BTREE-DESIGN§1.4) folds the runs.
 

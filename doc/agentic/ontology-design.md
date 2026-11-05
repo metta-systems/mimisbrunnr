@@ -274,10 +274,9 @@ well). Cost is one sorted-run append plus one root-pointer commit — 2 blocks C
 independent of how many tags/implications/relations the update touched. The size budget is
 absorbed by BTREE-DESIGN§1 compaction, not by per-key COW.
 
-**Why no envelope block.** The `OntologyRoot` 4 KiB block from earlier drafts held only
-`module_count` / `tag_count` / `implication_count` and four sub-tree pointers. With one tree
-and a memory-loaded image, those counters are derivable in O(1) from the loaded image and the
-sub-tree pointers collapse into the single `ontology_root` slot already present in
-`RootPointer`. Dropping the envelope removes one `BlockKind`, one COW step per update, and one
-freshness/CRC surface.
+**Why no envelope block.** An envelope block between the root pointer and the region would
+hold only module, tag and implication counts and sub-tree pointers. With one tree and a
+memory-loaded image, the counts are derivable in O(1) from the loaded image and the single
+`ontology_root` slot in `RootPointer` reaches the tree directly. Going without an envelope
+saves one `BlockKind`, one COW step per update, and one freshness/CRC surface.
 
