@@ -1,7 +1,7 @@
-//! Foundational identifier types (DESIGN §2.1).
+//! Foundational identifier types (SPECIFICATION-DESIGN§2.1).
 //!
 //! Every other identifier in the system is built on top of these. The names
-//! here are pinned by `docs/REWRITE_CONTRACT.md` §3 — Phase 1b's `storage`
+//! here are pinned by `doc/agentic/operations-design.md` (type ownership) — the `storage`
 //! crate references them directly.
 
 use serde::{Deserialize, Serialize};
@@ -12,13 +12,13 @@ pub type NodeId = u16;
 /// Disk identifier within a single pool.
 pub type DiskId = u16;
 
-/// Subscription identifier (DESIGN §11.2).
+/// Subscription identifier (SPECIFICATION-DESIGN§11.2).
 pub type SubscriptionId = u64;
 
-/// Ontology module identifier (DESIGN §4) — e.g. `"systems.metta.music"`.
+/// Ontology module identifier (SPECIFICATION-DESIGN§4) — e.g. `"systems.metta.music"`.
 pub type ModuleId = String;
 
-/// Tag identifier (DESIGN §2.1). Newtype wrapper around `u32` so that tags
+/// Tag identifier (SPECIFICATION-DESIGN§2.1). Newtype wrapper around `u32` so that tags
 /// can never be confused with raw integers in attribute values, object IDs,
 /// or counters.
 #[derive(

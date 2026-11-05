@@ -1,41 +1,41 @@
 //! Generic B+ tree machinery — the bcachefs-style sorted-run model.
 //!
-//! Implements IMPL §1.5.2–§1.5.5 in-memory machinery on top of the existing
+//! Implements BTREE-DESIGN§1.2–§1.5 in-memory machinery on top of the existing
 //! [`BtreeNodeHeader`] / [`SortedRunHeader`] structs from [`crate::btree_node`].
 //!
 //! What this module provides:
 //!
 //! * [`SortedRun`] — an in-memory sorted run (analogue of bcachefs's `bset`).
 //! * [`LoadedNode`] — the in-memory mirror of a 256 KiB region: a stack of
-//!   sorted runs plus a pending journal overlay (IMPL §3.4) and a lazily
+//!   sorted runs plus a pending journal overlay (JOURNAL-DESIGN§1.4) and a lazily
 //!   materialised merged view.
 //! * [`JournalEntry`] / [`JournalOp`] — the per-key overlay used until the
 //!   next flush converts pending entries into a fresh sorted run.
 //! * [`BtreeRegion`] — read / full-rewrite / append-only-grow path against a
 //!   [`BlockDevice`].
-//! * [`should_compact`] / [`compact`] — IMPL §1.5.4 trigger rule plus
+//! * [`should_compact`] / [`compact`] — BTREE-DESIGN§1.4 trigger rule plus
 //!   in-memory k-way merge that produces a single-run [`LoadedNode`].
 //!
-//! ## Out of scope (intentional for R1a-core)
+//! ## Not yet implemented
 //!
-//! * Packed-key codec (IMPL §1.5.6, `SortedRunKeyFormat` driving) —
-//!   `TODO(rewrite-phase-R1a-pack)`. Sorted-run payloads are CBOR for now;
+//! * Packed-key codec (BTREE-DESIGN§1.6, `SortedRunKeyFormat` driving) —
+//!   `TODO(BTREE1)`. Sorted-run payloads are CBOR for now;
 //!   keys round-trip verbatim.
 //! * COW / fresh-region allocation. The actual *allocator* call lives at the
-//!   index / pool layer (R1b); this module only knows how to read and write a
+//!   index / pool layer; this module only knows how to read and write a
 //!   region at a caller-supplied byte offset.
 //! * Auxiliary search trees (Eytzinger). Sorted-run lookup is a plain
 //!   binary search.
 //! * Journal-reclaim driver thread. We accept a `pending_journal` overlay as
 //!   input to compaction but do not schedule flushes from a WAL fill watermark.
-//! * `FormatPromote` WAL op — that is part of R1a-pack, when widths actually
+//! * `FormatPromote` WAL op — BTREE6 / JOURNAL3, when widths actually
 //!   matter.
 //! * `BTREE_NODE_FLAG_HEAD_OF_CHAIN` chunk-list semantics.
 //! * `BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS` recovery handling: the flag is
 //!   set during full compaction and cleared after, but recovery action on a
-//!   crashed compaction is `TODO(rewrite-phase-R1b)`.
+//!   crashed compaction is `TODO(BTREE7)`.
 //!
-//! ## On-disk layout (R1a-core)
+//! ## On-disk layout
 //!
 //! ```text
 //! offset 0                                     -> BtreeNodeHeader (64 B)
@@ -50,8 +50,8 @@
 //! an earlier run, and the append-only invariant is preserved at sector
 //! granularity. See [`BtreeRegion::append_sorted_run`].
 //!
-//! Sorted-run payload encoding (R1a-core): **`ciborium` CBOR** of
-//! `Vec<(K, V)>`, with `K, V: Serialize + DeserializeOwned`. R1a-pack adds a
+//! Default sorted-run payload encoding: **`ciborium` CBOR** of
+//! `Vec<(K, V)>`, with `K, V: Serialize + DeserializeOwned`. The packed codec adds a
 //! parallel **packed-key codec** path (see the `pack` submodule and
 //! [`BtreeRegion::write_full_packed`] / [`BtreeRegion::read_packed`]) that
 //! sets the on-disk flag [`SORTED_RUN_FLAG_PACKED_KEYS`] on the per-run
@@ -82,7 +82,7 @@ use crate::{
 
 /// Journal pinning for WAL retention.
 ///
-/// Implements IMPL §3.4 `DirtyNode` accounting — the WAL trimmer must not
+/// Implements JOURNAL-DESIGN§1.4 `DirtyNode` accounting — the WAL trimmer must not
 /// reclaim entries past the lowest live `lsn_min` across all pins.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct JournalPin {
@@ -134,7 +134,7 @@ impl JournalPin {
 // ---------- SortedRun ----------
 
 /// One sorted run within a [`LoadedNode`]. The on-disk analogue is the bytes
-/// `SortedRunHeader || payload` per IMPL §1.5.1 (bcachefs `bset`).
+/// `SortedRunHeader || payload` per BTREE-DESIGN§1.1 (bcachefs `bset`).
 ///
 /// Entries are kept in ascending order by `K`. Equal keys within a single run
 /// are not produced by this crate's flush path (full compaction collapses
@@ -146,7 +146,7 @@ pub struct SortedRun<K, V> {
     pub seq: u32,
     /// Newest WAL LSN merged into this run. Mirrors `SortedRunHeader.journal_seq`.
     pub journal_seq: u64,
-    /// `SORTED_RUN_FLAG_*`. R1a-core only sets `0`.
+    /// `SORTED_RUN_FLAG_*`. The CBOR codec sets `0`.
     pub flags: u32,
     /// Sorted entries.
     pub entries: Vec<(K, V)>,
@@ -212,7 +212,7 @@ impl<K: Ord, V> SortedRun<K, V> {
 
 /// Per-key overlay carried on top of a [`LoadedNode`]'s sorted runs until the
 /// next flush converts pending entries into a fresh sorted run. Mirrors the
-/// pending-journal slice of IMPL §3.4's `DirtyNode`.
+/// pending-journal slice of JOURNAL-DESIGN§1.4's `DirtyNode`.
 #[derive(Clone, Debug)]
 pub struct JournalEntry<K, V> {
     /// WAL LSN of the underlying mutation. Used for `journal_seq` accounting
@@ -228,9 +228,9 @@ pub struct JournalEntry<K, V> {
 pub enum JournalOp<K, V> {
     /// Insert or overwrite `(K, V)`.
     Insert(K, V),
-    /// Remove the key. Equivalent to `Whiteout` for R1a-core; the type
+    /// Remove the key. Equivalent to `Whiteout` today; the type
     /// distinction exists for forward compatibility with snapshot-aware
-    /// btrees in R6.
+    /// btrees (SNAPSHOT2).
     Remove(K),
     /// bcachefs whiteout — overrides earlier inserts in older runs.
     Whiteout(K),
@@ -253,7 +253,7 @@ impl<K, V> JournalOp<K, V> {
 
 // ---------- LoadedNode ----------
 
-/// In-memory mirror of a 256 KiB region, per IMPL §1.5.3.
+/// In-memory mirror of a 256 KiB region, per BTREE-DESIGN§1.3.
 ///
 /// Lookups consult sorted runs newest-first then check the pending-journal
 /// overlay for an override. The lazy `merged_view` short-circuits subsequent
@@ -395,7 +395,7 @@ impl<K: Ord + Clone, V: Clone> LoadedNode<K, V> {
         // Check for tombstones
         if self.pending_journal.iter().any(|e| e.op.is_tombstone()) {
             return Err(StorageError::CborEncode(
-                "flush_to_run: tombstones require compact() in R1a-core".to_string(),
+                "flush_to_run: tombstones require compact() until BTREE5".to_string(),
             ));
         }
 
@@ -546,7 +546,7 @@ impl BtreeRegion {
         offset: u64,
     ) -> Result<LoadedNode<K, V>, StorageError> {
         let buf = Self::read(device, offset)?;
-        // TODO: Implement proper deserialization of LoadedNode from bytes
+        // TODO(BTREE2): Implement proper deserialization of LoadedNode from bytes
         // For now, return an empty node
         Ok(LoadedNode::new_unchecked(BtreeKind::Forward, 0, 18))
     }

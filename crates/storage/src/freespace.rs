@@ -1,31 +1,31 @@
-//! Freespace LRU mirror (§12.4).
+//! Freespace LRU mirror (ALLOCATION-DESIGN§1.4).
 //!
-//! Per IMPL §12.4 each disk has its own §1.5 B+ tree rooted at
+//! Per ALLOCATION-DESIGN§1.4 each disk has its own BTREE-DESIGN§1 B+ tree rooted at
 //! `DiskDescriptorOnDisk.freespace_root`, keyed by
 //! `(fragmentation_band: u8, bucket_no: u32)`. The allocator uses band
 //! 0 for the foreground fast path, band 255 for the most-fragmented end,
 //! and copygc walks the high bands to reclaim space.
 //!
-//! ## Persistence (R1b-4)
+//! ## Persistence
 //!
-//! On disk the table occupies one 256 KiB §1.5 B+ tree region of
+//! On disk the table occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
 //! [`BtreeKind::FreespaceLru`]. The mirror is materialised into a single
 //! CBOR-encoded sorted run via [`BtreeRegion::write_full`] keyed by
-//! [`FreespaceLruKey`] ascending. Values are [`Empty`] — IMPL §12.4
+//! [`FreespaceLruKey`] ascending. Values are [`Empty`] — ALLOCATION-DESIGN§1.4
 //! describes a key-only B+ tree (the "value" is implicit in the key).
 //!
-//! R1b-4 simplifies to one pool-scoped tree. The wire key already
-//! carries `disk_id: u16` so the per-disk split (R1d) is a layout-only
+//! For now this is one pool-scoped tree. The wire key already
+//! carries `disk_id: u16` so the per-disk split (ALLOCATION5) is a layout-only
 //! change with no on-disk format break.
 //!
-//! TODO(rewrite-phase-R1d): split into per-disk metadata zones per
-//! IMPL §12.4 — one freespace LRU per disk, rooted at
+//! TODO(ALLOCATION5): split into per-disk metadata zones per
+//! ALLOCATION-DESIGN§1.4 — one freespace LRU per disk, rooted at
 //! `DiskDescriptorOnDisk.freespace_root`.
 //!
-//! TODO(rewrite-phase-Theme-H): live-allocator integration. R1b-4
+//! TODO(ALLOCATION5): live-allocator integration. The table
 //! ships only the persistence skeleton — the foreground allocator's
 //! "scan band 0" fast path, the lazy-reband-on-8-sector-boundary
-//! producer, and the copygc consumer all live in Theme H.
+//! producer, and the copygc consumer come with ALLOCATION5 and RECONCILE3.
 
 use std::{collections::BTreeMap, ops::Bound};
 
@@ -44,16 +44,16 @@ use crate::{
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const FREESPACE_LRU_REGION_SIZE: u64 = 256 * 1024;
 const FREESPACE_LRU_REGION_SIZE_LOG2: u8 = 18;
 
 /// Wire key for the freespace LRU B+ tree.
 ///
-/// Per IMPL §12.4 the per-disk tree is keyed by
-/// `(fragmentation_band: u8, bucket_no: u32)`. R1b-4 simplifies to one
+/// Per ALLOCATION-DESIGN§1.4 the per-disk tree is keyed by
+/// `(fragmentation_band: u8, bucket_no: u32)`. For now this is one
 /// pool-scoped tree; `disk_id: u16` is added between the two for
-/// forward compat with R1d. Lexicographic ordering of the byte image
+/// forward compat with ALLOCATION5. Lexicographic ordering of the byte image
 /// matches `(band, disk_id, bucket_no)` — band first so the allocator
 /// fast path (`band == 0`) is a contiguous prefix scan.
 ///
@@ -67,7 +67,7 @@ const FREESPACE_LRU_REGION_SIZE_LOG2: u8 = 18;
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
 pub struct FreespaceLruKey {
     /// `[0..1]` `0` = empty, `255` = nearly full, `1..=254` = in
-    /// between (formula in IMPL §12.4).
+    /// between (formula in ALLOCATION-DESIGN§1.4).
     pub fragmentation_band: u8,
     /// `[1..3]` disk id.
     pub disk_id: u16,
@@ -170,10 +170,10 @@ impl<'de> Deserialize<'de> for FreespaceLruKey {
 
 /// Empty wire value (zero on-disk bytes).
 ///
-/// IMPL §12.4 describes the freespace LRU as a key-only B+ tree. To
+/// ALLOCATION-DESIGN§1.4 describes the freespace LRU as a key-only B+ tree. To
 /// fit the [`LoadedNode<K, V>`] generic shape, we round-trip a
-/// zero-byte placeholder via CBOR (`null` in CBOR = 1 byte). Once R1c
-/// teaches the §1.5.6 packed-key codec to handle zero-width values,
+/// zero-byte placeholder via CBOR (`null` in CBOR = 1 byte). Once ALLOCATION5
+/// teaches the BTREE-DESIGN§1.6 packed-key codec to handle zero-width values,
 /// this becomes a true zero-payload encoding.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Empty;
@@ -203,12 +203,12 @@ impl<'de> Deserialize<'de> for Empty {
     }
 }
 
-/// In-memory mirror of the §12.4 freespace LRU.
+/// In-memory mirror of the ALLOCATION-DESIGN§1.4 freespace LRU.
 ///
 /// Backed by a `BTreeMap<FreespaceLruKey, ()>`. Lookups are point
-/// (`contains`) or banded prefix scans (`iter_band`). R1b-4 only ships
+/// (`contains`) or banded prefix scans (`iter_band`). This only ships
 /// the persistence skeleton; live allocator integration (foreground
-/// "scan band 0", lazy reband, copygc producer) is Theme H.
+/// "scan band 0", lazy reband, copygc producer) is ALLOCATION5 / RECONCILE3.
 #[derive(Clone, Debug, Default)]
 pub struct FreespaceLru {
     entries: BTreeMap<FreespaceLruKey, ()>,
@@ -277,7 +277,7 @@ impl FreespaceLru {
     }
 
     // ----------------------------------------------------------------
-    // R1b-4: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
     // ----------------------------------------------------------------
 
     /// Build a [`LoadedNode`] containing every entry as a single CBOR

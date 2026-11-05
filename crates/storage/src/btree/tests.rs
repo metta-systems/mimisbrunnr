@@ -1,4 +1,4 @@
-//! Tests for the generic B+ tree machinery (R1a-core).
+//! Tests for the generic B+ tree machinery.
 
 use std::sync::Mutex;
 
@@ -748,7 +748,7 @@ fn loaded_node_uses_smallvec_for_runs() {
     assert!(runs.is_empty());
 }
 
-// ---------- Packed-key region-level round-trips (R1a-pack) ----------
+// ---------- Packed-key region-level round-trips ----------
 
 mod packed_region {
     use super::*;

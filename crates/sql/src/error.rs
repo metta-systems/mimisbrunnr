@@ -12,7 +12,7 @@ pub enum SqlError {
     ParseError(String),
 
     /// The statement is syntactically valid SQL but its shape is outside the
-    /// Phase 5a subset (joins, subqueries, ORDER BY, GROUP BY beyond
+    /// supported subset (joins, subqueries, ORDER BY, GROUP BY beyond
     /// `COUNT(*)`, INSERT/UPDATE/DELETE, multiple statements, …).
     #[error("unsupported SQL construct: {0}")]
     Unsupported(String),
@@ -22,7 +22,7 @@ pub enum SqlError {
     #[error("unknown tag `{0}`")]
     UnknownTag(String),
 
-    /// A `LIKE` pattern uses wildcard semantics outside the Phase 5a subset
+    /// A `LIKE` pattern uses wildcard semantics outside the supported subset
     /// (only `'foo%'` prefix and `'%foo'` contains are accepted).
     #[error("unsupported LIKE pattern `{0}`")]
     UnsupportedPattern(String),

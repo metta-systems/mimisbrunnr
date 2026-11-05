@@ -1,8 +1,8 @@
-//! `ObjectLocation` (48 B) and `ReplicaRef` (8 B) — IMPL §6.1 / DESIGN §6.3.
+//! `ObjectLocation` (48 B) and `ReplicaRef` (8 B) — METADATA-DESIGN§2.1 / SPECIFICATION-DESIGN§6.3.
 //!
 //! `ObjectLocation` is logically a fixed-size 48-byte struct with up to four
-//! inline replicas. The IMPL spec defines it that way (`replicas: [ReplicaRef; 4]`),
-//! and the consistency invariant in §6.1 ("Cap of 4 inline") makes the inline
+//! inline replicas. The format spec defines it that way (`replicas: [ReplicaRef; 4]`),
+//! and the consistency invariant in METADATA-DESIGN§2.1 ("Cap of 4 inline") makes the inline
 //! array part of the format, not an artefact of a particular encoding.
 //!
 //! This module exposes:
@@ -25,23 +25,23 @@ use {
 
 use crate::error::MetaError;
 
-// ---------------- Flags (IMPL §6.1) ----------------
+// ---------------- Flags (METADATA-DESIGN§2.1) ----------------
 
 /// Set when `replicas[]` describe replicas of the head `ChunkList` region
-/// (IMPL §9.3) rather than the user data.
+/// (INDEX-DESIGN§4.3) rather than the user data.
 pub const LOCATION_FLAG_CHUNKED: u8 = 1 << 0;
 
 /// Set when no local replica exists; reads must go cross-node.
 pub const LOCATION_FLAG_REMOTE_ONLY: u8 = 1 << 1;
 
 /// Maximum number of inline replicas in an `ObjectLocation` — the format cap
-/// per IMPL §6.1 ("Cap of 4 inline").
+/// per METADATA-DESIGN§2.1 ("Cap of 4 inline").
 pub const MAX_INLINE_REPLICAS: usize = 4;
 
 // ---------------- ReplicaRef (8 B) ----------------
 
 /// Bucket-relative reference to a single physical replica of an extent
-/// (IMPL §6.1).
+/// (METADATA-DESIGN§2.1).
 ///
 /// Layout:
 /// ```text
@@ -94,7 +94,7 @@ const_assert_eq!(core::mem::size_of::<LocationHeader>(), LOCATION_HEADER_SIZE);
 
 // ---------------- ObjectLocation (48 B) ----------------
 
-/// Full fixed-size location record (IMPL §6.1, DESIGN §6.3).
+/// Full fixed-size location record (METADATA-DESIGN§2.1, SPECIFICATION-DESIGN§6.3).
 ///
 /// Layout:
 /// ```text
@@ -207,7 +207,7 @@ impl ObjectLocation {
     }
 
     /// Convert a `(bucket_no, sector_offset)` pair derived from an absolute
-    /// `block_no` per IMPL §6.1's helper formulas. `bucket_size_log2` is the
+    /// `block_no` per METADATA-DESIGN§2.1's helper formulas. `bucket_size_log2` is the
     /// log2 of the bucket size in bytes (e.g. 20 for 1 MiB buckets).
     pub fn block_no_to_bucket_offset(block_no: u64, bucket_size_log2: u32) -> (u32, u16) {
         let shift = bucket_size_log2 - 12;
@@ -220,9 +220,9 @@ impl ObjectLocation {
 // ---------- Serialize / Deserialize via bytemuck ----------
 //
 // `ObjectLocation` is `#[repr(C, align(8))] Pod` with a spec-pinned 48-byte
-// layout (IMPL §6.1). Round-trip the byte image directly so the CBOR wire
-// form mirrors the on-disk POD layout exactly. Used by the R1b sorted-run
-// CBOR path; the native §6.1 leaf encoder lands later.
+// layout (METADATA-DESIGN§2.1). Round-trip the byte image directly so the CBOR wire
+// form mirrors the on-disk POD layout exactly. Used by the CBOR sorted-run
+// CBOR path; the native METADATA-DESIGN§2.1 leaf encoder lands later.
 
 impl Serialize for ObjectLocation {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {

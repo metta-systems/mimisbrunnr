@@ -1,20 +1,20 @@
-//! Chunk index — content-addressed dedup directory (IMPL §9.3).
+//! Chunk index — content-addressed dedup directory (INDEX-DESIGN§4.3).
 //!
 //! On-disk: a B+ tree of large nodes keyed by 32-byte BLAKE3 chunk hash; the
-//! leaf entry [`ChunkIndexLeafEntry`] is 56 B per IMPL §9.3 lines 1946–1951
+//! leaf entry [`ChunkIndexLeafEntry`] is 56 B per INDEX-DESIGN§4.3 lines 1946–1951
 //! (32 B hash + 4 B `ref_count` + 4 B `length` + 16 B `BlobRef`). With the
-//! hash carried as the §1.5.6 packed key, the on-disk value tail is the
+//! hash carried as the BTREE-DESIGN§1.6 packed key, the on-disk value tail is the
 //! 24-byte [`ChunkIndexValue`] = `(ref_count, length, blob_ref)`.
 //!
 //! In-memory mirror: [`ChunkIndex`] = `HashMap<[u8;32], ChunkIndexValue>`.
 //!
-//! ## Persistence (R1c-A3.1)
+//! ## Persistence
 //!
-//! On disk the index occupies one 256 KiB §1.5 B+ tree region of
+//! On disk the index occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
 //! [`BtreeKind::ChunkIndex`]. Entries are serialised through the
-//! `SORTED_RUN_FLAG_PACKED_KEYS` codec (§1.5.6) — keys are packed as four
+//! `SORTED_RUN_FLAG_PACKED_KEYS` codec (BTREE-DESIGN§1.6) — keys are packed as four
 //! big-endian `u64` fields covering the 32-byte hash, values are written as
-//! the 24-byte [`ChunkIndexValue`] byte image. The C1 amendment persists the
+//! the 24-byte [`ChunkIndexValue`] byte image. The descriptor persists the
 //! `common_value_prefix` bytes inline in the descriptor, so the codec
 //! correctly round-trips even single-entry runs and runs whose values
 //! happen to share leading bytes (e.g. all entries with the same `disk_id`).
@@ -35,17 +35,17 @@ use crate::error::IndexError;
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const CHUNK_INDEX_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
 // ---------- ChunkIndexLeafEntry (full record, mirror only) ----------
 
-/// Size in bytes of [`ChunkIndexLeafEntry`] (56). IMPL §9.3.
+/// Size in bytes of [`ChunkIndexLeafEntry`] (56). INDEX-DESIGN§4.3.
 pub const CHUNK_INDEX_LEAF_ENTRY_SIZE: usize = 56;
 
-/// On-disk leaf entry layout described by IMPL §9.3. The full record is
-/// 56 B; the codec splits it into the 32 B `chunk_hash` (the §1.5.6
+/// On-disk leaf entry layout described by INDEX-DESIGN§4.3. The full record is
+/// 56 B; the codec splits it into the 32 B `chunk_hash` (the BTREE-DESIGN§1.6
 /// packed key) and the 24 B [`ChunkIndexValue`] tail. This struct exists
 /// for analyze-style tooling that wants to render the full record.
 ///
@@ -73,7 +73,7 @@ const_assert_eq!(
 // ---------- ChunkHashKey (packable key) ----------
 
 /// 32-byte BLAKE3 chunk hash. Used as the [`ChunkIndex`] map key and as the
-/// §1.5.6 packed-run key (decomposes into four big-endian `u64` fields so
+/// BTREE-DESIGN§1.6 packed-run key (decomposes into four big-endian `u64` fields so
 /// byte-wise lexicographic compare matches the natural hash byte order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkHashKey(pub [u8; 32]);
@@ -189,7 +189,7 @@ pub const CHUNK_INDEX_VALUE_SIZE: usize = 24;
 
 /// Fixed-size 24-byte value tail for the [`ChunkIndex`] B+ tree. Together
 /// with the 32 B `chunk_hash` packed-key prefix this reproduces the spec's
-/// 56 B [`ChunkIndexLeafEntry`] layout. Field order matches IMPL §9.3.
+/// 56 B [`ChunkIndexLeafEntry`] layout. Field order matches INDEX-DESIGN§4.3.
 ///
 /// ```text
 /// [0..4]   ref_count u32
@@ -304,7 +304,7 @@ mod serde_bytes_helper {
 
 /// In-memory `ChunkIndex`. Keyed by BLAKE3 chunk hash, value is the physical
 /// extent + reference count + plaintext length tracked per chunk
-/// (DESIGN §5 / IMPL §9.3).
+/// (SPECIFICATION-DESIGN§5 / INDEX-DESIGN§4.3).
 #[derive(Debug, Clone, Default)]
 pub struct ChunkIndex {
     entries: HashMap<ChunkHashKey, ChunkIndexValue>,
@@ -383,7 +383,7 @@ impl ChunkIndex {
     }
 
     // ----------------------------------------------------------------
-    // §1.5 B+ tree persistence (packed-key codec, §1.5.6).
+    // BTREE-DESIGN§1 B+ tree persistence (packed-key codec, BTREE-DESIGN§1.6).
     // ----------------------------------------------------------------
 
     /// Build a [`LoadedNode`] containing every entry as a single packed
@@ -572,7 +572,7 @@ mod tests {
 
     #[test]
     fn region_round_trip_single_entry() {
-        // The single-entry case used to trigger the C1 prefix-elision bug
+        // The single-entry case used to trigger a prefix-elision bug
         // (the descriptor's `common_value_prefix` would saturate to the
         // value's full length, eliding the entire value with no on-disk
         // record). Post-C1, the descriptor persists the prefix bytes
@@ -697,7 +697,7 @@ mod tests {
         }
         idx.flush_to_region(&dev, 0).unwrap();
 
-        // Read the §1.5 region header + first sorted-run header off disk
+        // Read the BTREE-DESIGN§1 region header + first sorted-run header off disk
         // and verify the packed flag is set — the codec is in use.
         let mut header_sector = vec![0u8; BLOCK_SIZE];
         dev.read_at(0, &mut header_sector).unwrap();

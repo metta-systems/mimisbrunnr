@@ -1,27 +1,27 @@
 //! `mimisbrunnr-meta` — object metadata wire structs and address helpers.
 //!
-//! Implements (Phase 2b — *structs and helpers only*; live tree machinery is
+//! Implements (*structs and helpers only*; live tree machinery is
 //! a later phase):
 //!
-//! - IMPL §5 — `ObjectRecord` (128 B), overflow record header, radix-tree
+//! - METADATA-DESIGN§1 — `ObjectRecord` (128 B), overflow record header, radix-tree
 //!   address translation. The COW radix tree itself is deferred.
-//! - IMPL §6.1 — `ObjectLocation`, `LocationHeader`, `ReplicaRef`, plus
+//! - METADATA-DESIGN§2.1 — `ObjectLocation`, `LocationHeader`, `ReplicaRef`, plus
 //!   variable-length parse / serialise helpers for the radix leaf encoder.
-//! - IMPL §6.2 — `BackpointerKey`, `BackpointerValue`, `OwnerKind` (with
+//! - METADATA-DESIGN§2.2 — `BackpointerKey`, `BackpointerValue`, `OwnerKind` (with
 //!   pinned discriminants), and an in-memory `BackpointerTable`
 //!   placeholder with `range_in_bucket` / `range_on_disk` helpers.
 //!
-//! Out of scope (TODO(rewrite-phase-N)):
+//! Not yet implemented:
 //!
-//! - The live COW radix tree for the object & location tables (§5 + §6.1):
+//! - The live COW radix tree for the object & location tables (METADATA-DESIGN§1 + METADATA-DESIGN§2.1):
 //!   COW write path, journal-reclaim integration, leaf occupancy bitmap,
-//!   merging of pending mutations past `last_persisted_lsn`.
-//! - The global B+ tree backing `BtreeKind::Backpointer` with §1.5.6 key
-//!   packing.
+//!   merging of pending mutations past `last_persisted_lsn` — TODO(METADATA1), METADATA2.
+//! - The global B+ tree backing `BtreeKind::Backpointer` with BTREE-DESIGN§1.6 key
+//!   packing — TODO(METADATA3).
 //! - `OverflowRecord` payload encoder/decoder, `OverflowAttr` variants,
-//!   chain navigation.
-//! - WAL integration (positional updates, `BackpointerInsert/Remove`,
-//!   `ReconcileMove` projection).
+//!   chain navigation — TODO(METADATA5).
+//! - WAL integration: positional updates (METADATA1), `BackpointerInsert/Remove`
+//!   (ENGINE5), `ReconcileMove` projection (RECONCILE2).
 
 #![forbid(unsafe_code)]
 

@@ -1,10 +1,7 @@
-//! Runtime [`Subscription`] record. DESIGN §11.2.
+//! Runtime [`Subscription`] record. SPECIFICATION-DESIGN§11.2.
 //!
-//! The on-disk B+ tree shape (IMPL §10.2) is implemented in a later phase;
-//! we serialise via CBOR for now.
-//!
-// TODO(rewrite-phase-N): replace the CBOR-blob persistence with the
-// `BtreeKind::Subscriptions` B+ tree per IMPL §10.2.
+//! On disk each subscription is a CBOR value in the `BtreeKind::Subscriptions`
+//! B+ tree (SUBSCRIPTIONS-DESIGN§1); see `SubscriptionEngine` for the flush.
 
 use mimisbrunnr_types::{ChangeInterest, Query, SubscriptionId, SubscriptionState};
 use roaring::RoaringBitmap;
@@ -12,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// Retention policy for an offline (or slow) consumer's pending events.
 ///
-/// DESIGN §11.6 mentions "max events" / "coalescing"; we expose the storage
+/// SPECIFICATION-DESIGN§11.6 mentions "max events" / "coalescing"; we expose the storage
 /// shape here. The consumer-facing `debounce_ms` lives on [`Subscription`]
 /// directly to mirror the spec's per-subscription batching knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,7 +28,7 @@ impl Default for Retention {
     }
 }
 
-/// Live subscription record (DESIGN §11.2).
+/// Live subscription record (SPECIFICATION-DESIGN§11.2).
 #[derive(Debug, Clone)]
 pub struct Subscription {
     pub id: SubscriptionId,
@@ -44,9 +41,9 @@ pub struct Subscription {
     pub retention: Retention,
     /// Optional debounce window (milliseconds). If `Some(ms)`, repeated
     /// events for the same `oid` within `ms` are coalesced into a single
-    /// event of the latest kind. Phase 4b: field is honoured by `tick()`
+    /// event of the latest kind. The field is honoured by `tick()`
     /// but a full per-tick flush is left as a TODO.
-    // TODO(rewrite-phase-N): wire full debounce flush in `tick()`.
+    // TODO(SUBSCRIPTION4): wire full debounce flush in `tick()`.
     pub debounce_ms: Option<u32>,
     /// Current member set. Maintained by the engine on every mutation hook.
     pub cached_result: RoaringBitmap,
@@ -56,7 +53,7 @@ impl Subscription {
     /// Construct a fresh `Active` subscription.
     ///
     /// The engine layer is responsible for computing `cached_result` (the
-    /// initial query evaluation) — DESIGN §11.4 atomic subscribe + snapshot.
+    /// initial query evaluation) — SPECIFICATION-DESIGN§11.4 atomic subscribe + snapshot.
     pub fn new(
         id: SubscriptionId,
         name: String,

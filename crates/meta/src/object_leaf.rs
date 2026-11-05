@@ -1,7 +1,7 @@
 //! Native positional radix-leaf format for the Object Record Table
-//! (IMPL §5).
+//! (METADATA-DESIGN§1).
 //!
-//! Replaces R1b's sorted-run B+ tree with the spec's positional layout:
+//! Replaces the CBOR sorted-run B+ tree with the spec's positional layout:
 //!
 //! ```text
 //! [0..64]            BtreeNodeHeader  (kind = ObjectTable, level = 0)
@@ -13,7 +13,7 @@
 //!
 //! Total = 256 KiB = 262 144 B.
 //!
-//! ## Scope (R1c-A2 first iteration)
+//! ## Scope
 //!
 //! Leaf-only trees: the radix translation
 //! ([`oid_to_radix_path`](crate::radix::oid_to_radix_path) at
@@ -21,7 +21,7 @@
 //! LEAF_RECORDS` is rejected with [`MetaError::OidOutOfRange`]; multi-
 //! level descent (root_level ≥ 1) lands in a follow-up.
 //!
-//! TODO(rewrite-phase-R1c-A2-multilevel): inner node format + tree
+//! TODO(METADATA1): inner node format + tree
 //! descent + COW write path + tree growth. Once those land, this
 //! module changes only insofar as the engine becomes responsible for
 //! routing reads/writes to the right leaf via the inner-node descent.
@@ -74,7 +74,7 @@ const _: () = assert!(
 
 /// 32-byte trailer at offset 320 inside the leaf. Spec line 1199 calls
 /// out "generation, version, reserved"; the bit positions inside the
-/// trailer aren't pinned in IMPL — this module encodes them explicitly:
+/// trailer aren't pinned in METADATA-DESIGN§1 — this module encodes them explicitly:
 ///
 /// ```text
 /// [0..8]   leaf_generation  u64    (separate from bucket generation;
@@ -106,7 +106,7 @@ pub const OBJECT_LEAF_FORMAT_VERSION: u16 = 1;
 /// occupancy bitmap).
 #[derive(Debug, Clone)]
 pub struct ObjectLeaf {
-    /// Per IMPL §1.5.1 every region carries a 64-byte header.
+    /// Per BTREE-DESIGN§1.1 every region carries a 64-byte header.
     pub header: BtreeNodeHeader,
     /// `slots[i] = Some(record)` iff bitmap bit `i` is set.
     pub slots: Box<[Option<ObjectRecord>; LEAF_RECORDS]>,
@@ -188,7 +188,7 @@ impl ObjectLeaf {
         // Bump per-leaf generation + region seq.
         self.trailer.leaf_generation = { self.trailer.leaf_generation }.saturating_add(1);
         self.header.seq = { self.header.seq }.saturating_add(1);
-        // Update min_key / max_key fields per IMPL §1.5.1 ("covered key
+        // Update min_key / max_key fields per BTREE-DESIGN§1.1 ("covered key
         // range"). For positional radix leaves the natural choice is
         // the first/last occupied oid_local encoded as 16 B big-endian
         // bytes (right-padded). This matches the "interpreted per-kind"

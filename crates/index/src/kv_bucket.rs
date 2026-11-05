@@ -1,4 +1,4 @@
-//! `KvBucket` 4 KiB block — IMPL §9.1.
+//! `KvBucket` 4 KiB block — INDEX-DESIGN§4.1.
 //!
 //! ```text
 //! [0..32]    BlockHeader  (kind = KvHashBucket, magic = "MIMR")

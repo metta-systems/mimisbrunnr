@@ -1,4 +1,4 @@
-//! On-disk per-disk descriptor (IMPL §10.4).
+//! On-disk per-disk descriptor (POOL-DESIGN§1).
 //!
 //! Wire layout for a single disk in the inline `PoolStateRoot.inline_disks[]`
 //! array (or, for >12 disks, in the `BtreeKind::DiskDescriptors` overflow tree
@@ -84,10 +84,10 @@ pub(crate) fn disk_state_from_u8(v: u8) -> Result<DiskState, PoolError> {
 }
 
 // ------------------------------------------------------------------------
-// DiskDescriptorOnDisk — 256 bytes, IMPL §10.4
+// DiskDescriptorOnDisk — 256 bytes, POOL-DESIGN§1
 // ------------------------------------------------------------------------
 
-/// Per-disk on-disk descriptor record. **256 bytes.** IMPL §10.4 lines
+/// Per-disk on-disk descriptor record. **256 bytes.** POOL-DESIGN§1 lines
 /// 2155–2172.
 ///
 /// Field layout (offsets in bytes):
@@ -135,9 +135,9 @@ const_assert_eq!(
 // ---------- Serialize / Deserialize via bytemuck ----------
 //
 // `DiskDescriptorOnDisk` is `#[repr(C, packed)] Pod` with a spec-pinned
-// 256 B layout (IMPL §10.4). Round-trip the byte image rather than
+// 256 B layout (POOL-DESIGN§1). Round-trip the byte image rather than
 // per-field tags so the CBOR wire form mirrors the on-disk POD layout
-// exactly. Used by the R1b-11 `disks_overflow_root` sorted-run path.
+// exactly. Used by the `disks_overflow_root` sorted-run path.
 
 impl Serialize for DiskDescriptorOnDisk {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {

@@ -1,24 +1,24 @@
-//! Journal pin / dirty-node bookkeeping. IMPL §3.4.
+//! Journal pin / dirty-node bookkeeping. JOURNAL-DESIGN§1.4.
 //!
-//! Phase 2 scope: the struct shape only. The actual journal-reclaim driver
-//! lives in a later phase.
+//! The struct shape only. The actual journal-reclaim driver
+//! is JOURNAL4.
 
 use mimisbrunnr_storage::BlockRef;
 
 /// In-memory pinning record for a dirty btree node.
 ///
-/// IMPL §3.4: each in-memory dirty btree node carries a journal pin — the LSN
+/// JOURNAL-DESIGN§1.4: each in-memory dirty btree node carries a journal pin — the LSN
 /// of the oldest WAL entry whose update has not yet been merged into the
 /// on-disk node. Reclaim of the WAL ring is gated on
 /// `min(all_dirty_nodes.pending_lsn_min)`.
 ///
-/// `in_memory` deliberately stays opaque — Phase 2b crates (`meta`, `index`)
+/// `in_memory` deliberately stays opaque — the `meta` and `index` crates
 /// will land their own `NodeContent` types and carry them via a generic
 /// parameter or trait. For now the struct just owns the pin metadata.
 //
-// TODO(rewrite-phase-N): journal-reclaim driver — choose flush victims by
+// TODO(JOURNAL4): journal-reclaim driver — choose flush victims by
 // (pending_lsn_max - pending_lsn_min) * pending_count and rewrite via the
-// COW path described in §3.4. This is the thread that advances
+// COW path described in JOURNAL-DESIGN§1.4. This is the thread that advances
 // `WalHeader.read_cursor` past flushed pages.
 #[derive(Debug, Clone)]
 pub struct DirtyNode {

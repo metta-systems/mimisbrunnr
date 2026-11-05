@@ -1,4 +1,4 @@
-//! Content presence / hydration model (DESIGN §10.3).
+//! Content presence / hydration model (SPECIFICATION-DESIGN§10.3).
 //!
 //! Captures whether an object's payload is locally resident, remote-only,
 //! actively hydrating, cached on a local tier, or partially materialised

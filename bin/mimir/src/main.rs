@@ -1,6 +1,6 @@
 //! `mimir` — query / mutation CLI for a Mímisbrunnr pool.
 //!
-//! Phase 7a entry point: parse args with `clap`, open the [`DiskEngine`],
+//! Entry point: parse args with `clap`, open the [`DiskEngine`],
 //! dispatch to a command handler in `mimir::commands`, and `commit()` on the
 //! way out so the WAL is durable.
 
@@ -130,7 +130,7 @@ enum OntologyAction {
     Orphans,
     /// Print a tag definition + its implication closure.
     Show { tag: String },
-    /// Adopt an orphan tag into a module. (Phase 7a: TODO)
+    /// Adopt an orphan tag into a module. (not implemented yet)
     Adopt { orphan: String, into: String },
 }
 
@@ -148,7 +148,7 @@ enum WatchAction {
     Drain { name: String },
     /// Tear down a subscription.
     Unsubscribe { name: String },
-    /// Continuously stream events. (Phase 7a: TODO)
+    /// Continuously stream events. (not implemented yet)
     Stream { name: String },
 }
 
@@ -166,7 +166,7 @@ enum ProjectAction {
     },
     /// Print the projected tree for `ctx`.
     Tree { ctx: String },
-    /// Walk a host directory and create one object per file. Phase 7a does
+    /// Walk a host directory and create one object per file. This does
     /// not read file contents into the blob store.
     Import {
         dir: PathBuf,

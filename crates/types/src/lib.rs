@@ -5,8 +5,8 @@
 //! ontology surface, placement / storage policy enums, watch/subscription
 //! events, …). It deliberately holds *no* on-disk wire structs — those live in
 //! the infrastructure crate that owns each byte layout (`storage`, `meta`,
-//! `wal`, `index`, …). See `docs/REWRITE_CONTRACT.md` §3 for the full
-//! ownership table.
+//! `wal`, `index`, …). See `doc/agentic/operations-design.md` (type ownership)
+//! for the full ownership table.
 //!
 //! All public types are `Send + Sync` unless explicitly noted.
 

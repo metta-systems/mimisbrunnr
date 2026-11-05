@@ -10,7 +10,7 @@
 //!   `BtreeKind::PlacementRules` B+ tree lands).
 //!
 //! The full placement-rule evaluator and rebalancing/drain machinery from
-//! DESIGN §8.4 are tagged as TODO for later phases — this module gives the
+//! SPECIFICATION-DESIGN§8.4 are tagged as TODO for later phases — this module gives the
 //! **disk-level** lifecycle (create / open / add / remove / status / pick).
 
 use std::{collections::BTreeMap, path::Path, sync::Arc};
@@ -36,10 +36,10 @@ use crate::{
 /// 0 and 4 KiB). We keep a small reserved gap and place the `PoolStateRoot`
 /// at offset `4 * BLOCK_SIZE` (16 KiB). Once the metadata zone is wired
 /// through the engine, this becomes a `BlockRef` recorded in the active
-/// `RootPointer.pool_state_root` (IMPL §2.2). For Phase 3c the offset is
+/// `RootPointer.pool_state_root` (ENGINE-DESIGN§1.2). Until POOL3 the offset is
 /// fixed.
 //
-// TODO(rewrite-phase-N): wire pool_state_root via RootPointer.pool_state_root
+// TODO(POOL3): wire pool_state_root via RootPointer.pool_state_root
 // instead of a hard-coded byte offset.
 pub const POOL_STATE_ROOT_OFFSET: u64 = (BLOCK_SIZE as u64) * 4;
 
@@ -50,7 +50,7 @@ const FMT_BOOTSTRAP_BUCKETS: u32 = 64;
 const FMT_WAL_OFFSET: u64 = 64 * 1024; // 64 KiB
 const FMT_WAL_SIZE: u64 = 1024 * 1024; // 1 MiB
 const FMT_INDEX_ZONE_OFFSET: u64 = FMT_WAL_OFFSET + FMT_WAL_SIZE; // ~1.0625 MiB
-// 32 MiB — fits R1c-A3.2 layout (3 MiB of fixed-offset directory
+// 32 MiB — fits the fixed-offset index-zone layout (3 MiB of fixed-offset directory
 // regions + 1 MiB legacy CBOR blob + 4 MiB tag bitmap area + 8 MiB
 // forward-overflow area + comfort margin).
 const FMT_INDEX_ZONE_SIZE: u64 = 32 * 1024 * 1024;
@@ -320,10 +320,10 @@ impl PoolManager {
     /// Begin removing a disk: marks the runtime state as `Draining` and
     /// persists the updated `PoolStateRoot`.
     ///
-    /// **Phase 3c scope:** no actual data evacuation. Subsequent phases
+    /// No actual data evacuation yet. POOL6
     /// will scan the location table and migrate matching extents.
     //
-    // TODO(rewrite-phase-N): evacuate per DESIGN §8.4 (location-table scan,
+    // TODO(POOL6): evacuate per SPECIFICATION-DESIGN§8.4 (location-table scan,
     // placement-rule re-evaluation, migration, then `state = Removed`).
     pub fn remove_disk(&mut self, disk_id: DiskId) -> Result<(), PoolError> {
         let runtime = self
@@ -332,7 +332,7 @@ impl PoolManager {
             .ok_or(PoolError::DiskNotFound(disk_id))?;
         runtime.state = DiskState::Draining;
         warn!(
-            "PoolManager::remove_disk(id={disk_id}) — Phase 3c marks Draining \
+            "PoolManager::remove_disk(id={disk_id}) — marks Draining \
              but does not migrate data"
         );
         self.write_pool_state_root()?;
@@ -410,12 +410,12 @@ impl PoolManager {
 
     /// Pick a disk for new data of `data_type` in tier `tier_pref`.
     ///
-    /// Phase 3c strategy: simple capacity-weighted choice among Online
+    /// Current strategy (until POOL4): simple capacity-weighted choice among Online
     /// disks in the requested tier — pick the one with the most free
     /// capacity. Returns `None` if no disk in that tier is online.
     //
-    // TODO(rewrite-phase-N): full placement-rule evaluator per DESIGN
-    // §8.3 (Pin > Prefer > Replicate > AutoTier > defaults).
+    // TODO(POOL4): full placement-rule evaluator per
+    // SPECIFICATION-DESIGN§8.3 (Pin > Prefer > Replicate > AutoTier > defaults).
     pub fn pick_disk(
         &self,
         tier_pref: StorageTier,
@@ -516,7 +516,7 @@ impl PoolManager {
 
 /// Derive a stable 16-byte fs UUID from `(node_id, disk_id)`. Real
 /// deployments would use a random UUID at format time and persist it; for
-/// Phase 3c this deterministic derivation is sufficient and re-formatting
+/// now this deterministic derivation is sufficient and re-formatting
 /// the same disk produces the same UUID.
 fn fs_uuid_for(node_id: NodeId, disk_id: DiskId) -> [u8; 16] {
     let mut u = [0u8; 16];

@@ -18,7 +18,7 @@ pub enum TransformError {
     UnsupportedAlgo(&'static str),
 
     /// Encryption was requested but the underlying ciphers are not yet
-    /// integrated (Phase 2c placeholder).
+    /// integrated (placeholder until ENCRYPTION1).
     #[error("encryption disabled in this build")]
     EncryptionDisabled,
 

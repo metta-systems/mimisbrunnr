@@ -1,10 +1,10 @@
-//! Heterogeneous attribute values (DESIGN §2.2, IMPL §4).
+//! Heterogeneous attribute values (SPECIFICATION-DESIGN§2.2, INDEX-DESIGN§1).
 //!
 //! `Value` is the only data type whose shape varies enough that fixed binary
 //! layout is wasteful — it is encoded as **CBOR** with a fixed tag scheme
 //! using `serde`'s externally-tagged enum representation.
 //!
-//! Encoding rules (IMPL §4):
+//! Encoding rules (INDEX-DESIGN§1):
 //! - Variants are numbered 0..=5 in the order `Text, Int, Float, Timestamp,
 //!   Blob, Scoped`. The numeric prefix prevents `Int(42)` from colliding with
 //!   `Text("42")` for hashing purposes.
@@ -22,15 +22,15 @@ use siphasher::sip::SipHasher24;
 use crate::{TypesError, ids::TagId};
 
 /// CBOR-encoded `Value`s above this size spill to a `BlobZone` extent;
-/// smaller values inline directly into the index leaf (IMPL §4.1).
+/// smaller values inline directly into the index leaf (INDEX-DESIGN§1.1).
 pub const VALUE_INLINE_THRESHOLD: usize = 96;
 
-/// SipHash-2-4 domain tag (IMPL §4.2). Mixed in before the type prefix and
+/// SipHash-2-4 domain tag (INDEX-DESIGN§1.2). Mixed in before the type prefix and
 /// payload so that identical bytes hashed in unrelated KV indices cannot
 /// collide.
 const KV_HASH_DOMAIN: &[u8] = b"mimir-kv";
 
-// Type tags (IMPL §4). These travel with the hash input — *not* with the CBOR
+// Type tags (INDEX-DESIGN§1). These travel with the hash input — *not* with the CBOR
 // payload, which carries its own `serde` discriminant.
 const TYPE_TAG_TEXT: u8 = 0;
 const TYPE_TAG_INT: u8 = 1;
@@ -54,7 +54,7 @@ pub enum Value {
     /// to a `BlobZone` extent — that bookkeeping happens in storage.
     Blob(Vec<u8>),
     /// Scoped value: "the inner value applies in the context of tag
-    /// `context`" (IMPL §4.3). Used by e.g. unix-path projections to tie a
+    /// `context`" (INDEX-DESIGN§1.3). Used by e.g. unix-path projections to tie a
     /// value to a `unix-path-context:*` grouping tag without inflating the
     /// tag namespace.
     ///
@@ -67,7 +67,7 @@ pub enum Value {
 }
 
 impl Value {
-    /// Construct a [`Value::Scoped`], rejecting nested scopes per IMPL §4.3.
+    /// Construct a [`Value::Scoped`], rejecting nested scopes per INDEX-DESIGN§1.3.
     pub fn scoped(context: TagId, inner: Value) -> Result<Self, TypesError> {
         if matches!(inner, Value::Scoped { .. }) {
             return Err(TypesError::NestedScopedValue);
@@ -131,7 +131,7 @@ impl Value {
     }
 
     /// Numeric type tag used by [`value_hash`] and by the on-wire encoding
-    /// preamble. Pinned by IMPL §4.
+    /// preamble. Pinned by INDEX-DESIGN§1.
     #[inline]
     pub const fn type_tag(&self) -> u8 {
         match self {
@@ -212,7 +212,7 @@ pub fn decode_cbor(bytes: &[u8]) -> Result<Value, TypesError> {
     Ok(v)
 }
 
-/// SipHash-2-4 keyed by a per-pool secret, truncated to 64 bits (IMPL §4.2).
+/// SipHash-2-4 keyed by a per-pool secret, truncated to 64 bits (INDEX-DESIGN§1.2).
 ///
 /// The hash mixes in:
 ///

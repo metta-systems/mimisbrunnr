@@ -2,10 +2,10 @@
 //!
 //! Implements:
 //!
-//! - DESIGN §8 — pool topology, semantic placement rules, disk operations.
-//! - IMPL §10.4 — `PoolStateRoot` (4 KiB), `DiskDescriptorOnDisk` (256 B)
+//! - SPECIFICATION-DESIGN§8 — pool topology, semantic placement rules, disk operations.
+//! - POOL-DESIGN§1 — `PoolStateRoot` (4 KiB), `DiskDescriptorOnDisk` (256 B)
 //!   wire layouts.
-//! - DESIGN §15 — per-pool TOML configuration (`pool.toml`).
+//! - SPECIFICATION-DESIGN§15 — per-pool TOML configuration (`pool.toml`).
 //!
 //! The logical enums (`MediaType`, `StorageTier`, `DiskState`, the logical
 //! `DiskDescriptor`, `PlacementRule`, `ChunkParams`, `ChunkingAlgo`) live in

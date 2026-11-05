@@ -2,7 +2,7 @@
 //! parser's gate) into [`mimisbrunnr_types::Query`] plus optional limit,
 //! offset, and aggregate metadata.
 //!
-//! Translation rules (Phase 5a — `docs/REWRITE_CONTRACT.md` §3 + the prompt
+//! Translation rules (`doc/agentic/operations-design.md` (type ownership) + the prompt
 //! describing the surface):
 //!
 //! - `WHERE tag = 'X'` → `Query::HasTag(resolve_tag(X))`.
@@ -121,7 +121,7 @@ fn plan_query(
         return Err(SqlError::Unsupported("SELECT DISTINCT".into()));
     }
 
-    // Validate FROM is exactly `objects` (Phase 5a — single virtual relation).
+    // Validate FROM is exactly `objects` (single virtual relation).
     validate_from(&select.from)?;
 
     let (projection, aggregate) = plan_projection(&select.projection)?;
@@ -358,7 +358,7 @@ fn plan_like(
     pattern: &str,
     ontology: &OntologyState,
 ) -> Result<Query, SqlError> {
-    // Phase 5a: only `'foo%'` (prefix) and `'%foo'` (contains) are accepted.
+    // Only `'foo%'` (prefix) and `'%foo'` (contains) are accepted.
     // Anything else (mid-string `%`, `_`, escape characters) is rejected.
     let has_lead = pattern.starts_with('%');
     let has_trail = pattern.ends_with('%');

@@ -1,4 +1,4 @@
-//! Implication DAG (DESIGN §3.3).
+//! Implication DAG (SPECIFICATION-DESIGN§3.3).
 //!
 //! Nodes are [`TagId`]s; edges are directed `from → to` meaning "from implies
 //! to". The graph is required to be acyclic — every `add_implication` is
@@ -232,7 +232,7 @@ impl ImplicationDag {
 // -------------------------------------------------------------------------
 
 /// Serialisable snapshot of the implication DAG. Public because it
-/// appears in the [`crate::PersistedState`] (R1b-8) signature.
+/// appears in the [`crate::PersistedState`] signature.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DagSnapshot {
     /// Tag node ids, sorted ascending.
@@ -242,7 +242,7 @@ pub struct DagSnapshot {
 }
 
 impl ImplicationDag {
-    /// Build a serialisable snapshot. R1b-8 persists this inside
+    /// Build a serialisable snapshot. The ontology region persists this inside
     /// [`crate::PersistedState`].
     pub fn snapshot(&self) -> DagSnapshot {
         let mut tags: Vec<TagId> = self.graph.node_weights().copied().collect();

@@ -1,12 +1,12 @@
 //! `mimisbrunnr-index` — forward / tag / KV / range / chunk indices.
 //!
 //! Implements the on-disk *struct shapes* and the in-memory mirror shapes
-//! pinned by IMPL §7 (Forward Index), §8 (Tag Inverted Index), §9 (KV
-//! equality, range, chunk indices) and §13 (in-memory mirrors). The live
-//! §1.5 B+ tree backing is **out of scope for this phase** — every persistent
+//! pinned by INDEX-DESIGN§2 (Forward Index), INDEX-DESIGN§3 (Tag Inverted Index), INDEX-DESIGN§4 (KV
+//! equality, range, chunk indices) and ENGINE-DESIGN§2 (in-memory mirrors). The live
+//! BTREE-DESIGN§1 B+ tree backing is **out of scope for this phase** — every persistent
 //! structure here exposes serialise/deserialise helpers based on CBOR
 //! (`ciborium`) so the engine can treat them as opaque blobs in the index
-//! zone until §1.5 is wired up properly.
+//! zone until BTREE-DESIGN§1 is wired up properly.
 //!
 //! Public surface:
 //!
@@ -18,10 +18,11 @@
 //! - In-memory mirrors:
 //!   - `TagStore` enum (Simple / Ordered / Ranked).
 //!   - `TagIndex`, `KvIndex`, `RangeIndex`, `ForwardIndex`, `ChunkIndex`.
-//!   - `FacetedExplorer` helper (DESIGN §5.6).
+//!   - `FacetedExplorer` helper (SPECIFICATION-DESIGN§5.6).
 //!
-//! TODO(rewrite-phase-N): replace the per-mirror `serialise/deserialise`
-//! helpers with §1.5 B+ tree backing once the storage primitives land.
+//! Each mirror persists through its own BTREE-DESIGN§1 B+ tree region; the
+//! per-mirror CBOR `serialise/deserialise` helpers are whole-mirror
+//! snapshots kept for tests.
 
 #![forbid(unsafe_code)]
 

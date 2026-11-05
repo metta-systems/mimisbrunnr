@@ -1,4 +1,4 @@
-//! BLAKE3 content hashing (DESIGN §9.1, IMPL §1.4).
+//! BLAKE3 content hashing (SPECIFICATION-DESIGN§9.1, FORMAT-DESIGN§1.4).
 //!
 //! The content hash is always taken over the **plaintext**, before
 //! compression / padding / encryption. Dedup and integrity verification are

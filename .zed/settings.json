@@ -16,12 +16,5 @@
       "command": "octofs",
       "args": [],
     },
-    "Haft": {
-      "command": "mcp-rtk",
-      "args": ["--", "haft", "serve"],
-      "env": {
-        "HAFT_PROJECT_ROOT": "$ZED_PROJECT_ROOT",
-      },
-    },
   },
 }

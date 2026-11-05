@@ -1,4 +1,4 @@
-//! Per-tag storage policy (DESIGN §3.5).
+//! Per-tag storage policy (SPECIFICATION-DESIGN§3.5).
 //!
 //! Each tag's `storage` field declares values for one or more **axes** —
 //! chunking, compression, encryption — that the storage layer applies to
@@ -16,7 +16,7 @@ use crate::{
 /// be `Some`; tags that drive no storage behaviour leave all of them `None`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct StoragePolicy {
-    /// Chunking parameters. Chunking is a placement decision (DESIGN §8.4).
+    /// Chunking parameters. Chunking is a placement decision (SPECIFICATION-DESIGN§8.4).
     pub chunking: Option<ChunkParams>,
     /// Compression algorithm.
     pub compression: Option<CompressionAlgo>,

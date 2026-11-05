@@ -76,9 +76,9 @@ enum Commands {
 
     /// Mount a single path-context subtree (feature = "fuse").
     ///
-    /// **Phase 7b note:** this currently mounts the *entire* filesystem;
-    /// the requested context will appear under
-    /// `<mountpoint>/ctx/<context>`. Subtree-only mounts are a TODO.
+    /// This currently mounts the *entire* filesystem; the requested context
+    /// appears under `<mountpoint>/ctx/<context>`. Subtree-only mounts:
+    /// TODO(UNIX7).
     MountUnix {
         /// Mount point.
         mountpoint: PathBuf,

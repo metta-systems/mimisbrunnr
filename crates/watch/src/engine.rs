@@ -1,27 +1,27 @@
-//! [`SubscriptionEngine`] — DESIGN §11.3.
+//! [`SubscriptionEngine`] — SPECIFICATION-DESIGN§11.3.
 //!
 //! Maintains an inverted `tag → [subscription_id]` index and dispatches
 //! [`WatchEvent`]s to per-subscription pending queues. The engine layer
-//! (Phase 5) wires the executor and the WAL replay logic; this crate is
+//! wires the executor and the WAL replay logic; this crate is
 //! purely the in-memory bookkeeping.
 //!
-//! ## Persistence (R1c-A5)
+//! ## Persistence
 //!
-//! On disk the engine occupies one 256 KiB §1.5 B+ tree region of
+//! On disk the engine occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
 //! [`BtreeKind::Subscriptions`]. The directory holds one sorted-run
 //! entry per subscription, keyed by `(SubscriptionId, snapshot)`
-//! (§1.5.6 packed) with the value tail being the CBOR-serialised
+//! (BTREE-DESIGN§1.6 packed) with the value tail being the CBOR-serialised
 //! [`PersistedSub`] (the spec's `SubscriptionRecord`) under
 //! `VALUE_SIZE_KIND_VARINT`. `next_id` is not persisted — it's
 //! re-derived at load time from `max(loaded_ids) + 1`.
 //!
-//! `cached_result` rides inline in the record's CBOR for R1c. The
-//! spec-target externalization (a `BlockRef` into a §8.2 `TagBitmap`
-//! chain) is deferred to post-Tier 3 D3 — once sub-bucket allocation
+//! `cached_result` rides inline in the record's CBOR. The
+//! spec-target externalization (a `BlockRef` into a INDEX-DESIGN§3.2 `TagBitmap`
+//! chain) is deferred to SUBSCRIPTION1 — once sub-bucket allocation
 //! is live, per-subscription bitmap pages can be allocated cheaply
 //! without competing with the fixed-offset tag-bitmap-area cap.
 //!
-//! TODO(post-D3): externalize `cached_result` to a `TagBitmap`
+//! TODO(SUBSCRIPTION1): externalize `cached_result` to a `TagBitmap`
 //! chain so per-sub cursor mutations don't rewrite the bitmap bytes.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -46,7 +46,7 @@ use crate::{
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const SUBSCRIPTIONS_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
@@ -67,7 +67,7 @@ fn hlc(ts_ns: i64) -> HybridTimestamp {
     HybridTimestamp::new(ts_ns, 0, 0 as NodeId)
 }
 
-/// Recursive tag extractor over a [`Query`] (DESIGN §11.3 inverted index
+/// Recursive tag extractor over a [`Query`] (SPECIFICATION-DESIGN§11.3 inverted index
 /// maintenance). Pulls every `TagId` that appears anywhere in the query
 /// tree — `HasTag`, `HasAttr.key`, `Related.predicate`, `IsA(t)`, plus all
 /// children of `And` / `Or` / `Not`.
@@ -97,7 +97,7 @@ fn walk(query: &Query, out: &mut BTreeSet<TagId>) {
     }
 }
 
-/// Inverted-index-driven dispatcher. DESIGN §11.3.
+/// Inverted-index-driven dispatcher. SPECIFICATION-DESIGN§11.3.
 #[derive(Debug, Default)]
 pub struct SubscriptionEngine {
     pub subscriptions: HashMap<SubscriptionId, Subscription>,
@@ -111,7 +111,7 @@ impl SubscriptionEngine {
         Self::default()
     }
 
-    /// Register a new subscription. DESIGN §11.4 atomic subscribe + snapshot.
+    /// Register a new subscription. SPECIFICATION-DESIGN§11.4 atomic subscribe + snapshot.
     ///
     /// `initial_result` is the result of evaluating `query` *at the same LSN
     /// that the engine layer sampled `current_lsn` from*. Any mutation
@@ -166,7 +166,7 @@ impl SubscriptionEngine {
         Ok(())
     }
 
-    /// Pause a live subscription (DESIGN §11.7 Active → Dormant).
+    /// Pause a live subscription (SPECIFICATION-DESIGN§11.7 Active → Dormant).
     pub fn pause(&mut self, id: SubscriptionId) {
         if let Some(sub) = self.subscriptions.get_mut(&id) {
             sub.state = SubscriptionState::Dormant;
@@ -191,7 +191,7 @@ impl SubscriptionEngine {
 
     /// Set the cursor (LSN of last delivered event). Used by the engine
     /// layer when it has finished replaying the WAL during catch-up.
-    // TODO(rewrite-phase-N): wire WAL scan in engine.
+    // TODO(SUBSCRIPTION6): wire WAL scan in engine.
     pub fn set_cursor(&mut self, id: SubscriptionId, lsn: u64) -> Result<(), WatchError> {
         let sub = self
             .subscriptions
@@ -202,7 +202,7 @@ impl SubscriptionEngine {
     }
 
     /// Refresh the inverted index against a new ontology snapshot
-    /// (DESIGN §11.8 ontology-aware subscriptions). Re-derives every
+    /// (SPECIFICATION-DESIGN§11.8 ontology-aware subscriptions). Re-derives every
     /// subscription's tag set — picking up any newly-installed implications
     /// for `IsA(t)` clauses.
     pub fn refresh_ontology_links(&mut self, ontology: &OntologyState) {
@@ -247,11 +247,11 @@ impl SubscriptionEngine {
         }
         let key = oid_to_u32(oid);
         let was_member = sub.cached_result.contains(key);
-        // Phase 4b: for `HasTag(t)` (and queries like `IsA(t)` / `Related`
+        // For `HasTag(t)` (and queries like `IsA(t)` / `Related`
         // where this single tag is sufficient), adding the tag transitions
         // the object into the matching set. For arbitrary boolean queries,
         // the engine layer is expected to call `set_membership` directly.
-        // TODO(rewrite-phase-N): full query re-evaluation in this hook.
+        // TODO(SUBSCRIPTION3): full query re-evaluation in this hook.
         if !was_member {
             sub.cached_result.insert(key);
             emit(
@@ -301,7 +301,7 @@ impl SubscriptionEngine {
             // Conservative for `HasTag(t)`: removing the watched tag means
             // the object no longer matches. Boolean queries must be
             // re-evaluated by the engine layer.
-            // TODO(rewrite-phase-N): full query re-evaluation in this hook.
+            // TODO(SUBSCRIPTION3): full query re-evaluation in this hook.
             sub.cached_result.remove(key);
             // Emit TagRemoved first (the spec lets a sub care about both),
             // then Exited, but masked individually by `interest`.
@@ -411,14 +411,14 @@ impl SubscriptionEngine {
         Ok(())
     }
 
-    /// Advance per-subscription debounce timers. Phase 4b: a no-op shim;
-    /// debouncing flushes are left as TODO. Provided so that callers can
+    /// Advance per-subscription debounce timers. A no-op shim for now;
+    /// debouncing flushes are SUBSCRIPTION4. Provided so that callers can
     /// wire it without reaching into private state later.
-    // TODO(rewrite-phase-N): implement per-sub debounce flush here.
+    // TODO(SUBSCRIPTION4): implement per-sub debounce flush here.
     pub fn tick(&mut self, _now_ns: i64) {}
 
     // ------------------------------------------------------------------
-    // Persistence (IMPL §10.2 / R1c-A5).
+    // Persistence (SUBSCRIPTIONS-DESIGN§1).
     // ------------------------------------------------------------------
 
     /// Serialise the durable engine state as a single CBOR blob. Kept
@@ -426,7 +426,7 @@ impl SubscriptionEngine {
     /// engine (e.g. snapshot transport). The on-disk persistence path
     /// goes through [`Self::flush_to_region`].
     ///
-    /// Skips the in-memory `pending_events` queue (DESIGN §11.5:
+    /// Skips the in-memory `pending_events` queue (SPECIFICATION-DESIGN§11.5:
     /// pending events are recovered by WAL replay, not by replaying a
     /// snapshot).
     pub fn serialise(&self) -> Result<Vec<u8>, WatchError> {
@@ -447,7 +447,7 @@ impl SubscriptionEngine {
     }
 
     /// Build a [`LoadedNode`] with one sorted-run entry per
-    /// subscription, sorted by id. Used by the §1.5 B+ tree flush
+    /// subscription, sorted by id. Used by the BTREE-DESIGN§1 B+ tree flush
     /// path (and by tests that want the underlying node shape).
     pub fn to_loaded_node(
         &self,
@@ -499,7 +499,7 @@ impl SubscriptionEngine {
 
     /// Write the in-memory state to a fresh 256 KiB region at byte
     /// `offset` on `device`. One sorted-run entry per subscription,
-    /// keyed by `(SubscriptionId, snapshot)` via the §1.5.6 packed
+    /// keyed by `(SubscriptionId, snapshot)` via the BTREE-DESIGN§1.6 packed
     /// codec; CBOR value tails ride under `VALUE_SIZE_KIND_VARINT`.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
@@ -568,7 +568,7 @@ impl SubscriptionEngine {
     /// as `max(ids)` (or `0` on an empty list); [`Self::register`]
     /// pre-bumps before use, so `next_id` ends up equal to the
     /// **last assigned id** rather than the next unused one. See
-    /// IMPL §10.2.
+    /// SUBSCRIPTIONS-DESIGN§1.
     fn from_records(records: Vec<PersistedSub>) -> Result<Self, WatchError> {
         let next_id = records.iter().map(|r| r.id).max().unwrap_or(0);
         let mut engine = SubscriptionEngine {
@@ -639,7 +639,7 @@ fn apply_retention(sub: &Subscription, queue: &mut VecDeque<WatchEvent>) {
 }
 
 /// Tags to index a subscription against, taking ontology closures into
-/// account for `IsA(t)` clauses (DESIGN §11.8). For non-`IsA` clauses this
+/// account for `IsA(t)` clauses (SPECIFICATION-DESIGN§11.8). For non-`IsA` clauses this
 /// is identical to [`extract_tags`].
 fn tags_for_indexing(query: &Query, ontology: &OntologyState) -> Vec<TagId> {
     let mut out: BTreeSet<TagId> = BTreeSet::new();
@@ -684,14 +684,14 @@ fn walk_with_ontology(query: &Query, ontology: &OntologyState, out: &mut BTreeSe
 }
 
 // -------------------------------------------------------------------------
-// On-disk wire types (IMPL §10.2).
+// On-disk wire types (SUBSCRIPTIONS-DESIGN§1).
 // -------------------------------------------------------------------------
 
 /// B+ tree key for the subscriptions directory: `(SubscriptionId,
-/// snapshot)` per IMPL §10.2.
+/// snapshot)` per SUBSCRIPTIONS-DESIGN§1.
 ///
-/// Snapshots are deferred to R6; every key written today carries
-/// `snapshot = 0`. The field is on-disk now so R6 won't need a layout
+/// Snapshots are deferred to SNAPSHOT2; every key written today carries
+/// `snapshot = 0`. The field is on-disk now so SNAPSHOT2 won't need a layout
 /// break.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
@@ -803,7 +803,7 @@ mod serde_bytes_helper {
 /// [`SubscriptionsValue`] byte tail. Mirrors [`Subscription`] modulo
 /// the roaring-bitmap proxy (`cached_result` carries the
 /// `RoaringBitmap::serialize_into` byte image; externalization to a
-/// §8.2 `TagBitmap` is post-D3 work).
+/// INDEX-DESIGN§3.2 `TagBitmap` is SUBSCRIPTION1).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSub {
     /// Subscription id.
@@ -1194,7 +1194,7 @@ mod tests {
         assert!(e.tag_to_subs.get(&car).unwrap().contains(&id));
     }
 
-    // ----- B+ tree region round-trip (R1c-A5 native path) -----
+    // ----- B+ tree region round-trip (native path) -----
 
     use mimisbrunnr_storage::FileBlockDevice;
     use tempfile::TempDir;

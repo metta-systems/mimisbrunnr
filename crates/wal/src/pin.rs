@@ -1,6 +1,6 @@
 //! Journal pinning for WAL retention.
 //!
-//! Implements IMPL §3.4 `DirtyNode` accounting — the WAL trimmer must not
+//! Implements JOURNAL-DESIGN§1.4 `DirtyNode` accounting — the WAL trimmer must not
 //! reclaim entries past the lowest live `lsn_min` across all pins.
 
 /// A pin held by a `LoadedNode` to prevent WAL truncation of pending entries.

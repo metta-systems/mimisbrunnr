@@ -1,6 +1,6 @@
 //! Per-pool TOML configuration (`pool.toml`).
 //!
-//! DESIGN §15 — links `brunnr` and `mimir` to the same pool by listing the
+//! SPECIFICATION-DESIGN§15 — links `brunnr` and `mimir` to the same pool by listing the
 //! disks that compose it.
 //!
 //! Example:

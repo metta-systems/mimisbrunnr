@@ -1,6 +1,6 @@
 //! `analyze` — read-only visual inspector for a Mímisbrunnr pool.
 //!
-//! Phase 7d rewrite. Opens a pool via [`DiskEngine::open`] (read-write today —
+//! Opens a pool via [`DiskEngine::open`] (read-write today —
 //! see `open_pool_read_only`), builds a [`PoolSnapshot`] of the in-memory state
 //! plus on-disk header metadata, and renders it via either:
 //!
@@ -102,7 +102,7 @@ pub struct DiskSummary {
     pub capacity_bytes: u64,
     pub used_bytes: u64,
     pub state: String,
-    /// Decoded superblock (only the primary disk for now — see TODO below).
+    /// Decoded superblock (only the primary disk for now — TODO(TOOLING7)).
     pub superblock: Option<SuperblockView>,
     pub root_pointer: Option<RootPointerView>,
 }

@@ -1,7 +1,7 @@
 //! WAL entry header, on-disk `HybridTimestamp`, framing constants, and
 //! per-op CBOR payload schemas.
 //!
-//! Implements IMPL §3.2 and §3.3.
+//! Implements JOURNAL-DESIGN§1.2 and JOURNAL-DESIGN§1.3.
 
 use {
     bytemuck::{Pod, Zeroable},
@@ -15,7 +15,7 @@ use crate::error::WalError;
 
 // ---------- Constants ----------
 
-/// `WALR` — entry-header magic. IMPL §3.2.
+/// `WALR` — entry-header magic. JOURNAL-DESIGN§1.2.
 pub const WAL_ENTRY_MAGIC: [u8; 4] = *b"WALR";
 
 /// Entry-header `format_version` for this build.
@@ -32,28 +32,28 @@ pub const WAL_FRAMING_CRC_LEN: usize = 4;
 /// AES-256-GCM authentication-tag length in encrypted framing.
 pub const WAL_GCM_TAG_LEN: usize = 16;
 
-/// Plaintext-payload cap. IMPL §3.2:
+/// Plaintext-payload cap. JOURNAL-DESIGN§1.2:
 /// `4096 - WalEntryHeader (40) - framing CRC (4) = 4052`.
 pub const WAL_MAX_PAYLOAD_PLAINTEXT: usize =
     WAL_SECTOR_SIZE - core::mem::size_of::<WalEntryHeader>() - WAL_FRAMING_CRC_LEN;
 
 /// Encrypted-payload cap (ciphertext bytes).
-/// `4052 - 16 = 4036`. IMPL §3.2.
+/// `4052 - 16 = 4036`. JOURNAL-DESIGN§1.2.
 pub const WAL_MAX_PAYLOAD_ENCRYPTED: usize = WAL_MAX_PAYLOAD_PLAINTEXT - WAL_GCM_TAG_LEN;
 
 // ---------- Flag bits ----------
 
-/// Payload encrypted with AES-256-GCM. IMPL §3.2.
+/// Payload encrypted with AES-256-GCM. JOURNAL-DESIGN§1.2.
 pub const WAL_ENTRY_FLAG_ENCRYPTED: u16 = 1 << 0;
 
-/// Payload zstd-compressed before optional encryption. IMPL §3.2.
+/// Payload zstd-compressed before optional encryption. JOURNAL-DESIGN§1.2.
 pub const WAL_ENTRY_FLAG_COMPRESSED: u16 = 1 << 1;
 
 // ---------- HybridTimestamp on-disk wire form ----------
 
-/// On-disk wire form of [`mimisbrunnr_types::HybridTimestamp`]. IMPL §3.2 / §10.4.
+/// On-disk wire form of [`mimisbrunnr_types::HybridTimestamp`]. JOURNAL-DESIGN§1.2 / POOL-DESIGN§1.
 ///
-/// The logical type lives in `mimisbrunnr-types` (per rewrite-contract §3); this
+/// The logical type lives in `mimisbrunnr-types` (per operations-design.md "Type ownership"); this
 /// 16-byte `#[repr(C, packed)]` struct is the on-disk wire form embedded in
 /// every [`WalEntryHeader`]. Field ordering is total: `physical_ns → logical →
 /// node_id` (matches the spec exactly).
@@ -91,7 +91,7 @@ impl WalHybridTimestampWire {
 
 // ---------- WalEntryHeader ----------
 
-/// 40-byte entry header. IMPL §3.2.
+/// 40-byte entry header. JOURNAL-DESIGN§1.2.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct WalEntryHeader {
@@ -144,10 +144,10 @@ impl WalEntryHeader {
 
 // ---------- WalOpKind ----------
 
-/// All WAL operation kinds. **Discriminants are pinned by DESIGN §6.4 — never
+/// All WAL operation kinds. **Discriminants are pinned by SPECIFICATION-DESIGN§6.4 — never
 /// renumber. Insertions append, never reorder.**
 ///
-/// Order matches DESIGN §6.4 source listing. The numeric value is the on-disk
+/// Order matches SPECIFICATION-DESIGN§6.4 source listing. The numeric value is the on-disk
 /// `op_kind` byte in [`WalEntryHeader`].
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -163,34 +163,34 @@ pub enum WalOpKind {
     RemoveRelation = 7,
     /// Non-chunked blob write.
     WriteBlob = 8,
-    /// Chunked-object flow (§9.6 / §3.3.1).
+    /// Chunked-object flow (SPECIFICATION-DESIGN§9.6 / JOURNAL-DESIGN§1.3.1).
     ChunkInsertBatch = 9,
     ChunkListAppend = 10,
     ChunkListReplace = 11,
     ChunkListShrink = 12,
     ChunkObjectFinalize = 13,
-    /// Bucket lifecycle (§6.1 / §12).
+    /// Bucket lifecycle (METADATA-DESIGN§2.1 / ALLOCATION-DESIGN§1).
     BucketAlloc = 14,
     BucketWrite = 15,
     BucketGenBump = 16,
     BucketDiscard = 17,
-    /// Backpointers (§6.2).
+    /// Backpointers (METADATA-DESIGN§2.2).
     BackpointerInsert = 18,
     BackpointerRemove = 19,
-    /// Tag bitmap allocation lifecycle (§8.1, §8.2).
+    /// Tag bitmap allocation lifecycle (INDEX-DESIGN§3.1, INDEX-DESIGN§3.2).
     TagBitmapGrow = 20,
     TagBitmapShrink = 21,
-    /// Snapshot lifecycle (§11).
+    /// Snapshot lifecycle (SNAPSHOTS-DESIGN§1).
     SnapshotCreate = 22,
     SnapshotDelete = 23,
     SnapshotUnlink = 24,
     SnapshotDepthUpdate = 25,
-    /// Reconcile worker (§17).
+    /// Reconcile worker (RECONCILE-DESIGN§1).
     ReconcileEnqueue = 26,
     ReconcileDequeue = 27,
     ReconcileMove = 28,
     ReconcileScanStep = 29,
-    /// Sorted-run format mutations (§1.5.6).
+    /// Sorted-run format mutations (BTREE-DESIGN§1.6).
     FormatPromote = 30,
     /// Atomic root-pointer flip + GC reservation.
     Checkpoint = 31,
@@ -331,7 +331,7 @@ pub struct WriteBlob {
     pub size: u64,
 }
 
-// --- Chunked-object flow (§3.3.1) ---
+// --- Chunked-object flow (JOURNAL-DESIGN§1.3.1) ---
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChunkInsertEntry {
@@ -374,7 +374,7 @@ pub struct ChunkObjectFinalize {
     pub list_head: BlockRefWire,
 }
 
-// --- Bucket lifecycle (§12) ---
+// --- Bucket lifecycle (ALLOCATION-DESIGN§1) ---
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BucketAlloc {
@@ -404,13 +404,13 @@ pub struct BucketDiscard {
     pub bucket_no: u32,
 }
 
-// --- Backpointers (§6.2) ---
+// --- Backpointers (METADATA-DESIGN§2.2) ---
 //
 // The richer typed wrappers (`BackpointerKey`, `BackpointerValue`) live in the
-// `meta` crate (Phase 2b). The WAL only needs to carry the CBOR shape — both
+// `meta` crate. The WAL only needs to carry the CBOR shape — both
 // sides agree on the wire form via these byte-buffer-ish types.
 
-/// Neutral wire form for the §6.2 backpointer key. `meta` will re-encode this
+/// Neutral wire form for the METADATA-DESIGN§2.2 backpointer key. `meta` will re-encode this
 /// into its richer typed wrapper. The `bytes` field carries the canonical
 /// little-endian packed key (variable length per `target_kind`).
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -418,7 +418,7 @@ pub struct BackpointerKeyWire {
     pub bytes: Vec<u8>,
 }
 
-/// Neutral wire form for the §6.2 backpointer value.
+/// Neutral wire form for the METADATA-DESIGN§2.2 backpointer value.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackpointerValueWire {
     pub bytes: Vec<u8>,
@@ -435,7 +435,7 @@ pub struct BackpointerRemove {
     pub key: BackpointerKeyWire,
 }
 
-// --- Tag bitmap (§8.1, §8.2) ---
+// --- Tag bitmap (INDEX-DESIGN§3.1, INDEX-DESIGN§3.2) ---
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TagBitmapGrow {
@@ -451,7 +451,7 @@ pub struct TagBitmapShrink {
     pub snapshot: u32,
 }
 
-// --- Snapshot (§11) ---
+// --- Snapshot (SNAPSHOTS-DESIGN§1) ---
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotCreate {
@@ -483,15 +483,15 @@ pub struct SnapshotDepthUpdate {
     pub new_ancestor_bitmap: [u8; 16],
 }
 
-// --- Reconcile (§17) ---
+// --- Reconcile (RECONCILE-DESIGN§1) ---
 
-/// Reconcile work item. IMPL §17.2. Kept small, byte-CBOR friendly.
+/// Reconcile work item. RECONCILE-DESIGN§1.2. Kept small, byte-CBOR friendly.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkItem {
     pub target_kind: u8,
     pub work_kind: u8,
     pub priority: u8,
-    /// Caller-defined opaque key (capped at 16 B per §6.2).
+    /// Caller-defined opaque key (capped at 16 B per METADATA-DESIGN§2.2).
     pub owner_key: Vec<u8>,
     /// Optional cursor / scan resumption blob.
     pub cursor: Vec<u8>,
@@ -526,7 +526,7 @@ pub struct ReconcileScanStep {
     pub cursor_key: Vec<u8>,
 }
 
-// --- Sorted-run promotion (§1.5.6) ---
+// --- Sorted-run promotion (BTREE-DESIGN§1.6) ---
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct FormatPromote {

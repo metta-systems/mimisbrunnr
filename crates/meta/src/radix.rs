@@ -1,5 +1,5 @@
 //! Radix-tree address translation for the Object / Location tables
-//! (IMPL §5 "Address translation").
+//! (METADATA-DESIGN§1 "Address translation").
 //!
 //! Logical layout:
 //!
@@ -11,21 +11,21 @@
 //!
 //! The helpers in this module are pure; they produce no I/O. The live radix
 //! tree (with COW write path and journal-reclaim integration) is a later
-//! phase — see `TODO(rewrite-phase-N)` in the table modules.
+//! phase — see `TODO(METADATA1)` in the table modules.
 
 use crate::error::MetaError;
 
-/// Maximum number of inner levels above the leaf. Per IMPL §5, depth 3
+/// Maximum number of inner levels above the leaf. Per METADATA-DESIGN§1, depth 3
 /// (4 levels total) covers `2044 × 16380³ ≈ 9 P` objects.
 pub const MAX_LEVELS: usize = 3;
 
-/// `ObjectRecord` slots per leaf node (IMPL §5 "Node capacities").
+/// `ObjectRecord` slots per leaf node (METADATA-DESIGN§1 "Node capacities").
 pub const LEAF_RECORDS: usize = 2044;
 
-/// `ObjectLocation` slots per location-table leaf node (IMPL §6.1).
+/// `ObjectLocation` slots per location-table leaf node (METADATA-DESIGN§2.1).
 pub const LEAF_RECORDS_LOCATION: usize = 5440;
 
-/// Child-pointer slots per inner node (IMPL §5 "Node capacities").
+/// Child-pointer slots per inner node (METADATA-DESIGN§1 "Node capacities").
 pub const INNER_FANOUT: usize = 16380;
 
 /// Decomposition of a local object id into a root-to-leaf radix path.

@@ -1,8 +1,8 @@
-//! Hybrid Logical Clock timestamp (DESIGN §10.4).
+//! Hybrid Logical Clock timestamp (SPECIFICATION-DESIGN§10.4).
 //!
 //! 16-byte logical structure used wherever the spec calls for cluster-wide
 //! ordering without coordination. The on-disk WAL header embeds the
-//! identical byte layout (IMPL §3); this type exposes the *logical* shape
+//! identical byte layout (JOURNAL-DESIGN§1); this type exposes the *logical* shape
 //! so other crates can construct/compare without reaching into the WAL crate.
 //!
 //! Total order: `physical_ns → logical → node_id`.
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::NodeId;
 
-/// Hybrid Logical Clock timestamp. Layout (DESIGN §10.4):
+/// Hybrid Logical Clock timestamp. Layout (SPECIFICATION-DESIGN§10.4):
 ///
 /// | Bytes  | Field         | Type   |
 /// |--------|---------------|--------|

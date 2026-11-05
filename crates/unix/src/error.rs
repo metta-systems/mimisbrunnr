@@ -1,4 +1,4 @@
-//! Errors raised by `mimisbrunnr-unix` (DESIGN §12).
+//! Errors raised by `mimisbrunnr-unix` (SPECIFICATION-DESIGN§12).
 
 use std::io;
 use std::path::PathBuf;

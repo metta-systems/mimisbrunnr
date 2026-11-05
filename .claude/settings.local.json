@@ -5,12 +5,8 @@
       "Bash(rtk ls *)",
       "Bash(rtk wc *)",
       "Bash(rtk cargo *)",
-      "Bash(rtk grep *)",
-      "Bash(haft spec *)"
+      "Bash(rtk grep *)"
     ]
   },
-  "enableAllProjectMcpServers": true,
-  "enabledMcpjsonServers": [
-    "haft"
-  ]
+  "enableAllProjectMcpServers": true
 }

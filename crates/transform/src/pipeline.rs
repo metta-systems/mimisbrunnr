@@ -1,4 +1,4 @@
-//! Composed transform pipeline (DESIGN §9.1).
+//! Composed transform pipeline (SPECIFICATION-DESIGN§9.1).
 //!
 //! The pipeline is the single entry point most callers should use; it
 //! composes hash → compress → pad → encrypt on the write side and the
@@ -14,7 +14,7 @@ use crate::{
 /// Result of `TransformPipeline::apply`.
 #[derive(Debug, Clone)]
 pub struct TransformResult {
-    /// BLAKE3 of the *plaintext* input (DESIGN §9.1: the content hash is
+    /// BLAKE3 of the *plaintext* input (SPECIFICATION-DESIGN§9.1: the content hash is
     /// always over plaintext, never over compressed/encrypted bytes).
     pub content_hash: [u8; 32],
     /// Bytes ready to land on disk / in the WAL / on the wire.
@@ -31,7 +31,7 @@ pub struct TransformResult {
 ///
 /// `key` is `None` exactly when `encryption == EncryptionMode::None`. The
 /// constructor does not enforce this — callers should pass a real key for
-/// any non-`None` mode (Phase 2c will still error out with
+/// any non-`None` mode (the encryptor still errors out with
 /// `EncryptionDisabled`, but this keeps the contract correct for later
 /// phases).
 #[derive(Debug, Clone, Copy)]
@@ -55,7 +55,7 @@ impl TransformPipeline {
     }
 
     /// No compression, no encryption — useful for tests and for the
-    /// pre-encryption boot path (DESIGN §9.5: untrusted nodes that don't
+    /// pre-encryption boot path (SPECIFICATION-DESIGN§9.5: untrusted nodes that don't
     /// hold keys can still verify framing).
     pub const fn passthrough() -> Self {
         Self {
@@ -67,7 +67,7 @@ impl TransformPipeline {
 
     /// Apply the write-path pipeline:
     ///
-    /// 1. BLAKE3-hash the plaintext (DESIGN §9.1: always over plaintext).
+    /// 1. BLAKE3-hash the plaintext (SPECIFICATION-DESIGN§9.1: always over plaintext).
     /// 2. Compress.
     /// 3. If the chosen `EncryptionMode` requires sector-aligned input
     ///    (XTS, HCTR2), pad with zeroes to a 4 KiB boundary.

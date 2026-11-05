@@ -1,18 +1,18 @@
 //! [`PathContextManager`] — registry of per-context [`PathProjection`]s
-//! (DESIGN §12.2).
+//! (SPECIFICATION-DESIGN§12.2).
 //!
 //! Holds many projections keyed by their `unix-path-context:*` Grouping tag
 //! id. Validation against the live ontology happens at `create_context` time;
 //! after that the manager is purely in-memory.
 //!
-//! ## Persistence (R1b-13)
+//! ## Persistence
 //!
-//! Per IMPL §10.3, **path projection has no dedicated on-disk B+ tree
+//! Per UNIX-DESIGN§1, **path projection has no dedicated on-disk B+ tree
 //! region** — paths are encoded as ordinary `Attr(unix-path, ...)`
 //! assertions on objects, with per-context overrides expressed via
 //! `Value::Scoped { context, inner }`. The path-projection data is
 //! therefore a *derived view* of the forward index (which got its own
-//! B+ tree region in R1b-2) plus the tag store (R1b-3).
+//! B+ tree region) plus the tag store.
 //!
 //! What this means for the manager:
 //! - `BtreeKind::PathProjections` does **not** exist in the spec
@@ -23,7 +23,7 @@
 //!   truth.
 //! - The engine layer reconstructs `PathContextManager` at mount time
 //!   by scanning the forward index for `unix-path` Attr assertions
-//!   (DESIGN §12.2 algorithm). The transient
+//!   (SPECIFICATION-DESIGN§12.2 algorithm). The transient
 //!   [`PathContextManager::serialise`] / [`PathContextManager::deserialise`]
 //!   helpers below are kept *only* for tooling / cli round-trips; the
 //!   engine's persistent path is the one above.
@@ -58,7 +58,7 @@ impl PathContextManager {
     ///
     /// Validates against `ontology` that:
     /// 1. `context` is a tag the ontology knows.
-    /// 2. The tag's semantics is [`TagSemantics::Grouping`] (DESIGN §12.2).
+    /// 2. The tag's semantics is [`TagSemantics::Grouping`] (SPECIFICATION-DESIGN§12.2).
     ///
     /// Fails if the projection already exists.
     pub fn create_context(
@@ -116,7 +116,7 @@ impl PathContextManager {
     ///
     /// **Not the engine's persistent path** — see crate-level docs. The
     /// engine reconstructs the manager from `Attr(unix-path, ...)`
-    /// assertions in the forward index at mount time per IMPL §10.3.
+    /// assertions in the forward index at mount time per UNIX-DESIGN§1.
     pub fn serialise(&self) -> Result<Vec<u8>, UnixError> {
         let mut buf = Vec::new();
         ciborium::ser::into_writer(self, &mut buf).map_err(|e| UnixError::Cbor(e.to_string()))?;

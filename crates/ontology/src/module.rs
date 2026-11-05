@@ -1,7 +1,7 @@
-//! Ontology module loader / serialiser (DESIGN §4).
+//! Ontology module loader / serialiser (SPECIFICATION-DESIGN§4).
 //!
 //! TOML is the human-edited distribution format; the on-disk form is CBOR
-//! (DESIGN §4 + IMPL §10.1). At install time TOML is parsed into
+//! (SPECIFICATION-DESIGN§4 + ONTOLOGY-DESIGN§1). At install time TOML is parsed into
 //! [`OntologyModule`]; the engine then converts to CBOR before writing.
 
 use std::collections::BTreeMap;
@@ -185,7 +185,7 @@ impl OntologyModule {
             // OrderedCollection.element_constraint references must be
             // resolvable at install time, but we only have names here. Leave
             // as `None` for now — the engine resolves via a second pass on
-            // install when a real ID exists. (DESIGN §4 only requires
+            // install when a real ID exists. (SPECIFICATION-DESIGN§4 only requires
             // `element_constraint` be optional.)
             let semantics = if let TagSemantics::OrderedCollection { .. } = semantics {
                 if let Some(name) = &t.element_constraint {

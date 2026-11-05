@@ -1,6 +1,6 @@
 //! Large-region (256 KiB) headers for B+ tree and radix node containers.
 //!
-//! Implements IMPL §1.5.1 — *structs and parse/serialise helpers only*.
+//! Implements BTREE-DESIGN§1.1 — *structs and parse/serialise helpers only*.
 //! The live-node machinery (sorted-run merge, append-only growth, full
 //! compaction, format promotion, packed-key codec) is deferred to the
 //! index/meta crates.
@@ -94,7 +94,7 @@ pub const SORTED_RUN_FLAG_PACKED_KEYS: u32 = 1 << 0;
 /// Flag: sorted-run payload is encrypted.
 pub const SORTED_RUN_FLAG_ENCRYPTED: u32 = 1 << 1;
 
-/// 32-byte header before each sorted run within a region. IMPL §1.5.1.
+/// 32-byte header before each sorted run within a region. BTREE-DESIGN§1.1.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct SortedRunHeader {
@@ -109,7 +109,7 @@ pub struct SortedRunHeader {
 
 const_assert_eq!(core::mem::size_of::<SortedRunHeader>(), 32);
 
-/// `"BSET"` magic for sorted runs, little-endian. IMPL §1.5.1.
+/// `"BSET"` magic for sorted runs, little-endian. BTREE-DESIGN§1.1.
 pub const SORTED_RUN_MAGIC: u32 = u32::from_le_bytes(*b"BSET");
 
 impl SortedRunHeader {
@@ -148,7 +148,7 @@ pub const VALUE_SIZE_KIND_FIXED: u8 = 0;
 /// unsigned LEB128 varint giving the *elided-tail* length in bytes.
 pub const VALUE_SIZE_KIND_VARINT: u8 = 1;
 
-/// 16-byte per-field descriptor for packed keys. IMPL §1.5.6.
+/// 16-byte per-field descriptor for packed keys. BTREE-DESIGN§1.6.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct FieldFormat {
@@ -164,7 +164,7 @@ const_assert_eq!(core::mem::size_of::<FieldFormat>(), 16);
 /// Variable-size sorted-run key-format descriptor. The struct itself is the
 /// 8-byte fixed header; the on-disk wire form continues with
 /// `[FieldFormat; nr_fields]` immediately followed by `common_value_prefix`
-/// raw bytes carrying the elided value prefix. IMPL §1.5.6.
+/// raw bytes carrying the elided value prefix. BTREE-DESIGN§1.6.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct SortedRunKeyFormat {

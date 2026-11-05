@@ -1,5 +1,5 @@
-//! `mimisbrunnr-engine` — the integration layer that ties every Phase 1–5
-//! crate together into a usable storage engine (DESIGN §15).
+//! `mimisbrunnr-engine` — the integration layer that ties every
+//! crate together into a usable storage engine (SPECIFICATION-DESIGN§15).
 //!
 //! Public API (re-exports):
 //!
@@ -10,22 +10,23 @@
 //!   superblock + WAL; thin mutation methods that project to `WalOp` and
 //!   append.
 //! - [`OpLog`] / [`OpKind`] / [`OpLogEntry`] — engine-level operation log
-//!   (DESIGN §15). Distinct from `mimisbrunnr_wal::WalOpKind`; mapping is in
+//!   (SPECIFICATION-DESIGN§15). Distinct from `mimisbrunnr_wal::WalOpKind`; mapping is in
 //!   [`wal_proj`].
 //! - [`HybridClock`] — HLC clock source.
 //! - [`EngineError`] — public error type.
 //!
-//! ## Phase 6 caveats
+//! ## Current limitations
 //!
-//! - **Index persistence** is a single CBOR blob in the index zone, prefixed
-//!   by a 4-byte magic + 4-byte length header.
-//!   `TODO(rewrite-phase-N)`: replace with §1.5 B+ trees.
+//! - **Index persistence**: indices and tables live in BTREE-DESIGN§1 B+ tree
+//!   regions at fixed offsets; oplog, path contexts, scalar counters and the
+//!   in-memory blob map still ride in a legacy CBOR blob in the index zone.
+//!   `TODO(ENGINE8)`: retire the legacy blob.
 //! - **Snapshots** are stubbed (`snapshot_create` returns
-//!   `EngineError::NotImplemented`).
-//! - **Reconcile** is a no-op (`reconcile_step` returns `Ok(0)`).
+//!   `EngineError::NotImplemented`; SNAPSHOT6).
+//! - **Reconcile** is a no-op (`reconcile_step` returns `Ok(0)`; RECONCILE2).
 //! - **Subscription membership** for arbitrary boolean queries is updated
 //!   only when the engine's mutation hook covers it (HasTag / IsA cases).
-//!   `TODO(rewrite-phase-N)`: full re-evaluation on every mutation.
+//!   `TODO(SUBSCRIPTION3)`: full re-evaluation on every mutation.
 
 #![forbid(unsafe_code)]
 

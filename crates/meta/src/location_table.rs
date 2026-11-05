@@ -1,20 +1,20 @@
 //! In-memory mirror of the location table.
 //!
-//! ## Persistence (R1b-3)
+//! ## Persistence
 //!
-//! On disk the table occupies one 256 KiB §1.5 B+ tree region of
+//! On disk the table occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
 //! [`BtreeKind::LocationTable`]. The mirror is materialised into a single
 //! CBOR-encoded sorted run via [`BtreeRegion::write_full`] keyed by an
 //! [`LocationTableKey`] (`oid`, `snapshot`) pair ascending; values are
 //! variable-length serialised [`ObjectLocation`] byte images carried in
 //! [`LocationTableValue`]'s `Vec<u8>` newtype (header + N replicas per
-//! IMPL §6.1).
+//! METADATA-DESIGN§2.1).
 //!
 //! `snapshot` is always 0 for now — see the analogous note on
 //! [`crate::object_table::ObjectTableKey`].
 //!
-//! TODO(rewrite-phase-R1d): swap to true positional-radix encoding per
-//! IMPL §6.1 (leaf fanout 5440 for 48-byte records). Same migration shape
+//! TODO(METADATA2): swap to true positional-radix encoding per
+//! METADATA-DESIGN§2.1 (leaf fanout 5440 for 48-byte records). Same migration shape
 //! as the object table.
 
 use std::collections::{BTreeMap, btree_map};
@@ -36,12 +36,12 @@ const REGION_SIZE_LOG2: u8 = 18;
 /// B+ tree key for the location table.
 ///
 /// `oid` is the raw `ObjectId.to_u64()`. `snapshot` is the snapshot-aware
-/// bkey position (IMPL §11.2) and is always 0 in the current revision.
+/// bkey position (SNAPSHOTS-DESIGN§1.2) and is always 0 in the current revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LocationTableKey {
     /// Raw `ObjectId.to_u64()`.
     pub oid: u64,
-    /// Snapshot id; always 0 until R6.
+    /// Snapshot id; always 0 until SNAPSHOT2.
     pub snapshot: u32,
 }
 
@@ -53,7 +53,7 @@ impl LocationTableKey {
 }
 
 /// B+ tree value for the location table: the variable-length
-/// `LocationHeader || N × ReplicaRef` byte image (IMPL §6.1) carried as a
+/// `LocationHeader || N × ReplicaRef` byte image (METADATA-DESIGN§2.1) carried as a
 /// length-tagged byte vector. We can't use the fixed-shape POD form here
 /// because the payload length depends on `replica_count`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,7 +123,7 @@ impl LocationTable {
     }
 
     // ----------------------------------------------------------------
-    // R1b-3: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
     // ----------------------------------------------------------------
 
     /// Build a [`LoadedNode`] containing every entry as a single CBOR
@@ -160,7 +160,7 @@ impl LocationTable {
         let mut locations: BTreeMap<u64, ObjectLocation> = BTreeMap::new();
         for (k, v) in node.merge_iter() {
             if k.snapshot != 0 {
-                // TODO(rewrite-phase-R6): merge snapshot history into the
+                // TODO(SNAPSHOT3): merge snapshot history into the
                 // sidecar `LocationHistory` btree.
                 continue;
             }
@@ -172,8 +172,8 @@ impl LocationTable {
     /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
     /// on `device`.
     ///
-    /// **R1c-A2**: writes via the native positional radix-leaf format
-    /// per IMPL §6.1 (see [`crate::LocationLeaf`]) — *no longer* via
+    /// Writes via the native positional radix-leaf format
+    /// per METADATA-DESIGN§2.1 (see [`crate::LocationLeaf`]) — *no longer* via
     /// the sorted-run B+ tree path. Leaf-only trees: any `oid_local ≥
     /// LEAF_RECORDS_LOCATION (5440)` returns
     /// [`MetaError::OidOutOfRange`]; multi-level descent + tree growth
@@ -195,13 +195,13 @@ impl LocationTable {
     /// Read the in-memory state from the 256 KiB region at byte `offset`
     /// on `device`. An all-zero region returns [`Self::default`].
     ///
-    /// **R1c-A2**: reads via the native positional radix-leaf format.
+    /// Reads via the native positional radix-leaf format.
     /// `node_id` is needed because the leaf only carries `oid_local`
     /// (the low 48 bits of `ObjectId`); the high 16 bits encode the
-    /// node id (DESIGN §2.1) which can't be recovered from an
+    /// node id (SPECIFICATION-DESIGN§2.1) which can't be recovered from an
     /// `ObjectLocation` alone. The engine passes its own `node_id`
     /// for single-node pools; multi-node cluster recovery uses
-    /// `ObjectTable` cross-reference (R12 territory).
+    /// `ObjectTable` cross-reference (CLUSTER5).
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
         offset: u64,
@@ -262,7 +262,7 @@ mod tests {
         assert_eq!(back.active_replicas(), &[r]);
     }
 
-    // ----- B+ tree region round-trip (R1b-3) -----
+    // ----- B+ tree region round-trip -----
 
     use mimisbrunnr_storage::FileBlockDevice;
     use tempfile::TempDir;

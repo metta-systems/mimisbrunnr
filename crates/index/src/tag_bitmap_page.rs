@@ -1,4 +1,4 @@
-//! `TagBitmapPage` 4 KiB block — IMPL §8.2.
+//! `TagBitmapPage` 4 KiB block — INDEX-DESIGN§3.2.
 //!
 //! Holds a slice of a roaring bitmap's portable serialisation. Bitmaps that
 //! fit in one page set `next_page = BlockRef::ZERO` and carry the full
@@ -16,9 +16,9 @@
 //! [4092..4096] crc           u32        (CRC32C over bytes [0..4092] with crc=0)
 //! ```
 //!
-//! Used by both KvIndex (§9.1; one page per `(tag_id, value_hash)`, always
+//! Used by both KvIndex (INDEX-DESIGN§4.1; one page per `(tag_id, value_hash)`, always
 //! `next_page == ZERO` because typical KV bitmaps fit in a single page) and
-//! TagIndex (§8.1; one chain per tag, the head reachable via the directory
+//! TagIndex (INDEX-DESIGN§3.1; one chain per tag, the head reachable via the directory
 //! leaf's `store_root`).
 
 use {
@@ -83,7 +83,7 @@ pub enum TagBitmapPageError {
 
     #[error(
         "bitmap byte image {got} bytes exceeds single-page capacity \
-         {TAG_BITMAP_PAGE_MAX_BYTES}; chained pages not yet implemented (R1c-A1)"
+         {TAG_BITMAP_PAGE_MAX_BYTES}; chained pages not yet implemented"
     )]
     Oversize { got: usize },
 

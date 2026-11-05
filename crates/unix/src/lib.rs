@@ -1,11 +1,11 @@
-//! Unix interoperability for Mímisbrunnr (DESIGN §12).
+//! Unix interoperability for Mímisbrunnr (SPECIFICATION-DESIGN§12).
 //!
 //! Unix paths are not the source of truth — they are *projections* of
-//! Mímisbrunnr objects onto a Unix-style tree (DESIGN §12.1). The same object
+//! Mímisbrunnr objects onto a Unix-style tree (SPECIFICATION-DESIGN§12.1). The same object
 //! can appear at multiple paths under multiple **path contexts**; a context is
 //! just a `Grouping` tag, and each per-context path is stored as
 //! `Attr(unix-path, Value::Scoped { context, inner: Text(path) })` per
-//! IMPLEMENTATION.md §10.3 / §4.3.
+//! UNIX-DESIGN§1 / INDEX-DESIGN§1.3.
 //!
 //! This crate is intentionally **side-effect-free where possible**:
 //! [`PathProjection`] / [`PathContextManager`] are pure data structures, the
@@ -15,7 +15,7 @@
 //! host filesystem on the export path, and even then it takes a content
 //! provider callback so we don't depend on any specific blob source.
 //!
-//! The engine layer (Phase 5) calls into this crate; this crate does **not**
+//! The engine layer calls into this crate; this crate does **not**
 //! depend on the engine.
 
 #![forbid(unsafe_code)]

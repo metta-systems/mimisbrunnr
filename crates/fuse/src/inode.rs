@@ -1,6 +1,6 @@
 //! Session-local inode identifier.
 //!
-//! Per IMPLEMENTATION.md §13.2, inodes are **never persisted** — they are
+//! Per ENGINE-DESIGN§2.2, inodes are **never persisted** — they are
 //! allocated lazily as the `TagVfs` is traversed and discarded when the
 //! mount is unmounted.
 

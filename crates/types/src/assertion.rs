@@ -1,4 +1,4 @@
-//! Object assertions and tag origins (DESIGN §2.2).
+//! Object assertions and tag origins (SPECIFICATION-DESIGN§2.2).
 
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +21,7 @@ pub enum Assertion {
 pub enum TagOrigin {
     /// Set explicitly by a user or application.
     Direct,
-    /// Inserted by the ontology implication engine (DESIGN §3.3).
+    /// Inserted by the ontology implication engine (SPECIFICATION-DESIGN§3.3).
     Materialized,
 }
 

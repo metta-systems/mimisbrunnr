@@ -6,7 +6,7 @@
 //! parse → plan → execute → format. The actual bitmap-algebra work lives in
 //! the query crate.
 //!
-//! ## Phase 5a surface
+//! ## Supported surface
 //!
 //! ```sql
 //! SELECT * FROM objects WHERE tag = 'electronic';

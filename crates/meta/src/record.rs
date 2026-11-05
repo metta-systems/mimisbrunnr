@@ -1,7 +1,7 @@
-//! `ObjectRecord` (128 B) — IMPL §5.1 / DESIGN §6.2.
+//! `ObjectRecord` (128 B) — METADATA-DESIGN§1.1 / SPECIFICATION-DESIGN§6.2.
 //!
 //! `#[repr(C)]` (NOT `packed`): records are accessed field-at-a-time on the
-//! hot path per IMPL §1.1. Field offsets are byte-for-byte aligned with the
+//! hot path per FORMAT-DESIGN§1.1. Field offsets are byte-for-byte aligned with the
 //! spec; see the inline `[a..b]` comments.
 
 use {
@@ -16,16 +16,16 @@ use crate::error::MetaError;
 /// On-disk size of a single `ObjectRecord` in bytes.
 pub const OBJECT_RECORD_SIZE: usize = 128;
 
-// ---------------- ObjectRecord.flags bits (IMPL §5.1) ----------------
+// ---------------- ObjectRecord.flags bits (METADATA-DESIGN§1.1) ----------------
 
 /// Set when the object's tags / attrs / relations have spilled to an
 /// `OverflowRecord` chain in the metadata zone (`overflow_offset`).
 pub const OBJECT_FLAG_HAS_OVERFLOW: u8 = 1 << 0;
 
-/// Set when the object's blob is FastCDC-chunked (see IMPL §9.3).
+/// Set when the object's blob is FastCDC-chunked (see INDEX-DESIGN§4.3).
 pub const OBJECT_FLAG_CHUNKED: u8 = 1 << 1;
 
-/// Fixed-size 128-byte object record (IMPL §5.1).
+/// Fixed-size 128-byte object record (METADATA-DESIGN§1.1).
 ///
 /// Layout (little-endian on disk; `#[repr(C)]` so the host's natural
 /// alignment matches the spec offsets — every multi-byte field is aligned to
@@ -194,10 +194,10 @@ impl ObjectRecord {
 // ---------- Serialize / Deserialize via bytemuck ----------
 //
 // `ObjectRecord` is `#[repr(C)] Pod` with a spec-pinned 128 B layout
-// (IMPL §5.1). The natural CBOR encoding round-trips the byte image
+// (METADATA-DESIGN§1.1). The natural CBOR encoding round-trips the byte image
 // rather than per-field tags — that keeps the serde wire form minimal
-// and matches the on-disk POD layout exactly. Used by the R1b sorted-run
-// CBOR path; the native §5 positional radix tree (R1d) will bypass this.
+// and matches the on-disk POD layout exactly. Used by the CBOR sorted-run
+// CBOR path; the native METADATA-DESIGN§1 positional radix tree (METADATA1) will bypass this.
 
 impl Serialize for ObjectRecord {
     fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {

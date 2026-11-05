@@ -1,7 +1,7 @@
-//! In-memory operation log + engine-level [`OpKind`] enum (DESIGN §15).
+//! In-memory operation log + engine-level [`OpKind`] enum (SPECIFICATION-DESIGN§15).
 //!
 //! `OpKind` is the **engine-level** mutation set. It is distinct from
-//! [`mimisbrunnr_wal::WalOpKind`] (IMPL §3.3), which has the full universe of
+//! [`mimisbrunnr_wal::WalOpKind`] (JOURNAL-DESIGN§1.3), which has the full universe of
 //! 32 byte-pinned WAL discriminants (object lifecycle, chunked-flow, bucket
 //! lifecycle, backpointers, snapshots, reconcile, …). Each engine op projects
 //! to one or more WAL ops; the mapping lives in
@@ -12,12 +12,12 @@ use std::collections::VecDeque;
 use mimisbrunnr_types::{HybridTimestamp, ObjectId, TagId, Value};
 use serde::{Deserialize, Serialize};
 
-/// One mutation in the engine-level log. Order matches DESIGN §15 table.
+/// One mutation in the engine-level log. Order matches SPECIFICATION-DESIGN§15 table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum OpKind {
     /// Allocate a fresh `ObjectId`.
     CreateObject { oid: ObjectId },
-    /// Mark an object tombstoned (DESIGN §7).
+    /// Mark an object tombstoned (SPECIFICATION-DESIGN§7).
     DeleteObject { oid: ObjectId },
     /// Add a tag with `Direct` origin; engine fans out implications as
     /// additional `Materialized` insertions (which are *not* logged again —
@@ -66,7 +66,7 @@ pub struct OpLogEntry {
     pub op: OpKind,
 }
 
-/// Default capacity of the in-memory oplog ring (DESIGN §15: "recent" ops for
+/// Default capacity of the in-memory oplog ring (SPECIFICATION-DESIGN§15: "recent" ops for
 /// subscriptions / sync). When the ring is full, oldest entries are evicted.
 pub const DEFAULT_OPLOG_CAPACITY: usize = 4096;
 
@@ -124,15 +124,15 @@ impl OpLog {
         self.max_len
     }
 
-    /// CBOR-encode for persistence. TODO(rewrite-phase-N): replace with the
-    /// IMPL §10 oplog btree once the structured persistence layer lands.
+    /// CBOR-encode for persistence. TODO(ENGINE6): replace with the
+    /// FORMAT-DESIGN§10 oplog btree once the structured persistence layer lands.
     pub fn serialise(&self) -> Result<Vec<u8>, crate::EngineError> {
         let mut buf = Vec::new();
         ciborium::ser::into_writer(self, &mut buf)?;
         Ok(buf)
     }
 
-    /// CBOR-decode. TODO(rewrite-phase-N) as above.
+    /// CBOR-decode. TODO(ENGINE6) as above.
     pub fn deserialise(bytes: &[u8]) -> Result<Self, crate::EngineError> {
         let oplog: Self = ciborium::de::from_reader(bytes)?;
         Ok(oplog)

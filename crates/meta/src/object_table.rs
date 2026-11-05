@@ -1,8 +1,8 @@
 //! In-memory mirror of the object record table.
 //!
-//! ## Persistence (R1b-3)
+//! ## Persistence
 //!
-//! On disk the table occupies one 256 KiB §1.5 B+ tree region of
+//! On disk the table occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
 //! [`BtreeKind::ObjectTable`]. The mirror is materialised into a single
 //! CBOR-encoded sorted run via [`BtreeRegion::write_full`] keyed by an
 //! [`ObjectTableKey`] (`oid`, `snapshot`) pair ascending; values are
@@ -10,12 +10,12 @@
 //! [`ObjectTableValue`]'s `Vec<u8>` newtype.
 //!
 //! The `snapshot` field on the on-disk key is always 0 for now —
-//! snapshot-aware bkey position per IMPL §11.2 lands in R6. The shape is
+//! snapshot-aware bkey position per SNAPSHOTS-DESIGN§1.2 lands with SNAPSHOT2. The shape is
 //! present today so the migration to snapshot-keyed records is a value
 //! mutation rather than a key-shape mutation.
 //!
-//! TODO(rewrite-phase-R1d): swap to true positional-radix encoding per
-//! IMPL §5 (`BtreeKind::ObjectTable` with positional addressing rather
+//! TODO(METADATA1): swap to true positional-radix encoding per
+//! METADATA-DESIGN§1 (`BtreeKind::ObjectTable` with positional addressing rather
 //! than a sorted run keyed by `(oid, snapshot)`). Native encoding
 //! requires the leaf occupancy bitmap and WAL-journalled positional
 //! updates; the current sorted-run path lets the table persist while
@@ -43,14 +43,14 @@ const REGION_SIZE_LOG2: u8 = 18;
 /// B+ tree key for the object record table.
 ///
 /// `oid` is the raw `ObjectId.to_u64()`. `snapshot` mirrors the
-/// snapshot-aware bkey position (IMPL §11.2) and is always 0 in the
+/// snapshot-aware bkey position (SNAPSHOTS-DESIGN§1.2) and is always 0 in the
 /// current revision — the field is plumbed so the wire shape doesn't
-/// move when R6 starts emitting non-zero snapshot ids.
+/// move when SNAPSHOT2 starts emitting non-zero snapshot ids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ObjectTableKey {
     /// Raw `ObjectId.to_u64()`.
     pub oid: u64,
-    /// Snapshot id; always 0 until R6.
+    /// Snapshot id; always 0 until SNAPSHOT2.
     pub snapshot: u32,
 }
 
@@ -62,7 +62,7 @@ impl ObjectTableKey {
 }
 
 /// B+ tree value for the object record table: the 128-byte byte image of
-/// an [`ObjectRecord`] (IMPL §5.1) carried as a length-tagged byte
+/// an [`ObjectRecord`] (METADATA-DESIGN§1.1) carried as a length-tagged byte
 /// vector. The wrapper exists so the `LoadedNode<ObjectTableKey,
 /// ObjectTableValue>` type isn't generic over `ObjectRecord`'s own
 /// `Serialize` impl, which lets future revisions evolve the wire form
@@ -100,7 +100,7 @@ impl ObjectTableValue {
 /// The in-memory map drops the `snapshot` axis — the engine only
 /// operates on the live (snapshot=0) view today. Persistence
 /// nonetheless threads the full `(oid, snapshot)` key per the wire
-/// type, so the snapshot axis is a free upgrade once R6 lands.
+/// type, so the snapshot axis is a free upgrade once SNAPSHOT2 lands.
 #[derive(Debug, Default)]
 pub struct ObjectTable {
     records: BTreeMap<u64, ObjectRecord>,
@@ -149,7 +149,7 @@ impl ObjectTable {
     }
 
     // ----------------------------------------------------------------
-    // R1b-3: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
     // ----------------------------------------------------------------
 
     /// Build a [`LoadedNode`] containing every record as a single CBOR
@@ -189,7 +189,7 @@ impl ObjectTable {
         let mut records: BTreeMap<u64, ObjectRecord> = BTreeMap::new();
         for (k, v) in node.merge_iter() {
             if k.snapshot != 0 {
-                // TODO(rewrite-phase-R6): merge snapshot history into the
+                // TODO(SNAPSHOT3): merge snapshot history into the
                 // sidecar `ObjectHistory` btree.
                 continue;
             }
@@ -201,8 +201,8 @@ impl ObjectTable {
     /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
     /// on `device`.
     ///
-    /// **R1c-A2**: writes via the native positional radix-leaf format
-    /// per IMPL §5 (see [`crate::ObjectLeaf`]) — *no longer* via the
+    /// Writes via the native positional radix-leaf format
+    /// per METADATA-DESIGN§1 (see [`crate::ObjectLeaf`]) — *no longer* via the
     /// sorted-run B+ tree path. Leaf-only trees: any `oid_local ≥
     /// LEAF_RECORDS (2044)` returns
     /// [`MetaError::OidOutOfRange`]; multi-level descent + tree growth
@@ -210,7 +210,7 @@ impl ObjectTable {
     ///
     /// The previous sorted-run [`Self::to_loaded_node`] /
     /// [`Self::from_loaded_node`] helpers stay live for now (they
-    /// shipped under R1b-3 and may still be useful for tooling /
+    /// shipped first and may still be useful for tooling /
     /// dump-and-diff workflows), but are no longer called by the
     /// engine's persistence path.
     pub fn flush_to_region<D: BlockDevice>(
@@ -222,7 +222,7 @@ impl ObjectTable {
         for (oid, record) in self.records.iter() {
             // ObjectId.local is the bottom 48 bits; for leaf-only trees
             // we further restrict to the first 2044 ids. Larger oids
-            // need multi-level descent (TODO follow-up).
+            // need multi-level descent (TODO(METADATA1)).
             let oid_local = oid & ((1u64 << 48) - 1);
             leaf.set(oid_local, *record)?;
         }
@@ -233,7 +233,7 @@ impl ObjectTable {
     /// Read the in-memory state from the 256 KiB region at byte `offset`
     /// on `device`. An all-zero region returns [`Self::default`].
     ///
-    /// **R1c-A2**: reads via the native positional radix-leaf format.
+    /// Reads via the native positional radix-leaf format.
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
         offset: u64,
@@ -317,7 +317,7 @@ mod tests {
         ));
     }
 
-    // ----- B+ tree region round-trip (R1b-3) -----
+    // ----- B+ tree region round-trip -----
 
     use mimisbrunnr_storage::FileBlockDevice;
     use tempfile::TempDir;

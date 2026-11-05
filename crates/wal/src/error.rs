@@ -41,7 +41,7 @@ pub enum WalError {
     #[error("wal ring full: used {used}, capacity {capacity}")]
     RingFull { used: u64, capacity: u64 },
 
-    /// `next_lsn` overflow — should never happen in practice (IMPL §14).
+    /// `next_lsn` overflow — should never happen in practice (ENCRYPTION-DESIGN§1).
     #[error("lsn overflow")]
     LsnOverflow,
 

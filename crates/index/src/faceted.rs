@@ -1,4 +1,4 @@
-//! Faceted exploration helper (DESIGN §5.6).
+//! Faceted exploration helper (SPECIFICATION-DESIGN§5.6).
 //!
 //! Given a current selection bitmap, returns the set of tags whose
 //! intersection with the selection is non-empty along with the cardinality
@@ -24,7 +24,7 @@ pub struct FacetCount {
 
 /// Faceted-exploration helper. Currently a thin wrapper over [`TagIndex`];
 /// we keep it as a distinct type so the API stays stable as we add an LRU
-/// cache (DESIGN §5.6 mentions one).
+/// cache (SPECIFICATION-DESIGN§5.6 mentions one).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct FacetedExplorer;
 

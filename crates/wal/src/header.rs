@@ -1,5 +1,5 @@
 //! WAL header (4 KiB block stored at `Superblock.wal_offset` in two adjacent
-//! A/B copies). IMPL §3.1.
+//! A/B copies). JOURNAL-DESIGN§1.1.
 
 use {
     bytemuck::{Pod, Zeroable},
@@ -16,7 +16,7 @@ pub const WAL_HEADER_FORMAT_VERSION: u16 = 1;
 /// 4-byte CRC slot fits inside `BlockHeader`'s frame.
 const WAL_HEADER_RESERVED_LEN: usize = 3996;
 
-/// 4 KiB on-disk WAL header. IMPL §3.1.
+/// 4 KiB on-disk WAL header. JOURNAL-DESIGN§1.1.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct WalHeader {

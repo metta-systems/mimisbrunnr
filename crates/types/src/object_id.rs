@@ -1,4 +1,4 @@
-//! Globally unique [`ObjectId`] (DESIGN §2.1).
+//! Globally unique [`ObjectId`] (SPECIFICATION-DESIGN§2.1).
 //!
 //! Bit layout:
 //! ```text

@@ -7,5 +7,5 @@ edition = "2024"
 path = "src/lib.rs"
 
 # Keep this crate out of the parent workspace; it is a standalone
-# const-assertion harness verifying docs/IMPLEMENTATION.md sizings.
+# const-assertion harness verifying the format specification's sizings (doc/agentic/format-design.md).
 [workspace]

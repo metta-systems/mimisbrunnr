@@ -1,24 +1,23 @@
-//! Range index — `(TagId, NormalisedKey) → RoaringBitmap` (DESIGN §5.4,
-//! IMPL §9.2).
+//! Range index — `(TagId, NormalisedKey) → RoaringBitmap` (SPECIFICATION-DESIGN§5.4,
+//! INDEX-DESIGN§4.2).
 //!
-//! ## Persistence (R1b-4)
+//! ## Persistence
 //!
-//! On disk the index occupies one 256 KiB §1.5 B+ tree region of
+//! On disk the index occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
 //! [`BtreeKind::Range`]. The in-memory mirror is materialised into a
 //! single CBOR-encoded sorted run via [`BtreeRegion::write_full`]; reload
 //! goes through [`BtreeRegion::read`]. Keys are `(u32 tag_id,
 //! NormalisedKey)` pairs sorted ascending; values are the per-key
 //! [`RoaringBitmapSerde`] (variable-length serialised bitmap).
 //!
-//! Variable-shape values preclude the §1.5.6 packed-key codec: it
+//! Variable-shape values preclude the BTREE-DESIGN§1.6 packed-key codec: it
 //! requires every entry's value to share the same byte length. Until
-//! R1a-pack-2 grows variable-size value support, RangeIndex flushes
+//! INDEX1 moves the oids into the key, RangeIndex flushes
 //! through the CBOR run codec.
 //!
-//! TODO(rewrite-phase-R1d): once R1c lands variable-value-size support,
-//! switch the *key* to the packed codec — the `(tag_id, NormalisedKey)`
-//! tuple is fixed-shape (4 + 16 = 20 B) and a packed key buys O(20%)
-//! payload savings.
+//! TODO(INDEX1): switch to the four-field key through the packed codec;
+//! with oids in the key the value side is fixed-shape, and a packed key
+//! buys O(20%) payload savings.
 
 use std::collections::BTreeMap;
 
@@ -33,7 +32,7 @@ use crate::{error::IndexError, normalised_key::NormalisedKey};
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const RANGE_INDEX_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
@@ -105,9 +104,8 @@ impl RangeIndex {
     /// `RoaringBitmap` framing lives in [`RoaringBitmapSerde`]'s custom
     /// serde impls. This helper is kept for symmetry with the other indices
     /// and to map ciborium errors to [`IndexError`]; callers may equally
-    /// reach for `ciborium::ser::into_writer` directly.
-    ///
-    /// TODO(rewrite-phase-N): replace with §1.5 B+ tree backing.
+    /// reach for `ciborium::ser::into_writer` directly. On-disk persistence
+    /// goes through the BTREE-DESIGN§1 region below, not this helper.
     pub fn serialise(&self) -> Result<Vec<u8>, IndexError> {
         let mut buf = Vec::new();
         ciborium::ser::into_writer(self, &mut buf)
@@ -122,7 +120,7 @@ impl RangeIndex {
     }
 
     // ----------------------------------------------------------------
-    // R1b-2: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
     // ----------------------------------------------------------------
 
     /// Build a [`LoadedNode`] containing every entry as a single CBOR
@@ -132,9 +130,9 @@ impl RangeIndex {
     /// Each value is the per-key [`RoaringBitmap`] serialised via
     /// `RoaringBitmap::serialize_into` and wrapped in [`RangeIndexValue`].
     ///
-    /// Per IMPL §11.2 the on-disk key carries a `snapshot: u32` suffix;
-    /// snapshots are deferred to R6 so every key written today carries
-    /// `snapshot = 0`. The field is on-disk now so R6 won't need a layout
+    /// Per SNAPSHOTS-DESIGN§1.2 the on-disk key carries a `snapshot: u32` suffix;
+    /// snapshots are deferred to SNAPSHOT2 so every key written today carries
+    /// `snapshot = 0`. The field is on-disk now so SNAPSHOT2 won't need a layout
     /// break.
     pub fn to_loaded_node(&self) -> LoadedNode<RangeIndexKey, RangeIndexValue> {
         // BTreeMap iteration is already sorted by (TagId, NormalisedKey),
@@ -177,7 +175,7 @@ impl RangeIndex {
     ) -> Result<Self, IndexError> {
         let mut map: BTreeMap<(TagId, NormalisedKey), RoaringBitmapSerde> = BTreeMap::new();
         for (k, v) in node.merge_iter() {
-            // Snapshot != 0 won't appear until R6 lands snapshot-aware reads.
+            // Snapshot != 0 won't appear until SNAPSHOT2 lands snapshot-aware reads.
             let bm = RoaringBitmap::deserialize_from(v.0.as_slice())
                 .map_err(|e| IndexError::Roaring(e.to_string()))?;
             map.insert((TagId::new(k.tag_id), k.norm_key), RoaringBitmapSerde(bm));
@@ -219,10 +217,10 @@ impl RangeIndex {
 // ---------- RangeIndexKey / RangeIndexValue (B+ tree wire types) ----------
 
 /// B+ tree key for the range index: `(tag_id, norm_key, snapshot)` per
-/// IMPL §9.2 + §11.2.
+/// INDEX-DESIGN§4.2 + SNAPSHOTS-DESIGN§1.2.
 ///
 /// `norm_key` is the 16-byte order-preserving encoding of the original
-/// [`Value`]. Snapshots are deferred to R6 so every key written today
+/// [`Value`]. Snapshots are deferred to SNAPSHOT2 so every key written today
 /// carries `snapshot = 0`. Sort order is `(tag_id, norm_key, snapshot)`
 /// — the derived `Ord` matches because field order is the same as
 /// declaration order.
@@ -319,7 +317,7 @@ mod tests {
         assert_eq!(idx.entry_count(), 0);
     }
 
-    // ----- B+ tree region round-trip (R1b-4) -----
+    // ----- B+ tree region round-trip -----
 
     use {mimisbrunnr_storage::FileBlockDevice, tempfile::TempDir};
 

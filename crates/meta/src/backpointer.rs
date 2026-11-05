@@ -1,4 +1,4 @@
-//! Backpointer table types — IMPL §6.2.
+//! Backpointer table types — METADATA-DESIGN§2.2.
 //!
 //! Reverse mapping `(disk_id, bucket_no, sector_offset) → owning key` powers
 //! copygc, evacuation, scrub, resilver and cluster reconcile. The actual
@@ -7,10 +7,10 @@
 //!
 //! - The on-disk [`BackpointerKey`] (8 B, packed) and [`BackpointerValue`]
 //!   (24 B, packed) struct definitions, sized exactly per spec.
-//! - The [`OwnerKind`] u8 enum with discriminants pinned per IMPL §6.2.
+//! - The [`OwnerKind`] u8 enum with discriminants pinned per METADATA-DESIGN§2.2.
 //! - A [`BackpointerTable`] in-memory placeholder backed by a `BTreeMap`,
 //!   with a `range_in_bucket` helper that exercises the prefix-scan
-//!   property the §1.5 B+ tree will eventually accelerate.
+//!   property the BTREE-DESIGN§1 B+ tree will eventually accelerate.
 
 use {
     bytemuck::{Pod, Zeroable},
@@ -27,7 +27,7 @@ use crate::error::MetaError;
 
 // ---------------- BackpointerKey (8 B, packed) ----------------
 
-/// Physical-location key for the backpointer table (IMPL §6.2).
+/// Physical-location key for the backpointer table (METADATA-DESIGN§2.2).
 ///
 /// Layout:
 /// ```text
@@ -36,7 +36,7 @@ use crate::error::MetaError;
 ///  [6..8]  sector_offset  u16   4 KiB units within the bucket
 /// ```
 ///
-/// Total = 8 bytes; packed so that the §1.5.6 key-packing codec sees a
+/// Total = 8 bytes; packed so that the BTREE-DESIGN§1.6 key-packing codec sees a
 /// stable byte order. Lexicographic ordering of the byte representation
 /// matches `(disk_id, bucket_no, sector_offset)` ordering — which is what
 /// the bucket-prefix range scan relies on.
@@ -125,10 +125,10 @@ impl<'de> Deserialize<'de> for BackpointerKey {
 
 // ---------------- OwnerKind (u8) ----------------
 
-/// Discriminator for the kind of owner a backpointer points back to (IMPL §6.2).
+/// Discriminator for the kind of owner a backpointer points back to (METADATA-DESIGN§2.2).
 ///
-/// Discriminants are **pinned by the spec**; do not renumber. The IMPL spec
-/// numbers these starting at 1 (see IMPL §6.2 enum block). The prompt's
+/// Discriminants are **pinned by the spec**; do not renumber. The format spec
+/// numbers these starting at 1 (see METADATA-DESIGN§2.2 enum block). The prompt's
 /// "BlobExtent = 0, …" form is not authoritative — the spec wins.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -161,7 +161,7 @@ impl OwnerKind {
 
 // ---------------- BackpointerValue (24 B, packed) ----------------
 
-/// Value stored under a [`BackpointerKey`] (IMPL §6.2).
+/// Value stored under a [`BackpointerKey`] (METADATA-DESIGN§2.2).
 ///
 /// Layout:
 /// ```text
@@ -172,7 +172,7 @@ impl OwnerKind {
 ///  [8..24]  owner_key       [u8; 16]   interpreted per OwnerKind
 /// ```
 ///
-/// Equality is byte-wise over the full 16-byte `owner_key` (IMPL §6.2
+/// Equality is byte-wise over the full 16-byte `owner_key` (METADATA-DESIGN§2.2
 /// "owner_key padding"), so writers must zero unused trailing bytes.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
@@ -226,17 +226,17 @@ impl<'de> Deserialize<'de> for BackpointerValue {
 
 /// In-memory mirror of the global backpointer B+ tree.
 ///
-/// ## Persistence (R1b-7)
+/// ## Persistence
 ///
-/// On disk the table occupies one 256 KiB §1.5 B+ tree region of
+/// On disk the table occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
 /// [`BtreeKind::Backpointer`]. The mirror is materialised into a single
 /// CBOR-encoded sorted run via [`BtreeRegion::write_full`] keyed by
 /// 8-byte [`BackpointerKey`] ascending; values are the 24-byte
 /// [`BackpointerValue`] byte image.
 ///
-/// TODO(rewrite-phase-R1d): switch to the IMPL §1.5.6 packed-key codec
-/// once R1c lands the prefix-template fix and variable-value-size
-/// support. With ~9 000 backpointers per 256 KiB leaf via §1.5.6 key
+/// TODO(METADATA3): switch to the BTREE-DESIGN§1.6 packed-key codec
+/// (the prefix-template fix it needed has landed).
+/// With ~9 000 backpointers per 256 KiB leaf via BTREE-DESIGN§1.6 key
 /// compression, that landing reduces this region's payload by an order
 /// of magnitude.
 #[derive(Debug, Default)]
@@ -246,7 +246,7 @@ pub struct BackpointerTable {
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const BACKPOINTER_TABLE_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
@@ -286,9 +286,9 @@ impl BackpointerTable {
         self.entries.iter()
     }
 
-    /// Range scan of every backpointer in `(disk_id, bucket_no)`. The IMPL
-    /// §6.2 "bucket-prefix scan" is the foundation of copygc /
-    /// evacuation / scrub. The proper §1.5 B+ tree turns this into one or
+    /// Range scan of every backpointer in `(disk_id, bucket_no)`. The
+    /// METADATA-DESIGN§2.2 "bucket-prefix scan" is the foundation of copygc /
+    /// evacuation / scrub. The proper BTREE-DESIGN§1 B+ tree turns this into one or
     /// two contiguous leaf loads; here it's a `BTreeMap::range`.
     pub fn range_in_bucket(
         &self,
@@ -302,7 +302,7 @@ impl BackpointerTable {
     }
 
     /// Range scan of every backpointer on a given disk. Used by disk
-    /// evacuation (IMPL §6.2 "Operations enabled" table).
+    /// evacuation (METADATA-DESIGN§2.2 "Operations enabled" table).
     pub fn range_on_disk(
         &self,
         disk_id: u16,
@@ -314,7 +314,7 @@ impl BackpointerTable {
     }
 
     // ----------------------------------------------------------------
-    // R1b-7: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
     // ----------------------------------------------------------------
 
     /// Build a [`LoadedNode`] containing every entry as a single CBOR
@@ -541,7 +541,7 @@ mod tests {
         assert_eq!(*k2, k);
     }
 
-    // ----- B+ tree region round-trip (R1b-7) -----
+    // ----- B+ tree region round-trip -----
 
     use {mimisbrunnr_storage::FileBlockDevice, tempfile::TempDir};
 

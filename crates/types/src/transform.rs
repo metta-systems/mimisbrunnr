@@ -1,4 +1,4 @@
-//! Compression / encryption mode enums (DESIGN §9.1).
+//! Compression / encryption mode enums (SPECIFICATION-DESIGN§9.1).
 //!
 //! `CompressionAlgo` and `EncryptionMode` describe the *configured choice*
 //! for a write — distinct from `CompressionState` / `EncryptionState`
@@ -18,7 +18,7 @@ pub enum CompressionAlgo {
     Lz4,
 }
 
-/// Encryption mode for a given zone / write target (DESIGN §9.3).
+/// Encryption mode for a given zone / write target (SPECIFICATION-DESIGN§9.3).
 ///
 /// Five fundamentally different cryptographic regimes; each is the right
 /// answer for a specific component:

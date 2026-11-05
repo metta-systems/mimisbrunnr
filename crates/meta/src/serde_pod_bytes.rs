@@ -1,9 +1,9 @@
-//! Serde helper for fixed-size POD byte images used by the R1b sorted-run
+//! Serde helper for fixed-size POD byte images used by the CBOR sorted-run
 //! CBOR persistence path.
 //!
 //! `ObjectRecord` (128 B), `ObjectLocation` (48 B), and `BackpointerKey` /
 //! `BackpointerValue` (8 / 24 B) are `#[repr(C)]` / `#[repr(C, packed)]`
-//! `Pod` types whose on-disk layout is spec-pinned by IMPL §5/§6. We
+//! `Pod` types whose on-disk layout is spec-pinned by METADATA-DESIGN§1/METADATA-DESIGN§2. We
 //! serialise their byte image (via `bytemuck::bytes_of`) rather than
 //! field-by-field — the CBOR wire form then carries the exact POD bytes
 //! and round-trips back through `bytemuck::from_bytes`.

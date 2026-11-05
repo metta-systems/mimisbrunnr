@@ -1,31 +1,31 @@
-//! Per-disk bucket allocation table (§12.2).
+//! Per-disk bucket allocation table (ALLOCATION-DESIGN§1.2).
 //!
 //! This module owns the on-disk record types, the data-type enum, the flag
-//! consts, an in-memory `BTreeMap`-backed mirror, and the §1.5 B+ tree
+//! consts, an in-memory `BTreeMap`-backed mirror, and the BTREE-DESIGN§1 B+ tree
 //! persistence path that lets the table live in a real
 //! [`BtreeKind::BucketAlloc`](crate::block::BtreeKind::BucketAlloc) region.
 //!
-//! ## Persistence (R1b-4)
+//! ## Persistence
 //!
-//! On disk the table occupies one 256 KiB §1.5 B+ tree region of
+//! On disk the table occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
 //! [`BtreeKind::BucketAlloc`]. The mirror is materialised into a single
 //! CBOR-encoded sorted run via [`BtreeRegion::write_full`] keyed by
 //! [`BucketAllocKey`] ascending; values are the 16-byte
 //! [`BucketAllocEntry`] byte image.
 //!
-//! Per IMPL §12.2 each disk gets its **own** B+ tree rooted at
-//! `DiskDescriptorOnDisk.buckets_root`. R1b-4 simplifies to one
+//! Per ALLOCATION-DESIGN§1.2 each disk gets its **own** B+ tree rooted at
+//! `DiskDescriptorOnDisk.buckets_root`. For now this is one
 //! pool-scoped tree carried in the index zone. The wire key already
-//! carries `disk_id: u16` so the per-disk split (R1d) is a layout-only
+//! carries `disk_id: u16` so the per-disk split (ALLOCATION4) is a layout-only
 //! change with no on-disk format break.
 //!
-//! TODO(rewrite-phase-R1d): split into per-disk metadata zones per
-//! IMPL §12.2 — one bucket alloc B+ tree per disk, rooted at
+//! TODO(ALLOCATION4): split into per-disk metadata zones per
+//! ALLOCATION-DESIGN§1.2 — one bucket alloc B+ tree per disk, rooted at
 //! `DiskDescriptorOnDisk.buckets_root`.
 //!
-//! TODO(rewrite-phase-R1d): switch to the IMPL §1.5.6 packed-key codec
-//! once R1c lands the prefix-template fix and variable-value-size
-//! support. Keys are dense small `u32`, ideal for packed bit-width
+//! TODO(ALLOCATION4): switch to the BTREE-DESIGN§1.6 packed-key codec
+//! (the prefix-template fix it needed has landed).
+//! Keys are dense small `u32`, ideal for packed bit-width
 //! compression.
 
 use std::collections::BTreeMap;
@@ -45,16 +45,16 @@ use crate::{
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const BUCKET_ALLOC_REGION_SIZE: u64 = 256 * 1024;
 const BUCKET_ALLOC_REGION_SIZE_LOG2: u8 = 18;
 
-/// Flag: bucket queued for TRIM (§12.7).
+/// Flag: bucket queued for TRIM (ALLOCATION-DESIGN§1.7).
 pub const BUCKET_FLAG_NEEDS_DISCARD: u8 = 1 << 0;
 /// Flag: bucket pinned by a live snapshot.
 pub const BUCKET_FLAG_PINNED_BY_SNAPSHOT: u8 = 1 << 1;
 
-/// Per-bucket allocation record (16 B). IMPL §12.2.
+/// Per-bucket allocation record (16 B). ALLOCATION-DESIGN§1.2.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default, Eq, PartialEq)]
 pub struct BucketAllocEntry {
@@ -67,7 +67,7 @@ pub struct BucketAllocEntry {
 
 const_assert_eq!(core::mem::size_of::<BucketAllocEntry>(), 16);
 
-/// Size in bytes of [`BucketAllocEntry`] (16). Used by the R1b-4
+/// Size in bytes of [`BucketAllocEntry`] (16). Used by the
 /// sorted-run length validator.
 pub const BUCKET_ALLOC_ENTRY_SIZE: usize = 16;
 
@@ -117,9 +117,9 @@ impl<'de> Deserialize<'de> for BucketAllocEntry {
 
 /// Wire key for the bucket-alloc B+ tree.
 ///
-/// Per IMPL §12.2, the per-disk tree is keyed by `bucket_no: u32` only.
-/// R1b-4 simplifies to one pool-scoped tree; `disk_id: u16` is added to
-/// the key so this can split per-disk later (R1d) without an on-disk
+/// Per ALLOCATION-DESIGN§1.2, the per-disk tree is keyed by `bucket_no: u32` only.
+/// For now this is one pool-scoped tree; `disk_id: u16` is added to
+/// the key so this can split per-disk later (ALLOCATION4) without an on-disk
 /// format break. Lexicographic ordering of the byte image matches
 /// `(disk_id, bucket_no)`.
 ///
@@ -225,7 +225,7 @@ impl<'de> Deserialize<'de> for BucketAllocKey {
     }
 }
 
-/// Bucket-content classification. **Discriminants pinned by IMPL §12.2.**
+/// Bucket-content classification. **Discriminants pinned by ALLOCATION-DESIGN§1.2.**
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BucketDataType {
@@ -261,9 +261,9 @@ impl BucketDataType {
 ///
 /// Backed by a `BTreeMap<u32, BucketAllocEntry>`. Keys are `bucket_no`.
 ///
-/// R1b-4 keeps this in-memory state pool-scoped (single allocator, no
+/// This keeps this in-memory state pool-scoped (single allocator, no
 /// per-disk split) while the on-disk wire shape is already
-/// `(disk_id, bucket_no)`-keyed for forward compatibility with R1d.
+/// `(disk_id, bucket_no)`-keyed for forward compatibility with ALLOCATION4.
 #[derive(Clone, Debug, Default)]
 pub struct BucketAllocTable {
     entries: BTreeMap<u32, BucketAllocEntry>,
@@ -301,7 +301,7 @@ impl BucketAllocTable {
     }
 
     // ----------------------------------------------------------------
-    // R1b-4: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
     // ----------------------------------------------------------------
 
     /// Build a [`LoadedNode`] containing every entry as a single CBOR
@@ -309,9 +309,9 @@ impl BucketAllocTable {
     /// [`BtreeKind::BucketAlloc`] and the spec's 18-bit (256 KiB) region
     /// size.
     ///
-    /// Every entry is keyed by `(disk_id, bucket_no)`. R1b-4 emits a
+    /// Every entry is keyed by `(disk_id, bucket_no)`. The flush emits a
     /// single-disk view because the in-memory `BucketAllocTable` is
-    /// pool-scoped — callers pass `disk_id = 0` until R1d splits the
+    /// pool-scoped — callers pass `disk_id = 0` until ALLOCATION4 splits the
     /// allocator per-disk.
     pub fn to_loaded_node(&self, disk_id: u16) -> LoadedNode<BucketAllocKey, BucketAllocEntry> {
         let entries: Vec<(BucketAllocKey, BucketAllocEntry)> = self
@@ -333,13 +333,13 @@ impl BucketAllocTable {
     /// Restore the in-memory state from a [`LoadedNode`] read via
     /// [`BtreeRegion::read`].
     ///
-    /// R1b-4 ignores the wire `disk_id`: the in-memory table is
-    /// pool-wide, indexed only by `bucket_no`. R1d will split per-disk
+    /// The loader ignores the wire `disk_id`: the in-memory table is
+    /// pool-wide, indexed only by `bucket_no`. ALLOCATION4 will split per-disk
     /// and use the full key.
     pub fn from_loaded_node(node: &LoadedNode<BucketAllocKey, BucketAllocEntry>) -> Self {
         let mut entries: BTreeMap<u32, BucketAllocEntry> = BTreeMap::new();
         for (k, v) in node.merge_iter() {
-            // Drop disk_id for now; R1d will key the in-memory map by
+            // Drop disk_id for now; ALLOCATION4 will key the in-memory map by
             // (disk_id, bucket_no).
             entries.insert(k.bucket_no, *v);
         }
@@ -350,7 +350,7 @@ impl BucketAllocTable {
     /// `offset` on `device`.
     ///
     /// `disk_id` is the wire-level disk id stamped onto every emitted
-    /// key. Pool-scoped callers pass `0` until R1d.
+    /// key. Pool-scoped callers pass `0` until ALLOCATION4.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &mut D,
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(dirty, 12);
     }
 
-    // ----- B+ tree region round-trip (R1b-4) -----
+    // ----- B+ tree region round-trip -----
 
     use {crate::file_device::FileBlockDevice, tempfile::TempDir};
 

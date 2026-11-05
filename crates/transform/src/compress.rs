@@ -1,4 +1,4 @@
-//! Compression stage of the transform pipeline (DESIGN §9.2).
+//! Compression stage of the transform pipeline (SPECIFICATION-DESIGN§9.2).
 //!
 //! Algorithm choice (`CompressionAlgo`) lives in `mimisbrunnr-types` so it
 //! can be referenced by `StoragePolicy` without depending on this crate.
@@ -37,7 +37,7 @@ impl Compressor {
             CompressionAlgo::None => Ok(plaintext.to_vec()),
             CompressionAlgo::Zstd(level) => zstd::encode_all(plaintext, level)
                 .map_err(|e| TransformError::Compression(e.to_string())),
-            // TODO(rewrite-phase-N): add lz4_flex workspace dep and wire here.
+            // TODO(BLOB7): add lz4_flex workspace dep and wire here.
             CompressionAlgo::Lz4 => Err(TransformError::UnsupportedAlgo("Lz4")),
         }
     }
@@ -54,7 +54,7 @@ impl Compressor {
             CompressionAlgo::None => Ok(compressed.to_vec()),
             CompressionAlgo::Zstd(_) => zstd::decode_all(compressed)
                 .map_err(|e| TransformError::Decompression(e.to_string())),
-            // TODO(rewrite-phase-N): add lz4_flex workspace dep and wire here.
+            // TODO(BLOB7): add lz4_flex workspace dep and wire here.
             CompressionAlgo::Lz4 => Err(TransformError::UnsupportedAlgo("Lz4")),
         }
     }

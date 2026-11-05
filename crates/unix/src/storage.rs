@@ -1,4 +1,4 @@
-//! Path-attribute construction (DESIGN §12.3, IMPL §10.3, §4.3).
+//! Path-attribute construction (SPECIFICATION-DESIGN§12.3, UNIX-DESIGN§1, INDEX-DESIGN§1.3).
 //!
 //! On-disk, a per-context Unix path is stored as the assertion
 //! `Attr(unix-path, Value::Scoped { context, inner: Value::Text(path) })`.
@@ -14,7 +14,7 @@ use crate::error::UnixError;
 use crate::projection::validate_relative_path;
 
 /// Canonical name of the `unix-path` attribute tag in the `unix-interop`
-/// ontology module (DESIGN §12.2). Engine layers resolve this name to a
+/// ontology module (SPECIFICATION-DESIGN§12.2). Engine layers resolve this name to a
 /// concrete [`TagId`] before calling [`build_path_attr`].
 pub const UNIX_PATH_TAG_NAME: &str = "unix-path";
 

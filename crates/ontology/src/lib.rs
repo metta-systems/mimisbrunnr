@@ -4,12 +4,11 @@
 //! module loader / installer / upgrader / scrubber, and storage-policy
 //! resolution. The logical types — [`TagDefinition`], [`TagSemantics`],
 //! [`TagRelation`], [`ValueType`], [`StoragePolicy`] — live in
-//! `mimisbrunnr-types` per `docs/REWRITE_CONTRACT.md` §3.
+//! `mimisbrunnr-types` per `doc/agentic/operations-design.md` (type ownership).
 //!
-//! See `docs/DESIGN.md` §3 (Ontology layer) and §4 (Modules), and
-//! `docs/IMPLEMENTATION.md` §10.1 (on-disk persistence). The on-disk B+ tree
-//! shape is implemented in a later phase; this crate currently persists
-//! state as a CBOR blob (marked `TODO(rewrite-phase-N)`).
+//! See SPECIFICATION-DESIGN§3 (Ontology layer) and SPECIFICATION-DESIGN§4 (Modules), and
+//! ONTOLOGY-DESIGN§1 (on-disk persistence), all under `doc/agentic/`. State persists as one
+//! CBOR `OntologyImage` per snapshot in the `BtreeKind::Ontology` B+ tree region.
 
 #![forbid(unsafe_code)]
 

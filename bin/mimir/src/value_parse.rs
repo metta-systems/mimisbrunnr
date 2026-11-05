@@ -69,7 +69,7 @@ fn infer(raw: &str) -> Value {
 ///   - `s:<i64>`  whole seconds since the Unix epoch.
 ///   - bare `i64` ≥ 1_000_000_000_000_000_000 (i.e. plausible ns-since-epoch).
 ///
-/// Phase 7a deliberately keeps this lightweight; full ISO-8601 lands when a
+/// This deliberately keeps this lightweight; full ISO-8601 lands when a
 /// shared time crate is added to the workspace.
 pub fn parse_timestamp(raw: &str) -> Result<Value, String> {
     if let Some(rest) = raw.strip_prefix("ns:") {

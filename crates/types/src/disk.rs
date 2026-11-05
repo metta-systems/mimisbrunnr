@@ -1,6 +1,6 @@
-//! Disk topology types (DESIGN §8.1) — the **logical** view.
+//! Disk topology types (SPECIFICATION-DESIGN§8.1) — the **logical** view.
 //!
-//! The on-disk `DiskDescriptorOnDisk` (per IMPL §10.4) lives in the `pool`
+//! The on-disk `DiskDescriptorOnDisk` (per POOL-DESIGN§1) lives in the `pool`
 //! crate; this struct is what the rest of the system carries in memory and
 //! shows in CLI / API output.
 
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::DiskId;
 
-/// Physical media class. Drives placement defaults (DESIGN §8.1).
+/// Physical media class. Drives placement defaults (SPECIFICATION-DESIGN§8.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MediaType {
     NVMe,
@@ -47,7 +47,7 @@ impl fmt::Display for MediaType {
     }
 }
 
-/// Storage tier. Discriminants are pinned by DESIGN §8.1 and used as array
+/// Storage tier. Discriminants are pinned by SPECIFICATION-DESIGN§8.1 and used as array
 /// indices into placement-priority tables — do not renumber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[repr(u8)]
@@ -91,7 +91,7 @@ impl fmt::Display for StorageTier {
     }
 }
 
-/// Operational state of a disk (DESIGN §8.1).
+/// Operational state of a disk (SPECIFICATION-DESIGN§8.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DiskState {
     /// Reads and writes accepted normally.
@@ -128,7 +128,7 @@ impl fmt::Display for DiskState {
 }
 
 /// Logical descriptor of a single disk in a pool. Mirrors the user-visible
-/// shape from DESIGN §8.1; the on-disk encoded form is owned by the `pool`
+/// shape from SPECIFICATION-DESIGN§8.1; the on-disk encoded form is owned by the `pool`
 /// crate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiskDescriptor {

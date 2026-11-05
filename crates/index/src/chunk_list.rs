@@ -1,4 +1,4 @@
-//! `ChunkList` per-object recipe structures (IMPL §9.3).
+//! `ChunkList` per-object recipe structures (INDEX-DESIGN§4.3).
 //!
 //! Two on-disk wire structs:
 //!
@@ -22,10 +22,10 @@ use crate::error::IndexError;
 
 // ---------- ChunkParamsRecord ----------
 
-/// Size in bytes of [`ChunkParamsRecord`] (16). IMPL §9.3 lines 1974–1981.
+/// Size in bytes of [`ChunkParamsRecord`] (16). INDEX-DESIGN§4.3 lines 1974–1981.
 pub const CHUNK_PARAMS_RECORD_SIZE: usize = 16;
 
-/// On-disk chunk-params record. IMPL §9.3.
+/// On-disk chunk-params record. INDEX-DESIGN§4.3.
 ///
 /// Layout:
 ///
@@ -55,7 +55,7 @@ const_assert_eq!(
 // computed: 1 (algo) + 1 (flags) + 2 (_pad) + 4 (min_size) + 4 (avg_size)
 // + 4 (max_size) = 16
 
-/// `ChunkingAlgo` discriminant — `0 = None`. IMPL §9.3.
+/// `ChunkingAlgo` discriminant — `0 = None`. INDEX-DESIGN§4.3.
 pub const CHUNKING_ALGO_NONE: u8 = 0;
 /// `ChunkingAlgo` discriminant — `1 = FixedSize`.
 pub const CHUNKING_ALGO_FIXED_SIZE: u8 = 1;
@@ -118,10 +118,10 @@ impl ChunkParamsRecord {
 
 // ---------- ChunkListEntry ----------
 
-/// Size in bytes of [`ChunkListEntry`] (40). IMPL §9.3 lines 1991–1995.
+/// Size in bytes of [`ChunkListEntry`] (40). INDEX-DESIGN§4.3 lines 1991–1995.
 pub const CHUNK_LIST_ENTRY_SIZE: usize = 40;
 
-/// On-disk per-chunk recipe entry. IMPL §9.3.
+/// On-disk per-chunk recipe entry. INDEX-DESIGN§4.3.
 ///
 /// Layout:
 ///

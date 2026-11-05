@@ -1,10 +1,10 @@
-//! Transform pipeline for Mímisbrunnr (DESIGN §9, IMPL §14).
+//! Transform pipeline for Mímisbrunnr (SPECIFICATION-DESIGN§9, ENCRYPTION-DESIGN§1).
 //!
 //! Composes hashing, compression, sector padding, and encryption into the
 //! single ordering the spec mandates — **hash → compress → pad → encrypt**
 //! on writes, reversed on reads.
 //!
-//! Phase 2c scope:
+//! Scope:
 //!
 //! - `ContentHasher` and `Hasher` — BLAKE3 (one-shot and streaming) over
 //!   plaintext.

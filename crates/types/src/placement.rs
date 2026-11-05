@@ -1,4 +1,4 @@
-//! Placement rules and chunking parameters (DESIGN §8.3).
+//! Placement rules and chunking parameters (SPECIFICATION-DESIGN§8.3).
 //!
 //! Placement rules bind semantic queries to physical topology — *and* to the
 //! granularity at which objects are stored. Chunking is a placement decision
@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{disk::StorageTier, query::Query};
 
-/// Content-defined chunking algorithm. Discriminants are pinned by DESIGN
-/// §8.3 and travel into on-disk superblock defaults — do not renumber.
+/// Content-defined chunking algorithm. Discriminants are pinned by
+/// SPECIFICATION-DESIGN§8.3 and travel into on-disk superblock defaults — do not renumber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ChunkingAlgo {
@@ -48,7 +48,7 @@ pub struct ChunkParams {
 
 impl Default for ChunkParams {
     fn default() -> Self {
-        // Match DESIGN §8.4 defaults for FastCDC.
+        // Match SPECIFICATION-DESIGN§8.4 defaults for FastCDC.
         Self {
             algo: ChunkingAlgo::None,
             min_size: 16 * 1024,

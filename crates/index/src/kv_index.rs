@@ -1,13 +1,13 @@
-//! KV equality index — `(TagId, value_hash) → RoaringBitmap` (DESIGN §5.3,
-//! IMPL §9.1).
+//! KV equality index — `(TagId, value_hash) → RoaringBitmap` (SPECIFICATION-DESIGN§5.3,
+//! INDEX-DESIGN§4.1).
 //!
 //! On disk: extendible hash directory + buckets framed inside 4 KiB
 //! `BlockKind::KvHashDirectory` / `KvHashBucket` blocks. This crate owns the
 //! per-block **header** layouts after the standard 32 B `BlockHeader`; the
 //! envelope itself lives in `mimisbrunnr-storage`.
 //!
-//! In memory: [`KvIndex`] = `HashMap<(TagId, u64), RoaringBitmap>` per IMPL
-//! §13.
+//! In memory: [`KvIndex`] = `HashMap<(TagId, u64), RoaringBitmap>` per
+//! ENGINE-DESIGN§2.
 
 use std::collections::HashMap;
 
@@ -24,14 +24,14 @@ use crate::error::IndexError;
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const KV_INDEX_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
 // ---------- KvHashDirectoryHeader ----------
 
 /// Size in bytes of [`KvHashDirectoryHeader`] (8 B). Sits at offset 32 inside
-/// a 4 KiB `KvHashDirectory` block (IMPL §9.1):
+/// a 4 KiB `KvHashDirectory` block (INDEX-DESIGN§4.1):
 ///
 /// ```text
 /// [0..1]  global_depth   u8
@@ -41,7 +41,7 @@ const REGION_SIZE_LOG2: u8 = 18;
 pub const KV_HASH_DIRECTORY_HEADER_SIZE: usize = 8;
 
 /// Header following the standard `BlockHeader` inside a 4 KiB
-/// `BlockKind::KvHashDirectory` block. IMPL §9.1.
+/// `BlockKind::KvHashDirectory` block. INDEX-DESIGN§4.1.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct KvHashDirectoryHeader {
@@ -59,7 +59,7 @@ const_assert_eq!(
 // ---------- KvHashBucketHeader ----------
 
 /// Size in bytes of [`KvHashBucketHeader`] (4 B). Sits at offset 32 inside a
-/// 4 KiB `KvHashBucket` block (IMPL §9.1):
+/// 4 KiB `KvHashBucket` block (INDEX-DESIGN§4.1):
 ///
 /// ```text
 /// [0..1] local_depth   u8
@@ -69,7 +69,7 @@ const_assert_eq!(
 pub const KV_HASH_BUCKET_HEADER_SIZE: usize = 4;
 
 /// Header following the standard `BlockHeader` inside a 4 KiB
-/// `BlockKind::KvHashBucket` block. IMPL §9.1.
+/// `BlockKind::KvHashBucket` block. INDEX-DESIGN§4.1.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct KvHashBucketHeader {
@@ -86,7 +86,7 @@ const_assert_eq!(
 
 // ---------- KvIndex (in-memory mirror) ----------
 
-/// In-memory KV equality index (IMPL §13).
+/// In-memory KV equality index (ENGINE-DESIGN§2).
 ///
 /// The map key is `(TagId, value_hash)` — the full `Value` is hashed via
 /// [`mimisbrunnr_types::value_hash`] using a per-pool secret. Two `Value`s
@@ -98,7 +98,7 @@ pub struct KvIndex {
     entries: HashMap<(TagId, u64), RoaringBitmapSerde>,
     /// 16-byte secret used to hash values. Defaults to all-zero; the engine
     /// is expected to plumb the real per-pool secret.
-    /// TODO(rewrite-phase-N): plumb the per-pool secret from `Superblock`.
+    /// TODO(ENCRYPTION6): plumb the per-pool secret from `Superblock`.
     #[serde(default = "default_secret")]
     secret: [u8; 16],
 }
@@ -189,7 +189,7 @@ impl KvIndex {
     /// map ciborium errors to [`IndexError`]; callers may equally reach for
     /// `ciborium::ser::into_writer` directly.
     ///
-    /// TODO(rewrite-phase-N): replace with the extendible-hash on-disk
+    /// TODO(INDEX4): replace with the extendible-hash on-disk
     /// backing.
     pub fn serialise(&self) -> Result<Vec<u8>, IndexError> {
         let mut buf = Vec::new();
@@ -205,13 +205,13 @@ impl KvIndex {
     }
 
     // ----------------------------------------------------------------
-    // R1b-1: §1.5 B+ tree persistence (CBOR-encoded sorted run).
+    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
     // ----------------------------------------------------------------
     //
     // Variable-shape values (roaring bitmaps, serialised to bytes) preclude
-    // the §1.5.6 packed-key codec: it requires every entry's value to share
-    // the same byte length. Until R1a-pack-2 grows variable-size value
-    // support, KvIndex flushes through the CBOR run codec.
+    // the BTREE-DESIGN§1.6 packed-key codec: it requires every entry's value to share
+    // the same byte length. Without variable-size value
+    // support in the packed codec, this path flushes through the CBOR run codec.
 
     /// Build a [`LoadedNode`] containing every entry as a single CBOR sorted
     /// run, sorted by `(tag_id, value_hash)`. Each value is the per-key
@@ -220,7 +220,7 @@ impl KvIndex {
     /// The node uses [`BtreeKind::KvDirectory`] (the spec doesn't yet
     /// allocate a dedicated `BtreeKind::KvIndex` — see TODO below) and the
     /// spec's 18-bit (256 KiB) region size.
-    /// TODO(rewrite-phase-R1c): once `BtreeKind::KvIndex` exists in the
+    /// TODO(INDEX4): once `BtreeKind::KvIndex` exists in the
     /// storage spec, switch to it.
     pub fn to_loaded_node(&self) -> LoadedNode<KvIndexKey, KvIndexValue> {
         let mut entries: Vec<(KvIndexKey, KvIndexValue)> = self
@@ -273,23 +273,23 @@ impl KvIndex {
     /// Write the in-memory state into a fresh 256 KiB region at byte
     /// `offset` on `device`.
     ///
-    /// **R1c-A1**: writes via the IMPL §9.1 native extendible-hash
+    /// Writes via the INDEX-DESIGN§4.1 native extendible-hash
     /// layout — `KvDirectory` 4 KiB block at slot 0, `KvBucket` 4 KiB
     /// blocks in slots `1..=bucket_count`, `TagBitmapPage` 4 KiB
     /// blocks one per `(tag_id, value_hash)` entry in the trailing
-    /// slots. Replaces R1b-1's CBOR sorted-run path
+    /// slots. Replaces the CBOR sorted-run path
     /// ([`Self::to_loaded_node`] / [`Self::from_loaded_node`] stay
     /// available for tooling but are no longer the engine's
     /// persistence path).
     ///
-    /// ## Capacity (R1c-A1)
+    /// ## Capacity
     ///
     /// The 256 KiB region holds 64 × 4 KiB blocks. Layout is:
     /// 1 directory + `bucket_count` buckets + `entry_count` bitmap
     /// pages. Practical entry cap is ~62 (depth=0 single bucket); the
     /// real spec capacity (~9 000 entries per region with global_depth
-    /// ≥ 4 + bucket_alloc-driven page pool) needs Tier 3 D3 sub-bucket
-    /// allocation to move bitmap pages out of the kv_index_root region.
+    /// ≥ 4 + bucket_alloc-driven page pool) needs sub-bucket
+    /// allocation (INDEX4) to move bitmap pages out of the kv_index_root region.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
@@ -301,7 +301,7 @@ impl KvIndex {
     /// Read the in-memory state from the 256 KiB region at byte `offset`
     /// on `device`. An all-zero region returns [`Self::default`].
     ///
-    /// **R1c-A1**: reads via the native extendible-hash layout.
+    /// Reads via the native extendible-hash layout.
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
         offset: u64,
@@ -315,7 +315,7 @@ impl KvIndex {
     }
 }
 
-// ---------- Extendible-hash region layout (R1c-A1) ----------
+// ---------- Extendible-hash region layout ----------
 
 /// Slot size — every block in the region is 4 KiB.
 const SLOT_SIZE: u64 = mimisbrunnr_storage::BLOCK_SIZE as u64;
@@ -371,8 +371,8 @@ fn flush_extendible_hash<D: BlockDevice>(
     let global_depth = select_global_depth(entry_count);
     if global_depth > crate::kv_directory::KV_DIRECTORY_MAX_INLINE_DEPTH {
         return Err(IndexError::Roaring(format!(
-            "KvIndex needs global_depth {} which exceeds R1c-A1 inline cap {}; \
-             add buckets via the bucket allocator (Tier 3 D3) to expand",
+            "KvIndex needs global_depth {} which exceeds the inline cap {}; \
+             add buckets via the bucket allocator (INDEX4) to expand",
             global_depth,
             crate::kv_directory::KV_DIRECTORY_MAX_INLINE_DEPTH
         )));
@@ -381,8 +381,8 @@ fn flush_extendible_hash<D: BlockDevice>(
     // Layout cap: 1 directory + bucket_count buckets + entry_count bitmap pages.
     if 1 + bucket_count + entry_count > SLOTS_PER_REGION {
         return Err(IndexError::Roaring(format!(
-            "KvIndex region too small under R1c-A1: directory(1) + buckets({}) \
-             + bitmaps({}) > {} slots; Tier 3 D3 moves bitmaps out of the region",
+            "KvIndex region too small: directory(1) + buckets({}) \
+             + bitmaps({}) > {} slots; INDEX4 moves bitmaps out of the region",
             bucket_count, entry_count, SLOTS_PER_REGION
         )));
     }
@@ -430,7 +430,7 @@ fn flush_extendible_hash<D: BlockDevice>(
     // 4. Build + write the directory. Each directory[i] points to its
     //    bucket; with global_depth ≤ N, multiple directory entries may
     //    point to the same bucket (extendible-hash semantics). Under
-    //    R1c-A1 directory entries map 1:1 to buckets.
+    //    Directory entries map 1:1 to buckets.
     let mut dir = crate::kv_directory::KvDirectoryBlock::new(global_depth)
         .map_err(|e| IndexError::Roaring(e.to_string()))?;
     for bucket_idx in 0..bucket_count {
@@ -499,7 +499,7 @@ fn load_extendible_hash<D: BlockDevice>(
 
 // ---------- KvIndexKey / KvIndexValue (B+ tree wire types) ----------
 
-/// B+ tree key for the KV index: `(tag_id, value_hash)` per IMPL §9.1.
+/// B+ tree key for the KV index: `(tag_id, value_hash)` per INDEX-DESIGN§4.1.
 ///
 /// Order is `tag_id` then `value_hash`, lexicographically — matches the
 /// derived `Ord` impl below.
@@ -614,7 +614,7 @@ mod tests {
         assert!(back.lookup(t(2), &Value::Text("foo".into())).contains(200));
     }
 
-    // ----- B+ tree region round-trip (R1b-1) -----
+    // ----- B+ tree region round-trip -----
 
     use mimisbrunnr_storage::FileBlockDevice;
     use tempfile::TempDir;

@@ -1,4 +1,4 @@
-//! `TagStore` enum (DESIGN §5.2) — Simple / Ordered / Ranked.
+//! `TagStore` enum (SPECIFICATION-DESIGN§5.2) — Simple / Ordered / Ranked.
 //!
 //! All three variants carry a roaring membership bitmap. `Ordered` adds a
 //! sequence vector (playlist-style ordering); `Ranked` adds a scored vector
@@ -13,15 +13,15 @@ use {
 /// Storage variant for a tag's membership data.
 #[derive(Debug, Clone)]
 pub enum TagStore {
-    /// Plain membership bitmap — the common case (DESIGN §5.1).
+    /// Plain membership bitmap — the common case (SPECIFICATION-DESIGN§5.1).
     Simple(RoaringBitmap),
-    /// Ordered collection: membership + sequence (DESIGN §5.2). The sequence
+    /// Ordered collection: membership + sequence (SPECIFICATION-DESIGN§5.2). The sequence
     /// preserves insertion / curator order (playlist tracks, album positions).
     Ordered {
         members: RoaringBitmap,
         sequence: Vec<ObjectId>,
     },
-    /// Ranked collection: membership + scored entries (DESIGN §5.2). Score is
+    /// Ranked collection: membership + scored entries (SPECIFICATION-DESIGN§5.2). Score is
     /// `i64` so that the in-memory mirror is `Ord`-able by score without the
     /// `f32` `NaN` foot-gun. Callers that want decimal scores convert via
     /// fixed-point.
@@ -183,7 +183,7 @@ impl TagStore {
 // ---------- Serde via the in-memory roaring bitmap CBOR fallback ----------
 
 /// Serde proxy: roaring bitmaps don't derive `Serialize`/`Deserialize`, so
-/// we go through the portable byte format (IMPL §13.1).
+/// we go through the portable byte format (ENGINE-DESIGN§2.1).
 #[derive(Serialize, Deserialize)]
 struct TagStoreSerde {
     kind: u8,

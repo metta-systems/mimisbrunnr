@@ -1,11 +1,11 @@
 //! WAL ring: append, iterate, checkpoint.
 //!
-//! Implements the runtime side of IMPL §3 — the on-disk header (`WalHeader`)
+//! Implements the runtime side of JOURNAL-DESIGN§1 — the on-disk header (`WalHeader`)
 //! lives in two adjacent A/B blocks at `Superblock.wal_offset`, the active one
 //! selected by `BlockHeader.generation`. The ring data area follows
 //! immediately after.
 //!
-//! Per IMPL §3.2 each entry is fully framed inside a single 4 KiB sector and
+//! Per JOURNAL-DESIGN§1.2 each entry is fully framed inside a single 4 KiB sector and
 //! never crosses a sector boundary. The ring is therefore *sector-addressed*:
 //! the write/read cursors are byte offsets that always sit on sector
 //! boundaries, and an entry that wouldn't fit in the remainder of the current
@@ -35,13 +35,13 @@ use crate::{
 ///
 /// Encryption (`WAL_ENTRY_FLAG_ENCRYPTED`) and compression
 /// (`WAL_ENTRY_FLAG_COMPRESSED`) are recognised here but rejected at append /
-/// iter time. Phase 2a only supports plaintext payloads.
+/// iter time. Only plaintext payloads are supported (ENCRYPTION3, JOURNAL5).
 //
-// TODO(rewrite-phase-N): wire AES-256-GCM for WAL_ENTRY_FLAG_ENCRYPTED
+// TODO(ENCRYPTION3): wire AES-256-GCM for WAL_ENTRY_FLAG_ENCRYPTED
 // payloads. Nonce = 64-bit lsn || 32-bit zero. AAD = first 36 bytes of
 // WalEntryHeader. Tag (16 B) sits between ciphertext and the framing CRC.
 //
-// TODO(rewrite-phase-N): wire zstd compression for WAL_ENTRY_FLAG_COMPRESSED
+// TODO(JOURNAL5): wire zstd compression for WAL_ENTRY_FLAG_COMPRESSED
 // payloads (compress *before* encrypt — never the reverse, GCM ciphertext
 // is incompressible).
 pub struct Wal {
@@ -62,7 +62,7 @@ pub struct Wal {
     read_only: bool,
 }
 
-/// Per IMPL §3.5 / §2.2: WAL header A/B alternation flips on every commit. We
+/// Per JOURNAL-DESIGN§1.5 / ENGINE-DESIGN§1.2: WAL header A/B alternation flips on every commit. We
 /// pick the slot by max valid generation; on the first format we write to
 /// slot 0.
 const HEADER_SLOT_A: u8 = 0;
@@ -273,7 +273,7 @@ impl Wal {
     /// Append a CBOR-serialised payload as a fresh entry. Returns the assigned
     /// LSN. The producer supplies the `HybridTimestamp` (via the
     /// in-process HLC; see `mimisbrunnr-types`). Panics on `next_lsn`
-    /// overflow per IMPL §14.
+    /// overflow per ENCRYPTION-DESIGN§1.
     pub fn append(
         &mut self,
         device: &dyn BlockDevice,
@@ -290,7 +290,7 @@ impl Wal {
     /// Append already-serialised payload bytes. Useful when the caller already
     /// has the encoded CBOR (e.g. from `WalOp::encode`). `flags` bits other
     /// than `WAL_ENTRY_FLAG_*` are ignored; the encrypted/compressed bits are
-    /// rejected (Phase 2a).
+    /// rejected (ENCRYPTION3, JOURNAL5).
     pub fn append_raw(
         &mut self,
         device: &dyn BlockDevice,
@@ -332,7 +332,7 @@ impl Wal {
         }
 
         let lsn = { self.header.next_lsn };
-        // IMPL §14: panic on LSN overflow.
+        // ENCRYPTION-DESIGN§1: panic on LSN overflow.
         let next_lsn = lsn.checked_add(1).expect("WAL next_lsn overflow");
 
         // Build entry header with payload_crc filled in.
@@ -525,7 +525,7 @@ impl Iterator for WalIter<'_> {
                 }));
             }
 
-            // Phase 2a: reject encrypted/compressed payloads explicitly.
+            // Until ENCRYPTION3 / JOURNAL5: reject encrypted/compressed payloads explicitly.
             let flags = { hdr.flags };
             if flags & WAL_ENTRY_FLAG_ENCRYPTED != 0 {
                 self.done = true;

@@ -1,7 +1,7 @@
 //! Native positional radix-leaf format for the Location Table
-//! (IMPL §6.1).
+//! (METADATA-DESIGN§2.1).
 //!
-//! Same shape as the object-table leaf (§5) but parameterised for
+//! Same shape as the object-table leaf (METADATA-DESIGN§1) but parameterised for
 //! 48-byte [`ObjectLocation`] records and a 5440-slot leaf:
 //!
 //! ```text
@@ -14,7 +14,7 @@
 //!
 //! Total = 256 KiB = 262 144 B.
 //!
-//! ## Scope (R1c-A2 first iteration)
+//! ## Scope
 //!
 //! Leaf-only trees: any `oid_local ≥ LEAF_RECORDS_LOCATION` is rejected
 //! with [`MetaError::OidOutOfRange`]. Multi-level descent + tree growth

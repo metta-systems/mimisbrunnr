@@ -1,6 +1,6 @@
 //! Crate-level error type.
 //!
-//! Per `docs/REWRITE_CONTRACT.md` §2, every crate exposes a single
+//! Per `doc/agentic/operations-design.md` (cross-cutting choices), every crate exposes a single
 //! `thiserror`-derived error enum. Public APIs return `Result<T, TypesError>`.
 
 use thiserror::Error;
@@ -17,7 +17,7 @@ pub enum TypesError {
     CborDecode(String),
 
     /// `Value::Scoped` whose `inner` is itself a `Scoped` — disallowed by
-    /// IMPL §4.3 (nested scopes are a format error).
+    /// INDEX-DESIGN§1.3 (nested scopes are a format error).
     #[error("Value::Scoped may not directly contain another Scoped value")]
     NestedScopedValue,
 }

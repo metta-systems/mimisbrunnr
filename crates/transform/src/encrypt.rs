@@ -1,6 +1,6 @@
-//! Encryption stage of the transform pipeline (DESIGN §9.3, IMPL §14).
+//! Encryption stage of the transform pipeline (SPECIFICATION-DESIGN§9.3, ENCRYPTION-DESIGN§1).
 //!
-//! Phase 2c **placeholder**: the real cipher integrations require workspace
+//! **Placeholder** (ENCRYPTION1): the real cipher integrations require workspace
 //! dependencies that are not yet pulled in (`aes`, `aes-gcm`, `xts-mode`,
 //! `hctr2`, `chacha20poly1305`). Until then this module wires the API
 //! surface — the caller may pass any `EncryptionMode` — but every non-`None`
@@ -8,7 +8,7 @@
 //! transparent passthrough so the rest of the pipeline can be exercised
 //! end-to-end.
 //!
-//! TODO(rewrite-phase-N): wire actual ciphers — needs aes-gcm, xts-mode,
+//! TODO(ENCRYPTION1): wire actual ciphers — needs aes-gcm, xts-mode,
 //! hctr2, chacha20poly1305 workspace deps.
 
 use mimisbrunnr_types::EncryptionMode;
@@ -16,9 +16,9 @@ use mimisbrunnr_types::EncryptionMode;
 use crate::error::TransformError;
 
 /// Opaque key handle. Will be replaced by the proper key hierarchy
-/// (Master KEK → DiskKey → per-zone keys, DESIGN §9.4) in a later phase.
+/// (Master KEK → DiskKey → per-zone keys, SPECIFICATION-DESIGN§9.4) in a later phase.
 ///
-/// TODO(rewrite-phase-N): replace with the full key hierarchy (DESIGN §9.4).
+/// TODO(ENCRYPTION2): replace with the full key hierarchy (SPECIFICATION-DESIGN§9.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransformKey(pub [u8; 32]);
 
@@ -46,7 +46,7 @@ impl Encryptor {
         Self
     }
 
-    /// Encrypt `data` under `mode`. In Phase 2c only `EncryptionMode::None`
+    /// Encrypt `data` under `mode`. For now only `EncryptionMode::None`
     /// is wired; every other variant returns
     /// `TransformError::EncryptionDisabled`.
     pub fn encrypt(
@@ -64,7 +64,7 @@ impl Encryptor {
         }
     }
 
-    /// Inverse of `encrypt` with the same Phase 2c restrictions.
+    /// Inverse of `encrypt` with the same restrictions.
     pub fn decrypt(
         &self,
         data: &[u8],
@@ -82,7 +82,7 @@ impl Encryptor {
 
     /// Whether `mode` is length-preserving (no AEAD tag).
     ///
-    /// Per DESIGN §9.3: `Hctr2` and `Xts` are length-preserving; `AesGcm`
+    /// Per SPECIFICATION-DESIGN§9.3: `Hctr2` and `Xts` are length-preserving; `AesGcm`
     /// and `ChaCha20Poly1305` append a 16-byte authentication tag.
     pub fn is_length_preserving(mode: EncryptionMode) -> bool {
         matches!(

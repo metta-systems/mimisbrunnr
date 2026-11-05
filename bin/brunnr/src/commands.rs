@@ -359,7 +359,7 @@ pub fn cmd_remove_disk(config_path: &Path, target: &str) -> Result<(), BrunnrErr
     de.remove_disk(disk_id)?;
     println!(
         "Disk {disk_id} marked Draining. Data is not yet evacuated \
-         (TODO: phase-N evacuation per DESIGN §8.4).",
+         (evacuation per SPECIFICATION-DESIGN§8.4 is not implemented yet).",
     );
     // Sanity-check the runtime state we just wrote.
     let s = de.status();
@@ -429,7 +429,7 @@ pub fn cmd_mount(
         MountRoot::Full
     };
 
-    // The Phase 6 `DiskEngine` keeps blobs in an in-memory HashMap keyed by
+    // `DiskEngine` keeps blobs in an in-memory HashMap keyed by
     // `oid_local`. Wrap that lookup in a closure the FUSE adapter can call.
     let content: ContentProvider<'static> =
         Box::new(move |oid: mimisbrunnr_types::ObjectId| {

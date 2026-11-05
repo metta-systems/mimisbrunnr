@@ -8,7 +8,7 @@
 //! unambiguous; cluster mode (where `ObjectId.node` is non-zero) and
 //! >4 G-objects pools both require a wider encoding.
 //!
-//! TODO(rewrite-phase-N): replace the 32-bit bitmap with a sharded encoding
+//! TODO(INDEX5): replace the 32-bit bitmap with a sharded encoding
 //! that covers the full 48-bit local-id space and the 16-bit node prefix.
 //!
 //! ## Universe
@@ -88,7 +88,7 @@ impl<'a> QueryExecutor<'a> {
     /// rebuilds [`ObjectId`]s by zero-extending them to 48 bits and treating
     /// the node id as 0.
     ///
-    /// TODO(rewrite-phase-N): once the bitmap representation grows beyond 32
+    /// TODO(INDEX5): once the bitmap representation grows beyond 32
     /// bits, plumb the node id through (likely via a side `objid_table` the
     /// engine maintains).
     pub fn evaluate_full(&self, query: &Query) -> Result<Vec<ObjectId>, QueryError> {
@@ -125,7 +125,7 @@ impl<'a> QueryExecutor<'a> {
                 // (object, assertion) pairs; replaced by a per-key reverse
                 // index in a later phase.
                 //
-                // TODO(rewrite-phase-N): replace the forward-index scan with a
+                // TODO(QUERY3): replace the forward-index scan with a
                 // dedicated `tag_id → bitmap-of-objects-with-this-attr-key`
                 // index.
                 let any_with_key = self.objects_with_attr_key(key);
@@ -138,12 +138,12 @@ impl<'a> QueryExecutor<'a> {
             CmpOp::Prefix => Ok(self.eval_prefix(key, value)),
             CmpOp::Contains => {
                 // Substring search needs a substring index we don't have yet.
-                // The DESIGN/IMPL spec's fallback is a forward-index scan;
+                // The spec's fallback is a forward-index scan;
                 // we deliberately surface this as an error rather than do a
                 // silent O(N) linear scan that would mask the missing
                 // capability.
                 //
-                // TODO(rewrite-phase-N): replace with a substring index or a
+                // TODO(QUERY1): replace with a substring index or a
                 // documented opt-in linear scan over `forward_index`.
                 Err(QueryError::UnsupportedCmpOp { op: "Contains" })
             }
@@ -191,7 +191,7 @@ impl<'a> QueryExecutor<'a> {
     /// Prefix-match for `Value::Text`. Implemented as a forward-index linear
     /// scan: cheap for small pools, replaced by a dedicated index later.
     ///
-    /// TODO(rewrite-phase-N): replace with a prefix-aware sub-index.
+    /// TODO(QUERY2): replace with a prefix-aware sub-index.
     fn eval_prefix(&self, key: TagId, value: &Value) -> RoaringBitmap {
         let needle = match value {
             Value::Text(s) => s.as_str(),
@@ -219,7 +219,7 @@ impl<'a> QueryExecutor<'a> {
     /// is O(forward index size); replaced by a relation-targeted reverse
     /// index in a later phase.
     ///
-    /// TODO(rewrite-phase-N): replace with a `(predicate, target) → bitmap`
+    /// TODO(QUERY4): replace with a `(predicate, target) → bitmap`
     /// reverse relation index.
     fn eval_related(&self, predicate: TagId, target: ObjectId) -> RoaringBitmap {
         let mut acc = RoaringBitmap::new();
@@ -240,7 +240,7 @@ impl<'a> QueryExecutor<'a> {
         acc
     }
 
-    /// `IsA(tag)` per DESIGN §3.3 / §2.3.
+    /// `IsA(tag)` per SPECIFICATION-DESIGN§3.3 / SPECIFICATION-DESIGN§2.3.
     ///
     /// Although materialised tags are inserted at write time (so
     /// `HasTag(vehicle)` already covers cars), `IsA` is the explicit form:
@@ -255,7 +255,7 @@ impl<'a> QueryExecutor<'a> {
         // `tag`. We enumerate every tag the index has membership for and
         // consult `OntologyState::materialise` on it; if its closure
         // contains `tag`, its membership bitmap contributes to the
-        // result. Per DESIGN §3.3, materialisation already happens at
+        // result. Per SPECIFICATION-DESIGN§3.3, materialisation already happens at
         // write time, so `HasTag(vehicle)` would normally cover cars
         // already; `IsA(vehicle)` is the explicit form for queries
         // against pools whose ontology was installed *after* writes.
@@ -351,7 +351,7 @@ fn oid_low32(oid_raw: u64) -> Option<u32> {
     // Single-node clusters never set bits 32..48, so the cast is faithful.
     let local48 = oid_raw & 0x0000_ffff_ffff_ffff;
     if local48 > u32::MAX as u64 {
-        // Caller-side TODO(rewrite-phase-N): widen the bitmap.
+        // Caller-side TODO(INDEX5): widen the bitmap.
         None
     } else {
         Some(local48 as u32)

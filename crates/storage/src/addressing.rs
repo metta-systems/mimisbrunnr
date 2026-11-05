@@ -1,11 +1,11 @@
-//! Block-addressing helpers. IMPL §2.3 and §12.3.
+//! Block-addressing helpers. ENGINE-DESIGN§1.3 and ALLOCATION-DESIGN§1.3.
 
 use crate::block::BLOCK_SIZE_LOG2;
 
 /// Decompose a logical 4 KiB `block_no` into `(bucket_no, in_bucket_offset)`
 /// for a disk whose buckets are `1 << bucket_size_log2` bytes each.
 ///
-/// IMPL §12.3:
+/// ALLOCATION-DESIGN§1.3:
 /// ```text
 /// bucket_no = block_no >> (bucket_size_log2 - 12)
 /// in_bucket = block_no &  ((1 << (bucket_size_log2 - 12)) - 1)

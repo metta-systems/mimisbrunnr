@@ -1,4 +1,4 @@
-//! Query algebra (DESIGN §2.3). Pure data — the executor lives in
+//! Query algebra (SPECIFICATION-DESIGN§2.3). Pure data — the executor lives in
 //! `mimisbrunnr-query`.
 
 use serde::{Deserialize, Serialize};

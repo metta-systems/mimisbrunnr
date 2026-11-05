@@ -1,5 +1,5 @@
 //! [`PathProjection`] — a per-context view of how Mímisbrunnr objects map to
-//! Unix paths under one path context (DESIGN §12.1).
+//! Unix paths under one path context (SPECIFICATION-DESIGN§12.1).
 //!
 //! A projection is a pure data structure — no I/O, no engine access. The
 //! engine layer materialises paths into a projection at query time, and
@@ -65,8 +65,8 @@ impl PathProjection {
     }
 
     /// Linear scan: find the first object id whose path matches `path`.
-    // TODO(rewrite-phase-N): replace with a path → oid index when the
-    // path-projection B+ tree (IMPL §10.3) lands.
+    // TODO(UNIX6): replace with a path → oid index when the
+    // path-projection B+ tree (UNIX-DESIGN§1) lands.
     pub fn reverse_lookup(&self, path: &str) -> Option<ObjectId> {
         self.paths
             .iter()

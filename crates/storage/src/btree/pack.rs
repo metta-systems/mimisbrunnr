@@ -1,4 +1,4 @@
-//! IMPL §1.5.6 packed-key codec.
+//! BTREE-DESIGN§1.6 packed-key codec.
 //!
 //! A sorted run's keys are decomposed into a sequence of fixed-count `u64`
 //! fields (plus an optional 0..=4 byte per-key header). For each field we
@@ -140,7 +140,7 @@ impl FieldHints {
 
 // ---------- PackableKey ----------
 
-/// Key types that can be encoded into the §1.5.6 packed-key format.
+/// Key types that can be encoded into the BTREE-DESIGN§1.6 packed-key format.
 ///
 /// The trait describes a key's *shape* — how many `u64` fields it
 /// decomposes into, an optional per-key 1..=4 byte type/flags discriminator,
@@ -285,7 +285,7 @@ impl PackableKey for (u32, u32) {
 /// shortest value's length and by the `u8` representable range
 /// (`0..=255`). The matching prefix bytes themselves are returned as the
 /// third tuple element so callers can persist them in the descriptor's
-/// trailing `value_prefix` slot (IMPL §1.5.6).
+/// trailing `value_prefix` slot (BTREE-DESIGN§1.6).
 ///
 /// **Edge cases:**
 ///
@@ -306,7 +306,7 @@ pub fn select_format<K: PackableKey, V: AsRef<[u8]>>(
 /// When `force_varint` is `true` the returned descriptor's
 /// `value_size_kind` is always [`VALUE_SIZE_KIND_VARINT`], regardless of
 /// whether the values happen to share a length. This is the right choice
-/// for values whose logical shape is variable-length (e.g. IMPL §7.1's
+/// for values whose logical shape is variable-length (e.g. INDEX-DESIGN§2.1's
 /// `LeafEntry`, which switches between an inline `[PackedAssertion; N]`
 /// body and a 16 B `BlockRef` spill ref): without the hint, the default
 /// auto-detection forces FIXED for single-entry runs, and the FIXED
@@ -940,7 +940,7 @@ pub fn check_fit<K: PackableKey>(
 
 // ---------- FormatPromote event ----------
 
-/// Storage-layer projection of the `FormatPromote` WAL op (IMPL §3.3).
+/// Storage-layer projection of the `FormatPromote` WAL op (JOURNAL-DESIGN§1.3).
 /// Emitted by the storage layer when a flush widens a sorted run's format;
 /// the engine layer is responsible for journalling this as a WAL op so
 /// recovery can reconstruct the in-memory sorted run state. The WAL op
@@ -1425,7 +1425,7 @@ mod tests {
         }
     }
 
-    // --- single-entry round-trip (the C1 spec amendment guarantee) ---
+    // --- single-entry round-trip (the prefix-elision fix guarantees this) ---
 
     /// Single-entry sorted runs are the case where `select_format` saturates
     /// `common_value_prefix` to the value's full length: every byte is

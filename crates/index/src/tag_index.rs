@@ -1,8 +1,8 @@
-//! Tag inverted index — `TagId → TagStore` (DESIGN §5.1, IMPL §8).
+//! Tag inverted index — `TagId → TagStore` (SPECIFICATION-DESIGN§5.1, INDEX-DESIGN§3).
 //!
 //! On disk:
 //!
-//! - The directory is a §1.5 B+ tree region of [`BtreeKind::TagDirectory`]
+//! - The directory is a BTREE-DESIGN§1 B+ tree region of [`BtreeKind::TagDirectory`]
 //!   with the 2-field packed key `(tag_id, snapshot)` and a 40 B value tail
 //!   ([`TagIndexValue`]) per entry. Together with the key bytes the value
 //!   reproduces the spec's 48 B [`TagIndexLeafEntry`] image.
@@ -12,9 +12,9 @@
 //!
 //! In memory:
 //!
-//! - [`TagIndex`] = `HashMap<TagId, TagStore>` per IMPL §13.
+//! - [`TagIndex`] = `HashMap<TagId, TagStore>` per ENGINE-DESIGN§2.
 //!
-//! ## Persistence (R1c-A3.3) — Simple stores only
+//! ## Persistence — Simple stores only
 //!
 //! - Directory: native packed sorted run, `value_size_kind = FIXED`,
 //!   40 B per value tail.
@@ -24,8 +24,8 @@
 //!   tag's roaring portable serialisation; chains terminate at the page
 //!   with `next_page == BlockRef::zeroed()`.
 //! - Ordered / Ranked stores: flush returns
-//!   [`IndexError::UnsupportedStoreKind`]; A3.4 / A3.5 will land the
-//!   §8.3 `OrderedStore` / `RankedStore` root-block paths.
+//!   [`IndexError::UnsupportedStoreKind`]; INDEX2 / INDEX3 will land the
+//!   INDEX-DESIGN§3.3 `OrderedStore` / `RankedStore` root-block paths.
 
 use std::collections::HashMap;
 
@@ -47,13 +47,13 @@ use crate::{error::IndexError, tag_store::TagStore};
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const TAG_INDEX_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
 // ---------- Store kind discriminants ----------
 
-/// Discriminants for `TagIndexLeafEntry::store_kind`. IMPL §8.1.
+/// Discriminants for `TagIndexLeafEntry::store_kind`. INDEX-DESIGN§3.1.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TagStoreKind {
@@ -79,10 +79,10 @@ impl TagStoreKind {
 
 // ---------- TagIndexLeafEntry ----------
 
-/// Size of [`TagIndexLeafEntry`] in bytes (48). IMPL §8.1.
+/// Size of [`TagIndexLeafEntry`] in bytes (48). INDEX-DESIGN§3.1.
 pub const TAG_INDEX_LEAF_ENTRY_SIZE: usize = 48;
 
-/// On-disk leaf entry for the tag-directory B+ tree (IMPL §8.1).
+/// On-disk leaf entry for the tag-directory B+ tree (INDEX-DESIGN§3.1).
 ///
 /// Layout (48 bytes):
 ///
@@ -97,7 +97,7 @@ pub const TAG_INDEX_LEAF_ENTRY_SIZE: usize = 48;
 /// [41..48] _pad                   [u8; 7]
 /// ```
 ///
-/// `#[repr(C, packed)]` per the rewrite contract §4 (despite IMPL §8.1
+/// `#[repr(C, packed)]` per operations-design.md "On-disk struct discipline" (despite INDEX-DESIGN§3.1
 /// favouring `#[repr(C)]` for hot-path access — the contract pins the
 /// packed form for "every fixed-size on-disk struct"; the size and field
 /// offsets are unchanged either way).
@@ -129,7 +129,7 @@ const_assert_eq!(
 pub const TAG_INDEX_VALUE_SIZE: usize = 40;
 
 /// Fixed-size 40-byte value tail for the [`TagIndex`] B+ tree. Together
-/// with the 2-field packed key `(tag_id, snapshot)` (§1.5.6) this
+/// with the 2-field packed key `(tag_id, snapshot)` (BTREE-DESIGN§1.6) this
 /// reproduces the spec's 48 B [`TagIndexLeafEntry`] layout. Field order
 /// matches the leaf entry sans the two key fields.
 ///
@@ -215,7 +215,7 @@ mod serde_bytes_helper {
 
 // ---------- TagIndex (in-memory mirror) ----------
 
-/// In-memory tag inverted index (IMPL §13).
+/// In-memory tag inverted index (ENGINE-DESIGN§2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TagIndex {
     stores: HashMap<TagId, TagStore>,
@@ -264,7 +264,7 @@ impl TagIndex {
         self.stores.get(&tag).is_some_and(|s| s.contains(oid))
     }
 
-    /// Borrow the membership bitmap for `tag`. DESIGN §5.1 query primitive.
+    /// Borrow the membership bitmap for `tag`. SPECIFICATION-DESIGN§5.1 query primitive.
     pub fn query_simple(&self, tag: TagId) -> Option<&RoaringBitmap> {
         self.stores.get(&tag).map(|s| s.members())
     }
@@ -344,12 +344,11 @@ impl TagIndex {
     ///
     /// `TagIndex` derives `Serialize`/`Deserialize` directly — the
     /// `RoaringBitmap` framing lives in [`crate::TagStore`]'s custom serde
-    /// impls (`bitmap_bytes` field, IMPL §13.1). This helper exists for
+    /// impls (`bitmap_bytes` field, ENGINE-DESIGN§2.1). This helper exists for
     /// symmetry with the other indices and to map ciborium errors to
     /// [`IndexError`]; callers may equally reach for `ciborium::ser::into_writer`
-    /// directly.
-    ///
-    /// TODO(rewrite-phase-N): replace with §1.5 B+ tree backing.
+    /// directly. On-disk persistence goes through the BTREE-DESIGN§1 region
+    /// below, not this helper.
     pub fn serialise(&self) -> Result<Vec<u8>, IndexError> {
         let mut buf = Vec::new();
         ciborium::ser::into_writer(self, &mut buf)
@@ -364,7 +363,7 @@ impl TagIndex {
     }
 
     // ----------------------------------------------------------------
-    // R1c-A3.3: §1.5 B+ tree persistence (packed-codec native leaf +
+    // BTREE-DESIGN§1 B+ tree persistence (packed-codec native leaf +
     // chained TagBitmapPages).
     // ----------------------------------------------------------------
 
@@ -381,7 +380,7 @@ impl TagIndex {
     {
         let mut stores: HashMap<TagId, TagStore> = HashMap::new();
         for (k, v) in entries {
-            // R1c-A3.3 only persists Simple; non-Simple flushes errored at
+            // Only Simple stores persist; non-Simple flushes errored at
             // write time, so any on-disk leaf must be Simple.
             if v.store_kind != TagStoreKind::Simple as u8 {
                 return Err(IndexError::UnsupportedStoreKind(v.store_kind));
@@ -392,9 +391,9 @@ impl TagIndex {
         Ok(Self { stores })
     }
 
-    /// Write the in-memory state to disk under the A3.3 layout:
+    /// Write the in-memory state to disk under this layout:
     ///
-    /// - `dir_offset` is the byte offset of the §1.5 directory region.
+    /// - `dir_offset` is the byte offset of the BTREE-DESIGN§1 directory region.
     /// - `bitmap_area_offset` is the byte offset of the start of the
     ///   bitmap-page area; pages are allocated sequentially from slot 0.
     /// - `bitmap_area_cap_pages` is the maximum number of 4 KiB pages
@@ -416,8 +415,8 @@ impl TagIndex {
             self.stores.iter().map(|(k, v)| (*k, v)).collect();
         sorted.sort_by_key(|(t, _)| t.raw());
 
-        // 2. Reject Ordered/Ranked stores up front (S2: A3.3 ships
-        //    Simple-only; A3.4/A3.5 will lift this).
+        // 2. Reject Ordered/Ranked stores up front (only
+        //    Simple persists; INDEX2 / INDEX3 will lift this).
         for (_, store) in &sorted {
             match store {
                 TagStore::Simple(_) => {}
@@ -459,10 +458,10 @@ impl TagIndex {
                     snapshot: 0,
                 },
                 TagIndexValue {
-                    last_modify_lsn: 0, // R1c stub; engine wires LSN later.
+                    last_modify_lsn: 0, // stub; the engine does not pass the LSN yet.
                     store_root,
                     cardinality,
-                    generation: 1, // bumped on rewrite (R1c stub).
+                    generation: 1, // bumped on rewrite (stub; ALLOCATION3).
                     store_kind: TagStoreKind::Simple as u8,
                     _pad: [0; 7],
                 },
@@ -596,7 +595,7 @@ fn read_bitmap_chain<D: BlockDevice>(
 }
 
 /// Construct a `BlockRef` pointing at the 4 KiB block whose byte offset is
-/// `byte_offset`. `generation = 1` is the R1c-D1 placeholder; D3 will
+/// `byte_offset`. `generation = 1` is a placeholder; ENGINE3 will
 /// bump generation per allocation.
 fn block_ref_at(byte_offset: u64) -> BlockRef {
     BlockRef {
@@ -609,11 +608,11 @@ fn block_ref_at(byte_offset: u64) -> BlockRef {
 
 // ---------- TagIndexKey (B+ tree wire type) ----------
 
-/// B+ tree key for the tag inverted index: `(tag_id, snapshot)` per IMPL
-/// §11.2.
+/// B+ tree key for the tag inverted index: `(tag_id, snapshot)` per
+/// SNAPSHOTS-DESIGN§1.2.
 ///
-/// Snapshots are deferred to R6; every key written today carries
-/// `snapshot = 0`. The field is on-disk now so R6 won't need a layout break.
+/// Snapshots are deferred to SNAPSHOT2; every key written today carries
+/// `snapshot = 0`. The field is on-disk now so SNAPSHOT2 won't need a layout break.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TagIndexKey {
     pub tag_id: u32,
@@ -737,11 +736,11 @@ mod tests {
         assert!(back.contains(t(2), oid(20)));
     }
 
-    // ----- B+ tree region round-trip (R1c-A3.3 native path) -----
+    // ----- B+ tree region round-trip (native path) -----
 
     use {mimisbrunnr_storage::FileBlockDevice, tempfile::TempDir};
 
-    // Test layout: directory at offset 0 (256 KiB §1.5 region); bitmap
+    // Test layout: directory at offset 0 (256 KiB BTREE-DESIGN§1 region); bitmap
     // area starts at 256 KiB with capacity for 32 pages (128 KiB worth).
     // Device is 1 MiB, comfortably more than the layout needs.
     const TEST_DIR_OFFSET: u64 = 0;

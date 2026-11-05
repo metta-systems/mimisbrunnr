@@ -1,4 +1,4 @@
-//! [`DiskEngine`] — persistent wrapper around [`Engine`] (DESIGN §15).
+//! [`DiskEngine`] — persistent wrapper around [`Engine`] (SPECIFICATION-DESIGN§15).
 //!
 //! Glues the in-memory engine to:
 //!
@@ -6,34 +6,31 @@
 //! - the primary disk's [`Superblock`] (atomic root commit at checkpoint),
 //! - a [`PoolManager`] (multi-disk lifecycle).
 //!
-//! ## Index persistence layout (post-R1b-4)
+//! ## Index persistence layout
 //!
-//! Within the index zone, R1b carves out **twelve** dedicated 256 KiB
-//! §1.5 B+ tree regions for the migrated indices and tables, with the
+//! Within the index zone, the engine carves out **twelve** dedicated 256 KiB
+//! BTREE-DESIGN§1 B+ tree regions for the migrated indices and tables, with the
 //! remaining state (oplog, path contexts, scalar bookkeeping) still
 //! living in a length-prefixed CBOR blob at the tail of the zone:
 //!
 //! ```text
-//! [zone.offset + 0]                  ChunkIndex region        (256 KiB)   ← R1b-1
-//! [zone.offset + 256 KiB]            KvIndex region           (256 KiB)   ← R1b-1
-//! [zone.offset + 512 KiB]            ForwardIndex region      (256 KiB)   ← R1b-2
-//! [zone.offset + 768 KiB]            TagIndex region          (256 KiB)   ← R1b-2
-//! [zone.offset + 1024 KiB]           RangeIndex region        (256 KiB)   ← R1b-2
-//! [zone.offset + 1280 KiB]           ObjectTable region       (256 KiB)   ← R1b-3
-//! [zone.offset + 1536 KiB]           LocationTable region     (256 KiB)   ← R1b-3
-//! [zone.offset + 1792 KiB]           Ontology region          (256 KiB)   ← R1b-3*
-//! [zone.offset + 2048 KiB]           Subscriptions region     (256 KiB)   ← R1b-3*
-//! [zone.offset + 2304 KiB]           BackpointerTable region  (256 KiB)   ← R1b-3
-//! [zone.offset + 2560 KiB]           BucketAllocTable region  (256 KiB)   ← R1b-4
-//! [zone.offset + 2816 KiB]           FreespaceLru region      (256 KiB)   ← R1b-4
+//! [zone.offset + 0]                  ChunkIndex region        (256 KiB)
+//! [zone.offset + 256 KiB]            KvIndex region           (256 KiB)
+//! [zone.offset + 512 KiB]            ForwardIndex region      (256 KiB)
+//! [zone.offset + 768 KiB]            TagIndex region          (256 KiB)
+//! [zone.offset + 1024 KiB]           RangeIndex region        (256 KiB)
+//! [zone.offset + 1280 KiB]           ObjectTable region       (256 KiB)
+//! [zone.offset + 1536 KiB]           LocationTable region     (256 KiB)
+//! [zone.offset + 1792 KiB]           Ontology region          (256 KiB)
+//! [zone.offset + 2048 KiB]           Subscriptions region     (256 KiB)
+//! [zone.offset + 2304 KiB]           BackpointerTable region  (256 KiB)
+//! [zone.offset + 2560 KiB]           BucketAllocTable region  (256 KiB)
+//! [zone.offset + 2816 KiB]           FreespaceLru region      (256 KiB)
 //! [zone.offset + 3072 KiB]           Legacy CBOR blob         (MIXI magic + u32 len + CBOR)
 //! ```
 //!
-//! \* Ontology and Subscriptions regions landed alongside R1b-3 since
-//! their `flush_to_region` / `load_from_region` APIs were already in
-//! place; they're documented here so the layout stays self-describing.
-//!
-//! Total dedicated region prefix after R1b-4: **3.0 MiB**. With the
+//! These fixed offsets give way to allocator placement in ENGINE3 / ENGINE4.
+//! Total dedicated region prefix: **3.0 MiB**. With the
 //! default 3%-of-disk index zone, a 1 GiB pool (≈ 30 MiB index zone)
 //! leaves ~27 MiB for the legacy blob. The 4 MiB minimum index
 //! zone (`FMT_INDEX_ZONE_SIZE` in `mimisbrunnr-pool::tier`) leaves
@@ -42,32 +39,31 @@
 //! `HashMap`. If a workload outgrows that, bump
 //! `FMT_INDEX_ZONE_SIZE` to 8 MiB.
 //!
-//! Per IMPL §12.2 / §12.4 the bucket alloc table and freespace LRU
+//! Per ALLOCATION-DESIGN§1.2 / ALLOCATION-DESIGN§1.4 the bucket alloc table and freespace LRU
 //! are actually **per-disk** B+ trees rooted at
-//! `DiskDescriptorOnDisk.{buckets_root, freespace_root}`. R1b-4
-//! simplifies to one pool-scoped region in the index zone; the wire
-//! keys already carry `disk_id` so the per-disk split (R1d) is a
-//! layout-only change with no on-disk format break. The
+//! `DiskDescriptorOnDisk.{buckets_root, freespace_root}`. For now both
+//! are one pool-scoped region in the index zone; the wire
+//! keys already carry `disk_id` so the per-disk split (ALLOCATION4,
+//! ALLOCATION5) is a layout-only change with no on-disk format break. The
 //! `RootPointer` does **not** gain `bucket_alloc_root` /
 //! `freespace_lru_root` slots — per spec those fields live on the
 //! per-disk descriptor, not on the pool-wide root pointer.
 //!
 //! The legacy blob now carries only:
 //!
-//! - `oplog` (not yet migrated; tracked under R1b-N for a later phase),
-//! - `path_contexts` (per IMPL §10.3, no native region — derived from
+//! - `oplog` (not yet migrated; ENGINE6),
+//! - `path_contexts` (per UNIX-DESIGN§1, no native region — derived from
 //!   forward-index `Attr(unix-path, ...)` at engine boot, see
 //!   `mimisbrunnr-unix::PathContextManager` docs),
 //! - scalar bookkeeping (`next_oid_local`, `next_tag_id`,
 //!   `last_applied_lsn`),
 //! - the transient `blobs: HashMap<u64, Vec<u8>>` (replaced by the real
-//!   blob zone once R4 lands).
+//!   blob zone in BLOB1, BLOB2 and BLOB6).
 //!
-//! Backwards compatibility with pre-R1b-13 pools is **not** supported:
-//! every region offset and the legacy-blob offset have shifted. This is
-//! a one-way migration; recreating the pool is the only path forward.
+//! Pools formatted before the region layout above (when every index
+//! lived in the CBOR blob) are **not** supported; recreate them.
 //!
-//! TODO(rewrite-phase-R1b-N): migrate `oplog` to its own region (or fold
+//! TODO(ENGINE6): migrate `oplog` to its own region (or fold
 //! its content into a new `BtreeKind` slot once one is allocated). After
 //! that the legacy blob can be retired entirely modulo the few scalars,
 //! which can move to the superblock.
@@ -83,8 +79,8 @@ use log::trace;
 use mimisbrunnr_index::{ChunkIndex, ForwardIndex, KvIndex, RangeIndex, TagIndex};
 use mimisbrunnr_meta::{BackpointerTable, LocationTable, ObjectTable};
 
-/// Per-index slot offsets within the index zone. R1b-4 wires twelve
-/// dedicated 256 KiB §1.5 B+ tree regions, pushing the legacy CBOR blob
+/// Per-index slot offsets within the index zone: twelve
+/// dedicated 256 KiB BTREE-DESIGN§1 B+ tree regions, pushing the legacy CBOR blob
 /// to offset 3.0 MiB.
 pub(crate) const CHUNK_INDEX_REGION_OFFSET: u64 = 0;
 /// See [`CHUNK_INDEX_REGION_OFFSET`].
@@ -95,24 +91,23 @@ pub(crate) const FORWARD_INDEX_REGION_OFFSET: u64 = 512 * 1024;
 pub(crate) const TAG_INDEX_REGION_OFFSET: u64 = 768 * 1024;
 /// See [`CHUNK_INDEX_REGION_OFFSET`].
 pub(crate) const RANGE_INDEX_REGION_OFFSET: u64 = 1024 * 1024;
-/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added by R1b-3.
+/// See [`CHUNK_INDEX_REGION_OFFSET`].
 pub(crate) const OBJECT_TABLE_REGION_OFFSET: u64 = 1280 * 1024;
-/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added by R1b-3.
+/// See [`CHUNK_INDEX_REGION_OFFSET`].
 pub(crate) const LOCATION_TABLE_REGION_OFFSET: u64 = 1536 * 1024;
-/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added alongside R1b-3.
+/// See [`CHUNK_INDEX_REGION_OFFSET`].
 pub(crate) const ONTOLOGY_REGION_OFFSET: u64 = 1792 * 1024;
-/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added alongside R1b-3.
+/// See [`CHUNK_INDEX_REGION_OFFSET`].
 pub(crate) const SUBSCRIPTIONS_REGION_OFFSET: u64 = 2048 * 1024;
-/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added by R1b-3.
+/// See [`CHUNK_INDEX_REGION_OFFSET`].
 pub(crate) const BACKPOINTER_TABLE_REGION_OFFSET: u64 = 2304 * 1024;
-/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added by R1b-4.
+/// See [`CHUNK_INDEX_REGION_OFFSET`].
 pub(crate) const BUCKET_ALLOC_REGION_OFFSET: u64 = 2560 * 1024;
-/// See [`CHUNK_INDEX_REGION_OFFSET`]. Added by R1b-4.
+/// See [`CHUNK_INDEX_REGION_OFFSET`].
 pub(crate) const FREESPACE_LRU_REGION_OFFSET: u64 = 2816 * 1024;
-/// See [`CHUNK_INDEX_REGION_OFFSET`]. Shifted from 2.5 MiB to 3.0 MiB
-/// by R1b-4.
+/// See [`CHUNK_INDEX_REGION_OFFSET`]. Follows the twelve regions at 3.0 MiB.
 pub(crate) const LEGACY_CBOR_BLOB_OFFSET: u64 = 3072 * 1024;
-/// TagIndex per-tag `TagBitmapPage` chains (R1c-A3.3) live in this area.
+/// TagIndex per-tag `TagBitmapPage` chains live in this area.
 /// Sits after the legacy CBOR blob (which is sized for up to ~1 MiB of
 /// path-context / oplog / subscriptions metadata); each 4 KiB slot here
 /// holds one bitmap-page chain link. Sized to [`TAG_BITMAP_AREA_PAGES`]
@@ -120,7 +115,7 @@ pub(crate) const LEGACY_CBOR_BLOB_OFFSET: u64 = 3072 * 1024;
 pub(crate) const TAG_BITMAP_AREA_OFFSET: u64 = 4 * 1024 * 1024;
 /// Number of 4 KiB `TagBitmapPage` slots in the tag bitmap area.
 pub(crate) const TAG_BITMAP_AREA_PAGES: usize = 1024;
-/// ForwardIndex per-object `ForwardOverflowRegion` chains (R1c-A3.2)
+/// ForwardIndex per-object `ForwardOverflowRegion` chains
 /// live in this area. Sits after the tag bitmap area. Each slot holds
 /// one 256 KiB `ForwardOverflowRegion`, chained via the trailing
 /// `next_page: BlockRef` slot. Sized to
@@ -134,8 +129,8 @@ pub(crate) const REGION_SIZE: u64 = 256 * 1024;
 
 /// Convert a [`BlockRef`] to its disk-absolute byte offset.
 ///
-/// `BlockRef.block_no` is in 4 KiB units (IMPL §2.3 / §12.3). Used by the
-/// R1c-D1 minimum-viable wiring that populates `RootPointer.*_root`
+/// `BlockRef.block_no` is in 4 KiB units (ENGINE-DESIGN§1.3 / ALLOCATION-DESIGN§1.3). Used by the
+/// minimum-viable wiring that populates `RootPointer.*_root`
 /// slots from the existing fixed-offset region layout.
 fn block_ref_offset(block_ref: &BlockRef) -> u64 {
     let block_no = { block_ref.block_no };
@@ -143,12 +138,12 @@ fn block_ref_offset(block_ref: &BlockRef) -> u64 {
 }
 
 /// Build a [`BlockRef`] for the tree currently living at
-/// `zone_offset + tree_offset_in_zone`. R1c-D1 uses this to seed initial
+/// `zone_offset + tree_offset_in_zone`. Seeds the initial
 /// `RootPointer.*_root` slots at format/create time; subsequent commits
-/// don't reallocate (COW reallocation is Tier 3 D3).
+/// don't reallocate (COW reallocation is ENGINE3).
 ///
 /// `disk_id` is the primary-disk id; `generation` is `1` for fresh
-/// pools and never bumps under R1c-D1 (the buckets aren't reused).
+/// pools and never bumps while trees stay at fixed offsets (the buckets aren't reused).
 fn root_ref_for(disk_id: u16, zone_offset: u64, tree_offset_in_zone: u64) -> BlockRef {
     let absolute = zone_offset + tree_offset_in_zone;
     let block_no = (absolute / mimisbrunnr_storage::BLOCK_SIZE as u64) as u32;
@@ -160,9 +155,9 @@ fn root_ref_for(disk_id: u16, zone_offset: u64, tree_offset_in_zone: u64) -> Blo
     }
 }
 
-/// Populate every `RootPointer.*_root` slot the engine knows about
-/// (R1c-D1). Called once at format time and again on every `commit()`
-/// (the slots stay stable across commits under D1; D3 will rotate them
+/// Populate every `RootPointer.*_root` slot the engine knows about.
+/// Called once at format time and again on every `commit()`
+/// (the slots stay stable across commits; ENGINE3 will rotate them
 /// per commit).
 fn seed_root_pointer(root: &mut mimisbrunnr_storage::RootPointer, disk_id: u16, zone_offset: u64) {
     root.chunk_index_root = root_ref_for(disk_id, zone_offset, CHUNK_INDEX_REGION_OFFSET);
@@ -226,8 +221,8 @@ pub struct EngineStatus {
 pub struct DiskEngine {
     pub engine: Engine,
     /// In-memory blob store keyed by `oid_local` (the bottom 48 bits of the
-    /// `ObjectId`). A real implementation would push these to the blob zone;
-    /// for Phase 6 we keep them in RAM and round-trip the metadata.
+    /// `ObjectId`). Kept in RAM until the blob zone lands (BLOB1, BLOB6);
+    /// only the metadata round-trips through the pool.
     pub blobs: HashMap<u64, Vec<u8>>,
     pub pool: PoolManager,
     pub primary_device: Arc<FileBlockDevice>,
@@ -245,10 +240,10 @@ pub struct DiskEngine {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexBlob {
-    // R1b-13: forward / tag / range / chunk / kv indices, the
+    // Forward / tag / range / chunk / kv indices, the
     // object_table / location_table tables, and the ontology /
-    // subscriptions modules have all migrated to dedicated 256 KiB §1.5
-    // B+ tree regions; their bytes are no longer carried here.
+    // subscriptions modules live in dedicated 256 KiB BTREE-DESIGN§1
+    // B+ tree regions; their bytes are not carried here.
     path_contexts_bytes: Vec<u8>,
     oplog_bytes: Vec<u8>,
     next_oid_local: u64,
@@ -256,11 +251,6 @@ struct IndexBlob {
     last_applied_lsn: u64,
     blobs: HashMap<u64, Vec<u8>>,
 }
-
-// R1b-13: removed `ObjectRecordCbor` and `LocationCbor` helpers — the
-// object_table and location_table now persist in their dedicated B+
-// tree regions, so the legacy blob no longer carries per-object /
-// per-location bytes.
 
 impl DiskEngine {
     // -------------------------------------------------------------------
@@ -296,22 +286,21 @@ impl DiskEngine {
         // 5. Build empty engine.
         let engine = Engine::new(config.node_id);
 
-        // 6. Populate the initial `RootPointer` (R1c-D1).
+        // 6. Populate the initial `RootPointer`.
         //
-        // Per IMPL §2.2, every B+ tree root is anchored as a `BlockRef`
-        // in the active `RootPointer`. R1c-D1 ships the *minimum-viable*
+        // Per ENGINE-DESIGN§1.2, every B+ tree root is anchored as a `BlockRef`
+        // in the active `RootPointer`. This is the *minimum-viable*
         // population: each tree's slot is seeded with the `BlockRef`
         // that points at its existing fixed offset in the index zone.
         // Subsequent commits don't re-allocate (COW reallocation is
-        // Tier 3 D3); the BlockRef stays stable across the pool's
-        // lifetime under D1.
+        // ENGINE3); the BlockRef stays stable across the pool's lifetime.
         //
         // The `disks_overflow_root`, `placement_rules_root`, and
         // `cluster_peers_root` stay `BlockRef::ZERO` — those trees
-        // either don't yet exist (cluster_peers, deferred to R12) or
+        // either don't yet exist (cluster_peers, CLUSTER1) or
         // are populated only when the pool exceeds 12 disks
-        // (disks_overflow). The reconcile, snapshot, value_spill, and
-        // *_history slots are R6/R7 territory.
+        // (disks_overflow). The reconcile (RECONCILE1), snapshot (SNAPSHOT1),
+        // value_spill (INDEX7) and *_history (SNAPSHOT3) slots stay zero too.
         let zone_offset = { superblock.index_zone.offset };
         let active = *superblock.active_root_pointer();
         let mut new_root = active;
@@ -362,7 +351,7 @@ impl DiskEngine {
 
         let zone_offset = { superblock.index_zone.offset };
 
-        // 1a. Migrated indices and tables: dedicated 256 KiB §1.5 B+
+        // 1a. Migrated indices and tables: dedicated 256 KiB BTREE-DESIGN§1 B+
         // tree regions at fixed slot offsets.
         load_all_regions(
             &mut engine,
@@ -496,7 +485,7 @@ impl DiskEngine {
     ///
     /// 1. Flush the migrated indices ([`ChunkIndex`], [`KvIndex`],
     ///    [`ForwardIndex`], [`TagIndex`], [`RangeIndex`]) to their
-    ///    dedicated 256 KiB §1.5 B+ tree regions at fixed slot offsets.
+    ///    dedicated 256 KiB BTREE-DESIGN§1 B+ tree regions at fixed slot offsets.
     /// 2. Write the remaining indices as a length-prefixed CBOR blob at
     ///    [`LEGACY_CBOR_BLOB_OFFSET`] within the zone.
     pub fn save_index_state(&mut self) -> Result<(), EngineError> {
@@ -507,21 +496,21 @@ impl DiskEngine {
         let zone_offset = { self.superblock.index_zone.offset };
         let zone_length = { self.superblock.index_zone.length };
 
-        // Sanity-check zone is large enough for the new layout. R1c-A3.2
-        // adds the forward-overflow area after the tag bitmap area, so
+        // Sanity-check zone is large enough for the layout: the
+        // forward-overflow area follows the tag bitmap area, so
         // the zone needs space for both.
         let forward_overflow_area_end = FORWARD_OVERFLOW_AREA_OFFSET
             + (FORWARD_OVERFLOW_AREA_REGIONS as u64) * 256 * 1024;
         if zone_length < forward_overflow_area_end {
             return Err(EngineError::NotImplemented(
-                "index zone too small for R1c-A3.2 layout (needs ≥ 16 MiB for directory regions + tag bitmap area + forward overflow area)",
+                "index zone too small for the fixed-offset layout (needs ≥ 16 MiB for directory regions + tag bitmap area + forward overflow area)",
             ));
         }
 
         // 1. Flush migrated indices to the offsets named by their
-        //    `RootPointer.*_root` BlockRef slots (R1c-D1). The slot
+        //    `RootPointer.*_root` BlockRef slots. The slot
         //    values are seeded at format time and don't change across
-        //    commits under D1; D3 will rotate them per commit.
+        //    commits; ENGINE3 will rotate them per commit.
         let active = *self.superblock.active_root_pointer();
         let dev = self.primary_device.as_ref();
         self.engine
@@ -543,7 +532,7 @@ impl DiskEngine {
             .map_err(EngineError::from)?;
         // TagIndex needs a bitmap-area reservation in addition to the
         // directory region. The bitmap area is fixed at
-        // `zone_offset + TAG_BITMAP_AREA_OFFSET` (R1c-A3.3 layout).
+        // `zone_offset + TAG_BITMAP_AREA_OFFSET` until ENGINE4.
         self.engine
             .tag_index
             .flush_to_region(
@@ -577,8 +566,9 @@ impl DiskEngine {
             .backpointer_table
             .flush_to_region(dev, block_ref_offset(&active.backpointer_root))
             .map_err(EngineError::from)?;
-        // R1b-4: bucket alloc + freespace LRU. Pool-scoped for now;
-        // wire `disk_id = 0` until R1d splits per-disk per IMPL §12.2.
+        // Bucket alloc + freespace LRU. Pool-scoped for now; wire
+        // `disk_id = 0` until ALLOCATION4 / ALLOCATION5 split them per disk
+        // (ALLOCATION-DESIGN§1.2).
         self.engine
             .bucket_alloc
             .flush_to_region(
@@ -605,7 +595,7 @@ impl DiskEngine {
         let blob_room = zone_length - LEGACY_CBOR_BLOB_OFFSET;
         if total > blob_room {
             return Err(EngineError::NotImplemented(
-                "legacy index blob too large for the index zone — TODO(rewrite-phase-R1b-N): \
+                "legacy index blob too large for the index zone — TODO(ENGINE8): \
                  migrate the remaining indices off the CBOR blob",
             ));
         }
@@ -673,7 +663,7 @@ impl DiskEngine {
         Ok(())
     }
 
-    /// Atomic root-commit (DESIGN §15 MVP cadence):
+    /// Atomic root-commit (SPECIFICATION-DESIGN§15 MVP cadence):
     ///
     /// 1. Save index state to the index zone.
     /// 2. Append a `Checkpoint` WAL entry recording the new root.
@@ -688,27 +678,24 @@ impl DiskEngine {
         self.save_index_state()?;
 
         // 2. Build a fresh root pointer carrying the LSN we're about to
-        //    checkpoint at. Most fields stay `BlockRef::ZERO` placeholders
-        //    until the §1.5 B+ tree machinery lands.
-        // TODO(rewrite-phase-N): populate every B+ tree root in RootPointer
-        // (object_table_root, location_table_root, …). For now they are
-        // BlockRef::ZERO sentinels.
+        //    checkpoint at. Slots for trees that don't exist yet stay
+        //    `BlockRef::ZERO` (see `create`).
         //
-        // Note (R1b-4): `bucket_alloc_root` / `freespace_lru_root` are
-        // **not** RootPointer fields — per IMPL §12.2 / §12.4 those
+        // Note: `bucket_alloc_root` / `freespace_lru_root` are
+        // **not** RootPointer fields — per ALLOCATION-DESIGN§1.2 / ALLOCATION-DESIGN§1.4 those
         // roots live on `DiskDescriptorOnDisk.{buckets_root,
         // freespace_root}`, not on the pool-wide root pointer. The
-        // R1b-4 pool-scoped simplification keeps both regions in the
+        // pool-scoped simplification keeps both regions in the
         // index zone instead, so the per-disk root fields stay
-        // zeroed until R1d splits the trees per-disk.
+        // zeroed until ALLOCATION4 / ALLOCATION5 split the trees per disk.
         let next_lsn = self.wal.next_lsn();
         let mut new_root = *self.superblock.active_root_pointer();
         new_root.seq = { new_root.seq }.saturating_add(1);
         new_root.lsn = next_lsn;
-        // R1c-D1: keep `RootPointer.*_root` slots populated. Trees stay
-        // at their existing fixed offsets across commits; the slots are
-        // re-seeded each commit so a pool created pre-R1c-D1 gets its
-        // RootPointer healed on the next commit.
+        // Keep `RootPointer.*_root` slots populated. Trees stay at their
+        // existing fixed offsets across commits (TODO(ENGINE3): fresh
+        // region per commit); re-seeding each commit also heals a pool
+        // created before the slots were populated.
         let zone_offset = { self.superblock.index_zone.offset };
         let primary_id = { self.superblock.disk_id };
         seed_root_pointer(&mut new_root, primary_id, zone_offset);
@@ -890,8 +877,8 @@ impl DiskEngine {
     }
 
     /// Run the transform pipeline, persist the bytes into the in-memory
-    /// `blobs` map (Phase 6 placeholder) and append a `WriteBlob` WAL op.
-    /// TODO(rewrite-phase-N): write to the blob zone via the placement engine
+    /// `blobs` map (placeholder) and append a `WriteBlob` WAL op.
+    /// TODO(BLOB1): write to the blob zone via the placement engine
     /// rather than an in-RAM HashMap.
     pub fn write_blob(
         &mut self,
@@ -916,7 +903,7 @@ impl DiskEngine {
     /// never been written. The bytes returned are the **post-transform**
     /// payload (whatever `write_blob` stored).
     ///
-    /// TODO(rewrite-phase-R4): read from the blob zone via `ObjectLocation`
+    /// TODO(BLOB2): read from the blob zone via `ObjectLocation`
     /// (chunked / replicated) and run the inverse transform pipeline.
     pub fn read_blob(&self, oid: ObjectId) -> Result<Option<Vec<u8>>, EngineError> {
         Ok(self.blobs.get(&oid.local_seq()).cloned())
@@ -953,19 +940,19 @@ impl DiskEngine {
     // Snapshot + reconcile stubs.
     // -------------------------------------------------------------------
 
-    /// Snapshot creation — DESIGN §11 / IMPL §11. Stub for Phase 6.
+    /// Snapshot creation — SPECIFICATION-DESIGN§11 / SNAPSHOTS-DESIGN§1. Stub until SNAPSHOT6.
     pub fn snapshot_create(
         &mut self,
         _label: Option<String>,
     ) -> Result<u32, EngineError> {
         Err(EngineError::NotImplemented(
-            "snapshots — IMPL §11 (snapshot tree, ancestor bitmap, sidecar history btrees)",
+            "snapshots — SNAPSHOTS-DESIGN§1 (snapshot tree, ancestor bitmap, sidecar history btrees)",
         ))
     }
 
-    /// Reconcile work-queue driver — DESIGN §17 / IMPL §17. Stub for Phase 6.
+    /// Reconcile work-queue driver — SPECIFICATION-DESIGN§17 / RECONCILE-DESIGN§1. Stub.
     pub fn reconcile_step(&mut self, _max_items: usize) -> Result<usize, EngineError> {
-        // TODO(rewrite-phase-N): drive the reconcile work-queue.
+        // TODO(RECONCILE2): drive the reconcile work-queue.
         Ok(0)
     }
 
@@ -991,27 +978,25 @@ impl DiskEngine {
 // Index-zone CBOR helpers (free functions to avoid borrow conflicts).
 // ----------------------------------------------------------------------
 
-/// Load every R1b-migrated index / table from its dedicated 256 KiB
-/// §1.5 B+ tree region. Used by [`DiskEngine::open`],
+/// Load every index / table from its dedicated 256 KiB
+/// BTREE-DESIGN§1 B+ tree region. Used by [`DiskEngine::open`],
 /// [`DiskEngine::open_read_only`] and [`DiskEngine::load_index_state`].
-/// Load every R1b dedicated B+ tree region.
 ///
-/// Migrated indices and tables: read from the offsets named by the
-/// active `RootPointer.*_root` slots (R1c-D1). A `BlockRef::ZERO` slot
-/// indicates a tree that was never initialised under D1+ → return
-/// `default()` (empty). Pre-D1 pools — created when `RootPointer.*_root`
-/// were always zeroed — therefore start blank under D1; recreate the
-/// pool to load existing data.
+/// Indices and tables are read from the offsets named by the
+/// active `RootPointer.*_root` slots. A `BlockRef::ZERO` slot
+/// indicates a tree that was never initialised → return
+/// `default()` (empty). Pools created before the slots were populated
+/// therefore start blank; recreate the pool to load existing data.
 ///
 /// The bootstrap roots (`bucket_alloc`, `freespace_lru`) stay at fixed
-/// offsets in the index zone; per IMPL §12.2 they're meant to live on
+/// offsets in the index zone; per ALLOCATION-DESIGN§1.2 they're meant to live on
 /// per-disk roots (`DiskDescriptorOnDisk.{buckets_root, freespace_root}`)
-/// — the per-disk split is Tier 3 E1 / E2.
+/// — the per-disk split is ALLOCATION4 / ALLOCATION5.
 ///
-/// `node_id` is needed by [`LocationTable::load_from_region`] (R1c-A2)
+/// `node_id` is needed by [`LocationTable::load_from_region`]
 /// to reconstruct the full `ObjectId.to_u64()` keys from the leaf's
 /// `oid_local` slot index. Single-node pools pass their own node id;
-/// multi-node cluster recovery (R12) needs cross-reference against
+/// multi-node cluster recovery (CLUSTER5) needs cross-reference against
 /// `ObjectTable`.
 fn load_all_regions<D: BlockDevice>(
     engine: &mut Engine,
@@ -1074,7 +1059,7 @@ fn load_all_regions<D: BlockDevice>(
     } else {
         BackpointerTable::load_from_region(device, block_ref_offset(&root.backpointer_root))?
     };
-    // Bootstrap roots stay at fixed offsets (Tier 3 E1/E2 splits per-disk).
+    // Bootstrap roots stay at fixed offsets (ALLOCATION4 / ALLOCATION5 split them per disk).
     engine.bucket_alloc =
         BucketAllocTable::load_from_region(device, zone_offset + BUCKET_ALLOC_REGION_OFFSET)
             .map_err(EngineError::from)?;
@@ -1084,8 +1069,7 @@ fn load_all_regions<D: BlockDevice>(
     Ok(())
 }
 
-/// `true` when the `BlockRef` is the all-zero sentinel (pre-D1 pool or
-/// uninitialised slot).
+/// `true` when the `BlockRef` is the all-zero sentinel (uninitialised slot).
 fn is_zero(block_ref: &BlockRef) -> bool {
     let block_no = { block_ref.block_no };
     let generation = { block_ref.generation };
@@ -1096,9 +1080,9 @@ fn build_index_blob(
     engine: &Engine,
     blobs: &HashMap<u64, Vec<u8>>,
 ) -> Result<IndexBlob, EngineError> {
-    // R1b-13: object_table, location_table, ontology, subscriptions, and
-    // every R1b-1..R1b-4 index have moved to dedicated 256 KiB §1.5 B+
-    // tree regions; they are no longer carried in the legacy blob.
+    // object_table, location_table, ontology, subscriptions, and
+    // every index live in dedicated 256 KiB BTREE-DESIGN§1 B+
+    // tree regions; they are not carried in the legacy blob.
     Ok(IndexBlob {
         path_contexts_bytes: engine.path_contexts.serialise()?,
         oplog_bytes: engine.oplog.serialise()?,
@@ -1142,9 +1126,9 @@ fn read_index_blob(
         return Ok(None);
     }
     if magic != INDEX_BLOB_MAGIC {
-        // Treat as corruption — Phase 6: skip rather than fail boot. The WAL
+        // Treat as corruption — skip rather than fail boot. The WAL
         // replay will rebuild what it can.
-        // TODO(rewrite-phase-N): surface this to the operator instead.
+        // TODO(ENGINE8): surface this to the operator instead.
         return Ok(None);
     }
     let payload_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as u64;
@@ -1158,7 +1142,7 @@ fn read_index_blob(
 }
 
 fn apply_index_blob(engine: &mut Engine, blob: IndexBlob) {
-    // R1b-13: forward / tag / range / chunk / kv indices, plus
+    // Forward / tag / range / chunk / kv indices, plus
     // object_table / location_table / ontology / subscriptions, all live
     // in dedicated B+ tree regions; the engine fields are populated by
     // the per-region loaders in `load_index_state` before this function

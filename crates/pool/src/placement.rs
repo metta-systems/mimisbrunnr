@@ -1,8 +1,8 @@
 //! Placement-rule serialisation helpers.
 //!
-//! ## Persistence (R1b-10)
+//! ## Persistence
 //!
-//! On disk the rule set occupies one 256 KiB §1.5 B+ tree region of
+//! On disk the rule set occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
 //! [`BtreeKind::PlacementRules`]. The whole `Vec<PlacementRule>` is
 //! materialised into a single CBOR-encoded sorted-run entry keyed by
 //! `u32 snapshot` (always `0` today) via [`BtreeRegion::write_full`];
@@ -11,8 +11,8 @@
 //! helpers are retained for one revision so callers using the raw
 //! CBOR-blob path keep working while the engine migration lands.
 //!
-//! TODO(rewrite-phase-R1d): replace the single-entry blob with the IMPL
-//! §10.4 native per-rule shape — a sorted run keyed by `(rule_id,
+//! TODO(POOL5): replace the single-entry blob with the
+//! POOL-DESIGN§1 native per-rule shape — a sorted run keyed by `(rule_id,
 //! snapshot)` with one `PlacementRule` per entry. `RootPointer.placement_rules_root`
 //! refers to this region.
 
@@ -25,7 +25,7 @@ use crate::error::PoolError;
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const PLACEMENT_RULES_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
@@ -47,7 +47,7 @@ pub fn decode_placement_rules(bytes: &[u8]) -> Result<Vec<PlacementRule>, PoolEr
 }
 
 // ----------------------------------------------------------------
-// R1b-10: §1.5 B+ tree persistence (single-entry CBOR run).
+// BTREE-DESIGN§1 B+ tree persistence (single-entry CBOR run).
 // ----------------------------------------------------------------
 
 /// Build a [`LoadedNode`] containing a single sorted-run entry
@@ -148,7 +148,7 @@ mod tests {
         assert_eq!(rules, back);
     }
 
-    // ----- B+ tree region round-trip (R1b-10) -----
+    // ----- B+ tree region round-trip -----
 
     use {mimisbrunnr_storage::FileBlockDevice, tempfile::TempDir};
 

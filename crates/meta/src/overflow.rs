@@ -1,14 +1,14 @@
-//! `OverflowRecord` (4 KiB) — IMPL §5.2.
+//! `OverflowRecord` (4 KiB) — METADATA-DESIGN§1.2.
 //!
 //! When an object has `tag_count > 4`, any `attr_count`, or any
 //! `relation_count`, the inline tag slots in `ObjectRecord` are abandoned and
 //! all three lists move to a chain of 4 KiB `OverflowRecord` blocks in the
 //! metadata zone (head addressed by `ObjectRecord.overflow_offset`,
-//! continuation by `OverflowRecord.next_overflow`). See IMPL §5.2 for the
+//! continuation by `OverflowRecord.next_overflow`). See METADATA-DESIGN§1.2 for the
 //! variable-length payload format.
 //!
 //! This phase ships **only the fixed-size header** (the 56-byte preamble
-//! that the §1.5 block-management code can validate without knowing the
+//! that the BTREE-DESIGN§1 block-management code can validate without knowing the
 //! payload schema). The chain navigation, payload encoder/decoder, and
 //! `OverflowAttr` variant decoding are deferred — see TODO below.
 
@@ -22,7 +22,7 @@ use {
 pub const OVERFLOW_RECORD_SIZE: usize = 4096;
 
 /// Set in an `OverflowAttr.flags` byte to indicate the body is a 16-byte
-/// `BlobRef` rather than a 96-byte inline value (IMPL §5.2).
+/// `BlobRef` rather than a 96-byte inline value (METADATA-DESIGN§1.2).
 pub const OVERFLOW_ATTR_FLAG_SPILL: u8 = 1 << 0;
 
 /// Fixed-size header of an overflow record: covers everything up to the
@@ -44,12 +44,12 @@ pub const OVERFLOW_ATTR_FLAG_SPILL: u8 = 1 << 0;
 ///  [48..56]  next_overflow    u64   block_no of next overflow block, 0 if last
 /// ```
 ///
-/// `#[repr(C, packed)]` matches the spec convention (IMPL §1.1) and keeps
+/// `#[repr(C, packed)]` matches the spec convention (FORMAT-DESIGN§1.1) and keeps
 /// the layout deterministic across compilers; readers must use
 /// `let v = { hdr.field };` to copy aligned locals before use (see
-/// REWRITE_CONTRACT.md §4.7).
+/// `doc/agentic/operations-design.md`, on-disk struct discipline rule 7).
 //
-// TODO(rewrite-phase-N): expose payload encoder / decoder, `OverflowAttr`
+// TODO(METADATA5): expose payload encoder / decoder, `OverflowAttr`
 // struct, and chain-walking helpers. They are deferred along with the live
 // 4 KiB block-management path that owns `BLOCK_FLAG_CONTINUATION`.
 #[repr(C, packed)]

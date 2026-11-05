@@ -3,16 +3,15 @@
 //!
 //! Implements:
 //!
-//! - IMPL §1 — block headers, kind enumerations, CRC32C, B+ tree node and
+//! - FORMAT-DESIGN§1 — block headers, kind enumerations, CRC32C, B+ tree node and
 //!   sorted-run envelopes (structs only — see crate docs for deferred items).
-//! - IMPL §2 — superblock, zone map, atomic root commit (steps 5–6).
-//! - IMPL §12 (partial) — bucket alloc record, data-type enum, generation
+//! - ENGINE-DESIGN§1 — superblock, zone map, atomic root commit (steps 5–6).
+//! - ALLOCATION-DESIGN§1 (partial) — bucket alloc record, data-type enum, generation
 //!   check, in-memory `BucketAllocTable` placeholder.
 //!
-//! The full §1.5 B+ tree machinery (sorted-run merge-search, append-only
-//! growth, full compaction, format promotion, packed-key codec), encryption
-//! ciphers, and `ZoneMap` continuation chaining are intentionally **out of
-//! scope for this phase** and tagged `TODO(rewrite-phase-N)`.
+//! Not yet implemented: the remaining BTREE-DESIGN§1 B+ tree machinery
+//! (BTREE4–BTREE8), encryption ciphers (ENCRYPTION1, ENCRYPTION4), and
+//! `ZoneMap` continuation chaining (TODO(ENGINE9)).
 
 mod addressing;
 mod alloc;

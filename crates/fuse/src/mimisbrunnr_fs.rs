@@ -1,7 +1,7 @@
 //! [`MimisbrunnrFs`] — adapter that exposes a [`crate::TagVfs`] as a
 //! `fuser::Filesystem`.
 //!
-//! Phase 5b is **read-only** — every write-flavoured operation returns
+//! The mount is **read-only** (UNIX2) — every write-flavoured operation returns
 //! `EROFS`. The adapter is enabled behind the `fuse` Cargo feature so the
 //! base VFS layer (and its tests) can build without `fuser` (and its
 //! libfuse C-library dependency).
@@ -135,7 +135,7 @@ impl<'a> MimisbrunnrFs<'a> {
             kind,
             perm,
             nlink: vfs_attr.nlink,
-            // TODO(rewrite-phase-N): plumb real uid/gid/mode through from
+            // TODO(UNIX3): plumb real uid/gid/mode through from
             // the engine. We avoid `libc::getuid()` to keep this crate
             // libc-free.
             uid: 0,
@@ -260,7 +260,7 @@ impl Filesystem for MimisbrunnrFs<'static> {
     }
 
     // ----- Read-only stubs for write paths. -----
-    // TODO(rewrite-phase-N): writable mount.
+    // TODO(UNIX2): writable mount.
 
     fn write(
         &self,

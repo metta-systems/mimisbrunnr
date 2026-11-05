@@ -1,8 +1,8 @@
-//! `mimisbrunnr-fuse` — FUSE bridge for Mímisbrunnr (DESIGN §12.6, §12.7).
+//! `mimisbrunnr-fuse` — FUSE bridge for Mímisbrunnr (SPECIFICATION-DESIGN§12.6, SPECIFICATION-DESIGN§12.7).
 //!
 //! This crate is a *thin reader* over the in-memory mirrors that the engine
 //! holds (tag / kv / forward indices, ontology state, path-context manager).
-//! It does **not** depend on the engine — the engine (Phase 6) is expected to
+//! It does **not** depend on the engine — the engine is expected to
 //! own a [`TagVfs`] and pass references into [`MimisbrunnrFs`] when mounting.
 //!
 //! # Mount layout
@@ -24,7 +24,7 @@
 //! ```
 //!
 //! Under `/tags/`, each path component is a tag name; the listing of a
-//! directory is the **faceted refinement** (DESIGN §5.6) of the current tag
+//! directory is the **faceted refinement** (SPECIFICATION-DESIGN§5.6) of the current tag
 //! set — only tags that have non-empty intersection with the current matched
 //! bitmap are shown. Files in a tags-directory are the matched objects, named
 //! by `ObjectId` in decimal.
@@ -35,14 +35,14 @@
 //!
 //! # Inode identity
 //!
-//! Per IMPLEMENTATION.md §13.2, inodes are **session-local** and allocated
+//! Per ENGINE-DESIGN§2.2, inodes are **session-local** and allocated
 //! lazily as paths are traversed. They are *never persisted* — the TagVfs is
 //! a derived projection.
 //!
-//! # Read-only in this phase
+//! # Read-only
 //!
-//! Phase 5b ships a read-only mount. Write operations return `EROFS` and are
-//! marked with `TODO(rewrite-phase-N): writable mount`.
+//! The mount is read-only. Write operations return `EROFS` and are
+//! marked with `TODO(UNIX2): writable mount`.
 
 #![forbid(unsafe_code)]
 

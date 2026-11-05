@@ -1,5 +1,5 @@
 //! Zone-extent descriptors and the optional `ZoneMap` continuation block.
-//! IMPL §2.1.
+//! ENGINE-DESIGN§1.1.
 
 use {
     bytemuck::{Pod, Zeroable},

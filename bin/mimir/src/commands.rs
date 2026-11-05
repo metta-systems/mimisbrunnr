@@ -55,7 +55,7 @@ impl std::fmt::Display for CommandError {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::BadArg(m) => write!(f, "bad argument: {m}"),
             Self::NotFound(m) => write!(f, "not found: {m}"),
-            Self::Unimplemented(m) => write!(f, "TODO(rewrite-phase-N): {m}"),
+            Self::Unimplemented(m) => write!(f, "not implemented yet: {m}"),
         }
     }
 }
@@ -423,7 +423,7 @@ pub fn run_ontology_show<W: Write>(
     Ok(())
 }
 
-/// Stub for `mimir ontology adopt`. Phase 7a returns a TODO.
+/// Stub for `mimir ontology adopt`. Returns `Unimplemented` (ONTOLOGY3).
 pub fn run_ontology_adopt<W: Write>(
     _engine: &mut DiskEngine,
     _out: &mut W,
@@ -524,7 +524,7 @@ pub fn run_watch_unsubscribe<W: Write>(
     Ok(())
 }
 
-/// Stub for `mimir watch stream`. Phase 7a returns a TODO.
+/// Stub for `mimir watch stream`. Returns `Unimplemented` (SUBSCRIPTION5).
 pub fn run_watch_stream<W: Write>(
     _engine: &mut DiskEngine,
     _out: &mut W,
@@ -702,7 +702,7 @@ pub fn run_project_tree<W: Write>(
 
 /// `mimir project import <dir> --context <ctx>`
 ///
-/// Phase 7a: walks the host tree via [`Importer`] and creates one object
+/// Walks the host tree via [`Importer`] and creates one object
 /// per file with the path attribute attached, but **does not** read file
 /// contents into the blob store. Use the populate tool for that.
 pub fn run_project_import<W: Write>(

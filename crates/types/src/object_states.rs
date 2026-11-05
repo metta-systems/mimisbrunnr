@@ -1,4 +1,4 @@
-//! Per-record lifecycle / transform state enums (DESIGN §6.2).
+//! Per-record lifecycle / transform state enums (SPECIFICATION-DESIGN§6.2).
 //!
 //! These are logical mirrors of the `u8`-discriminated fields in
 //! `ObjectRecord` (which itself lives in `mimisbrunnr-meta`). Discriminants
@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Object lifecycle state. Drives the four-phase deletion protocol
-/// (DESIGN §7.1).
+/// (SPECIFICATION-DESIGN§7.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ObjectState {
@@ -34,7 +34,7 @@ impl ObjectState {
     }
 }
 
-/// Compression algorithm currently encoding an object's blob (DESIGN §6.2).
+/// Compression algorithm currently encoding an object's blob (SPECIFICATION-DESIGN§6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum CompressionState {
@@ -54,7 +54,7 @@ impl CompressionState {
     }
 }
 
-/// Encryption mode currently in effect for an object's blob (DESIGN §6.2).
+/// Encryption mode currently in effect for an object's blob (SPECIFICATION-DESIGN§6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum EncryptionState {

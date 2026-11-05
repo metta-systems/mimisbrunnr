@@ -35,7 +35,7 @@ use mimisbrunnr_wal::{
 
 use crate::{Engine, EngineError, OpKind};
 
-/// Origin byte for the `Direct` provenance — matches IMPL §3.3 / DESIGN §6.4.
+/// Origin byte for the `Direct` provenance — matches JOURNAL-DESIGN§1.3 / SPECIFICATION-DESIGN§6.4.
 pub const TAG_ORIGIN_DIRECT: u8 = 0;
 /// Origin byte for the `Materialized` provenance.
 pub const TAG_ORIGIN_MATERIALIZED: u8 = 1;
@@ -195,8 +195,8 @@ pub fn replay_wal_op(
 /// Helper: compute the `value_hash` the engine and the WAL agree on for
 /// `Attr` payloads. Wraps [`mimisbrunnr_types::value_hash`] so callers don't
 /// have to plumb the per-pool secret. Today we use the all-zero secret per
-/// the IMPL §4.2 TODO; replace once the per-pool secret is wired.
-// TODO(rewrite-phase-N): plumb the per-pool secret from `Superblock`.
+/// the INDEX-DESIGN§1.2 TODO; replace once the per-pool secret is wired.
+// TODO(ENCRYPTION6): plumb the per-pool secret from `Superblock`.
 pub fn engine_value_hash(value: &mimisbrunnr_types::Value) -> u64 {
     value_hash(value, &[0u8; 16])
 }

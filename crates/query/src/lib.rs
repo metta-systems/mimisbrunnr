@@ -1,4 +1,4 @@
-//! `mimisbrunnr-query` — query algebra evaluator (DESIGN §2.3, §5).
+//! `mimisbrunnr-query` — query algebra evaluator (SPECIFICATION-DESIGN§2.3, SPECIFICATION-DESIGN§5).
 //!
 //! Walks the [`mimisbrunnr_types::Query`] tree, consulting the in-memory
 //! mirrors exposed by `mimisbrunnr-index` and the
@@ -16,7 +16,7 @@
 //! large-pool support requires either a wider bitmap or sharding by a
 //! high-order key — see the TODO below.
 //!
-//! TODO(rewrite-phase-N): replace the 32-bit bitmap with a sharded encoding
+//! TODO(INDEX5): replace the 32-bit bitmap with a sharded encoding
 //! that covers the full 48-bit local-id space and the 16-bit node prefix.
 //!
 //! ## DSL

@@ -1,4 +1,4 @@
-//! Superblock — IMPL §2.1 / §2.2.
+//! Superblock — ENGINE-DESIGN§1.1 / ENGINE-DESIGN§1.2.
 //!
 //! Three redundant copies are written at byte offsets `0`, `4096`, and
 //! `device_capacity - 4096`. The active copy is the one with the highest
@@ -21,7 +21,7 @@ use crate::{
 
 /// Stable on-disk byte encoding for [`MediaType`].
 ///
-/// The spec (IMPL §2.1) reserves the `media_type` byte for a `MediaType`
+/// The spec (ENGINE-DESIGN§1.1) reserves the `media_type` byte for a `MediaType`
 /// discriminator but does not pin the values. We choose a stable mapping
 /// here and use it everywhere; later phases can extend this enum but must
 /// never renumber it.
@@ -54,11 +54,11 @@ fn media_type_from_u8(v: u8) -> Result<MediaType, StorageError> {
     }
 }
 
-/// `"MIMISBRUNNR\0\0\0\0\0"` full magic. IMPL §1.4 / §2.1.
+/// `"MIMISBRUNNR\0\0\0\0\0"` full magic. FORMAT-DESIGN§1.4 / ENGINE-DESIGN§1.1.
 pub const SUPERBLOCK_MAGIC_FULL: [u8; 16] = *b"MIMISBRUNNR\0\0\0\0\0";
 
 /// 16-byte placeholder for the inline `ChunkParamsRecord`. The full struct
-/// is owned by §9.3 in a later phase; we store the bytes opaquely so the
+/// is owned by INDEX-DESIGN§4.3 in a later phase; we store the bytes opaquely so the
 /// Superblock layout remains stable.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default, Eq, PartialEq)]
@@ -68,7 +68,7 @@ pub struct ChunkParamsRecord {
 
 const_assert_eq!(core::mem::size_of::<ChunkParamsRecord>(), 16);
 
-/// 4 KiB superblock layout. IMPL §2.1.
+/// 4 KiB superblock layout. ENGINE-DESIGN§1.1.
 ///
 /// **Active-root selection** uses the `seq` / `lsn` of the *active* root
 /// (`active_root` field), so corrupting one copy and not its pair still
@@ -254,7 +254,7 @@ impl Superblock {
     }
 
     /// The byte offsets at which the 3 superblock copies live on a device of
-    /// `capacity` bytes. IMPL §2.
+    /// `capacity` bytes. ENGINE-DESIGN§1.
     pub fn copy_offsets(capacity: u64) -> [u64; 3] {
         [0, BLOCK_SIZE as u64, capacity - BLOCK_SIZE as u64]
     }
@@ -379,7 +379,7 @@ impl Superblock {
         best.map(|(_, _, sb)| sb).ok_or(StorageError::NoValidSuperblock)
     }
 
-    /// Commit a new `RootPointer`, executing steps 5–6 of the IMPL §2.2 atomic
+    /// Commit a new `RootPointer`, executing steps 5–6 of the ENGINE-DESIGN§1.2 atomic
     /// commit protocol:
     ///
     /// 5. Write the new pointer into the **inactive** slot of all 3 superblock

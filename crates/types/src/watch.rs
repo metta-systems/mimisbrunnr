@@ -1,4 +1,4 @@
-//! Subscription / watch types (DESIGN §11.2).
+//! Subscription / watch types (SPECIFICATION-DESIGN§11.2).
 //!
 //! Only the data shapes — the engine, oplog cursor management, and inverted
 //! tag→subscription index live in `mimisbrunnr-watch`.

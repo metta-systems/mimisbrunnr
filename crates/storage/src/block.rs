@@ -1,6 +1,6 @@
 //! Per-block headers and kind enumerations.
 //!
-//! Implements IMPL §1.3.
+//! Implements FORMAT-DESIGN§1.3.
 
 use {
     bytemuck::{Pod, Zeroable},
@@ -11,7 +11,7 @@ use crate::error::StorageError;
 
 /// Logical block size — 4 KiB.
 ///
-/// IMPL §1.2.
+/// FORMAT-DESIGN§1.2.
 pub const BLOCK_SIZE: usize = 4096;
 
 /// `log2(BLOCK_SIZE)`.
@@ -26,7 +26,7 @@ pub const BLOCK_PREAMBLE_MAGIC_BTREE: [u8; 4] = *b"MIMB";
 // ---------- BlockPreamble ----------
 
 /// 8-byte common preamble shared by [`BlockHeader`] (4 KiB blocks) and
-/// `BtreeNodeHeader` (256 KiB regions). IMPL §1.3.
+/// `BtreeNodeHeader` (256 KiB regions). FORMAT-DESIGN§1.3.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct BlockPreamble {
@@ -47,7 +47,7 @@ pub const BLOCK_FLAG_ENCRYPTED: u32 = 1 << 0;
 /// Flag: continuation of a chained record.
 pub const BLOCK_FLAG_CONTINUATION: u32 = 1 << 1;
 
-/// 32-byte header that prefixes every persistent 4 KiB block. IMPL §1.3.
+/// 32-byte header that prefixes every persistent 4 KiB block. FORMAT-DESIGN§1.3.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct BlockHeader {
@@ -86,7 +86,7 @@ impl BlockHeader {
 // ---------- BlockKind ----------
 
 /// `BlockKind` enumerates the small (4 KiB) block types. **Discriminants are
-/// pinned by the spec — do not renumber.** IMPL §1.3.
+/// pinned by the spec — do not renumber.** FORMAT-DESIGN§1.3.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockKind {
@@ -127,7 +127,7 @@ impl BlockKind {
 // ---------- BtreeKind ----------
 
 /// `BtreeKind` enumerates the large-region (256 KiB) types. **Discriminants
-/// are pinned by the spec — do not renumber.** IMPL §1.3.
+/// are pinned by the spec — do not renumber.** FORMAT-DESIGN§1.3.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BtreeKind {
@@ -199,7 +199,7 @@ impl BtreeKind {
 // ---------- CRC helpers ----------
 
 /// Compute CRC32C (Castagnoli) over a byte slice. The caller is responsible
-/// for zeroing any in-band CRC slot before invoking this. IMPL §1.4.
+/// for zeroing any in-band CRC slot before invoking this. FORMAT-DESIGN§1.4.
 pub fn block_crc(bytes_with_zeroed_crc_slot: &[u8]) -> u32 {
     crc32c::crc32c(bytes_with_zeroed_crc_slot)
 }

@@ -1,4 +1,4 @@
-//! [`Engine`] — central in-memory state holder (DESIGN §15).
+//! [`Engine`] — central in-memory state holder (SPECIFICATION-DESIGN§15).
 //!
 //! Owns every in-memory mirror (object table, location table, all five
 //! indices, ontology state, subscriptions, path contexts, oplog) plus the
@@ -41,26 +41,26 @@ pub struct BlobWriteResult {
 pub struct Engine {
     pub object_table: ObjectTable,
     pub location_table: LocationTable,
-    /// Backpointer table — IMPL §6.2. Snapshot-agnostic. The engine
-    /// doesn't drive backpointer mutations yet (that's R4 / R7), but
+    /// Backpointer table — METADATA-DESIGN§2.2. Snapshot-agnostic. The engine
+    /// doesn't drive backpointer mutations yet (ENGINE5), but
     /// the field is present so the empty table round-trips through
     /// commit / load against its dedicated B+ tree region.
-    /// TODO(rewrite-phase-R4): populate on every blob / chunk write.
+    /// TODO(ENGINE5): populate on every blob / chunk write.
     pub backpointer_table: BackpointerTable,
-    /// Bucket allocation table — IMPL §12.2. Pool-scoped (R1b-4); the
-    /// per-disk split is R1d. The engine doesn't drive bucket
-    /// allocation today (Theme F / H), but having the field lets the
+    /// Bucket allocation table — ALLOCATION-DESIGN§1.2. Pool-scoped; the
+    /// per-disk split is ALLOCATION4. The engine doesn't drive bucket
+    /// allocation today (ALLOCATION1), but having the field lets the
     /// empty table round-trip through commit / load against its
     /// dedicated B+ tree region.
-    /// TODO(rewrite-phase-Theme-H): populate via the foreground
+    /// TODO(ALLOCATION1): populate via the foreground
     /// allocator + copygc producer.
     pub bucket_alloc: BucketAllocTable,
-    /// Freespace LRU — IMPL §12.4. Pool-scoped (R1b-4); the per-disk
-    /// split is R1d. The engine doesn't drive LRU mutations today
-    /// (Theme H), but having the field lets the empty table
+    /// Freespace LRU — ALLOCATION-DESIGN§1.4. Pool-scoped; the per-disk
+    /// split is ALLOCATION5. The engine doesn't drive LRU mutations today
+    /// (ALLOCATION5), but having the field lets the empty table
     /// round-trip through commit / load against its dedicated B+ tree
     /// region.
-    /// TODO(rewrite-phase-Theme-H): live allocator integration —
+    /// TODO(ALLOCATION5): live allocator integration —
     /// "scan band 0" foreground fast path, lazy reband on 8-sector
     /// boundary, copygc producer.
     pub freespace_lru: FreespaceLru,
@@ -162,7 +162,7 @@ impl Engine {
     }
 
     /// Delete `oid`: tombstone the record, drop assertions from every index,
-    /// emit subscription hooks. Per DESIGN §7 the ID is **never** reused.
+    /// emit subscription hooks. Per SPECIFICATION-DESIGN§7 the ID is **never** reused.
     pub fn delete_object(&mut self, oid: ObjectId) -> Result<(), EngineError> {
         let raw = oid.to_u64();
         let rec = self
@@ -529,11 +529,11 @@ impl Engine {
     /// Register a subscription. Computes the initial result via the live
     /// query executor.
     ///
-    /// Note (DESIGN §11.3): for arbitrary boolean queries the engine layer is
+    /// Note (SPECIFICATION-DESIGN§11.3): for arbitrary boolean queries the engine layer is
     /// expected to call `SubscriptionEngine::set_membership` after every
-    /// mutation that could change a sub's matched set. Phase 6 leaves this as
+    /// mutation that could change a sub's matched set. The engine leaves this as
     /// a TODO — only `HasTag` / `IsA` clauses get correct live updates.
-    /// TODO(rewrite-phase-N): re-evaluate boolean queries on every mutation.
+    /// TODO(SUBSCRIPTION3): re-evaluate boolean queries on every mutation.
     pub fn subscribe(
         &mut self,
         name: String,

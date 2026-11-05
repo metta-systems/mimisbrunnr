@@ -48,13 +48,13 @@ pub enum MetaError {
     },
 
     /// `ObjectLocation` declared a `replica_count` outside the legal range
-    /// `0..=4` (the inline cap; see DESIGN §6.3 / IMPL §6.1).
+    /// `0..=4` (the inline cap; see SPECIFICATION-DESIGN§6.3 / METADATA-DESIGN§2.1).
     #[error("invalid replica_count: {0} (must be 0..=4)")]
     InvalidReplicaCount(u8),
 
     /// An object id (or local sequence) overflowed the radix tree's
     /// addressable range at the requested `root_level`. The caller should
-    /// grow the tree first (IMPL §5 "Tree growth").
+    /// grow the tree first (METADATA-DESIGN§1 "Tree growth").
     #[error("oid_local {oid_local} exceeds radix tree range at root_level {root_level}")]
     OidOutOfRange {
         /// The local sequence (low 48 bits of `ObjectId`) that did not fit.

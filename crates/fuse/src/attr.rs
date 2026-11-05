@@ -7,7 +7,7 @@
 /// File-kind discriminant — the only two shapes the FUSE bridge currently
 /// presents (read-only directories and read-only regular files).
 ///
-/// TODO(rewrite-phase-N): add `Symlink` once `/ctx/` projections start
+/// TODO(UNIX4): add `Symlink` once `/ctx/` projections start
 /// emitting symlinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VfsAttrKind {
@@ -19,11 +19,11 @@ pub enum VfsAttrKind {
 
 /// Minimal stat-like info for a VFS entry.
 ///
-/// Phase 5b is read-only, so most POSIX timestamps and ownership fields are
-/// not modelled. The engine keeps these in `ObjectRecord` (per IMPL §5) and
+/// The mount is read-only (UNIX2), so most POSIX timestamps and ownership fields are
+/// not modelled. The engine keeps these in `ObjectRecord` (per METADATA-DESIGN§1) and
 /// will plumb them through in a later phase.
 ///
-/// TODO(rewrite-phase-N): widen with `mtime`, `mode`, `uid`, `gid` once the
+/// TODO(UNIX3): widen with `mtime`, `mode`, `uid`, `gid` once the
 /// engine exposes per-object metadata to the FUSE bridge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VfsAttr {

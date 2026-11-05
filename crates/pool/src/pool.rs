@@ -1,4 +1,4 @@
-//! `PoolStateRoot` — pool-wide on-disk state (IMPL §10.4).
+//! `PoolStateRoot` — pool-wide on-disk state (POOL-DESIGN§1).
 //!
 //! A single 4 KiB block holding pool-wide scalars and the inline
 //! disk-descriptor array. For pools with ≤12 disks the entire descriptor
@@ -24,7 +24,7 @@ use crate::{
 
 /// 256 KiB region size in bytes for the disks-overflow B+ tree (matches
 /// the spec's 18-bit `region_size_log2`).
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const DISKS_OVERFLOW_REGION_SIZE: u64 = 256 * 1024;
 const DISKS_OVERFLOW_REGION_SIZE_LOG2: u8 = 18;
 
@@ -44,7 +44,7 @@ const POOL_STATE_ROOT_CRC_OFFSET: usize = POOL_STATE_ROOT_SIZE - 4; // 4092
 /// Format-version slot for [`PoolStateRoot`]'s `BlockHeader`.
 const POOL_STATE_ROOT_FORMAT_VERSION: u16 = 1;
 
-/// 4 KiB on-disk pool state block. IMPL §10.4 lines 2125–2132.
+/// 4 KiB on-disk pool state block. POOL-DESIGN§1 lines 2125–2132.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct PoolStateRoot {
@@ -168,17 +168,17 @@ impl PoolStateRoot {
 }
 
 // ----------------------------------------------------------------
-// R1b-11: disks_overflow_root §1.5 B+ tree (CBOR-encoded sorted run).
+// disks_overflow_root BTREE-DESIGN§1 B+ tree (CBOR-encoded sorted run).
 // ----------------------------------------------------------------
 //
 // Pools with more than `POOL_STATE_ROOT_INLINE_DISKS` disks overflow the
 // inline `PoolStateRoot.inline_disks[]` array into a `BtreeKind::DiskDescriptors`
-// B+ tree (IMPL §10.4). The region is keyed by `disk_id: u16` ascending,
+// B+ tree (POOL-DESIGN§1). The region is keyed by `disk_id: u16` ascending,
 // values are 256-byte `DiskDescriptorOnDisk` byte images. `RootPointer.disks_overflow_root`
 // refers to this region.
 //
-// TODO(rewrite-phase-R1d): switch to the IMPL §1.5.6 packed-key codec once
-// R1c lands the prefix-template fix and variable-value-size support.
+// TODO(POOL1): switch to the BTREE-DESIGN§1.6 packed-key codec (the
+// prefix-template fix it needed has landed).
 
 /// Build a [`LoadedNode`] containing one sorted-run entry per overflow
 /// disk, sorted by `disk_id`. The node uses [`BtreeKind::DiskDescriptors`]
@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(psr.inline_disk_count(), POOL_STATE_ROOT_INLINE_DISKS);
     }
 
-    // ----- B+ tree region round-trip (R1b-11, disks_overflow) -----
+    // ----- B+ tree region round-trip (disks_overflow) -----
 
     use {
         super::{flush_disks_overflow_to_region, load_disks_overflow_from_region},

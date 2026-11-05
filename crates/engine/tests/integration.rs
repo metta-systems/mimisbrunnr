@@ -1,4 +1,4 @@
-//! Phase 6 integration tests for `mimisbrunnr-engine`.
+//! Integration tests for `mimisbrunnr-engine`.
 //!
 //! Forward-index inspection in tests goes through `assertions_of(oid)` per
 //! object or the public `ForwardIndex::iter()` (added in phase R0).
@@ -683,7 +683,7 @@ fn read_only_then_mutating_open_sees_subsequent_changes() {
 }
 
 // ----------------------------------------------------------------------
-// R1b-1: per-region index persistence (ChunkIndex / KvIndex)
+// Per-region index persistence (ChunkIndex / KvIndex)
 // ----------------------------------------------------------------------
 
 #[test]
@@ -703,14 +703,14 @@ fn fresh_pool_open_before_first_commit_sees_empty_migrated_indices() {
 }
 
 // ----------------------------------------------------------------------
-// R1b-2: per-region index persistence (Forward / Tag / Range)
+// Per-region index persistence (Forward / Tag / Range)
 // ----------------------------------------------------------------------
 
 #[test]
 fn fresh_pool_open_before_first_commit_sees_empty_r1b2_indices() {
     // All five migrated regions are zero-filled at format time, so an
     // `open` against a freshly-created pool must succeed and see empty
-    // forward / tag / range states alongside the R1b-1 indices.
+    // forward / tag / range states alongside the chunk / kv indices.
     let tmp = TempDir::new().unwrap();
     let (cfg, cfg_path) = small_pool(&tmp);
     {
@@ -827,7 +827,7 @@ fn migrated_indices_persist_across_commit_drop_open() {
 
     let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
     // ChunkIndex inserts go through the in-memory engine directly — no
-    // public DiskEngine surface for them in R1b-1, but the persistence
+    // public DiskEngine surface for them yet, but the persistence
     // round-trip must still cover them.
     let blob_ref = mimisbrunnr_storage::BlobRef {
         disk_id: 0,
@@ -859,13 +859,13 @@ fn migrated_indices_persist_across_commit_drop_open() {
 }
 
 // ----------------------------------------------------------------------
-// R1b-3: per-region object table / location table / backpointer table
+// Per-region object table / location table / backpointer table
 // ----------------------------------------------------------------------
 
 #[test]
 fn fresh_pool_open_before_first_commit_sees_empty_r1b3_tables() {
-    // Every region (including the three R1b-3 ones plus the two new
-    // R1b-4 ones) is zero-filled at format time, so an `open` against
+    // Every region (including the object / location / backpointer tables plus the two
+    // allocation ones) is zero-filled at format time, so an `open` against
     // a freshly-created pool must succeed and see empty
     // object/location/backpointer/bucket-alloc/freespace-LRU states.
     let tmp = TempDir::new().unwrap();
@@ -917,7 +917,7 @@ fn r1b3_location_table_persists_across_commit_drop_open() {
     let oid = de.create_object().unwrap();
 
     // Inject a location directly (engine doesn't drive blob-zone allocation
-    // yet — that's R4). The persistence round-trip is what we care about.
+    // yet — that's ENGINE5). The persistence round-trip is what we care about.
     let r = ReplicaRef {
         disk_id: 0,
         sector_offset: 5,
@@ -948,7 +948,7 @@ fn r1b3_backpointer_table_persists_across_commit_drop_open() {
     let (cfg, cfg_path) = small_pool(&tmp);
     let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
 
-    // Engine doesn't drive backpointer mutations yet (R4); insert a few
+    // Engine doesn't drive backpointer mutations yet (ENGINE5); insert a few
     // manually so we can prove the round-trip works end-to-end.
     let entries: Vec<(BackpointerKey, BackpointerValue)> = (0u32..5)
         .map(|i| {
@@ -1078,7 +1078,7 @@ fn all_ten_migrated_structures_round_trip_together() {
 }
 
 // ----------------------------------------------------------------------
-// R1b-4: bucket alloc table + freespace LRU
+// Bucket alloc table + freespace LRU
 // ----------------------------------------------------------------------
 
 #[test]
@@ -1092,7 +1092,7 @@ fn r1b4_bucket_alloc_table_persists_across_commit_drop_open() {
     let (cfg, cfg_path) = small_pool(&tmp);
     let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
 
-    // Engine doesn't drive bucket allocation yet (Theme F / H);
+    // Engine doesn't drive bucket allocation yet (ALLOCATION1);
     // inject directly so we can prove the round-trip works.
     let entries: Vec<(u32, BucketAllocEntry)> = (0u32..16)
         .map(|i| {
@@ -1235,7 +1235,7 @@ fn all_twelve_migrated_structures_round_trip_together() {
     };
     de.engine.backpointer_table.insert(bk, bv);
 
-    // BucketAllocTable (R1b-4).
+    // BucketAllocTable.
     de.engine.bucket_alloc.insert(
         13,
         BucketAllocEntry {
@@ -1247,7 +1247,7 @@ fn all_twelve_migrated_structures_round_trip_together() {
         },
     );
 
-    // FreespaceLru (R1b-4).
+    // FreespaceLru.
     de.engine.freespace_lru.insert(0, 0, 13);
     de.engine.freespace_lru.insert(255, 0, 99);
 
@@ -1280,7 +1280,7 @@ fn all_twelve_migrated_structures_round_trip_together() {
     assert_eq!(bm.len(), 1);
     assert_eq!(de2.engine.backpointer_table.len(), 1);
     assert!(de2.engine.backpointer_table.get(&bk).is_some());
-    // R1b-4: bucket alloc + freespace LRU.
+    // Bucket alloc + freespace LRU.
     assert_eq!(de2.engine.bucket_alloc.len(), 1);
     let ba = de2.engine.bucket_alloc.get(13).unwrap();
     assert_eq!({ ba.generation }, 13);
@@ -1290,7 +1290,7 @@ fn all_twelve_migrated_structures_round_trip_together() {
     assert_eq!(de2.engine.subscriptions.subscriptions.len(), 1);
 }
 
-// ----- R1c-D1: RootPointer.*_root slots populated -----
+// ----- RootPointer.*_root slots populated -----
 
 #[test]
 fn rootpointer_slots_populated_post_create() {
@@ -1298,7 +1298,7 @@ fn rootpointer_slots_populated_post_create() {
     let (cfg, cfg_path) = small_pool(&tmp);
     let de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
 
-    // The 10 R1b-migrated trees must all have non-zero BlockRefs.
+    // The 10 region-backed trees must all have non-zero BlockRefs.
     let r = de.superblock.active_root_pointer();
     assert!({ r.chunk_index_root.block_no } != 0, "chunk_index_root");
     assert!({ r.kv_index_root.block_no } != 0, "kv_index_root");
@@ -1311,14 +1311,14 @@ fn rootpointer_slots_populated_post_create() {
     assert!({ r.subscriptions_root.block_no } != 0, "subscriptions_root");
     assert!({ r.backpointer_root.block_no } != 0, "backpointer_root");
 
-    // Each slot's generation is set (1 under R1c-D1).
+    // Each slot's generation is set (1 while trees stay at fixed offsets).
     assert_eq!({ r.chunk_index_root.generation }, 1);
     assert_eq!({ r.kv_index_root.generation }, 1);
 
     // Slots that don't yet have engine-side trees (cluster_peers,
     // disks_overflow, placement_rules, reconcile_*, snapshot_chain,
     // value_spill, *_history) stay zero — they're populated by later
-    // phases (R6/R7/R12).
+    // items (SNAPSHOT1, RECONCILE1, CLUSTER1).
     assert_eq!({ r.cluster_peers_root.block_no }, 0);
     assert_eq!({ r.snapshot_chain_root.block_no }, 0);
     assert_eq!({ r.reconcile_work_root.block_no }, 0);
@@ -1336,7 +1336,7 @@ fn rootpointer_slots_stable_across_commit() {
     de.commit().unwrap();
     let post_commit = *de.superblock.active_root_pointer();
 
-    // R1c-D1 keeps slots stable (COW reallocation is Tier 3 D3).
+    // Slots stay stable across commits (COW reallocation is ENGINE3).
     assert_eq!(
         { pre_commit.chunk_index_root.block_no },
         { post_commit.chunk_index_root.block_no },
@@ -1352,7 +1352,7 @@ fn rootpointer_slots_stable_across_commit() {
     assert!({ post_commit.lsn } >= { pre_commit.lsn });
 }
 
-// ----- R1c-A2: object_table / location_table use native positional radix leaves -----
+// ----- object_table / location_table use native positional radix leaves -----
 
 #[test]
 fn object_table_on_disk_uses_native_leaf_layout() {

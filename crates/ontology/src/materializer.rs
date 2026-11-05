@@ -1,4 +1,4 @@
-//! Materializer (DESIGN §3.3).
+//! Materializer (SPECIFICATION-DESIGN§3.3).
 //!
 //! Thin wrapper around [`ImplicationDag`] exposing the public materialisation
 //! API. Returns sets; does **not** touch any index. The engine wires the

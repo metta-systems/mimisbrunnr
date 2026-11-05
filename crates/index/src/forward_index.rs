@@ -1,20 +1,20 @@
 //! Forward index — `oid → [(Assertion, TagOrigin)]`.
 //!
 //! - On-disk wire structs: [`PackedAssertion`] (16 B), [`LeafEntry`]
-//!   (variable length: inline assertions or spill-ref). IMPL §7.1.
-//! - In-memory mirror: [`ForwardIndex`] (per IMPL §13:
+//!   (variable length: inline assertions or spill-ref). INDEX-DESIGN§2.1.
+//! - In-memory mirror: [`ForwardIndex`] (per ENGINE-DESIGN§2:
 //!   `HashMap<u64, Vec<(Assertion, TagOrigin)>>`).
 //!
 //! [`ForwardIndex`] derives `Serialize`/`Deserialize` directly; callers
 //! reach for `ciborium::ser::into_writer` / `ciborium::de::from_reader`.
 //!
-//! ## Persistence (R1c-A3.2) — native packed leaf + ForwardOverflow spill
+//! ## Persistence — native packed leaf + ForwardOverflow spill
 //!
-//! On disk the index occupies one 256 KiB §1.5 B+ tree region of
+//! On disk the index occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
 //! [`BtreeKind::Forward`]. The directory's sorted-run is written via the
-//! `SORTED_RUN_FLAG_PACKED_KEYS` codec (§1.5.6) with the 2-field key
+//! `SORTED_RUN_FLAG_PACKED_KEYS` codec (BTREE-DESIGN§1.6) with the 2-field key
 //! `(oid, snapshot)` and `value_size_kind = VALUE_SIZE_KIND_VARINT`
-//! (forced, even for single-entry runs) — the value tail is the §7.1
+//! (forced, even for single-entry runs) — the value tail is the INDEX-DESIGN§2.1
 //! `LeafEntry` byte image minus the key bytes (a 2 B `header` plus either
 //! the inline `[PackedAssertion; total]` body or a 16 B `BlockRef` spill
 //! ref).
@@ -25,9 +25,9 @@
 //! region holds up to 16 379 `PackedAssertion`s and chains via a trailing
 //! `BlockRef` slot.
 //!
-//! Per IMPL §11.2 the on-disk key is `(oid, snapshot)`; snapshots are
-//! deferred to R6 so every key carries `snapshot = 0` today. The field is
-//! on-disk now so R6 won't need a layout break.
+//! Per SNAPSHOTS-DESIGN§1.2 the on-disk key is `(oid, snapshot)`; snapshots are
+//! deferred to SNAPSHOT2 so every key carries `snapshot = 0` today. The field is
+//! on-disk now so SNAPSHOT2 won't need a layout break.
 
 use std::collections::HashMap;
 
@@ -46,7 +46,7 @@ use crate::error::IndexError;
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const FORWARD_INDEX_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
@@ -67,7 +67,7 @@ pub const PACKED_ASSERTION_ORIGIN_MATERIALIZED: u8 = 1;
 /// Size in bytes of [`PackedAssertion`] — 1 + 1 + 2 + 4 + 8 = 16 B.
 pub const PACKED_ASSERTION_SIZE: usize = 16;
 
-/// On-disk packed assertion. IMPL §7.1.
+/// On-disk packed assertion. INDEX-DESIGN§2.1.
 ///
 /// Layout (16 bytes, naturally aligned within a `LeafEntry`):
 ///
@@ -144,10 +144,10 @@ impl PackedAssertion {
     }
 
     /// Convert back to the logical pair. The full `Relation` target is
-    /// recovered from `b` (now 64-bit; A3.2). For `Attr` entries the
+    /// recovered from `b` (now 64-bit). For `Attr` entries the
     /// actual `Value` is **not** recoverable from the wire form (only
     /// its `value_hash` lives on disk); callers either supply it via
-    /// `attr_value` or accept the `Value::Int(0)` placeholder. R6's
+    /// `attr_value` or accept the `Value::Int(0)` placeholder. INDEX7's
     /// value-spill table will round-trip the full `Value` via the
     /// `value_hash` index.
     pub fn to_logical(
@@ -176,11 +176,11 @@ impl PackedAssertion {
 
 // ---------- LeafEntry header bitfield ----------
 
-/// `LeafEntry.header` flag: body is `spill_ref: BlockRef`. IMPL §7.1.
+/// `LeafEntry.header` flag: body is `spill_ref: BlockRef`. INDEX-DESIGN§2.1.
 pub const LEAF_ENTRY_SPILL_FLAG: u16 = 1 << 15;
 /// `LeafEntry.header` mask for the assertion-count bits (low 15 bits).
 pub const LEAF_ENTRY_TOTAL_MASK: u16 = 0x7FFF;
-/// IMPL §7.2: objects with more than this many assertions spill to a
+/// INDEX-DESIGN§2.2: objects with more than this many assertions spill to a
 /// `ForwardOverflow` region.
 pub const LEAF_ENTRY_INLINE_SPILL_THRESHOLD: usize = 8;
 
@@ -210,7 +210,7 @@ pub enum LeafEntryBody {
 pub struct LeafEntry {
     /// Object id sort key.
     pub oid: u64,
-    /// Snapshot id (IMPL §11.2 — packs to ~0 bits when one snapshot
+    /// Snapshot id (SNAPSHOTS-DESIGN§1.2 — packs to ~0 bits when one snapshot
     /// dominates).
     pub snapshot: u32,
     /// The leaf entry body — inline assertions or a spill ref.
@@ -258,7 +258,7 @@ impl LeafEntry {
         })
     }
 
-    /// Total assertion count carried by this entry. IMPL §7.1: a single
+    /// Total assertion count carried by this entry. INDEX-DESIGN§2.1: a single
     /// masked read regardless of spill state.
     pub fn total(&self) -> u16 {
         match &self.body {
@@ -378,14 +378,14 @@ impl LeafEntry {
 
 // ---------- ForwardIndex (in-memory mirror) ----------
 
-/// In-memory mirror of the forward index (IMPL §13).
+/// In-memory mirror of the forward index (ENGINE-DESIGN§2).
 ///
-/// Public surface mirrors DESIGN §5.5 (`direct_tags`, `materialized_tags`,
+/// Public surface mirrors SPECIFICATION-DESIGN§5.5 (`direct_tags`, `materialized_tags`,
 /// `assertions_of`, …). The struct derives `Serialize`/`Deserialize` directly
 /// — callers reach for `ciborium::ser::into_writer` / `ciborium::de::from_reader`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ForwardIndex {
-    /// Keyed by raw `ObjectId` (`oid.to_u64()`); per IMPL §13 the in-memory
+    /// Keyed by raw `ObjectId` (`oid.to_u64()`); per ENGINE-DESIGN§2 the in-memory
     /// shape is `HashMap<u64, SmallVec<[(Assertion, TagOrigin); 8]>>`. We use
     /// `Vec` since `smallvec` is not in the workspace deps yet.
     entries: HashMap<u64, Vec<(Assertion, TagOrigin)>>,
@@ -457,7 +457,7 @@ impl ForwardIndex {
     }
 
     /// `true` if `oid` has more than [`LEAF_ENTRY_INLINE_SPILL_THRESHOLD`]
-    /// assertions and would spill on disk per IMPL §7.2.
+    /// assertions and would spill on disk per INDEX-DESIGN§2.2.
     pub fn would_spill(&self, oid: ObjectId) -> bool {
         self.entries
             .get(&oid.to_u64())
@@ -479,13 +479,13 @@ impl ForwardIndex {
     }
 
     // ----------------------------------------------------------------
-    // R1c-A3.2: §1.5 B+ tree persistence (packed-codec native leaf +
-    // chained ForwardOverflow regions per §7.2).
+    // BTREE-DESIGN§1 B+ tree persistence (packed-codec native leaf +
+    // chained ForwardOverflow regions per INDEX-DESIGN§2.2).
     // ----------------------------------------------------------------
 
-    /// Write the in-memory state to disk under the A3.2 layout:
+    /// Write the in-memory state to disk under this layout:
     ///
-    /// - `dir_offset` is the byte offset of the §1.5 directory region.
+    /// - `dir_offset` is the byte offset of the BTREE-DESIGN§1 directory region.
     /// - `overflow_area_offset` is the byte offset of slot 0 of the
     ///   forward-overflow region area. Spilled per-object assertion lists
     ///   are written into this area as 256 KiB
@@ -519,9 +519,9 @@ impl ForwardIndex {
             let packed: Vec<PackedAssertion> = asserts
                 .iter()
                 .map(|(a, o)| {
-                    // §7.1: `b` carries the value_hash for Attr; we use a
-                    // zero SipHash key here. R6 will wire the per-pool
-                    // value-spill table's key.
+                    // INDEX-DESIGN§2.1: `b` carries the value_hash for Attr; we use a
+                    // zero SipHash key here. ENCRYPTION6 will wire the per-pool
+                    // secret.
                     let h = match a {
                         Assertion::Attr { value, .. } => value_hash(value, &[0u8; 16]),
                         _ => 0,
@@ -660,7 +660,7 @@ impl ForwardIndex {
 
 // ---------- ForwardOverflowRegion + chain helpers ----------
 
-/// Per IMPL §7.2: number of `PackedAssertion`s a single overflow region
+/// Per INDEX-DESIGN§2.2: number of `PackedAssertion`s a single overflow region
 /// can hold. With `PackedAssertion = 16 B` and the trailing `next_page`
 /// BlockRef occupying the last 16 B of a 256 KiB region, the body fits
 /// `(262 144 − 64 − 16) / 16 = 16 379` entries.
@@ -814,7 +814,7 @@ fn read_overflow_chain<D: BlockDevice>(
 }
 
 /// Construct a `BlockRef` pointing at the 4 KiB block whose byte offset
-/// is `byte_offset`. `generation = 1` is the R1c-D1 placeholder; D3 will
+/// is `byte_offset`. `generation = 1` is a placeholder; ENGINE3 will
 /// bump generation per allocation.
 fn block_ref_at(byte_offset: u64) -> BlockRef {
     BlockRef {
@@ -827,11 +827,11 @@ fn block_ref_at(byte_offset: u64) -> BlockRef {
 
 // ---------- ForwardIndexKey / ForwardIndexValue (B+ tree wire types) ----------
 
-/// B+ tree key for the forward index: `(oid, snapshot)` per IMPL §11.2.
+/// B+ tree key for the forward index: `(oid, snapshot)` per SNAPSHOTS-DESIGN§1.2.
 ///
-/// Snapshots are deferred to R6 so every key written today carries
+/// Snapshots are deferred to SNAPSHOT2 so every key written today carries
 /// `snapshot = 0`; the field is on-disk now so the layout doesn't break
-/// when R6 lands.
+/// when SNAPSHOT2 lands.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
 )]
@@ -871,7 +871,7 @@ impl PackableKey for ForwardIndexKey {
     }
 }
 
-/// B+ tree value for the forward index: the §7.1 `LeafEntry` value tail —
+/// B+ tree value for the forward index: the INDEX-DESIGN§2.1 `LeafEntry` value tail —
 /// 2 B `header` followed by either an inline `[PackedAssertion; total]`
 /// body or a 16 B spill `BlockRef`. Stored as raw bytes so the packed
 /// codec can write the variable-length tail directly.
@@ -1101,7 +1101,7 @@ mod tests {
 
     #[test]
     fn forward_index_would_spill_at_threshold_plus_one() {
-        // IMPL §7.2: spill kicks in for >8 assertions.
+        // INDEX-DESIGN§2.2: spill kicks in for >8 assertions.
         let mut fi = ForwardIndex::new();
         for i in 0..LEAF_ENTRY_INLINE_SPILL_THRESHOLD as u32 {
             fi.add_assertion(oid(1), Assertion::Tag(tag(i)), TagOrigin::Direct);
@@ -1167,12 +1167,12 @@ mod tests {
         assert_eq!(fi.object_count(), 0);
     }
 
-    // ----- B+ tree region round-trip (R1c-A3.2 native path) -----
+    // ----- B+ tree region round-trip (native path) -----
 
     use mimisbrunnr_storage::FileBlockDevice;
     use tempfile::TempDir;
 
-    // Test layout: directory at offset 0 (256 KiB §1.5 region); overflow
+    // Test layout: directory at offset 0 (256 KiB BTREE-DESIGN§1 region); overflow
     // area starts at 256 KiB with capacity for 8 regions (2 MiB worth).
     // Device is 8 MiB, comfortably more than the layout needs.
     const TEST_DIR_OFFSET: u64 = 0;

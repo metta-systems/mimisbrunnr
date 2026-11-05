@@ -9,14 +9,14 @@ pub enum QueryError {
     /// requested index can't service. Today this is only `Contains` (until a
     /// substring index lands) — `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, and
     /// `Prefix` are all serviceable.
-    #[error("comparison operator `{op}` is not yet supported (TODO(rewrite-phase-N))")]
+    #[error("comparison operator `{op}` is not yet supported (TODO(QUERY1))")]
     UnsupportedCmpOp { op: &'static str },
 
     /// The bitmap encoding only carries the low 32 bits of an `ObjectId`; if
     /// the engine ever asks for an `ObjectId` whose local sequence exceeds
     /// `u32::MAX` we surface this rather than silently aliasing two IDs.
     #[error(
-        "ObjectId local sequence {local} exceeds 32 bits (TODO(rewrite-phase-N): wider bitmap)"
+        "ObjectId local sequence {local} exceeds 32 bits (TODO(INDEX5): wider bitmap)"
     )]
     ObjectIdTooLarge { local: u64 },
 

@@ -1,6 +1,6 @@
 //! [`Exporter`] — turn a [`PathProjection`] + a list of object ids into a
 //! materialisation plan, then optionally execute it against a host directory
-//! (DESIGN §12.4).
+//! (SPECIFICATION-DESIGN§12.4).
 //!
 //! Planning is pure: it only reads the projection and returns a `Vec<ExportEntry>`.
 //! Execution is the only place this crate writes to disk; the engine layer

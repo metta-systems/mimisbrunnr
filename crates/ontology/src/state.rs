@@ -1,18 +1,18 @@
 //! [`OntologyState`] — the live registry plus install / upgrade / scrub /
-//! policy-resolution machinery (DESIGN §3.5, §4.4–§4.6).
+//! policy-resolution machinery (SPECIFICATION-DESIGN§3.5, SPECIFICATION-DESIGN§4.4–§4.6).
 //!
-//! ## Persistence (IMPL §10.1)
+//! ## Persistence (ONTOLOGY-DESIGN§1)
 //!
 //! The ontology is fully loaded into memory at mount and rewritten as a
 //! single coherent [`OntologyImage`] (CBOR) on every checkpoint. On disk
-//! the image lives as one sorted-run entry per snapshot inside the §1.5
+//! the image lives as one sorted-run entry per snapshot inside the BTREE-DESIGN§1
 //! B+ tree region of [`BtreeKind::Ontology`] — `RootPointer.ontology_root`
 //! points at this region directly (no 4 KiB envelope block).
 //!
 //! Updates are batch-shaped (rare; one update touches many tags and
 //! relations at once), so the on-disk form is optimised for batch rewrite
 //! and compact serialised size — not per-element disk-resident lookup.
-//! See `docs/IMPLEMENTATION.md` §10.1 for the rationale.
+//! See ONTOLOGY-DESIGN§1 (`doc/agentic/ontology-design.md`) for the rationale.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -31,7 +31,7 @@ use crate::{
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
-#[allow(dead_code)] // consumed by engine layout once R1b lands engine-side.
+#[allow(dead_code)] // not yet consumed by the engine layout.
 pub const ONTOLOGY_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
@@ -61,7 +61,7 @@ pub struct OntologyState {
     pub names: HashMap<String, TagId>,
     pub dag: ImplicationDag,
     /// Tag-to-tag relations carrying `MutuallyExclusive` / `Requires` /
-    /// `Alias` semantics (DESIGN §3.2). `ImpliedBy` relations are folded
+    /// `Alias` semantics (SPECIFICATION-DESIGN§3.2). `ImpliedBy` relations are folded
     /// into `dag` and `TagDefinition.implies` rather than stored here.
     pub relations: Vec<(TagId, TagRelation, TagId)>,
     pub installed_modules: HashMap<ModuleId, ModuleRecord>,
@@ -72,7 +72,7 @@ impl OntologyState {
         Self::default()
     }
 
-    /// Install a module. Performs DESIGN §3.5's static invariant check before
+    /// Install a module. Performs SPECIFICATION-DESIGN§3.5's static invariant check before
     /// committing — refuses install on conflict, leaving state untouched.
     pub fn install(
         &mut self,
@@ -108,7 +108,7 @@ impl OntologyState {
         let mut tags_skipped = 0usize;
         let mut newly_registered_tags: Vec<TagId> = Vec::new();
 
-        // Phase 1: register tags. Skip if name already exists.
+        // Step 1: register tags. Skip if name already exists.
         for def in module.tags {
             if let Some(&existing) = self.names.get(&def.name) {
                 tags_skipped += 1;
@@ -125,7 +125,7 @@ impl OntologyState {
             newly_registered_tags.push(id);
         }
 
-        // Phase 2: add implications by name.
+        // Step 2: add implications by name.
         let mut implications_added = 0usize;
         let mut module_implications: Vec<(TagId, TagId)> = Vec::new();
         for (from_name, to_name) in module.implications {
@@ -140,7 +140,7 @@ impl OntologyState {
             self.dag.add_implication(from, to)?;
             module_implications.push((from, to));
             implications_added += 1;
-            // Also record on the TagDefinition for symmetry with DESIGN §3.1.
+            // Also record on the TagDefinition for symmetry with SPECIFICATION-DESIGN§3.1.
             if let Some(def) = self.tags.get_mut(&from)
                 && !def.implies.contains(&to)
             {
@@ -148,7 +148,7 @@ impl OntologyState {
             }
         }
 
-        // Phase 3: add tag-to-tag relations (mutex / requires / alias).
+        // Step 3: add tag-to-tag relations (mutex / requires / alias).
         // `ImpliedBy` would duplicate the dag edges built in phase 2 and is
         // rejected. References must resolve to known tag names.
         let mut module_relations: Vec<(TagId, TagRelation, TagId)> = Vec::new();
@@ -173,7 +173,7 @@ impl OntologyState {
             module_relations.push(edge);
         }
 
-        // Phase 4: static invariant — every storage axis must form a chain
+        // Step 4: static invariant — every storage axis must form a chain
         // among its declaring tags.
         self.check_axis_invariant()?;
 
@@ -196,7 +196,7 @@ impl OntologyState {
         })
     }
 
-    /// Upgrade a previously installed module to a new version (DESIGN §4.5).
+    /// Upgrade a previously installed module to a new version (SPECIFICATION-DESIGN§4.5).
     /// The diff is "safe-only": new tags and new implications are added.
     /// Removed tags / changed semantics require an explicit migration path
     /// not yet implemented; we error rather than silently destroy data.
@@ -279,7 +279,7 @@ impl OntologyState {
         }
     }
 
-    /// Remove a module (DESIGN §4.6 `RemoveUnique` policy). Tags exclusive to
+    /// Remove a module (SPECIFICATION-DESIGN§4.6 `RemoveUnique` policy). Tags exclusive to
     /// this module are removed; tags also registered by another installed
     /// module are kept. Implications added by this module are removed iff
     /// they aren't reproduced by another installed module's record.
@@ -346,7 +346,7 @@ impl OntologyState {
     }
 
     /// Resolve effective storage policy for an object given its tag set
-    /// (DESIGN §3.5). For each axis, picks the unique most-derived tag
+    /// (SPECIFICATION-DESIGN§3.5). For each axis, picks the unique most-derived tag
     /// declaring it; falls back to `default` per axis.
     pub fn resolve_policy(&self, object_tags: &[TagId], default: &StoragePolicy) -> StoragePolicy {
         let mut chunking = default.chunking;
@@ -418,7 +418,7 @@ impl OntologyState {
         declaring.into_iter().min()
     }
 
-    /// DESIGN §3.5 static invariant — for each axis, every pair of
+    /// SPECIFICATION-DESIGN§3.5 static invariant — for each axis, every pair of
     /// directly-declaring tags must form a chain in the implication DAG.
     fn check_axis_invariant(&self) -> Result<(), OntologyError> {
         type AxisPredicate = fn(&StoragePolicy) -> bool;
@@ -472,10 +472,10 @@ impl OntologyState {
     }
 
     // ---------------------------------------------------------------------
-    // CBOR persistence (IMPL §10.1).
+    // CBOR persistence (ONTOLOGY-DESIGN§1).
     // ---------------------------------------------------------------------
 
-    /// Serialise to a standalone CBOR(OntologyImage) blob (no §1.5 framing).
+    /// Serialise to a standalone CBOR(OntologyImage) blob (no BTREE-DESIGN§1 framing).
     /// Useful for tooling and tests; the on-disk path goes through
     /// [`Self::flush_to_region`].
     pub fn serialise(&self) -> Result<Vec<u8>, OntologyError> {
@@ -494,8 +494,8 @@ impl OntologyState {
     }
 
     // ----------------------------------------------------------------
-    // §1.5 region persistence (IMPL §10.1) — one CBOR(OntologyImage)
-    // sorted-run entry per snapshot. R6 will populate non-zero
+    // BTREE-DESIGN§1 region persistence (ONTOLOGY-DESIGN§1) — one CBOR(OntologyImage)
+    // sorted-run entry per snapshot. SNAPSHOT2 will populate non-zero
     // snapshots; today every write goes under `snapshot = 0`.
     // ----------------------------------------------------------------
 
@@ -585,8 +585,8 @@ impl OntologyState {
 /// changes; readers refuse newer versions they don't recognise.
 pub const ONTOLOGY_IMAGE_FORMAT_VERSION: u16 = 1;
 
-/// On-disk image of the ontology (IMPL §10.1). Serialised as the value of
-/// each entry in the [`BtreeKind::Ontology`] §1.5 region keyed by
+/// On-disk image of the ontology (ONTOLOGY-DESIGN§1). Serialised as the value of
+/// each entry in the [`BtreeKind::Ontology`] BTREE-DESIGN§1 region keyed by
 /// `snapshot: u32`, and also as the body of [`OntologyState::serialise`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OntologyImage {
@@ -974,7 +974,7 @@ mod tests {
         assert_eq!(resolved.compression, Some(CompressionAlgo::Zstd(9)));
     }
 
-    // ----- B+ tree region round-trip (R1b-8) -----
+    // ----- B+ tree region round-trip -----
 
     use {mimisbrunnr_storage::FileBlockDevice, tempfile::TempDir};
 

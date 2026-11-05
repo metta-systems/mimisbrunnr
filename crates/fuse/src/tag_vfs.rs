@@ -1,6 +1,6 @@
 //! [`TagVfs`] — read-only tag/path VFS over the engine's in-memory mirrors.
 //!
-//! See `docs/DESIGN.md` §12.6 for the mount layout and the faceted-refinement
+//! See SPECIFICATION-DESIGN§12.6 (`doc/agentic/specification-design.md`) for the mount layout and the faceted-refinement
 //! algorithm under `/tags/`. Everything here is **derived** state; nothing is
 //! persisted.
 //!
@@ -26,7 +26,7 @@ use crate::attr::VfsAttr;
 use crate::entry::{VfsEntry, VfsEntryKind};
 use crate::inode::{INODE_CTX_ROOT, INODE_FIRST_DYNAMIC, INODE_ROOT, INODE_TAGS_ROOT, InodeId};
 
-/// Read-only tag/path VFS (DESIGN §12.6).
+/// Read-only tag/path VFS (SPECIFICATION-DESIGN§12.6).
 ///
 /// Holds shared references into the engine's in-memory mirrors plus a
 /// session-local inode table. Borrows are split into immutable (the
@@ -36,7 +36,7 @@ use crate::inode::{INODE_CTX_ROOT, INODE_FIRST_DYNAMIC, INODE_ROOT, INODE_TAGS_R
 pub struct TagVfs<'a> {
     /// Tag inverted index — primary source for `HasTag`, faceted refinement.
     pub tag_index: &'a TagIndex,
-    /// KV equality index (kept for parity; not used in Phase 5b but listed
+    /// KV equality index (kept for parity; not used yet but listed
     /// in the spec so the engine can reuse the same handle when it adds
     /// attribute-driven views).
     pub kv_index: &'a KvIndex,
@@ -601,7 +601,7 @@ impl<'a> TagVfs<'a> {
 /// they pack object ids into roaring bitmaps. See `mimisbrunnr_query`'s
 /// module docs for the rationale.
 ///
-/// TODO(rewrite-phase-N): the 32-bit truncation is a shared limitation; this
+/// TODO(INDEX5): the 32-bit truncation is a shared limitation; this
 /// will lift when the bitmap representation widens.
 fn low32_of(oid: ObjectId) -> u32 {
     (oid.local_seq() & 0xffff_ffff) as u32

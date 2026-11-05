@@ -1,10 +1,10 @@
-//! Bucket allocator — IMPL §12.1, §12.2, §12.3, §12.5.
+//! Bucket allocator — ALLOCATION-DESIGN§1.1, ALLOCATION-DESIGN§1.2, ALLOCATION-DESIGN§1.3, ALLOCATION-DESIGN§1.5.
 //!
 //! Wraps a [`BucketAllocTable`] with the `(alloc, free, deref)`
 //! operations the engine needs to land trees in real allocated buckets
 //! instead of the pre-R1c fixed-offset index zone layout.
 //!
-//! ## Allocation model (R1c-D2 — first pass)
+//! ## Allocation model (first pass)
 //!
 //! - Linear scan for a `BucketDataType::Free` bucket; bump its
 //!   `generation`, stamp the requested `data_type`, return a
@@ -15,18 +15,18 @@
 //!   [`StorageError::StaleBlockRef`].
 //!
 //! Linear scan is O(N) per alloc; acceptable for ≤ 1 M buckets (typical
-//! dev pool). The freespace LRU fast path (§12.4,
-//! [`crate::freespace`]) supersedes this in Tier 3 (E2).
+//! dev pool). The freespace LRU fast path (ALLOCATION-DESIGN§1.4,
+//! [`crate::freespace`]) supersedes this in ALLOCATION5.
 //!
 //! ## Region allocation
 //!
 //! Many B+ tree regions are 256 KiB — exactly the size of a 256 KiB
-//! bucket, but **smaller** than the default 1 MiB bucket. Spec §1.5.5:
+//! bucket, but **smaller** than the default 1 MiB bucket. Spec BTREE-DESIGN§1.5:
 //! "A 256 KiB node in a 1 MiB bucket means **4 nodes per bucket**".
-//! For Tier 1 D2 we accept one region per bucket (sub-bucket packing
-//! is Tier 3 D3) — one bucket = one B+ tree region.
+//! For now we accept one region per bucket (sub-bucket packing
+//! is ALLOCATION1) — one bucket = one B+ tree region.
 //!
-//! TODO(rewrite-phase-R1c-D3): pack 4 × 256 KiB regions per 1 MiB
+//! TODO(ALLOCATION1): pack 4 × 256 KiB regions per 1 MiB
 //! bucket via [`BucketAllocator::alloc_region`] returning sub-extents.
 
 use {
@@ -45,7 +45,7 @@ use {
 /// Borrows the table mutably; callers create one allocator per
 /// engine-mutation scope and drop it when done. The persisted state
 /// lives in `BucketAllocTable` and is round-tripped via the standard
-/// §1.5 B+ tree region (today; per-disk roots in Tier 3).
+/// BTREE-DESIGN§1 B+ tree region (today; per-disk roots in ALLOCATION4).
 pub struct BucketAllocator<'a> {
     table: &'a mut BucketAllocTable,
     bucket_size_log2: u8,
@@ -210,8 +210,8 @@ impl<'a> BucketAllocator<'a> {
         Ok(())
     }
 
-    /// Validate that `block_ref` still refers to a live extent. IMPL
-    /// §12.3 dereference protocol. Returns
+    /// Validate that `block_ref` still refers to a live extent.
+    /// ALLOCATION-DESIGN§1.3 dereference protocol. Returns
     /// [`StorageError::StaleBlockRef`] if the bucket's current
     /// generation doesn't match.
     pub fn validate(&self, block_ref: &BlockRef) -> Result<(), StorageError> {
@@ -244,7 +244,7 @@ impl<'a> BucketAllocator<'a> {
 
     /// Seed the freelist at format time: every bucket past
     /// `first_usable_bucket` gets a `(generation = 1, Free)` entry.
-    /// IMPL §12.1 line 2578: "bootstrap_buckets pins the leading
+    /// ALLOCATION-DESIGN§1.1 line 2578: "bootstrap_buckets pins the leading
     /// buckets used for the superblock, WAL header, and the root pages
     /// of the alloc table itself; these are excluded from the
     /// freespace LRU".

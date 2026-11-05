@@ -1,5 +1,5 @@
 //! [`Importer`] — walk a host filesystem subtree and produce a stream of
-//! [`ImportEntry`]s ready for the engine layer to ingest (DESIGN §12.5).
+//! [`ImportEntry`]s ready for the engine layer to ingest (SPECIFICATION-DESIGN§12.5).
 //!
 //! Side-effect-only operations (filesystem reads); does **not** create
 //! Mímisbrunnr objects, hash blobs, or assert tags. Those concerns live in
@@ -28,8 +28,8 @@ pub enum ImportKind {
     /// Symbolic link with its raw target. The target is the literal contents
     /// of the link, not a resolved path.
     Symlink(PathBuf),
-    /// Directory. Mímisbrunnr does not store directory objects (DESIGN
-    /// §12.2), but the entry is emitted so callers that want to mirror an
+    /// Directory. Mímisbrunnr does not store directory objects
+    /// (SPECIFICATION-DESIGN§12.2), but the entry is emitted so callers that want to mirror an
     /// empty tree can still see them.
     Directory,
 }

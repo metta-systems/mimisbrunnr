@@ -1,4 +1,4 @@
-//! `RootPointer`, `BlockRef`, `BlobRef`. IMPL §2.2.
+//! `RootPointer`, `BlockRef`, `BlobRef`. ENGINE-DESIGN§1.2.
 
 use {
     bytemuck::{Pod, Zeroable},
@@ -37,7 +37,7 @@ const_assert_eq!(core::mem::size_of::<BlobRef>(), 16);
 
 // ---------- RootPointer ----------
 
-/// 408-byte root pointer. IMPL §2.2.
+/// 408-byte root pointer. ENGINE-DESIGN§1.2.
 ///
 /// Holds two scalars (`seq`, `lsn`), 24 `BlockRef` slots, a `flags` word and
 /// a trailing CRC32C over bytes `[0..404]`.
@@ -118,7 +118,7 @@ impl BlockRef {
 
     /// Generation check: the pointer is fresh iff its `generation` matches
     /// the bucket's current generation. Returns `true` when fresh.
-    /// IMPL §12.3.
+    /// ALLOCATION-DESIGN§1.3.
     pub fn dereference_check(&self, alloc: &crate::alloc::BucketAllocEntry) -> bool {
         let bucket_gen = { alloc.generation } as u64;
         let ref_gen = { self.generation };

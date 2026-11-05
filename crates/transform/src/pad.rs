@@ -1,4 +1,4 @@
-//! Sector-alignment padding (DESIGN §9.1, step 3).
+//! Sector-alignment padding (SPECIFICATION-DESIGN§9.1, step 3).
 //!
 //! Block-cipher modes used for on-disk encryption — XTS in particular —
 //! operate on fixed-size sectors. The padder zero-extends a buffer in

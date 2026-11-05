@@ -1,4 +1,4 @@
-//! `KvDirectory` 4 KiB block — IMPL §9.1.
+//! `KvDirectory` 4 KiB block — INDEX-DESIGN§4.1.
 //!
 //! ```text
 //! [0..32]    BlockHeader  (kind = KvHashDirectory, magic = "MIMR")
@@ -15,11 +15,11 @@
 //!
 //! The inline `entries` array is sufficient for `global_depth ≤ 7`
 //! (i.e. ≤ 128 hash buckets). At `global_depth ≥ 8`, `spillover_root`
-//! points at a §1.5 large-node positional region
+//! points at a BTREE-DESIGN§1 large-node positional region
 //! (`BtreeKind::KvDirectory`, level 0) holding the full
 //! `2^global_depth`-sized `BlockRef[]` array.
 //!
-//! ## R1c-A1 scope
+//! ## Scope
 //!
 //! - **Inline directory only.** `global_depth ≤ 7` enforced by writers;
 //!   spillover is unimplemented (returns
@@ -27,7 +27,7 @@
 //! - **Cap on bucket count.** With the engine's current 256 KiB
 //!   `kv_index_root` region serving as a slot pool for both directory,
 //!   buckets, and bitmap pages, the practical `global_depth` cap is
-//!   ~4 (16 buckets) until Tier 3 D3 lands sub-bucket allocation and
+//!   ~4 (16 buckets) until INDEX4 (after ALLOCATION1) lands sub-bucket allocation and
 //!   moves bucket pages into the bucket allocator's pool.
 
 use {
@@ -98,7 +98,7 @@ pub enum KvDirectoryError {
 
     #[error(
         "global_depth {0} exceeds inline cap {KV_DIRECTORY_MAX_INLINE_DEPTH}; \
-         spillover is not yet implemented (R1c-A1)"
+         spillover is not yet implemented"
     )]
     SpilloverUnsupported(u8),
 

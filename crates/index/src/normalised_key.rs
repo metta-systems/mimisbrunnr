@@ -1,5 +1,5 @@
 //! Order-preserving 16-byte encoding of [`Value`] for the range B+ tree
-//! (IMPL §9.2).
+//! (INDEX-DESIGN§4.2).
 //!
 //! Layout (always 16 bytes):
 //!
@@ -9,7 +9,7 @@
 //! ```
 //!
 //! The leading type tag enforces inter-type ordering ("Int < Text" etc.)
-//! exactly as IMPL §9.2 prescribes ("values of different types are ordered by
+//! exactly as INDEX-DESIGN§4.2 prescribes ("values of different types are ordered by
 //! type-tag prefix"). Within a single type the trailing 15 bytes are
 //! lexicographically comparable as raw `[u8; 16]` and reproduce the natural
 //! ordering for that variant.
@@ -43,7 +43,7 @@ pub struct NormalisedKey(pub [u8; NORMALISED_KEY_LEN]);
 impl NormalisedKey {
     /// Build a normalised key from `value`. Long strings/blobs are truncated
     /// to the first 13 bytes; the trailing length byte and continuation flag
-    /// disambiguate prefixes per IMPL §9.2.
+    /// disambiguate prefixes per INDEX-DESIGN§4.2.
     pub fn from_value(value: &Value) -> Self {
         let mut out = [0u8; NORMALISED_KEY_LEN];
         match value {
@@ -94,7 +94,7 @@ impl NormalisedKey {
                 // Scoped: leading type tag, then 4-byte context, then a
                 // truncated 11-byte slice of the inner value's normalised
                 // key payload. This gives prefix scans over a single
-                // context. (Spec §9.2 covers the analogous range-index
+                // context. (Spec INDEX-DESIGN§4.2 covers the analogous range-index
                 // shape; this `NormalisedKey` is a compact in-memory mirror
                 // sufficient for the in-memory `RangeIndex` we ship in this
                 // phase.)

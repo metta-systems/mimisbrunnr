@@ -48,28 +48,28 @@ pub enum IndexError {
     Storage(#[from] StorageError),
 
     /// Flush attempted on a `TagStore` variant whose native on-disk shape
-    /// (§8.3 OrderedStore / RankedStore root blocks) isn't implemented
-    /// yet. A3.3 ships Simple-only; A3.4/A3.5 will lift this.
+    /// (INDEX-DESIGN§3.3 OrderedStore / RankedStore root blocks) isn't implemented
+    /// yet. Only Simple persists; INDEX2 / INDEX3 will lift this.
     #[error("tag store kind {0} is not yet supported by the native flush path")]
     UnsupportedStoreKind(u8),
 
     /// A tag's membership bitmap holds > 2³² entries and can't fit the
-    /// 32-bit `cardinality` slot in `TagIndexLeafEntry` (§8.1).
+    /// 32-bit `cardinality` slot in `TagIndexLeafEntry` (INDEX-DESIGN§3.1).
     #[error("tag cardinality {0} exceeds u32::MAX")]
     CardinalityOverflow(u64),
 
     /// Tag-bitmap-page chain ran beyond the bitmap-area cap (smoke-test
-    /// scale: 1 024 pages per A3.3 layout).
+    /// scale: 1 024 pages in the fixed tag bitmap area).
     #[error("tag bitmap area exhausted: needed page slot {needed}, cap {cap}")]
     BitmapAreaExhausted { needed: usize, cap: usize },
 
-    /// A `ForwardOverflow` chain (§7.2) terminated unexpectedly — either
+    /// A `ForwardOverflow` chain (INDEX-DESIGN§2.2) terminated unexpectedly — either
     /// `next_page` was zeroed mid-chain or a region's `payload_used`
     /// disagreed with the leaf entry's `total` slot.
     #[error("forward-overflow chain corrupt: {0}")]
     CorruptOverflowChain(&'static str),
 
-    /// Forward-overflow region area ran beyond its cap (R1c-A3.2 layout).
+    /// Forward-overflow region area ran beyond its cap (fixed-offset area until ENGINE4).
     #[error("forward overflow area exhausted: needed region slot {needed}, cap {cap}")]
     OverflowAreaExhausted { needed: usize, cap: usize },
 }
