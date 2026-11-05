@@ -15,6 +15,8 @@ disk_bytes  := "134217728"  # 128 MiB per disk
 fuse_dir    := justfile_directory() / "crates" / "types"
 fuse_ctx    := "mimisbrunnr-types-src"
 fuse_mount  := "/tmp/mbrunnr-test"
+# Extra mount options, e.g. `just fuse_opts="-o backend=fskit" demo-fuse`.
+fuse_opts   := ""
 mimir       := "cargo run --quiet --bin mimir -- --pool " + pool_toml
 brunnr      := "cargo run --quiet --bin brunnr --"
 brunnr_fuse := "cargo run --quiet --features brunnr/fuse --bin brunnr --"
@@ -183,7 +185,7 @@ demo-fuse: build pool-create ontology-setup populate-objects import-source && de
     # - `RUST_LOG=mimisbrunnr_fuse=trace` — just FUSE calls
     # - `RUST_LOG=mimisbrunnr_storage::file_device=trace` — just physical I/O
     # Mount it as a FUSE filesystem
-    -env RUST_LOG=trace,mimisbrunnr_fuse=info,fuser=info {{brunnr_fuse}} mount-unix "{{fuse_mount}}" --config "{{pool_toml}}" --context {{fuse_ctx}}
+    -env RUST_LOG=trace,mimisbrunnr_fuse=info,fuser=info {{brunnr_fuse}} mount-unix "{{fuse_mount}}" --config "{{pool_toml}}" --context {{fuse_ctx}} {{fuse_opts}}
 
 # Unmount after exiting FUSE driver
 demo-fuse-unmount:

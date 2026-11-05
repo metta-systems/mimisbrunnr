@@ -380,6 +380,7 @@ pub fn cmd_mount(
     config_path: &Path,
     mountpoint: &Path,
     context: Option<&str>,
+    mount_options: &[String],
 ) -> Result<(), BrunnrError> {
     use mimisbrunnr_fuse::{ContentProvider, MimisbrunnrFs, MountRoot, TagVfs};
 
@@ -439,10 +440,73 @@ pub fn cmd_mount(
         });
     let fs: MimisbrunnrFs<'static> = MimisbrunnrFs::new_with_root(tag_vfs, content, mount_root);
 
-    let mount_config = fuser::Config::default();
-    fuser::mount2(fs, mountpoint, &mount_config)
-        .map_err(|e| BrunnrError::Mount(e.to_string()))?;
+    let mut mount_config = fuser::Config::default();
+    mount_config.mount_options = mount_options
+        .iter()
+        .map(|option| fuser::MountOption::CUSTOM(option.clone()))
+        .collect();
+
+    let kernel_device_present = Path::new(MACFUSE_KERNEL_DEVICE).exists();
+    log::info!(
+        "fuse mount: mountpoint={} canonical={:?} options={:?} macfuse_kernel_device={}",
+        mountpoint.display(),
+        std::fs::canonicalize(mountpoint).ok(),
+        mount_options,
+        kernel_device_present,
+    );
+
+    fuser::mount2(fs, mountpoint, &mount_config).map_err(|error| {
+        log::debug!(
+            "fuser::mount2 failed: kind={:?} raw_os_error={:?} error={error}",
+            error.kind(),
+            error.raw_os_error()
+        );
+        let hint = if cfg!(target_os = "macos") {
+            macfuse_mount_hint(kernel_device_present, mount_options, mountpoint)
+        } else {
+            String::new()
+        };
+        BrunnrError::Mount(format!("{error}{hint}"))
+    })?;
     Ok(())
+}
+
+/// Device node macFUSE's kernel extension creates once it is loaded.
+#[cfg(feature = "fuse")]
+const MACFUSE_KERNEL_DEVICE: &str = "/dev/macfuse0";
+
+/// Likely causes of a macFUSE mount failure. macFUSE's libfuse reports a
+/// failed `mount_macfuse` without an errno, which fuser turns into
+/// "Unspecified Error", so the cause has to be guessed from the host state.
+#[cfg(feature = "fuse")]
+pub fn macfuse_mount_hint(
+    kernel_device_present: bool,
+    mount_options: &[String],
+    mountpoint: &Path,
+) -> String {
+    let uses_fskit = mount_options
+        .iter()
+        .any(|option| option.split(',').any(|part| part == "backend=fskit"));
+    let mut hint = String::new();
+    if uses_fskit {
+        hint.push_str(
+            "\n  hint: FSKit backend requested; enable macFUSE under System Settings → General → \
+             Login Items & Extensions → File System Extensions",
+        );
+        if !mountpoint.starts_with("/Volumes") {
+            hint.push_str(
+                "\n  hint: the FSKit backend may only mount under /Volumes; try a mountpoint there",
+            );
+        }
+    } else if !kernel_device_present {
+        hint.push_str(&format!(
+            "\n  hint: macFUSE kernel extension is not loaded ({MACFUSE_KERNEL_DEVICE} missing); \
+             run /Library/Filesystems/macfuse.fs/Contents/Resources/load_macfuse to see why, \
+             re-allow it in System Settings → Privacy & Security after a macOS update, \
+             or try the FSKit backend with `-o backend=fskit`"
+        ));
+    }
+    hint
 }
 
 #[cfg(not(feature = "fuse"))]
@@ -450,6 +514,7 @@ pub fn cmd_mount(
     _config_path: &Path,
     _mountpoint: &Path,
     _context: Option<&str>,
+    _mount_options: &[String],
 ) -> Result<(), BrunnrError> {
     Err(BrunnrError::FuseNotEnabled)
 }
@@ -776,7 +841,28 @@ mod tests {
     #[test]
     fn mount_without_fuse_feature_errors() {
         let tmp = TempDir::new().unwrap();
-        let err = cmd_mount(tmp.path(), tmp.path(), None).unwrap_err();
+        let err = cmd_mount(tmp.path(), tmp.path(), None, &[]).unwrap_err();
         assert!(matches!(err, BrunnrError::FuseNotEnabled));
+    }
+
+    #[cfg(feature = "fuse")]
+    #[test]
+    fn macfuse_mount_hint_names_likely_cause() {
+        let mountpoint = Path::new("/tmp/mbrunnr-test");
+        let kernel_missing = macfuse_mount_hint(false, &[], mountpoint);
+        assert!(kernel_missing.contains("kernel extension is not loaded"));
+        assert!(kernel_missing.contains("backend=fskit"));
+
+        assert!(macfuse_mount_hint(true, &[], mountpoint).is_empty());
+
+        let fskit_options = ["ro,backend=fskit".to_string()];
+        let fskit_outside_volumes = macfuse_mount_hint(false, &fskit_options, mountpoint);
+        assert!(fskit_outside_volumes.contains("File System Extensions"));
+        assert!(fskit_outside_volumes.contains("/Volumes"));
+        assert!(!fskit_outside_volumes.contains("kernel extension"));
+
+        let fskit_in_volumes =
+            macfuse_mount_hint(false, &fskit_options, Path::new("/Volumes/mbrunnr"));
+        assert!(!fskit_in_volumes.contains("only mount under /Volumes"));
     }
 }

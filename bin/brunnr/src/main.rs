@@ -72,6 +72,11 @@ enum Commands {
     Mount {
         /// Mount point.
         mountpoint: PathBuf,
+
+        /// Extra mount option passed to libfuse, e.g. `-o backend=fskit` or
+        /// `-o debug` (repeatable).
+        #[arg(short = 'o', long = "option")]
+        options: Vec<String>,
     },
 
     /// Mount a single path-context subtree (feature = "fuse").
@@ -86,6 +91,11 @@ enum Commands {
         /// Path-context name to expose.
         #[arg(long)]
         context: String,
+
+        /// Extra mount option passed to libfuse, e.g. `-o backend=fskit` or
+        /// `-o debug` (repeatable).
+        #[arg(short = 'o', long = "option")]
+        options: Vec<String>,
     },
 
     /// Unmount a mountpoint (best-effort, platform-specific).
@@ -111,11 +121,15 @@ fn main() {
             capacity,
         } => commands::cmd_add_disk(&cli.config, &path, &tier, &media, capacity),
         Commands::RemoveDisk { target } => commands::cmd_remove_disk(&cli.config, &target),
-        Commands::Mount { mountpoint } => commands::cmd_mount(&cli.config, &mountpoint, None),
+        Commands::Mount {
+            mountpoint,
+            options,
+        } => commands::cmd_mount(&cli.config, &mountpoint, None, &options),
         Commands::MountUnix {
             mountpoint,
             context,
-        } => commands::cmd_mount(&cli.config, &mountpoint, Some(&context)),
+            options,
+        } => commands::cmd_mount(&cli.config, &mountpoint, Some(&context), &options),
         Commands::Unmount { mountpoint } => commands::cmd_unmount(&mountpoint),
     };
 
