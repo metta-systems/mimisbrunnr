@@ -19,6 +19,10 @@ Design: [engine-design.md](engine-design.md) · Decisions: [engine-decisions.md]
 - [ ] **ENGINE7 — Derive counters at boot.** `next_oid_local` from the object table, `last_applied_lsn` from the latest checkpoint; `next_tag_id` via [ONTOLOGY1](ontology-implementation-plan.md).
 - [ ] **ENGINE8 — Delete the legacy blob.** Remove `IndexBlob`, `INDEX_BLOB_MAGIC`, `LEGACY_CBOR_BLOB_OFFSET`, `read_index_blob`, `apply_index_blob`, `build_index_blob`. Prerequisites: ENGINE6, ENGINE7, [UNIX1](unix-implementation-plan.md), [BLOB6](blob-implementation-plan.md). Acceptance: format, insert tags, objects and a path context, commit, reopen: all state survives with no `MIXI` blob on disk.
 
+## Device target
+
+- [ ] **ENGINE10 — `no_std` engine.** The engine and the crates below it build for `aarch64-unknown-none-softfloat` with default features off: `#![no_std]` + `alloc`, `hashbrown` or `BTreeMap` for `HashMap`, dependencies with `default-features = false`, `FileBlockDevice`, `PoolConfig` TOML, the module TOML loader and `petgraph` behind `std`. A single-disk pool opens from a `BlockDevice` and its superblock without `pool.toml`, through an offset view when the pool lives in a partition. A `just` recipe builds the `no_std` set. Prerequisites: OPERATIONS-D4, [BLOB2](blob-implementation-plan.md). Acceptance: a host test builds a partitioned SD-card image, writes `doom1.wad` into the pool partition with the `std` tools, opens it through the `no_std` API over a 512-byte-sector `BlockDevice` and reads the exact bytes by query.
+
 ## Zone growth
 
 - [ ] **ENGINE9 — `ZoneMap` continuation chain.** When a zone exceeds the extents one `ZoneMap` block holds, chain a follow-on block through `BLOCK_FLAG_CONTINUATION` and walk the chain at mount (ENGINE-DESIGN§1.1). Acceptance: a zone grown past one block's extent capacity resolves every extent after reopen.

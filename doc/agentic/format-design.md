@@ -33,18 +33,13 @@ Goals:
 ### 1.1 Byte order, alignment, packing
 
 - All multi-byte integers are **little-endian**.
-- All fixed-size on-disk structs are `#[repr(C)]` (or `#[repr(C, packed)]` — see below), with
-  `Pod + Zeroable` from `bytemuck`. This permits `bytemuck::cast_slice` over an mmapped region
-  for zero-copy traversal.
-- `#[repr(C, packed)]` is the **common form** in this document. Every field is placed at an
-  offset chosen by hand and documented inline (e.g. `// [12..20]`); explicit `_pad` arrays
-  fill any gaps. Because the layout is already aligned by construction, `packed` strips
-  Rust's implicit padding without changing the byte image and without introducing unaligned
-  loads in practice — readers either `bytemuck::cast` whole records (which copies the bytes
-  into an aligned local) or read individual fields via `read_unaligned` on platforms that
-  need it. `#[repr(C)]` (no `packed`) is used when the struct is large and accessed
-  field-at-a-time (e.g. `ObjectRecord`, `TagDirectory` leaf entries) so the compiler can
-  emit aligned loads on hot paths.
+- All fixed-size on-disk structs are `#[repr(C)]` with `Pod + Zeroable` from `bytemuck`, never
+  `packed`. Every field sits at an offset that is a multiple of its own size, chosen by hand and
+  documented inline (e.g. `// [12..20]`); explicit `_pad` arrays fill any gaps, so the compiler
+  inserts no padding of its own. A struct's alignment never exceeds the alignment of its offset
+  within the 4 KiB block, so a reader borrows it, or a slice of them, in place from a mapped or
+  read sector (`bytemuck::try_from_bytes`, `try_cast_slice`). Targets that fault on unaligned
+  access (`+strict-align`) read every field with aligned loads.
 - No bit-packed fields cross a byte boundary (use a `u32` flags word, not C bitfields).
 - All structs are sized as a multiple of 8 bytes; explicit `_pad` arrays document tail padding.
 - Strings on disk are UTF-8, length-prefixed (`u16 len`), never NUL-terminated.

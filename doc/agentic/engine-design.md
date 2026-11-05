@@ -15,6 +15,7 @@ The engine orchestrates mutations WAL-first, keeps one long-lived `LoadedNode` p
 - **Commit.** Flush dirty trees (append a run, or compact into a fresh region), write the new `RootPointer`, flip it with `commit_root`, then free the previous copies. A crash before the flip leaves the previous root's regions intact.
 - **No legacy blob.** The `MIXI` CBOR blob is retired: counters are derived at boot (`next_oid_local` from the object table, `next_tag_id` from the ontology, `last_applied_lsn` from the latest checkpoint), path contexts are rebuilt from the forward index, and blob bytes live in the blob zone.
 - **Pools are disposable** until the maintainer declares the format stable: a format change means recreating the pool.
+- **One engine on host and device.** The engine and every crate it depends on build as `no_std` + `alloc` (operations-design "Deployment targets"); file-backed devices, `pool.toml` and other host parts sit behind the `std` feature. A pool opens from a `BlockDevice` alone, and opening replays the WAL in memory on every target, the device included.
 
 ## Invariants
 

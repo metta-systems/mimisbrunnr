@@ -103,6 +103,7 @@ These touch disjoint code and can run whenever their prerequisites hold:
 - **Pool:** [POOL1](pool-implementation-plan.md), [POOL3](pool-implementation-plan.md), [POOL4](pool-implementation-plan.md), [POOL5](pool-implementation-plan.md).
 - **Unix and FUSE:** [UNIX2](unix-implementation-plan.md)–[UNIX6](unix-implementation-plan.md), [UNIX8](unix-implementation-plan.md); [UNIX9](unix-implementation-plan.md) after UNIX-D3; [UNIX10](unix-implementation-plan.md) after BLOB1.
 - **Zone growth:** [ENGINE9](engine-implementation-plan.md).
+- **Device target** (operations-design "Deployment targets"): [SPEC24](specification-implementation-plan.md) any time; [ENGINE10](engine-implementation-plan.md) after OPERATIONS-D4 and BLOB2. [OPERATIONS-D5](operations-decisions.md) decides whether BLOB1 and BLOB2 move ahead of ENGINE3.
 - **Tooling:** [TOOLING3](tooling-implementation-plan.md)–[TOOLING8](tooling-implementation-plan.md); TOOLING3 early, since later end-to-end acceptance criteria use it.
 - **Specification:** [SPEC3](specification-implementation-plan.md)–[SPEC23](specification-implementation-plan.md) as their decisions resolve; SPEC21 (trim struct bodies) scope by scope as code lands.
 - **Blob:** [BLOB7](blob-implementation-plan.md).

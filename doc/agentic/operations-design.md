@@ -19,6 +19,12 @@ Mímisbrunnr is the associative filesystem of the Mettā operating system. Once 
 - **User-mode scope.** System services and end-user applications both use it by default.
 - **Per node.** Each node runs its own instance, is authoritative for its own writes, and converges with peers by exchanging metadata. There is no single cluster-level instance.
 
+### Deployment targets
+
+- **Host** (macOS, Linux): `std`. The `mimir` / `brunnr` tools create pools, write content and inspect them, including pools inside a partition of an SD-card image or device.
+- **Vesper userspace** (Mettā on Raspberry Pi; `aarch64` soft-float, `+strict-align`, `no_std` + `alloc` over an `rlsf` heap): Mímisbrunnr is a library the Vesper filesystem server links. It opens a pool on an SD-card partition through a sector-level `BlockDevice` the server supplies, answers queries and reads content; writing on the device (for example game saves) follows. The server's IPC interface belongs to Vesper.
+- The same library code serves both targets: the engine and the crates below it are `no_std` + `alloc`, with host-only parts (file devices, TOML, CLI, FUSE) behind a default `std` feature.
+
 ### Boundary
 
 **In scope:**
@@ -51,6 +57,7 @@ End-to-end checks that show the target system exists. Each is owned by the plan 
 |---|---|
 | `brunnr create`, `mimir tag`, `mimir query` round-trip returns the expected ObjectId set with no path argument | [TOOLING3](tooling-implementation-plan.md) |
 | An ontology rule on a tag (for example `archive` implies cold tier) re-places matching objects without a separate user action | [POOL2](pool-implementation-plan.md) |
+| A pool written on the host into a partition of an SD-card image is opened by the `no_std` build of the engine over a sector-reading `BlockDevice`, and a query for `doom1.wad` returns its exact bytes | [ENGINE10](engine-implementation-plan.md) |
 | Snapshot create, then a query with that `snapshot_id`, returns the old assertion graph and resolves blob reads from the snapshot | [SNAPSHOT6](snapshots-implementation-plan.md) |
 | Two nodes converge on a shared assertion graph, each authoritative for its own writes, with no global snapshot coordination | [CLUSTER6](cluster-implementation-plan.md) |
 | A node answers a tag query for an object it did not write using only local metadata | [CLUSTER6](cluster-implementation-plan.md) |
@@ -90,14 +97,15 @@ Workspace-level evidence (`just test`, `just clippy`) backs every claim: a regre
 
 | Concern | Choice |
 |---|---|
-| Concurrency | Sync only: `std::thread` and blocking I/O, no async runtime. |
+| Concurrency | Sync only: blocking I/O, no async runtime; `std::thread` only in `std`-gated code. |
+| `std` | Library crates are `#![no_std]` + `alloc`; host-only parts sit behind a default `std` feature. Dependencies are taken with `default-features = false` where they offer it. |
 | Structured on-disk data | CBOR via `ciborium`; deterministic encoding where AEAD authenticates it. |
 | JSON | Never on disk; allowed in CLI output, logs and test fixtures. |
 | TOML | Human-edited configuration only (`pool.toml`, ontology modules). |
 | Content hash | BLAKE3. |
 | Block and sorted-run CRC | CRC32C (`crc32c`). |
 | KV value hash | SipHash-2-4 keyed by the per-pool secret, 64-bit. |
-| Fixed-size on-disk structs | `bytemuck::{Pod, Zeroable}`, `#[repr(C, packed)]` or `#[repr(C)]` as the spec states. |
+| Fixed-size on-disk structs | `bytemuck::{Pod, Zeroable}`, `#[repr(C)]`, naturally aligned. |
 | Bitfields | `bitbybit` + `arbitrary-int`. |
 | Endianness | Little-endian on disk; big-endian hosts are out of scope. |
 | Strings on disk | UTF-8, `u16` length prefix, never NUL-terminated. |
@@ -130,13 +138,13 @@ Logical types live in `mimisbrunnr-types`; each on-disk wire struct lives in the
 
 ## On-disk struct discipline
 
-1. `#[repr(C, packed)]` or `#[repr(C)]` exactly as the spec states.
+1. `#[repr(C)]`, never `packed`; every field at its natural alignment (FORMAT-DESIGN§1.1).
 2. Derive `bytemuck::Pod` and `Zeroable`.
 3. Compile-time size assertion matching the spec (`const _: () = assert!(size_of::<T>() == N);`), mirrored in `validation/`.
 4. Total size a multiple of 8 bytes; tail padding is an explicit `_pad` field.
 5. Field offsets commented inline as `// [a..b]`.
 6. No `transmute`; use `bytemuck::cast`, `cast_slice`, `from_bytes`.
-7. Copy packed multi-byte fields to a local (`let x = { header.field };`) before use.
+7. Borrow fields in place; no `read_unaligned`, no copying fields out to dodge alignment.
 8. Zero-copy and compact (FORMAT-DESIGN goal 1): a reader can borrow the struct, or a slice of them, in place from a mapped or read sector with `bytemuck::try_from_bytes` / `try_cast_slice`; no fixed-shape data on a read hot path goes through CBOR.
 
 Variable-shape data (CBOR values, module manifests, WAL payloads, placement rule parameters) uses `serde` derives with `ciborium`.

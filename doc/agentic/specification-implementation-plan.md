@@ -11,6 +11,7 @@ Section numbers in item titles from SPEC3 on are sections of the system design (
 - [ ] **SPEC21 — Trim implemented struct bodies to byte tables.** For each structure that exists in code with a size assertion and a `validation/` entry, replace the Rust listing in its format section with a field / offset / size / meaning table plus invariants; keep full listings for structures not yet implemented. One scope at a time.
 - [ ] **SPEC22 — Reconcile each scope's summary with its format sections.** The "Selected design" bullets written before the split restate parts of the format sections; cut the overlap so each fact has one home.
 - [ ] **SPEC23 — Merge format conventions with workspace conventions.** FORMAT-DESIGN§1.1–1.4 and the struct-discipline, CRC and magic rules in [operations-design.md](operations-design.md) overlap; keep each rule in one place.
+- [ ] **SPEC24 — No packed on-disk structs.** Every `#[repr(C, packed)]` struct in `crates/` and `validation/` becomes `#[repr(C)]` per FORMAT-DESIGN§1.1; readers borrow fields instead of copying them out; format sections that call a struct packed are corrected. Acceptance: no `packed` in `crates/` or `validation/`; size assertions and `validation/` unchanged; every byte image identical (existing round-trip tests pass unmodified).
 
 ## System design clarity
 
