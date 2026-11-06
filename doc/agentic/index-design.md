@@ -50,13 +50,23 @@ recursive (the inner Value can be any variant *except* another `Scoped` — nest
 format error). The pattern generalises: any attribute can be scoped by any tag, not only the
 unix-path projection use case.
 
-### 1.1 Inlined vs spilled values
+### 1.1 Value table
 
-- Values whose CBOR encoding is ≤ 96 bytes are stored **inline** in the index leaf (KV or B+
-  tree).
-- Values larger than 96 bytes are **spilled**: the index stores `BlobRef { disk_id, block_no,
-  length }` and the value lives as a `BlobZone` extent. The 96-byte threshold matches the size at
-  which a B+ tree leaf can still pack ≥ 16 entries per page.
+Indices identify an attribute value by its `value_hash` (INDEX-DESIGN§1.2): KV entries and
+forward-index assertions carry the hash, never the value. Every distinct value is stored once, in
+the **value table** — a BTREE-DESIGN§1 large-node tree of `BtreeKind::ValueSpill`, rooted at
+`RootPointer.value_spill_root`, keyed by `value_hash`:
+
+- A value whose encoding is ≤ 96 bytes is stored **inline** as the entry's value tail. The
+  96-byte threshold keeps ≥ 16 entries per 4 KiB of leaf.
+- A larger value is stored **out of line**: the entry holds `BlobRef { disk_id, block_no,
+  length }` and the encoding lives as a blob-zone extent.
+
+**The hash is the value's identity.** Writing an attribute computes its `value_hash` and probes
+the value table. No entry: the value is inserted. An entry holding an equal value: it is reused.
+An entry holding a *different* value: the write fails with a defined collision error and changes
+nothing, so a hash names exactly one value pool-wide and no read path compares values. Entries
+that no assertion references any longer are reclaimable; finding them is a background scan.
 
 ### 1.2 Value hash for KV index
 
@@ -234,8 +244,8 @@ equal `BlockRef::zeroed()` for a consistent chain — a mismatch signals format 
   into a fresh region with a single merged sorted run.
 
 For attributes whose actual `Value` matters (not just its hash), the `value_hash` indirects into
-the **value spill table** (a separate B+ tree keyed by `value_hash → CBOR(Value)`), shared with
-the KV index (INDEX-DESIGN§3). Tag and Relation entries are self-contained.
+the value table (INDEX-DESIGN§1.1), shared with the KV index (INDEX-DESIGN§4.1). Tag and Relation
+entries are self-contained.
 
 ### 2.4 Properties
 
@@ -427,9 +437,9 @@ entries, supporting `global_depth` up to 13 (8 192 buckets) before chaining to a
 
 The bitmap referenced by each entry is a `TagBitmap` (INDEX-DESIGN§3.2), reused via the same machinery.
 
-The accompanying **value spill table** uses the standard BTREE-DESIGN§1 large-node B+ tree:
-`value_hash → CBOR(Value)`, so the actual value can be reconstructed when needed (display,
-faceted enumeration, range comparisons).
+The value behind each `value_hash` is in the value table (INDEX-DESIGN§1.1), for display, faceted
+enumeration and range comparisons. Because a hash names one value (INDEX-DESIGN§1.1), an
+equality lookup returns its entry's bitmap without comparing values.
 
 ### 4.2 Range Index
 

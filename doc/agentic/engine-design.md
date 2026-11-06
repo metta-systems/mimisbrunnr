@@ -163,7 +163,7 @@ struct RootPointer {                         // 408 bytes
     kv_index_root:            BlockRef,      // [112..128]  INDEX-DESIGN§4.1   KvDirectory (4 KiB block)
     range_index_root:         BlockRef,      // [128..144]  INDEX-DESIGN§4.2
     chunk_index_root:         BlockRef,      // [144..160]  INDEX-DESIGN§4.3   content-addressed (snapshot-agnostic)
-    value_spill_root:         BlockRef,      // [160..176]  INDEX-DESIGN§2.3   content-addressed by value_hash
+    value_spill_root:         BlockRef,      // [160..176]  INDEX-DESIGN§1.1   value table, by value_hash
     backpointer_root:         BlockRef,      // [176..192]  METADATA-DESIGN§2.2   physical (snapshot-agnostic)
     ontology_root:            BlockRef,      // [192..208]  ONTOLOGY-DESIGN§1  → BTREE-DESIGN§1 region directly (no envelope)
     subscriptions_root:       BlockRef,      // [208..224]  SUBSCRIPTIONS-DESIGN§1

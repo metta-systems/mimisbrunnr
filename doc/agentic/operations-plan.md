@@ -34,9 +34,7 @@ Steps 1–7 replace the prototype's shortcuts with the specified binary formats 
 Each fixes a layout that later steps write; decide them first.
 
 - [OPERATIONS-D4](operations-decisions.md) — checksum algorithm.
-- [INDEX-D1](index-decisions.md) — object ids in bitmaps.
-- [INDEX-D3](index-decisions.md) — equality lookups under hash collisions.
-- [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes.
+- [INDEX-D1](index-decisions.md) — object ids in bitmaps.- [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes.
 - [ALLOCATION-D1](allocation-decisions.md) — sub-bucket regions.
 - [ENGINE-D1](engine-decisions.md) — oplog persistence.
 
@@ -51,9 +49,9 @@ Independent of each other unless an order is given.
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
 - [INDEX1](index-implementation-plan.md) — four-field range key.
 - [INDEX2](index-implementation-plan.md), [INDEX3](index-implementation-plan.md) — ordered and ranked tag stores.
-- [INDEX7](index-implementation-plan.md) — value-spill table.
+- [INDEX7](index-implementation-plan.md) — value table.
 - [INDEX8](index-implementation-plan.md) — tag bitmaps beyond one page.
-- [INDEX10](index-implementation-plan.md) — stored `value_hash` secret; [INDEX11](index-implementation-plan.md) — collision-safe equality lookups.
+- [INDEX10](index-implementation-plan.md) — stored `value_hash` secret; then [INDEX11](index-implementation-plan.md) (after INDEX7) — colliding values rejected on write.
 - [ENGINE11](engine-implementation-plan.md) — typed chunking defaults in the superblock.
 - [BTREE8](btree-implementation-plan.md) — codec-transparent region read.
 - [ONTOLOGY2](ontology-implementation-plan.md) — storage errors.

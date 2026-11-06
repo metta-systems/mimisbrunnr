@@ -142,7 +142,7 @@ enum BtreeKind {
     Range                 = 7,   // INDEX-DESIGN§4.2 range index B+ tree (snapshot-aware)
     // KV equality + value storage
     KvDirectory           = 8,   // INDEX-DESIGN§4.1 extendible-hash directory spillover (positional, no sorted runs)
-    ValueSpill            = 9,   // value-hash → CBOR(Value); content-addressed
+    ValueSpill            = 9,   // INDEX-DESIGN§1.1 value table: value_hash → value; content-addressed
     // Chunk content-addressing
     ChunkIndex            = 10,  // INDEX-DESIGN§4.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
     ChunkList             = 11,  // INDEX-DESIGN§4.3 per-object FastCDC chunk-list region (positional, no sorted runs)
