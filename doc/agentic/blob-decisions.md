@@ -20,6 +20,10 @@ Objects are stored uncompressed until this is decided. Writing on the device (ga
 
 The outcome sets which algorithms the host writes, which the device reads and writes, and whether one algorithm serves both. Shapes BLOB-D1 and [BLOB7](blob-implementation-plan.md).
 
+## BLOB-D4 — Small-object bucket layout
+
+Tiny objects are packed into small-object buckets at checkpoint (JOURNAL-DESIGN§1.8). Decide the layout: (a) slotted 4 KiB blocks — a slot directory of `(offset, length)` per block, objects addressed as `(block, slot)`, freed slots reused when the block is rewritten; (b) size classes — fixed-size slots per bucket (64 B, 128 B, … 2 KiB), addressed by index, with a free bitmap; (c) append-only log buckets compacted by copy GC like other buckets. The choice sets `ObjectLocation`'s form for packed objects and how space is reclaimed on delete. Blocks [BLOB8](blob-implementation-plan.md).
+
 ## Future work
 
 - None recorded.

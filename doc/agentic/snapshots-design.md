@@ -271,7 +271,7 @@ avoid racing with live ancestry queries). The pass emits, in this order:
 
 Each op is small (≤ ~50 B) and replays locally against the snapshots btree leaf.
 Decomposing the pass into per-edit ops (rather than a single bulk reorg op) keeps each
-WAL entry within the JOURNAL-DESIGN§1.2 sector cap regardless of how many descendants are affected.
+journal entry small regardless of how many descendants are affected.
 
 **Constraints.**
 - A snapshot with more than one non-deleted child cannot collapse during cleanup; all but one

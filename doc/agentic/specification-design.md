@@ -468,7 +468,7 @@ The filesystem operates directly on raw block devices. Each disk is divided into
 ```
  0                    Superblock primary (4KB)
  4K                   Superblock copy (4KB)
- ...                  Write-Ahead Log (64 MiB circular buffer)
+ ...                  Journal buckets (listed in the superblock)
                       ┌───────────────────────────────────┐
                       │  Zone 1: INDEX ZONE               │
                       │  Term index, postings, ontology   │
@@ -487,7 +487,7 @@ The filesystem operates directly on raw block devices. Each disk is divided into
  end-4K               Superblock backup copy
 ```
 
-**Superblock.** A 4 KiB block written 3× (offsets 0, 4096, last-4096-of-device) for redundancy. Holds a `BlockHeader`, pool/disk identity (UUID, node_id, disk_id, media_type, tier), capacity, format-version fields, two alternating `RootPointer` slots for atomic root commit (§6.4), static layout pointers (`wal_offset`, `bucket_size_log2`, `btree_node_size_log2`), zone extents (`index_zone`, `metadata_zone`, `blob_zone` of type `ZoneExtent`), feature-flag words (`compat`, `ro_compat`, `incompat`), and the pool-wide default chunking policy (§3.5). See ENGINE-DESIGN§1.1 for the full byte layout.
+**Superblock.** A 4 KiB block written 3× (offsets 0, 4096, last-4096-of-device) for redundancy. Holds a `BlockHeader`, pool/disk identity (UUID, node_id, disk_id, media_type, tier), capacity, format-version fields, two alternating `RootPointer` slots holding the mount hint for the committed root (§6.4), the journal bucket list, static layout pointers ( `bucket_size_log2`, `btree_node_size_log2`), zone extents (`index_zone`, `metadata_zone`, `blob_zone` of type `ZoneExtent`), feature-flag words (`compat`, `ro_compat`, `incompat`), and the pool-wide default chunking policy (§3.5). See ENGINE-DESIGN§1.1 for the full byte layout.
 
 **Growable zones:** Each zone starts as a single contiguous extent. When grown non-contiguously, additional extents are recorded in a **ZoneMap** block (4 KiB; up to 126 extents per block, chained for more); `Superblock.zone_map_offset` is `0` until the first non-contiguous grow.
 
@@ -506,6 +506,7 @@ enum ObjectState {
     Tombstoned = 1,   // marked deleted, invisible, sync op emitted
     BlobReclaim = 2,  // indexes cleaned up, blob extents being reclaimed
     Cleared = 3,      // slot zeroed, ID never reused
+    Writing = 4,      // append-only stream in progress; durable up to its journaled length (JOURNAL-DESIGN§1.8)
 }
 
 #[repr(u8)]
@@ -568,15 +569,17 @@ For chunked objects (`LOCATION_FLAG_CHUNKED`), `replicas[]` describe replicas of
 
 A complementary **backpointer table** (`(disk_id, bucket_no, sector_offset) → owning key`) is maintained for copygc, scrub, evacuation, and resilver — turning O(pool size) operations into O(data on affected bucket). See METADATA-DESIGN§2.2.
 
-### 6.4 Write-Ahead Log
+### 6.4 Journal
 
-The WAL is the **btree-update journal** — a 64 MiB circular buffer (configurable; multiple of 4 KiB) hosted on the pool's hot-tier disks (NVMe/SSD). Cold and Glacier tiers are excluded — their latency would dominate fsync. Mutations land in the WAL first; B+ tree / radix-tree pages are rewritten lazily by a journal-reclaim thread (JOURNAL-DESIGN§1.4), so per-mutation cost is one ~80 B journal append rather than a full-page rewrite. Checkpointing periodically flips the superblock's atomic root pointer (JOURNAL-DESIGN§1.5 of IMPL).
+The journal is the **redo log** of every mutation, kept in an ordered list of allocator buckets on the pool's fastest tier and named in the superblock. Mutations land in the journal first; tree pages are rewritten lazily behind it (JOURNAL-DESIGN§1.4), so per-mutation cost is a small entry — 24 bytes for a tag add — rather than a page rewrite. It is designed to behave well on SSD, NVMe, SD cards and HDDs alike (JOURNAL-DESIGN§1).
 
-**Mirroring across hot disks.** WAL appends fan out to every hot-tier disk's ring under a single shared LSN — typically the fastest disk as primary plus one mirror. A user fsync waits for the append to land on at least the configured replica count (default 2). Recovery picks whichever ring has the highest valid LSN.
+**Journal sets.** Each commit writes one new *journal set* — a 64-byte header with sequence number, trim point, base timestamp and one checksum, then a batch of 8-byte-headed binary entries, padded to 4 KiB — and never rewrites it, so a torn write can only lose a set not yet acknowledged. Compression and encryption apply per set (JOURNAL-DESIGN§1.2).
 
-**Header.** The WAL header is itself a 4 KiB block (`BlockKind::WalSegment`), A/B-alternated using `BlockHeader.generation`, holding `next_lsn`, `write_cursor`, `read_cursor`, `used_bytes`, `last_checkpoint_lsn`, `segment_size`, and `encryption_keyid`. See JOURNAL-DESIGN§1.1.
+**Commits and checkpoints.** Group commit adapts to load: idle commits go out at once, concurrent ones batch into sets up to 256 KiB, pipelined; one FUA write or flush per commit, with new data extents verified by checksum at recovery instead of a second flush. Callers choose `Sync` or `Buffered { max_delay }` durability. A checkpoint is a `Checkpoint` entry carrying the new root pointer; the superblock's root slots are only a mount hint (JOURNAL-DESIGN§1.5).
 
-**Entry framing.** Each entry is a 40-byte `WalEntryHeader` + payload + framing CRC, fitting inside one 4 KiB sector — never crossing a sector boundary, so a torn 4 KiB write loses at most one entry. Header carries `magic("WALR")`, `op_kind`, `format_version`, `flags`, `lsn`, a 16-byte `HybridTimestamp`, `payload_length`, and `payload_crc`. Payloads are CBOR-encoded; the heterogeneous op shapes (`AddTag` vs `WriteBlob` differ wildly) make CBOR the right choice for write-once-read-once journal payloads.
+**History and mirroring.** Retained journal buckets are the oplog that subscriptions replay from (JOURNAL-DESIGN§1.6). With several hot disks, each commit writes the same set to each (JOURNAL-DESIGN§1.7).
+
+**Data paths.** File data goes to blob extents beside the journal; tiny objects ride inside it until packed; streams are append-only objects made durable step by step (JOURNAL-DESIGN§1.8).
 
 ```rust
 enum WalOpKind {
@@ -594,12 +597,9 @@ enum WalOpKind {
     ReconcileEnqueue, ReconcileDequeue, ReconcileMove, ReconcileScanStep,
     FormatPromote,
     Checkpoint,
+    WriteInline, ExtendObject,                 // tiny objects and streams (JOURNAL-DESIGN§1.8)
 }
 ```
-
-**Encryption.** Entries optionally encrypt payloads with **AES-256-GCM** when `WAL_ENTRY_FLAG_ENCRYPTED` is set: nonce = 64-bit `lsn || 32-bit zero` (unique by LSN monotonicity), AAD = the first 36 bytes of the entry header (everything except `payload_crc`), tag (16 B) appended before the trailing framing CRC. See JOURNAL-DESIGN§1.2 for the full read/write order.
-
-Extended oplog retention (compressed segments on disk) supports dormant subscriptions catching up after being offline.
 
 ---
 

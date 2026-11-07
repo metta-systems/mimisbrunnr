@@ -13,4 +13,4 @@ Design: [subscriptions-design.md](subscriptions-design.md) · Decisions: [subscr
 - [ ] **SUBSCRIPTION3 — Membership maintenance.** Engine mutation hooks re-evaluate affected subscriptions against the query executor and call `set_membership` (today no caller does; hooks only handle "watched tag added").
 - [ ] **SUBSCRIPTION4 — Debounce flush.** `SubscriptionEngine::tick` flushes events whose debounce window elapsed (currently a no-op).
 - [ ] **SUBSCRIPTION5 — `mimir watch stream`.** Prerequisite: SUBSCRIPTION-D1.
-- [ ] **SUBSCRIPTION6 — Offline catch-up.** A replay loop delivers events from a subscription's cursor to the present (SPECIFICATION-DESIGN§11.5). Prerequisite: [ENGINE-D1](engine-decisions.md).
+- [ ] **SUBSCRIPTION6 — Offline catch-up.** A replay loop delivers events from a subscription's cursor to the present (SPECIFICATION-DESIGN§11.5), reading the retained journal and falling back to the result-set diff beyond it. Prerequisite: [JOURNAL13](journal-implementation-plan.md).

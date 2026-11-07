@@ -15,7 +15,8 @@ The engine orchestrates mutations WAL-first, keeps one long-lived `LoadedNode` p
 - **Commit.** Flush dirty trees (append a run, or compact into a fresh region), write the new `RootPointer`, flip it with `commit_root`, then free the previous copies. A crash before the flip leaves the previous root's regions intact.
 - **No legacy blob.** The `MIXI` CBOR blob is retired: counters are derived at boot (`next_oid_local` from the object table, `next_tag_id` from the ontology, `last_applied_lsn` from the latest checkpoint), path contexts are rebuilt from the forward index, and blob bytes live in the blob zone.
 - **Pools are disposable** until the maintainer declares the format stable: a format change means recreating the pool.
-- **One engine on host and device.** The engine and every crate it depends on build as `no_std` + `alloc` (operations-design "Deployment targets"); file-backed devices, `pool.toml` and other host parts sit behind the `std` feature. A pool opens from a `BlockDevice` alone, and opening replays the WAL in memory on every target, the device included.
+- **One engine on host and device.** The engine and every crate it depends on build as `no_std` + `alloc` (operations-design "Deployment targets"); file-backed devices, `pool.toml` and other host parts sit behind the `std` feature. A pool opens from a `BlockDevice` alone, and opening replays the journal on every target, the device included.
+- **Durability per call.** Every mutating call takes `Sync` (returns once durable) or `Buffered { max_delay }` (durable within the bound), and an explicit `commit` waits for everything before it (JOURNAL-DESIGN§1.5). The `BlockDevice` trait offers a write-through (FUA) write, a cache flush and a discard, each reporting whether the device supports it.
 
 ## Invariants
 
@@ -51,15 +52,17 @@ struct Superblock {                          // 4096 bytes total
     last_mount_timestamp_ns: i64,            //  [96..104]
     mount_count: u64,                        // [104..112]
 
-    // Two alternating root pointers — atomic commit. RootPointer = 408 bytes (ENGINE-DESIGN§1.2).
+    // Root hint — two alternating copies of the RootPointer (408 bytes, ENGINE-DESIGN§1.2),
+    // rewritten only on clean unmount and when the journal bucket list changes. The committed
+    // root is the newer of this hint and the journal's last Checkpoint (JOURNAL-DESIGN§1.5).
     root_a: RootPointer,                     // [112..520]
     root_b: RootPointer,                     // [520..928]
     active_root: u8,                         // [928..929]   0 = a, 1 = b
     _pad2: [u8; 7],                          // [929..936]
 
-    // Static layout pointers (set at format time, not written again).
-    wal_offset: u64,                         // [936..944]
-    wal_size: u64,                           // [944..952]
+    // Journal location (JOURNAL-DESIGN§1.1); the bucket list itself is at [1136..2160].
+    journal_bucket_count: u16,               // [936..938]   0 = this disk carries no journal
+    _pad_j: [u8; 14],                        // [938..952]
     bucket_size_log2: u8,                    // [952..953]   e.g. 20 = 1 MiB bucket
     copygc_reserve_pct: u8,                  // [953..954]   default 8 (range 5..=21)
     btree_node_size_log2: u8,                // [954..955]   default 18 = 256 KiB (BTREE-DESIGN§1)
@@ -87,7 +90,9 @@ struct Superblock {                          // 4096 bytes total
     default_chunking_threshold: u64,         // [1112..1120] objects ≤ this size are never
                                              //              chunked regardless of policy
     default_chunking: ChunkParamsRecord,     // [1120..1136] 16 B (INDEX-DESIGN§4.3)
-    _reserved: [u8; 2956],                   // [1136..4092] zeroed, available for future fields
+    journal_buckets: [u32; 256],             // [1136..2160] bucket numbers in journal order;
+                                             //              the first journal_bucket_count are valid
+    _reserved: [u8; 1932],                   // [2160..4092] zeroed, available for future fields
     // trailing CRC32C at [4092..4096] lives inside BlockHeader's frame
 }
 
@@ -140,14 +145,14 @@ authoritative for that zone's address space.
 
 ### 1.2 Atomic root commit
 
-The two-root scheme is the only way to update the filesystem state durably without TOCTTOU
-windows:
+The `RootPointer` names every tree's root. A root is committed by a `Checkpoint` journal entry
+carrying it (JOURNAL-DESIGN§1.5); the superblock's two copies are a mount hint:
 
 ```rust
 #[repr(C, packed)]
 struct RootPointer {                         // 408 bytes
     seq: u64,                                //   [0..8]    monotonic; larger seq wins
-    lsn: u64,                                //   [8..16]   WAL LSN this root corresponds to
+    lsn: u64,                                //   [8..16]   journal LSN this root corresponds to
 
     // Logical / data btrees (snapshot-aware unless noted; see SNAPSHOTS-DESIGN§1.2 table).
     object_table_root:        BlockRef,      //  [16..32]   METADATA-DESIGN§1     radix table — current view
@@ -198,20 +203,22 @@ deref time.
 **Commit protocol** (invoked per the cadence in JOURNAL-DESIGN§1.5, *not* per mutation):
 
 1. Quiesce: stop new flushes from advancing past `commit_lsn`. Pending mutations keep going to
-   the WAL.
-2. Write all dirty btree pages produced by the journal-reclaim thread into open buckets (bucket
-   allocation tracked in WAL only — see ALLOCATION-DESIGN§1).
-3. Append `Checkpoint` WAL entry referencing the new pages and computing the new `RootPointer`.
-4. `fsync` the WAL segment.
-5. Write the new `RootPointer` into the **inactive** slot of all superblock copies, flip
-   `active_root`, recompute superblock CRC, write all 3 superblock copies, `fsync` the device.
-6. Advance `WalHeader.read_cursor` to the new `RootPointer.lsn`; old root pages are released to
-   the allocator (their buckets become candidates for generation bump once no live snapshot
-   pins them).
+   the journal.
+2. Write all dirty tree pages into open buckets (bucket allocation recorded in the journal —
+   see ALLOCATION-DESIGN§1).
+3. Commit a jset containing a `Checkpoint` entry with the new `RootPointer` (JOURNAL-DESIGN§1.5),
+   under the usual write barrier.
+4. Later jsets carry `last_seq` at or after this checkpoint (unless pins or retention hold it
+   back); old root pages are released to the allocator (their buckets become candidates for
+   generation bump once no live snapshot pins them).
+5. On clean unmount, and whenever the journal bucket list changes, write the current
+   `RootPointer` into the **inactive** superblock slot, flip `active_root`, recompute the
+   superblock CRC and write all superblock copies.
 
-A reader picks the superblock copy with the highest `(seq, lsn)` whose CRC validates and whose
-active root validates. If active root is corrupt, fall back to inactive root (the last good
-checkpoint). If both roots are corrupt, replay the WAL forward from the inactive root's `lsn`.
+At mount the committed root is the newer (by `seq`) of the superblock hint — the copy with the
+highest `(seq, lsn)` whose CRC and active root validate, falling back to the inactive root — and
+the last valid `Checkpoint` in the journal; the journal is then replayed after its `lsn`. After a
+clean unmount the two agree and the journal tail is empty.
 
 ### 1.3 Block addressing
 

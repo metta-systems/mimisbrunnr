@@ -17,8 +17,8 @@ Goals:
    indirection a fixed layout can avoid.
 2. **Format evolution.** Every persistent structure carries a version tag and a length so newer
    readers can skip unknown trailing fields and older readers can refuse cleanly.
-3. **Atomic root updates.** Mutations land in the WAL, then in shadowed (alternating) root blocks.
-   A torn write never produces a corrupt root.
+3. **Atomic root updates.** Mutations land in the journal; a root is committed by a journal
+   entry in a write-once journal set. A torn write never produces a corrupt root.
 4. **Key-level snapshots.** Snapshots are 32-bit IDs embedded in the position of every key in
    snapshot-aware btrees. Creation is O(1); diffs are set differences over the snapshot tree's
    ancestor relation, driving cluster sync.
@@ -80,7 +80,7 @@ struct BlockHeader {              // 32 bytes
                                   //          in a future format revision; values for the current
                                   //          4 KiB block are < 4096.
     generation: u64,              // [12..20] monotonic per-block generation, for COW
-    lsn: u64,                     // [20..28] WAL LSN that produced this block
+    lsn: u64,                     // [20..28] journal LSN that produced this block
     flags: u32,                   // [28..32] BLOCK_FLAG_*
 }
 
@@ -106,9 +106,7 @@ enum BlockKind {
     Superblock        = 0,   // per-disk identity + format pointers (ENGINE-DESIGN§1.1)
     ZoneMap           = 1,   // per-disk extra-extent zone descriptors (ENGINE-DESIGN§1.1)
     PoolStateRoot     = 2,   // pool-wide disk geometry + tunables (POOL-DESIGN§1)
-    // WAL framing
-    WalSegment        = 3,   // WAL header / segment marker
-    Checkpoint        = 4,   // checkpoint block within the WAL
+    // 3..=4 unassigned (journal sets carry their own header, JOURNAL-DESIGN§1.2)
     // 5..=9 unassigned (index data lives in BtreeKind trees, INDEX-DESIGN)
     // Per-object metadata overflow
     OverflowRecord    = 10,  // per-object tag/attr overflow (4 KiB; METADATA-DESIGN§1.2)
@@ -202,16 +200,16 @@ field an older version lacks from the default its format section documents; a ve
 than the reader knows is a defined error, governed by the FORMAT-DESIGN§15 feature flags.
 Rewriting a record always writes the current version, so records migrate in place as they are
 rewritten (FORMAT-DESIGN§15.4). Values nested inside a record (`Value`, a query AST) are
-versioned by that record; a `Value`'s own extension point is its type tag. WAL payloads are
-versioned by `WalEntryHeader.format_version` instead (JOURNAL-DESIGN§1.2).
+versioned by that record; a `Value`'s own extension point is its type tag. Journal payloads are
+versioned by `JsetHeader.version` instead (JOURNAL-DESIGN§1.2).
 
 ## 2. Superblock and Atomic Root
 
 Specified in [ENGINE-DESIGN§1](engine-design.md#1-superblock-and-atomic-root).
 
-## 3. Write-Ahead Log
+## 3. Journal
 
-Specified in [JOURNAL-DESIGN§1](journal-design.md#1-write-ahead-log).
+Specified in [JOURNAL-DESIGN§1](journal-design.md#1-journal).
 
 ## 4. Values and Terms
 
@@ -386,7 +384,7 @@ For each `BtreeKind` / `BlockKind`, schema evolution follows one of three patter
 
 ## 16. Summary of On-Disk Footprint (10 M objects, 5 000 tags, ~100 live snapshots)
 
-Steady-state footprint. The WAL ring holds the unmaterialised journal tail (≤ 64 MiB); per-key
+Steady-state footprint. The journal holds the unmaterialised tail plus retained history (its bucket list, typically 64 MiB on a host); per-key
 snapshot overhead scales with logical changes since each snapshot's parent. The forward-index
 sizing assumes 8 assertions per object (the INDEX-DESIGN§2.2 inline-spill threshold and the INDEX-DESIGN§2.1 calculation
 basis), which is a worst-case upper bound — small-object workloads (~4 assertions) cut the
@@ -395,7 +393,7 @@ forward index roughly in half (~660 MiB at this scale).
 | Structure              | Size      | Notes                                              |
 | ---------------------- | --------- | -------------------------------------------------- |
 | Superblock × 3         | 12 KiB    | Fixed                                              |
-| WAL                    | 64 MiB    | Btree-update journal (JOURNAL-DESIGN§1); mirrored across devices |
+| Journal                | ~64 MiB   | Journal buckets (JOURNAL-DESIGN§1) plus retained history; mirrored across hot devices |
 | Bucket alloc table     | ~288 MiB  | 16 M buckets × ~18 B/entry (16 B value + ~2 B packed `bucket_no`) + sorted-run overhead (BTREE-DESIGN§1.1 headers, format descriptors, tail padding) |
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
 | Object table (records) | ~1.19 GiB | Positional — no key packing applies; 4 893 leaves × 256 KiB |

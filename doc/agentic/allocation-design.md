@@ -85,7 +85,7 @@ const BUCKET_FLAG_PINNED_BY_SNAPSHOT: u8 = 1 << 1;  // contents reachable from a
 #[repr(u8)]
 enum BucketDataType {
     Free        = 0,                         // not in use; freespace LRU candidate
-    Wal         = 1,                         // WAL ring buckets
+    Journal     = 1,                         // journal buckets (JOURNAL-DESIGN§1.1)
     Index       = 2,                         // index-zone btree pages, tag bitmaps
     Metadata    = 3,                         // object table, location table, forward index
     Blob        = 4,                         // user data blobs

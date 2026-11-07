@@ -1,113 +1,146 @@
 # Journal (WAL) — design
 
 Scope: `crates/wal`, the WAL projection in `crates/engine/src/wal_proj.rs`, checkpoint cadence in `crates/engine`.
-Governing spec: JOURNAL-DESIGN§1 (JOURNAL-DESIGN§1.2 entry format, JOURNAL-DESIGN§1.3 ops, JOURNAL-DESIGN§1.4 journal pins and deferred flushes, JOURNAL-DESIGN§1.5 checkpoints), SPECIFICATION-DESIGN§6.4.
+Governing spec: JOURNAL-DESIGN§1 (§1.1 journal location, §1.2 journal sets, §1.3 ops, §1.4 pins and reclaim, §1.5 commits and checkpoints, §1.6 retention, §1.7 mirroring, §1.8 data paths), SPECIFICATION-DESIGN§6.4.
 
 Plan: [journal-implementation-plan.md](journal-implementation-plan.md) · Open decisions: [journal-decisions.md](journal-decisions.md) · Completed: [journal-completed.md](journal-completed.md) · Order: [operations-plan.md](operations-plan.md)
 
 ## Goal
 
-The WAL is the durability point for every mutation; B+ tree pages are flushed lazily behind it, and the WAL is trimmed only past entries that every in-memory node has persisted.
+The journal is the durability point for every mutation on any medium — SD card, SSD, NVMe, HDD — and for every write shape from tiny files to long streams; B+ tree nodes and object data are written behind or beside it, and its retained history is the oplog.
 
 ## Selected design
 
-- **Journal pins.** Each `LoadedNode` holds one `JournalPin { lsn_min, lsn_max, count }` over its pending journal. The checkpoint advances `read_cursor` only to `min(checkpoint_lsn, lowest live lsn_min)`.
-- **`JournalPin` lives in `mimisbrunnr-storage`**, beside `LoadedNode`; `mimisbrunnr-wal` depends on storage and uses that type. One definition only.
-- **Checkpoint cadence** is driven by WAL fill level (JOURNAL-DESIGN§1.4 thresholds), accumulated dirty bytes and elapsed time (30 s). The engine exposes `checkpoint` and a query of which band is due; it starts no thread. The embedder drives it — a `std`-gated helper thread on the host, the filesystem server's own thread or event loop on Vesper (sync-only contract: no async runtime). `commit()` remains as a forced flush for tests and foreground sync points.
+- **Journal buckets, write-once journal sets.** The journal is an ordered list of allocator buckets named in the superblock. Each commit writes one new *journal set* (jset) — a header and a batch of entries — that is never rewritten, so a torn write loses only the set not yet acknowledged.
+- **Compact entries.** One 64-byte header, one checksum, one compression unit and one AEAD tag per jset; 8 bytes of header per entry. An `AddTag` costs 24 bytes.
+- **The root travels in the journal.** A checkpoint is a `Checkpoint` entry carrying the new `RootPointer`; the superblock's root slots are a mount hint, rewritten only on clean unmount and when the journal's bucket list changes.
+- **Adaptive group commit.** Idle commits seal and write at once; under load, commits join the next set and sets grow toward 256 KiB. Sets are pipelined and acknowledged in sequence. FUA where the device offers it, a cache flush otherwise; one flush per commit, with data extents verified by checksum on recovery instead of a second flush.
+- **Caller-chosen durability.** `Sync` returns once durable; `Buffered { max_delay }` becomes durable within a bound.
+- **Data beside the journal.** File data goes to blob extents; only tiny writes ride inside the journal, to be packed later. Streams are append-only objects made durable by periodic `ExtendObject` entries.
+- **Retention is the oplog.** Journal buckets are kept past the trim point while subscriptions need history, within a cap.
+- **Journal pins.** Each `LoadedNode` holds one `JournalPin { lsn_min, lsn_max, count }` over its pending journal; the trim point is the lowest live pin or the last checkpoint. `JournalPin` lives in `mimisbrunnr-storage`, beside `LoadedNode`.
+- **The engine starts no thread.** It exposes `commit`, `checkpoint` and a non-blocking query of what is due; the embedder drives them — a `std`-gated helper thread on the host, the filesystem server's own thread or event loop on Vesper.
 - **`FormatPromote`** (`WalOpKind::FormatPromote = 30`) journals a sorted-run format widening before the widened run is written; replay re-applies it before decoding later runs.
-- Compression and encryption flags on WAL entries follow JOURNAL-DESIGN§1.2: compress, then encrypt ([encryption-design.md](encryption-design.md)).
 
 ## Invariants
 
-- No mutation is reported durable before its WAL entry is written.
-- WAL trimming never passes an entry a pending node still needs.
-- Replay from the last checkpoint reproduces the committed state.
+- No mutation is reported durable before the jset holding it, and every jset before it, is durable.
+- A jset is never overwritten while any retained history or pending node needs it.
+- No durable jset references blob data that did not land: recovery verifies extents named in the unflushed tail and drops entries whose data fails.
+- Replay from the committed root reproduces the committed state.
 
 ## Format specification
 
 The numbered sections below are the normative on-disk and algorithmic specification for this scope; [format-design.md](format-design.md) lists every scope's sections in format order.
 
-## 1. Write-Ahead Log
+## 1. Journal
 
-The WAL is the **btree-update journal**: a 64 MiB circular log (configurable; must be a multiple
-of 4 KiB), hosted on the pool's **hot-tier** disks (`StorageTier::Hot` — NVMe / SSD; see
-SPECIFICATION-DESIGN§8.1). On disks that don't carry a ring, `Superblock.wal_offset` and `wal_size` are
-simply `0` — no allocation, no reservation. Adding a ring later (e.g. a cold disk being
-promoted to hot, or an operator widening the mirror) is a routine allocation: 64 MiB is a
-trivial reservation on cold-tier capacities, so the format doesn't pre-allocate the slot.
+The journal is the **redo log** of every mutation: each entry records one logical change (add
+tag, set attribute, write extent, bucket transition, …). B+ tree nodes are **not** rewritten
+per mutation — they are flushed lazily as appended runs or copy-on-write regions
+(JOURNAL-DESIGN§1.4) — and object data is written to blob extents beside the journal
+(JOURNAL-DESIGN§1.8). The journal is therefore the **source of truth** for any state newer than
+the committed root.
 
-Each entry records one key-level mutation (add tag, write extent, bucket transition, …).
-Btree nodes on disk are **not** rewritten per mutation — they are rewritten lazily when
-journal reclaim or memory pressure demands it (JOURNAL-DESIGN§1.4). The journal is therefore the **source
-of truth** for any btree state newer than each node's `BlockHeader.lsn`.
+It lives on the pool's fastest tier (`StorageTier::Hot` when present, SPECIFICATION-DESIGN§8.1) and is
+designed to behave well on every medium:
 
-**Mirroring across hot disks.** WAL appends fan out to every hot-tier disk's ring as the same
-byte sequence under a single shared LSN — typically the fastest disk as primary plus one
-mirror (SPECIFICATION-DESIGN§8.2 illustrates NVMe primary + SSD mirror, with the HDD carrying no ring).
-Cold and Glacier-tier disks are deliberately excluded: their latency would dominate fsync
-and they exist to hold cold blob extents, not hot mutation state. A user fsync waits for the
-append to land on at least the configured replica count of hot rings (default 2) before
-returning; recovery picks whichever ring has the highest valid LSN and uses the others to
-fill any missing entries. Per-disk rings share an LSN namespace because each is the same
-logical journal, just persisted in parallel.
+| Medium | What the design relies on |
+|---|---|
+| SSD / NVMe | write-once sets (no read-modify-write of partial flash pages); sets up to 256 KiB; pipelining across the queue; FUA writes |
+| SD card / eMMC | strictly sequential, append-only writes within whole buckets; one flush per commit |
+| HDD | contiguous journal buckets, so a set write and recovery's scan are sequential; batching amortises seeks |
 
-If the pool has only one hot-tier disk, the WAL runs unmirrored on that disk and the user is
-responsible for accepting the durability tradeoff (or adding a second hot disk).
+Per-mutation cost is an 8-byte entry head plus its binary payload (an `AddTag` is 24 bytes),
+plus a share of its set's 64-byte header. Tree rewrites are amortised across all mutations that
+touched each node since its last flush.
 
-Per-mutation cost is one ≈ 80-byte journal append. Btree page rewrites are amortised across all
-mutations that touched each node since its last flush. A tag mutation that touches four index
-trees costs four journal entries; the corresponding page rewrites land later, batched.
+### 1.1 Journal location
 
-Internal layout is segmented to allow parallel truncation and replay.
-
-### 1.1 WAL headers (two 4 KiB blocks at `wal_offset`)
+The journal is an ordered list of buckets of allocator data type `Journal`
+(ALLOCATION-DESIGN§1.2), recorded in the superblock of each disk that carries journal buckets:
 
 ```rust
-#[repr(C, packed)]
-struct WalHeader {                           // 4096 bytes (one block)
-    header: BlockHeader,                     // [0..32]   kind = WalSegment, format_version = 1
-    next_lsn: u64,                           // [32..40]
-    write_cursor: u64,                       // [40..48]  byte offset within WAL ring
-    read_cursor: u64,                        // [48..56]  oldest entry not yet checkpointed
-    used_bytes: u64,                         // [56..64]
-    last_checkpoint_lsn: u64,                // [64..72]  newest Checkpoint entry's LSN;
-                                             //           recovery scans forward from there
-    segment_size: u32,                       // [72..76]  typically 1 MiB
-    _pad: u32,                               // [76..80]  align to u64
-    encryption_keyid: [u8; 16],              // [80..96]
-    _reserved: [u8; 3996],                   // [96..4092]
-    // trailing CRC32C at [4092..4096] inside BlockHeader's frame
-}
+// Superblock fields (ENGINE-DESIGN§1.1)
+journal_bucket_count: u16,                   // buckets in the list; 0 = this disk carries no journal
+journal_buckets:      [u32; 256],            // bucket numbers on this disk, in journal order
 ```
 
-The header is updated using the same A/B alternation as the superblock root — the WAL header
-lives in two adjacent blocks; the active one is the copy with the larger
-`BlockHeader.generation` whose CRC validates. (The `BlockHeader.generation` field is the same
-monotonic counter that drives every COW block update; no separate `seq` is needed.)
+- The buckets are written in list order, each from its start; a bucket is a sequence of jsets
+  (JOURNAL-DESIGN§1.2) followed by unwritten space.
+- The allocator places journal buckets contiguously when it can, so on an HDD the journal is one
+  sequential region. Typical sizes: a few MiB on a device, 64 MiB or more on a host.
+- Growing, shrinking or moving the journal rewrites the bucket list — the only reason the
+  journal ever causes a superblock write. Freed journal buckets are discarded (TRIM) by the
+  allocator (ALLOCATION-DESIGN§1.7).
+- Recovery reads the first jset of every listed bucket to find the newest, then walks forward
+  from the trim point (JOURNAL-DESIGN§1.5).
 
-### 1.2 WAL entry
+### 1.2 Journal sets
 
-Entries are byte-packed and **never cross a 4 KiB sector boundary**: each entry is one fully-formed
-`WalEntryHeader`+payload+CRC frame within a single sector. The bound on `payload_length` is
-`4096 − WalEntryHeader (40) − framing CRC32C (4) = 4052 B` plaintext; encrypted entries pay an
-additional 16 B GCM tag and so cap at 4036 B. An attempted append exceeding the bound is a
-programming error: the producer must write bulk data to the blob zone and reference it, not
-embed it in a WAL op. Sector-aligned framing makes recovery trivial — a torn 4 KiB
-write loses at most one entry, and replay never has to reassemble fragments across sectors.
+Every commit writes **one new journal set** (jset): a header, then the batch of entries, padded
+with zeros to a multiple of 4 KiB, at the next unwritten position of the current journal bucket.
+A jset is never rewritten. A torn or lost write can therefore destroy only the jset being
+written — which no caller has been told is durable — never an earlier one. A jset never spans
+two buckets and is at most 256 KiB; a commit whose batch exceeds either bound is split into
+consecutive jsets acknowledged together.
 
 ```rust
-#[repr(C, packed)]
-struct WalEntryHeader {                      // 40 bytes
-    magic: u32,                              // "WALR"
-    op_kind: u8,                             // WalOpKind
-    format_version: u8,
-    flags: u16,                              // WAL_ENTRY_FLAG_*
-    lsn: u64,
-    timestamp: HybridTimestamp,              // 16 bytes — defined below
-    payload_length: u32,
-    payload_crc: u32,                        // CRC32C of payload (post-compression/encryption)
+#[repr(C)]
+struct JsetHeader {                          // 64 bytes
+    magic:        u32,                       //  [0..4]   "JSET"
+    version:      u16,                       //  [4..6]   jset format version
+    flags:        u16,                       //  [6..8]   JSET_FLAG_*
+    seq:          u64,                       //  [8..16]  monotonic jset sequence number
+    last_seq:     u64,                       // [16..24]  oldest seq still needed (JOURNAL-DESIGN§1.4)
+    hlc_base:     HybridTimestamp,           // [24..40]  entry timestamps are offsets from this
+    payload_len:  u32,                       // [40..44]  bytes of entries as stored (after compression)
+    entry_count:  u32,                       // [44..48]
+    plain_len:    u32,                       // [48..52]  bytes of entries before compression
+    _pad:         u32,                       // [52..56]
+    checksum:     u64,                       // [56..64]  over the whole jset with this field zero
 }
+// followed by: entries (payload_len bytes), then, if JSET_FLAG_ENCRYPTED, a 16-byte AEAD tag;
+// then zero padding to a multiple of 4 KiB.
 
+const JSET_FLAG_ENCRYPTED:  u16 = 1 << 0;    // entries are AEAD-encrypted (ENCRYPTION-DESIGN§1)
+const JSET_FLAG_COMPRESSED: u16 = 1 << 1;    // entries are compressed before encryption
+
+#[repr(C)]
+struct EntryHead {                           // 8 bytes, 8-aligned within the plaintext entries
+    op_kind:   u8,                           // [0..1]  WalOpKind
+    flags:     u8,                           // [1..2]  ENTRY_FLAG_*
+    len:       u16,                          // [2..4]  payload bytes that follow (excluding padding)
+    hlc_delta: u32,                          // [4..8]  nanoseconds after hlc_base.physical_ns
+}
+// followed by the op's payload record (JOURNAL-DESIGN§1.3), zero-padded to a multiple of 8.
+
+const ENTRY_FLAG_HLC_EXPLICIT: u8 = 1 << 0;  // a full 16-byte HybridTimestamp precedes the payload
+                                             //   (ops applied from another node keep their HLC)
+```
+
+**LSN.** An entry's LSN is `seq << 16 | index`, where `index` is its position in the jset
+(< 2¹⁶). Every LSN in the format — `BlockHeader.lsn`, `RootPointer.lsn`, subscription cursors,
+`last_modify_lsn` — is this value; LSNs increase with seq and position.
+
+**Timestamps.** An entry's HLC is `hlc_base` with `physical_ns + hlc_delta`, `node_id` from the
+base, and `logical` equal to `hlc_base.logical` plus the number of earlier entries in the set
+with the same physical time; `ENTRY_FLAG_HLC_EXPLICIT` entries carry their own. A batch spanning
+more than 2³² ns (≈ 4.3 s) is sealed before the delta would overflow.
+
+**Checksum, compression and encryption are per jset.** The checksum (algorithm per
+OPERATIONS-D4) covers the header with `checksum` zeroed, the stored entries, the AEAD tag if
+any, and the padding. With `JSET_FLAG_COMPRESSED` the entries are compressed as one unit
+(algorithm per BLOB-D3). With `JSET_FLAG_ENCRYPTED` they are then encrypted with the key
+hierarchy's journal key (ENCRYPTION-DESIGN§1): nonce = 64-bit `seq` ‖ 32 zero bits, AAD = the
+header with `checksum` zeroed. Writers compress, then encrypt; readers verify the checksum, then
+decrypt and authenticate, then decompress, then read entries in order.
+
+**Validity.** A jset is valid when its magic, version and checksum hold and its `seq` is the
+successor of the previous jset's. Replay stops at the first invalid or out-of-sequence jset; a
+device that dropped acknowledged writes surfaces as a shorter journal, never as wrong data.
+
+```rust
 // HybridTimestamp is the cluster-wide hybrid logical clock for total ordering
 // without coordination (SPECIFICATION-DESIGN§10.4). Sort order: physical_ns → logical → node_id.
 // Resolution is nanoseconds (matches every other *_ns field in the format —
@@ -122,66 +155,15 @@ struct HybridTimestamp {                     // 16 bytes
     _pad:        u32,                        // [12..16] tail pad to multiple-of-8 (FORMAT-DESIGN§1.1)
 }
 
-// WalEntryHeader.flags bits
-const WAL_ENTRY_FLAG_ENCRYPTED:  u16 = 1 << 0;  // payload encrypted (AES-256-GCM)
-const WAL_ENTRY_FLAG_COMPRESSED: u16 = 1 << 1;  // payload compressed (zstd) before encryption
 ```
-
-**Plaintext framing** (`WAL_ENTRY_FLAG_ENCRYPTED == 0`):
-
-```
-WalEntryHeader (40 B) | payload (payload_length B) | framing CRC32C (4 B)
-```
-
-`payload_crc` covers the payload bytes; the trailing 4-byte CRC32C covers `WalEntryHeader ||
-payload` for end-to-end framing detection.
-
-**Encrypted framing** (`WAL_ENTRY_FLAG_ENCRYPTED == 1`):
-
-```
-WalEntryHeader (40 B) | ciphertext (payload_length B) | GCM tag (16 B) | framing CRC32C (4 B)
-```
-
-The 16-byte AES-256-GCM tag sits between the ciphertext and the trailing framing CRC — it does
-**not** replace `payload_crc`, which is too narrow (4 B) to hold it. `payload_length` is
-unchanged because GCM is length-preserving; it counts ciphertext bytes, which equal plaintext
-bytes (after optional zstd compression). Encrypted-entry overhead is 60 B (header + tag +
-framing CRC) versus 44 B plaintext.
-
-Encryption inputs (cipher details: ENCRYPTION-DESIGN§1):
-
-- **Key**: `DiskKey`.
-- **Nonce**: 96 bits = 64-bit `lsn` || 32-bit zero. Unique by LSN monotonicity (ENCRYPTION-DESIGN§1).
-- **AAD**: the first 36 bytes of `WalEntryHeader` — every field except `payload_crc`. This
-  authenticates magic, op_kind, format_version, flags, lsn, timestamp, and payload_length,
-  preventing header-swap attacks. `payload_crc` is excluded because it is computed *after* the
-  GCM call (over the ciphertext that GCM produces) and so cannot be an input to it.
-- **Plaintext**: the op's binary payload record (JOURNAL-DESIGN§1.3), optionally zstd-compressed first when
-  `WAL_ENTRY_FLAG_COMPRESSED` is also set. Order is *compress, then encrypt* — never the
-  reverse, since GCM ciphertext is incompressible.
-
-In encrypted mode `payload_crc` is CRC32C over the ciphertext (computed post-GCM). Readers
-without the key can still validate I/O integrity via the two CRCs; readers with the key
-additionally authenticate via the GCM tag.
-
-**Write order.** (1) write the payload record → (2) optional zstd compress → (3) AES-256-GCM encrypt with
-the AAD-and-nonce above → (4) compute `payload_crc` over ciphertext, fill in `WalEntryHeader` →
-(5) compute trailing framing CRC over the assembled bytes → (6) issue a single sequential write
-to the WAL ring.
-
-**Read / replay order.** (1) verify trailing framing CRC (cheap, no key needed); reject the
-entry on mismatch — torn write or media corruption. (2) verify `payload_crc` over ciphertext
-(also key-free). (3) if `WAL_ENTRY_FLAG_ENCRYPTED`: AES-256-GCM-decrypt with header[0..36] as
-AAD and the LSN-derived nonce; reject on tag mismatch (tampering or wrong key). (4) if
-`WAL_ENTRY_FLAG_COMPRESSED`: zstd-decompress. (5) read the payload record for `op_kind`.
 
 Payloads are binary records (FORMAT-DESIGN§1.6), not CBOR: every op's shape is known from
 `op_kind`, so a record carries no field names or type information, its bytes are fixed by its
 field values alone (what AEAD authentication needs), and replay reads fields in place. The only
-CBOR inside a WAL payload is an attribute `Value` (INDEX-DESIGN§1). A WAL entry is versioned
-by `WalEntryHeader.format_version`; the WAL is replayed and trimmed, never migrated in place.
+CBOR inside a payload is an attribute `Value` (INDEX-DESIGN§1.1). Jsets are versioned by
+`JsetHeader.version`; the journal is replayed and trimmed, never migrated in place.
 
-### 1.3 WAL op payloads
+### 1.3 Op payloads
 
 Each listing below is normative for its op's payload record, laid out by the FORMAT-DESIGN§1.6
 record rules:
@@ -194,26 +176,28 @@ record rules:
   string (`bytes`, `String`, a packed key) is a `u32` length in the head and the bytes after
   it, zero-padded to a multiple of 8; `Value` is a `u32` length and its CBOR encoding.
   `Option<String>` uses length `u32::MAX` for `None`.
-- `payload_length` covers the head, the variable part and its padding; a reader rejects a
-  payload whose length disagrees with its head.
+- `EntryHead.len` covers the head and the variable part (not the trailing padding); a reader
+  rejects a payload whose length disagrees with its head.
+- An extent checksum (`extent_sum`) is the OPERATIONS-D4 checksum of the extent's bytes as
+  written; recovery uses it to verify data written in the same commit (JOURNAL-DESIGN§1.5).
 
 ```rust
 CreateObject     : { oid: u64, generation: u32, created_ns: i64 }
 DeleteObject     : { oid: u64, lsn: u64 }
-AddTag           : { oid: u64, tag: u32, origin: u8 }
+AddTag           : { oid: u64, tag: u32 }                     // a direct tag (INDEX-DESIGN§2.4)
 RemoveTag        : { oid: u64, tag: u32 }
 SetAttr          : { oid: u64, key: u32, value: Value }       // Value tagged-union (INDEX-DESIGN§1)
 RemoveAttr       : { oid: u64, term_id: u64 }                   // the attribute term (INDEX-DESIGN§1.2)
 AddRelation      : { oid: u64, predicate: u32, target: u64 }
 RemoveRelation   : { oid: u64, predicate: u32, target: u64 }
-WriteBlob        : { oid: u64, content_hash: [u8;32], extent: BlockRef, size: u64 }
+WriteBlob        : { oid: u64, content_hash: [u8;32], extent: BlockRef, size: u64, extent_sum: u64 }
                    // Non-chunked objects only. Chunked objects (INDEX-DESIGN§4.3) use the
                    // ChunkInsertBatch / ChunkListAppend / ChunkObjectFinalize flow
                    // described in JOURNAL-DESIGN§1.3.1.
 
 // FastCDC chunked objects (INDEX-DESIGN§4.3, JOURNAL-DESIGN§1.3.1)
-ChunkInsertBatch    : { chunks: [(chunk_hash: [u8;32], extent: BlockRef, length: u32); N] }
-                   // N chosen by producer s.t. encoded op fits the JOURNAL-DESIGN§1.2 sector cap;
+ChunkInsertBatch    : { chunks: [(chunk_hash: [u8;32], extent: BlockRef, length: u32, extent_sum: u64); N] }
+                   // N ≤ 1 000, chosen by the producer; one entry fits a jset (JOURNAL-DESIGN§1.2);
                    //   replay inserts each (hash → extent) into ChunkIndex (or bumps
                    //   ref_count if the hash already exists). Idempotent under LSN.
 ChunkListAppend     : { oid: u64, position_start: u64, region: BlockRef, count: u32 }
@@ -257,7 +241,7 @@ BackpointerRemove: { key: BackpointerKey }                                // exp
 
 // Snapshot lifecycle (SNAPSHOTS-DESIGN§1)
 SnapshotCreate   : { new_id: u32, parent_id: u32, current_replacement: u32, label: Option<String> }
-                   // label capped at 256 bytes — one-sector WAL invariant (JOURNAL-DESIGN§1.2)
+                   // label capped at 256 bytes
 SnapshotDelete   : { id: u32 }                                            // marks for async cleanup
 // Note: snapshot deletion does NOT emit per-key WAL ops. The actual
 // re-tag / drop happens via a reconcile-driven scan whose progress is
@@ -289,12 +273,24 @@ ReconcileMove    : { from_loc: BlockRef, to_loc: BlockRef, owner_key: bytes }
                    // atomic location-update for move-path completion;
                    //   owner_key capped at 16 bytes (METADATA-DESIGN§2.2)
 ReconcileScanStep: { scan_id: u64, btree: BtreeKind, cursor_key: bytes }  // resumable progress;
-                   //   cursor_key capped at 256 bytes — one-sector WAL invariant (JOURNAL-DESIGN§1.2)
+                   //   cursor_key capped at 256 bytes
 
 // Sorted-run format mutations (BTREE-DESIGN§1.6)
 FormatPromote    : { node_ref: BlockRef, sorted_run_seq: u32, new_format: SortedRunKeyFormat }
 
 Checkpoint       : { new_root: RootPointer, gc_reserve_buckets: u32 }
+                   // Commits a root (JOURNAL-DESIGN§1.5): every tree flushed up to this
+                   //   entry's LSN is reachable from new_root. Recovery starts from the newest
+                   //   valid Checkpoint and replays the entries after it.
+
+// Data paths (JOURNAL-DESIGN§1.8)
+WriteInline      : { oid: u64, content_hash: [u8;32], data: bytes }      // WalOpKind 32
+                   // A whole object of at most INLINE_WRITE_MAX bytes, carried in the
+                   //   journal itself; a later checkpoint moves it into a small-object bucket.
+ExtendObject     : { oid: u64, new_length: u64, extents: [(extent: BlockRef, length: u32,
+                     extent_sum: u64); N] }                               // WalOpKind 33
+                   // Appends extents to an object in the Writing state and makes its first
+                   //   new_length bytes durable.
 ```
 
 Replay applies entries strictly in LSN order. Each in-memory mutation is idempotent under
@@ -319,7 +315,7 @@ matching `PlacementRule::Chunk` → superblock default). Then:
    the `(hash, extent, length)` triple to a pending `ChunkInsertBatch` and the hash to
    the region's entry array.
 3. When the in-flight `ChunkInsertBatch` reaches the producer's chosen size cap (bounded
-   by `WAL_OP_MAX_PAYLOAD`), emits the batch as a WAL op.
+   by 1 000 chunks per entry), emits the batch as a journal entry.
 4. When the head region fills (or fsync arrives), commits it and allocates a chained
    non-head region (no `ChunkParamsRecord`). Each region commit emits
    `ChunkListAppend { oid, position_start, region, count }`.
@@ -358,37 +354,38 @@ FastCDC's avg-chunk-size knob spans ~3 orders of magnitude in real deployments (
 4 KiB for fine-grained edits at the small end, up to 8 MiB for resumability-only large
 transfers at the other. The five-regime table below shows how the design scales:
 
-| Avg chunk | Typical workload                   | Chunks      | `ChunkInsertBatch` ops (≤ 76/op) | `ChunkListAppend` ops (one per 6 551-entry region) | Cumulative WAL bytes (worst case: 1 sector/op) | WAL append rate at 530 MiB/s plaintext |
-| --------- | ---------------------------------- | ----------- | -------------------------------- | -------------------------------------------------- | ---------------------------------------------- | -------------------------------------- |
-| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 110 377                          | 1 281                                              | ~436 MiB (1.3 % of plaintext)                  | ~7.1 MiB/s                             |
-| 16 KiB    | VM disks, databases                | 2 097 152   | 27 595                           | 321                                                | ~109 MiB (0.33 %)                              | ~1.8 MiB/s                             |
-| 256 KiB   | generic FastCDC default            | 131 072     | 1 725                            | 21                                                 | ~6.8 MiB (0.020 %)                             | ~114 KiB/s                             |
-| 1 MiB     | backup-tool default (restic-class) | 32 768      | 432                              | 6                                                  | ~1.7 MiB (0.0052 %)                            | ~29 KiB/s                              |
-| **8 MiB** | large extreme — pure resumability  | 4 096       | 54                               | 1                                                  | ~220 KiB (0.00067 %)                           | ~3.6 KiB/s                             |
+| Avg chunk | Typical workload                   | Chunks      | `ChunkInsertBatch` entries (≤ 1 000 chunks each) | `ChunkListAppend` entries (one per 6 551-entry region) | Journal bytes (64 B per chunk) | Journal append rate at 530 MiB/s plaintext |
+| --------- | ---------------------------------- | ----------- | ------------------------------------------------ | ------------------------------------------------------ | ------------------------------ | ------------------------------------------ |
+| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 8 389                                            | 1 281                                                  | ~512 MiB (1.6 % of plaintext)  | ~8.3 MiB/s                                 |
+| 16 KiB    | VM disks, databases                | 2 097 152   | 2 098                                            | 321                                                    | ~128 MiB (0.39 %)              | ~2.1 MiB/s                                 |
+| 256 KiB   | generic FastCDC default            | 131 072     | 132                                              | 21                                                     | ~8 MiB (0.024 %)               | ~130 KiB/s                                 |
+| 1 MiB     | backup-tool default (restic-class) | 32 768      | 33                                               | 6                                                      | ~2 MiB (0.006 %)               | ~33 KiB/s                                  |
+| **8 MiB** | large extreme — pure resumability  | 4 096       | 5                                                | 1                                                      | ~256 KiB (0.0008 %)            | ~4 KiB/s                                   |
 
 The spread is roughly **2 000×** across regimes on every axis — the same op set covers all
 of it, only the constants change.
 
-**Cumulative ≠ simultaneous.** The 64 MiB ring is circular. Steady-state ring fill is bounded
-by *reclaim latency*, not by total traffic over the operation. Reclaim's job is flushing
-ChunkIndex leaves (256 KiB regions packing 4 678 chunks each); the leaf-flush rate it must
-sustain to keep the ring drained is `chunks_per_second / 4 678` leaves/s — equivalently,
-`(producer_plaintext_rate / avg_chunk_size) / 4 678` leaves/s. At 530 MiB/s plaintext:
+**Cumulative ≠ simultaneous.** Steady-state journal fill is bounded by *reclaim latency*, not
+by total traffic over the operation: buckets are freed as soon as the trim point passes them
+(JOURNAL-DESIGN§1.4). Reclaim's job is flushing ChunkIndex leaves (256 KiB regions packing
+4 678 chunks each); the leaf-flush rate it must sustain is `chunks_per_second / 4 678`
+leaves/s — equivalently, `(producer_plaintext_rate / avg_chunk_size) / 4 678` leaves/s. At
+530 MiB/s plaintext:
 
 - **4 KiB regime:** ~135 K chunks/s ÷ 4 678 = ~29 leaves/s = ~7.4 MiB/s of leaf rewrites.
   Comfortably within NVMe write bandwidth (~1–3 GiB/s typical) but no longer trivial; this
-  is where reclaim genuinely has to keep up. Cumulative WAL exceeds the 64 MiB ring by ~7×,
-  so the ring cycles continuously.
+  is where reclaim genuinely has to keep up. Cumulative journal traffic exceeds a 64 MiB
+  journal by ~8×, so its buckets cycle continuously.
 - **16 KiB regime (canonical VM / DB workload):** ~7 leaves/s ≈ 1.8 MiB/s leaf rewrites.
-  Ring cycles ~1.7× over the 60-second write. JOURNAL-DESIGN§1.4's *idle* / *background-flush* bands
-  cover the producer comfortably.
-- **256 KiB and above:** WAL traffic is in the noise; reclaim is essentially never the
-  bottleneck. The ring barely fills.
+  A 64 MiB journal cycles ~2× over the 60-second write. JOURNAL-DESIGN§1.4's *idle* /
+  *background-flush* bands cover the producer comfortably.
+- **256 KiB and above:** journal traffic is in the noise; reclaim is essentially never the
+  bottleneck.
 
 The design therefore scales from "fine-grained dedup workload that genuinely stresses
 reclaim" to "barely-noticed bookkeeping" without changing op shapes. The producer's choice
 of FastCDC parameters trades dedup granularity (small chunks → more shared chunks across
-edits) against per-chunk overhead (small chunks → more WAL ops, more ChunkIndex leaves,
+edits) against per-chunk overhead (small chunks → more journal bytes, more ChunkIndex leaves,
 larger per-object ChunkList chain).
 
 **HDD-only pools.** A pool whose only writable disk is rotational clamps the producer to
@@ -407,7 +404,7 @@ unique data.
 
 ### 1.4 Journal pins and deferred btree flushes
 
-Each in-memory dirty btree node carries a **journal pin** — the LSN of the oldest WAL entry
+Each in-memory dirty btree node carries a **journal pin** — the LSN of the oldest journal entry
 whose update has not yet been merged into the on-disk node:
 
 ```rust
@@ -421,9 +418,15 @@ struct DirtyNode {                           // in-memory only
 }
 ```
 
-**Journal reclaim invariant.** `WalHeader.read_cursor` (the LSN below which entries may be
-overwritten) cannot advance past `min(all_dirty_nodes.pending_lsn_min)`. The reclaim thread
-monitors WAL fill level:
+**Trim point.** Each jset records `last_seq`, the oldest jset replay still needs: the seq of the
+newest `Checkpoint`, or of the lowest live `pending_lsn_min` if that is older, or of the oldest
+retained history (JOURNAL-DESIGN§1.6) if that is older still. A journal bucket whose jsets are all
+older than the newest durable `last_seq` is free; it is discarded and its slot reused for new
+jsets. No header or cursor is written to trim. Implementations that checkpoint every dirty node
+at each `Checkpoint` (the simplest correct policy, suited to small working sets) never hold pins
+across a checkpoint, so their trim point is the last `Checkpoint`.
+
+Reclaim scheduling follows journal fill — the share of journal buckets not free:
 
 | Fill level | Reclaim behaviour                                                           |
 | ---------- | --------------------------------------------------------------------------- |
@@ -433,8 +436,9 @@ monitors WAL fill level:
 | > 85 %     | New mutations stall until reclaim catches up.                               |
 
 A flush rewrites the affected leaf via the COW path (METADATA-DESIGN§1), then each parent up to the root,
-updating `BlockHeader.lsn = pending_lsn_max` and clearing the journal pin. The next checkpoint
-(ENGINE-DESIGN§1.2) commits the new root pointers atomically.
+updating `BlockHeader.lsn = pending_lsn_max` and clearing the journal pin. The next `Checkpoint`
+(JOURNAL-DESIGN§1.5) commits the new roots atomically. "Stall" means a mutation waits for, or
+performs inline, the reclaim the embedder's driver has not yet run; the engine owns no thread.
 
 **Memory reclaim.** A node may be evicted from the in-memory btree cache only after its pending
 journal entries have been merged and the resulting page persisted. Clean nodes (no pending
@@ -450,9 +454,9 @@ lag under ~10 K entries per node.
 ENGINE-DESIGN§2 and the flush thread cooperate through them without a shared coarse mutex:
 
 - **Per-tree write mutex** (mutation path). One mutex per snapshot-aware btree, plus one for
-  the WAL ring. It serialises LSN allocation, the WAL append, and the in-memory-mirror
-  update — the steps that must be atomic across concurrent writers. It is released before
-  any per-node bookkeeping.
+  the open jset. Writers reserve space in the open jset, copy their entry in and take its LSN
+  under that lock, then update the in-memory mirror — the steps that must be atomic across
+  concurrent writers. It is released before any per-node bookkeeping or I/O.
 - **Per-DirtyNode rwlock** (flush path). One rwlock per loaded node. Because rewrites are
   full-node COW (a fresh page at a fresh location), the flush thread holds only the *shared*
   lock on the source DirtyNode while it builds the new page contents. The *exclusive* lock
@@ -468,30 +472,89 @@ exclusive-swap moment. **Readers** consult the arc-swap'd index handle and are n
 on either lock — never on the per-tree mutex (writers release it before any disk I/O), never
 on a DirtyNode lock (readers go through the arc-swap'd snapshot, not the live DirtyNode).
 
-**Durability semantics.**
+### 1.5 Commits, checkpoints and recovery
 
-- A user fsync triggers a journal flush (an fsync of the WAL ring) — the mutation is durable
-  even though its btree page may not yet be persisted.
-- Crash recovery reads the active root pointer, then replays all WAL entries with
-  `lsn > root.lsn` against the loaded btree.
-- `RootPointer.lsn` therefore lags `WalHeader.next_lsn`; the gap is the unmaterialised journal
-  tail, bounded by reclaim policy.
+**Durability levels.** Every mutating call names one:
 
-### 1.5 Atomic root commit cadence
+- `Sync` — the call returns once the jset holding its entries, and every earlier jset, is
+  durable.
+- `Buffered { max_delay }` — the call returns at once; its entries become durable no later than
+  `max_delay` after it, through the embedder's driver (JOURNAL-DESIGN§1.4 "Stall", JOURNAL4).
+  Streams, bulk imports and caches use this.
 
-The ENGINE-DESIGN§1.2 commit protocol is invoked when:
+**Group commit.** Entries accumulate in the open jset. A commit seals it when a `Sync` caller
+waits and no jset is in flight (idle: lowest latency), when it reaches 256 KiB, when a
+`Buffered` deadline arrives, or when its HLC span would overflow (JOURNAL-DESIGN§1.2). While a
+jset is in flight, newly arriving commits join the next one, so set size grows with load.
+Several jsets may be in flight at once; a commit is acknowledged when every jset up to its own
+is durable.
 
-1. Btree topology actually changes (root split / merge / new tree depth).
-2. Sufficient flushes have accumulated that committing a fresh root meaningfully advances
-   `read_cursor`. Default: whichever of the two thresholds is hit first —
-   - **30 s** of mutation activity, or
-   - **256 MiB** of **flushed btree-page bytes**: cumulative bytes the journal-reclaim
-     thread has rewritten to fresh buckets since the last checkpoint. Not WAL bytes — the
-     WAL ring itself is only 64 MiB.
-3. A snapshot is created — snapshot creation forces a checkpoint so the snapshot's
-   `RootPointer` materialises a coherent btree state.
+**Write barrier, one flush per commit.** A jset is written with FUA where the device offers it,
+otherwise followed by one cache flush. Blob data written in the same commit is not flushed
+separately first: entries that reference new extents carry each extent's `extent_sum`
+(JOURNAL-DESIGN§1.3), and the commit issues its data writes, its jset write and then one barrier.
+If power fails between the two, recovery detects it (below). On devices that offer neither FUA
+nor a reliable flush, durability is whatever the device provides; sequence numbers and
+checksums still turn lost writes into a shorter journal, never corrupt state.
 
-Routine mutations do **not** flip the superblock root.
+**Checkpoints** are invoked when:
+
+1. Btree topology changes (root split / merge / new tree depth).
+2. Enough has been flushed that committing a root meaningfully advances the trim point.
+   Default: whichever comes first — **30 s** of mutation activity, or **256 MiB** of flushed
+   tree bytes since the last checkpoint.
+3. Journal fill reaches the aggressive band (JOURNAL-DESIGN§1.4).
+4. A snapshot is created, so its `RootPointer` materialises a coherent state.
+
+A checkpoint flushes the dirty trees, then commits a jset containing a `Checkpoint` entry with
+the new `RootPointer` (ENGINE-DESIGN§1.2). It writes nothing else: the superblock's root slots are
+rewritten only on clean unmount and when the journal bucket list changes, as a hint that lets a
+clean mount skip the journal scan.
+
+**Recovery:**
+
+1. Read the first jset of every journal bucket (JOURNAL-DESIGN§1.1); order buckets by their first
+   `seq`; walk forward from the newest durable `last_seq` through valid, consecutive jsets.
+2. The committed root is the newer of the superblock's root hint and the last `Checkpoint`
+   entry found.
+3. Verify every extent referenced by entries after that root, in the last jsets written before
+   the tail (those whose commit may have been cut between data and barrier), against its
+   `extent_sum`. An entry whose extent fails is dropped together with every later entry of its
+   commit; the objects it touched stay at their previous state.
+4. Replay the remaining entries after the root's LSN, in LSN order. Each in-memory mutation is
+   idempotent under `lsn ≤ structure.lsn`, so a crash during replay is safe.
+
+Recovery reads one jset per bucket plus the unflushed tail, and verifies data proportional to
+that tail, never to the pool.
+
+### 1.6 Retention
+
+Jsets are self-describing, so history is kept by not freeing journal buckets yet. The trim point
+(JOURNAL-DESIGN§1.4) is held back to the oldest subscription cursor that wants op replay
+(SUBSCRIPTIONS-DESIGN "Offline catch-up"), within a cap on retained bytes and age set per pool.
+A subscription whose cursor falls behind the cap catches up by result-set diff instead. The
+retained journal is the oplog: nothing else records mutation history, and cluster sync reads
+snapshot diffs, never the journal (CLUSTER-DESIGN).
+
+### 1.7 Mirroring
+
+When several hot-tier disks carry journal buckets, each commit writes the same jset — same
+`seq`, same bytes — to the current journal bucket of each, and is acknowledged once the
+configured number of copies is durable. Recovery merges the disks' journals by `seq`, taking any
+copy that validates. Whether and how the journal mirrors by default is JOURNAL-D1.
+
+### 1.8 Data paths
+
+Object bytes do not go through the journal, with one exception:
+
+| Write | Path |
+|---|---|
+| Tiny: whole object ≤ `INLINE_WRITE_MAX` (2 KiB by default, set per pool) | `WriteInline` carries the bytes; one jset write makes the object durable. A later checkpoint moves inline objects into small-object buckets that pack many objects per block, so a 200-byte file does not occupy a 4 KiB blob sector ([BLOB-DESIGN](blob-design.md)). |
+| Small to large | Bytes go to blob extents at the stream's write point (ALLOCATION-DESIGN§1.5); `WriteBlob` or the chunked flow (JOURNAL-DESIGN§1.3.1) records them, with `extent_sum`s. |
+| Streaming (camera recording, logs, downloads) | The object is created in the `Writing` state (METADATA-DESIGN§1.1); bytes are appended to extents taken whole bucket by bucket from a per-stream write point, so the stream is physically sequential; `ExtendObject` (or `ChunkListAppend` for chunked streams) makes each prefix durable, typically under `Buffered` durability once per second or on request. Closing the object sets its final length and content hash, computed incrementally while streaming, and moves it to `Active`. |
+
+After a crash a `Writing` object ends at its last journaled length; bytes written beyond it are
+reclaimed. Readers may follow a `Writing` object up to its durable length.
 
 ---
 

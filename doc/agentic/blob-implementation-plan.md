@@ -10,6 +10,8 @@ Design: [blob-design.md](blob-design.md) · Decisions: [blob-decisions.md](blob-
 - [ ] **BLOB4 — Selective chunking.** The write path consults the resolved storage policy (SPECIFICATION-DESIGN§9.6) to choose chunked or whole-object storage and the pipeline stages.
 - [ ] **BLOB5 — Populate `ObjectLocation.replicas`.** Prerequisite: BLOB1.
 - [ ] **BLOB6 — Remove the in-memory blob map.** `DiskEngine.blobs: HashMap<u64, Vec<u8>>` goes away. Prerequisite: BLOB2.
+- [ ] **BLOB8 — Tiny objects in the journal and small-object buckets.** Objects up to `INLINE_WRITE_MAX` are written with `WriteInline` and readable at once; a checkpoint packs them into small-object buckets in the layout BLOB-D4 selects and records their locations. Prerequisites: BLOB-D4, BLOB2, [JOURNAL9](journal-implementation-plan.md). Acceptance: 10 000 objects of 200 bytes round-trip through reopen, occupy far less than 10 000 × 4 KiB, and each write costs one journal set.
+- [ ] **BLOB9 — Streaming objects.** Create an object in the `Writing` state, append through a per-stream write point in whole buckets, make prefixes durable with `ExtendObject` (or `ChunkListAppend` when chunked), read up to the durable length while writing, and close with the final length and incrementally computed BLAKE3 hash; after a crash the object ends at its last journaled length and later bytes are reclaimed. Prerequisites: BLOB3, [JOURNAL10](journal-implementation-plan.md), [ALLOCATION7](allocation-implementation-plan.md). Acceptance: a 1 GiB stream written with a `Buffered` commit per second, interrupted at random points, reopens at a durable prefix whose bytes and length match what was acknowledged; the extents of an uninterrupted stream are physically sequential.
 
 ## Compression
 

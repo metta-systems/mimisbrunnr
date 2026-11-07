@@ -36,13 +36,13 @@ Each fixes a layout that later steps write; decide them first.
 - [OPERATIONS-D4](operations-decisions.md) — checksum algorithm.
 - [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md), [BTREE-D3](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes, aligned values in sorted runs.
 - [ALLOCATION-D1](allocation-decisions.md) — sub-bucket regions.
-- [ENGINE-D1](engine-decisions.md) — oplog persistence.
+- [BLOB-D4](blob-decisions.md) — small-object bucket layout.
 
 ### 2. Binary formats that need no new allocation
 
 Independent of each other unless an order is given.
 
-- **Encodings** (FORMAT-DESIGN§1.6): [SPEC25](specification-implementation-plan.md) and [INDEX9](index-implementation-plan.md) first; then [JOURNAL8](journal-implementation-plan.md) (binary WAL payloads), [QUERY11](query-implementation-plan.md) and [ONTOLOGY10](ontology-implementation-plan.md); after QUERY11, [SUBSCRIPTION7](subscriptions-implementation-plan.md) and [POOL5](pool-implementation-plan.md) (native placement-rules tree).
+- **Encodings** (FORMAT-DESIGN§1.6): [SPEC25](specification-implementation-plan.md) and [INDEX9](index-implementation-plan.md) first; then [JOURNAL8](journal-implementation-plan.md) (binary payloads, then [JOURNAL9](journal-implementation-plan.md): journal buckets and journal sets, after JOURNAL7), [QUERY11](query-implementation-plan.md) and [ONTOLOGY10](ontology-implementation-plan.md); after QUERY11, [SUBSCRIPTION7](subscriptions-implementation-plan.md) and [POOL5](pool-implementation-plan.md) (native placement-rules tree).
 - [SPEC24](specification-implementation-plan.md) — no packed on-disk structs.
 - [JOURNAL7](journal-implementation-plan.md) — one checksum algorithm (after OPERATIONS-D4).
 - [POOL3](pool-implementation-plan.md), then [POOL7](pool-implementation-plan.md) — pool state through the root pointer; pool assembled from its devices, no `pool.toml`.
@@ -64,7 +64,7 @@ The term dictionary, postings and forward index replace every index structure, s
 ### 4. Live tree machinery
 
 1. [BTREE4](btree-implementation-plan.md) — covered key ranges (after BTREE-D2).
-2. [JOURNAL2](journal-implementation-plan.md) — WAL trim respects pins.
+2. [JOURNAL2](journal-implementation-plan.md) — trim respects pins; [JOURNAL10](journal-implementation-plan.md) — group commit and durability levels.
 3. [BTREE5](btree-implementation-plan.md) — append-on-flush with whiteouts (after BTREE-D1).
 4. [ENGINE1](engine-implementation-plan.md) — long-lived nodes per tree.
 5. [BTREE6](btree-implementation-plan.md), then [JOURNAL3](journal-implementation-plan.md) — `FormatPromote` emit and replay.
@@ -74,7 +74,7 @@ The term dictionary, postings and forward index replace every index structure, s
 ### 5. Copy-on-write allocation
 
 1. [ALLOCATION1](allocation-implementation-plan.md) — sub-bucket regions (after ALLOCATION-D1).
-2. [ENGINE3](engine-implementation-plan.md) — COW commit.
+2. [ENGINE3](engine-implementation-plan.md) — COW commit; then [JOURNAL12](journal-implementation-plan.md) — root in the journal.
 3. [ALLOCATION3](allocation-implementation-plan.md) — generation check on read.
 4. [BTREE7](btree-implementation-plan.md), then [ENGINE2](engine-implementation-plan.md) — compaction.
 5. [METADATA1](metadata-implementation-plan.md), then [METADATA2](metadata-implementation-plan.md) — multi-level radix tables.
@@ -86,10 +86,10 @@ The term dictionary, postings and forward index replace every index structure, s
 
 ### 6. Blob zone and legacy blob retirement
 
-1. [BLOB1](blob-implementation-plan.md), [BLOB2](blob-implementation-plan.md), [BLOB5](blob-implementation-plan.md).
+1. [BLOB1](blob-implementation-plan.md), [BLOB2](blob-implementation-plan.md), [BLOB5](blob-implementation-plan.md); then [JOURNAL11](journal-implementation-plan.md) — one barrier per commit with extent verification.
 2. [ENGINE5](engine-implementation-plan.md) — backpointers in the engine; then [METADATA6](metadata-implementation-plan.md) — blob reclaim and tombstone expiry (after METADATA-D3).
-3. [BLOB3](blob-implementation-plan.md), [BLOB4](blob-implementation-plan.md) — chunked objects, selective chunking.
-4. [BLOB6](blob-implementation-plan.md), [UNIX1](unix-implementation-plan.md), [ENGINE6](engine-implementation-plan.md) (after ENGINE-D1), [ENGINE7](engine-implementation-plan.md), then [ENGINE8](engine-implementation-plan.md) — no legacy blob.
+3. [BLOB3](blob-implementation-plan.md), [BLOB4](blob-implementation-plan.md) — chunked objects, selective chunking; then [BLOB8](blob-implementation-plan.md) — tiny objects (after BLOB-D4) and [BLOB9](blob-implementation-plan.md) — streaming objects.
+4. [JOURNAL13](journal-implementation-plan.md) — retention as the oplog; then [BLOB6](blob-implementation-plan.md), [UNIX1](unix-implementation-plan.md), [ENGINE6](engine-implementation-plan.md), [ENGINE7](engine-implementation-plan.md), then [ENGINE8](engine-implementation-plan.md) — no legacy blob.
 
 ### 7. Device target
 

@@ -28,24 +28,22 @@ The on-disk layout is encryption-aware but encryption-agnostic:
   decrypt then check magic.
 - **Blob zone**: encrypted with **HCTR2-AES-128**, tweak = `(object_id || block_no_within_extent)`.
   Length-preserving.
-- **WAL**: each entry is **AES-256-GCM** authenticated when `WAL_ENTRY_FLAG_ENCRYPTED` is set.
-  - **Nonce**: 96 bits = 64-bit LSN || 32-bit zero. Nonces are unique by construction — LSNs
-    are monotonically allocated and never repeat under one key. AES-GCM is *not* a
-    nonce-misuse-resistant scheme; uniqueness must be enforced and reuse is catastrophic.
-  - **LSN wrap is forbidden.** The 64-bit LSN space (~1.8 × 10¹⁹ values) cannot wrap within
-    any realistic deployment lifetime — at 10⁶ entries/s sustained, wrap takes ~580 000
-    years. The implementation **panics on `next_lsn` overflow** rather than wrapping; this
-    is treated as an unrecoverable invariant violation, since reusing an LSN under the same
-    `DiskKey` would reuse a GCM nonce (ENCRYPTION-DESIGN§1) and break confidentiality + integrity.
-    Operationally there is no "near-the-boundary" code path to test or rotate around.
-  - **AAD**: the first 36 bytes of `WalEntryHeader` — every field except `payload_crc` —
-    authenticating magic, op_kind, format_version, flags, lsn, timestamp, and payload_length.
-    Header-swap attacks (re-binding a valid ciphertext to a different LSN or op_kind) are
-    therefore detected as tag mismatches.
-  - **Layout**: the 16-byte GCM tag is appended to the ciphertext, before the trailing 4-byte
-    framing CRC; see JOURNAL-DESIGN§1.2 for the full byte layout and read/write ordering. `payload_crc`
-    remains a 4-byte CRC32C — over ciphertext in encrypted mode, over plaintext otherwise —
-    so readers without the key still validate framing/I/O integrity.
+- **Journal**: each journal set's entries are **AES-256-GCM** authenticated as one unit when
+  `JSET_FLAG_ENCRYPTED` is set (JOURNAL-DESIGN§1.2).
+  - **Key**: the pool's journal key from the key hierarchy — one key for the whole journal, so
+    mirrored copies of a set on different disks are byte-identical.
+  - **Nonce**: 96 bits = 64-bit jset `seq` || 32-bit zero. Nonces are unique by construction —
+    sequence numbers are monotonically allocated and never repeat under one key. AES-GCM is
+    *not* a nonce-misuse-resistant scheme; uniqueness must be enforced and reuse is catastrophic.
+  - **Sequence wrap is forbidden.** The 64-bit space cannot wrap within any realistic
+    deployment lifetime (at 10⁶ sets/s, ~580 000 years). The implementation **panics on `seq`
+    overflow** rather than wrapping, since reusing a sequence number under the same key would
+    reuse a GCM nonce and break confidentiality and integrity.
+  - **AAD**: the `JsetHeader` with its `checksum` field zeroed, authenticating sequence, trim
+    point, timestamp base, lengths and flags; re-binding a valid ciphertext to another position
+    in the journal is detected as a tag mismatch.
+  - **Layout**: the 16-byte tag follows the ciphertext; the set's checksum covers ciphertext and
+    tag, so readers without the key still validate I/O integrity.
 - **Sync bundles**: **ChaCha20-Poly1305** with random nonces.
 
 Keys never leave the in-memory key hierarchy (`MasterKEK → DiskKey`). The superblock stores only

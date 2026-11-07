@@ -33,7 +33,7 @@ An `ObjectId` is referenced from every posting list the object is in, the forwar
 
 ### Phases
 
-Deletion walks `ObjectRecord.state` (`ObjectState`, discriminants pinned: `Active = 0`, `Tombstoned = 1`, `BlobReclaim = 2`, `Cleared = 3`) through the four phases of SPECIFICATION-DESIGN§7.1:
+Deletion walks `ObjectRecord.state` (`ObjectState`, discriminants pinned: `Active = 0`, `Tombstoned = 1`, `BlobReclaim = 2`, `Cleared = 3`, and `Writing = 4` for a stream not yet closed (JOURNAL-DESIGN§1.8), which deletion treats like `Active`) through the four phases of SPECIFICATION-DESIGN§7.1:
 
 1. **Tombstone.** `state = Tombstoned`, `modified_ns` = deletion time; the `DeleteObject` WAL entry and oplog op are written and subscribers get `Deleted`. The object is invisible to queries from here on. O(1).
 2. **Index cleanup.** The forward entry and the ontology's closure tables give exactly what to undo, so cost is O(terms on the object), not O(terms in the pool): the object leaves the postings of every term in its forward entry and of every tag those imply (one container each, INDEX-DESIGN§2.4, INDEX-DESIGN§3.1) and, for ordered or ranked collections, their sequences (INDEX-DESIGN§3.3); each term's dictionary statistics are updated; then the forward entry goes. Twenty terms are about 2 µs, so the work is not parallelised.

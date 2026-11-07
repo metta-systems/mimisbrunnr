@@ -72,7 +72,7 @@ A returning consumer gets the events between its cursor and now by one of two st
 | 1 month, ~5 M entries | ~5 s | ~1 ms plus per-object checks |
 | 6 months | log no longer holds it | ~1 ms plus per-object checks |
 
-The switch between strategies is a threshold on the number of entries behind. How far back replay can reach depends on how the oplog persists ([ENGINE-D1](engine-decisions.md)).
+The switch between strategies is a threshold on the number of entries behind. Replay reads the retained journal, which is held back for subscriptions that want it within a per-pool cap (JOURNAL-DESIGN§1.6); a cursor older than the retained history uses the diff.
 
 ## Batching
 
@@ -94,7 +94,7 @@ Commands: `mimir watch register <name> <query> | list | drain <name> | unsubscri
 - **A hybrid-logical-clock timestamp as the cursor.** The cursor is the WAL LSN of the last delivered event; events still carry their HLC timestamp.
 - **Persisting subscriptions in the metadata zone with the match bitmap at a separate offset.** Subscriptions are per-record B+ tree entries (SUBSCRIPTIONS-DESIGN§1).
 - **Separate attribute and wildcard indexes** (`attr_to_subs`, `wildcard_subs`). Attribute keys and relation predicates are tags, so one `tag_to_subs` covers them, and every query mentions at least one tag.
-- **The subscription engine owning its own extended log retention.** How much history exists is the oplog's decision ([ENGINE-D1](engine-decisions.md), where retained compressed segments are option (c)); a subscription beyond it falls back to the diff.
+- **The subscription engine owning its own extended log.** History is the retained journal (JOURNAL-DESIGN§1.6); a subscription beyond it falls back to the diff.
 
 ## Format specification
 

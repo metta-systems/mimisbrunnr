@@ -174,7 +174,7 @@ them or none. `BackpointerInsert` / `BackpointerRemove` remain first-class WAL o
 because they are also emitted directly by non-move callers (object deletion, fresh writes,
 lazy btree-node free) — moves are the only flow that needs the bundled `ReconcileMove`.
 
-**Type adaptation.** `BlockRef` is the uniform 16-byte handle used in the WAL ring
+**Type adaptation.** `BlockRef` is the uniform 16-byte handle used in journal entries
 (`{disk_id, block_no, generation}`); the on-disk owner fields use narrower or differently-shaped
 types for compactness. Replay demotes `to_loc: BlockRef` into the target's shape:
 
@@ -187,7 +187,7 @@ types for compactness. Replay demotes `to_loc: BlockRef` into the target's shape
 
 Writers do the inverse promotion when emitting `ReconcileMove`: they read the destination
 bucket's current `BucketAllocEntry.generation` to populate `BlockRef.generation`, and any
-`length` carried by the source field is dropped on the WAL ring (the WAL op carries no
+`length` carried by the source field is dropped in the journal (the journal entry carries no
 `length` because none of its consumers — `BackpointerInsert`, the owner-update — needs one
 beyond what the existing owner record already holds). The move-preserves-length invariant is
 load-bearing here: a hypothetical future op that *changes* the plaintext length of a chunk
