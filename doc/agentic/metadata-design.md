@@ -274,9 +274,9 @@ not under the object's own encryption policy, in:
 
 | Copy | Held until | Protection |
 |---|---|---|
-| Record leaf versions written before the move (copy-on-write leaves) | their bucket is reused and overwritten; freeing does not overwrite | metadata zone: XTS-AES-256 under the disk key when the pool is encrypted (ENCRYPTION-DESIGN§1), plaintext otherwise |
+| Record leaf versions written before the move (copy-on-write leaves) | their bucket is reused and overwritten; freeing does not overwrite | node buckets: XTS-AES-256 under the disk key when the pool is encrypted (ENCRYPTION-DESIGN§1), plaintext otherwise |
 | Journal sets whose entries carried the bytes (`WriteInline`, the record's put) | the journal trims past them, which retention (JOURNAL-DESIGN§1.6) can delay indefinitely, and their buckets are reused | journal: AES-256-GCM under the journal key when encrypted, plaintext otherwise |
-| `ObjectHistory` records of snapshots taken before the move (SNAPSHOTS-DESIGN§1.2) | every such snapshot is deleted and its cleanup scan has run | metadata zone, as above |
+| `ObjectHistory` records of snapshots taken before the move (SNAPSHOTS-DESIGN§1.2) | every such snapshot is deleted and its cleanup scan has run | node buckets, as above |
 | Peers' copies of the record (cluster sync) | each peer moves its copy out and reclaims as above | each peer's own pool protection |
 
 No step overwrites or scrubs these copies, so an object that must never have existed outside

@@ -492,7 +492,7 @@ The split is the same pattern as Git (object database vs. tree object) or ZFS de
 file extent map):
 
 - **Read** a chunked object: walk its `ChunkList` in order → for each `chunk_hash` look up
-  `ChunkIndex` → get `BlobRef` → read bytes from the blob zone.
+  `ChunkIndex` → get `BlobRef` → read bytes from its data bucket.
 - **Write** a chunked object: FastCDC splits plaintext → for each chunk, hash it and probe
   `ChunkIndex` → if hit, bump `ref_count`; if miss, write the bytes and insert. Either way,
   append the hash to the new object's `ChunkList`.

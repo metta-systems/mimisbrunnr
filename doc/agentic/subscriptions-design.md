@@ -92,7 +92,7 @@ Commands: `mimir watch register <name> <query> | list | drain <name> | unsubscri
 ## Rejected alternatives
 
 - **A hybrid-logical-clock timestamp as the cursor.** The cursor is the WAL LSN of the last delivered event; events still carry their HLC timestamp.
-- **Persisting subscriptions in the metadata zone with the match bitmap at a separate offset.** Subscriptions are per-record B+ tree entries (SUBSCRIPTIONS-DESIGN§1).
+- **Persisting subscriptions at fixed offsets with the match bitmap in a separate area.** Subscriptions are per-record B+ tree entries (SUBSCRIPTIONS-DESIGN§1).
 - **Separate attribute and wildcard indexes** (`attr_to_subs`, `wildcard_subs`). Attribute keys and relation predicates are tags, so one `tag_to_subs` covers them, and every query mentions at least one tag.
 - **The subscription engine owning its own extended log.** History is the retained journal (JOURNAL-DESIGN§1.6); a subscription beyond it falls back to the diff.
 

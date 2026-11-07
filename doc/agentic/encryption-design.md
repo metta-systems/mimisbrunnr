@@ -23,11 +23,12 @@ The numbered sections below are the normative on-disk and algorithmic specificat
 
 The on-disk layout is encryption-aware but encryption-agnostic:
 
-- **Index zone, metadata zone**: blocks encrypted with **XTS-AES-256**, tweak = `block_no`. Fixed
-  layout is preserved (no expansion). `BlockHeader` is encrypted along with payload — verifiers
-  decrypt then check magic.
-- **Blob zone**: encrypted with **HCTR2-AES-128**, tweak = `(object_id || block_no_within_extent)`.
-  Length-preserving.
+- **Node buckets** (tree nodes and positional regions, ALLOCATION-DESIGN§1.2): blocks encrypted
+  with **XTS-AES-256**, tweak = the block's address `(disk_id, bucket_no, sector)`. Fixed layout
+  is preserved (no expansion). Headers are encrypted along with payload — verifiers decrypt then
+  check magic.
+- **Data and packed buckets**: encrypted with **HCTR2-AES-128**, tweak = `(object_id ||
+  block_no_within_extent)`. Length-preserving.
 - **Journal**: each journal set's entries are **AES-256-GCM** authenticated as one unit when
   `JSET_FLAG_ENCRYPTED` is set (JOURNAL-DESIGN§1.2).
   - **Key**: the pool's journal key from the key hierarchy — one key for the whole journal, so

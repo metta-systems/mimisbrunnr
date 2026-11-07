@@ -453,37 +453,29 @@ Object → the `TermId`s it asserts directly. Used for listing an object's tags 
 
 ## 6. On-Disk Layout
 
-### 6.1 Raw Disk Zones
+### 6.1 Raw Disks and Buckets
 
 The filesystem operates directly on raw block devices. Each disk is divided into fixed-size **buckets** (default 1 MiB; configurable 256 KiB–4 MiB at format time) — a bcachefs-derived allocation primitive that gives constant-time bucket invalidation via generation numbers, native fit for SMR/zoned drives, and crash-safe pointer staleness detection. Within a bucket, writes are **append-only**; a bucket is reused only after its generation is bumped, atomically invalidating every pointer that referenced its previous contents.
 
 ```
  0                    Superblock primary (4KB)
  4K                   Superblock copy (4KB)
- ...                  Journal buckets (listed in the superblock)
-                      ┌───────────────────────────────────┐
-                      │  Zone 1: INDEX ZONE               │
-                      │  Term index, postings, ontology   │
-                      │  3% of usable space (first extent)│
-                      ├───────────────────────────────────┤
-                      │  Zone 2: METADATA ZONE            │
-                      │  Object records, forward index,   │
-                      │  backpointers                     │
-                      │  2% of usable space (first extent)│
-                      ├───────────────────────────────────┤
-                      │  Zone 3: BLOB ZONE                │
-                      │  File content, large values       │
-                      │  ~95% of usable space (1st extent)│
+ first_usable_bucket  ┌───────────────────────────────────┐
+  …                   │  Buckets, each of one kind:       │
+                      │   Journal — journal sets          │
+                      │   Node    — tree nodes, regions   │
+                      │   Data    — object extents, chunks│
+                      │   Packed  — small-object blocks   │
+                      │   Free                            │
                       └───────────────────────────────────┘
- ...                  [Optional additional zone extents]
  end-4K               Superblock backup copy
 ```
 
-**Superblock.** A 4 KiB block written 3× (offsets 0, 4096, last-4096-of-device) for redundancy. Holds a `BlockHeader`, pool/disk identity (UUID, node_id, disk_id, media_type, tier), capacity, format-version fields, two alternating `RootPointer` slots holding the mount hint for the committed root (§6.4), the journal bucket list, static layout pointers ( `bucket_size_log2`, `btree_node_size_log2`), zone extents (`index_zone`, `metadata_zone`, `blob_zone` of type `ZoneExtent`), feature-flag words (`compat`, `ro_compat`, `incompat`), and the pool-wide default chunking policy (§3.5). See ENGINE-DESIGN§1.1 for the full byte layout.
+There are no fixed areas: metadata and data share one bucket space, placed by bucket kind, tier and placement rules, and a device grows by adding buckets.
 
-**Growable zones:** Each zone starts as a single contiguous extent. When grown non-contiguously, additional extents are recorded in a **ZoneMap** block (4 KiB; up to 126 extents per block, chained for more); `Superblock.zone_map_offset` is `0` until the first non-contiguous grow.
+**Superblock.** A 4 KiB block written 3× (offsets 0, 4096, last-4096-of-device) for redundancy. Holds a `BlockHeader`, pool and disk identity (pool UUID, disk UUID, node_id, disk_id, media_type, tier), capacity, geometry (`bucket_size_log2`, `btree_node_size_log2`, `metadata_replicas`), format-version and feature-flag fields, the journal bucket list and a hint to the newest checkpoint (§6.4). See ENGINE-DESIGN§1.1 for the full byte layout.
 
-**Atomic root commit.** All persistent B+ tree / radix-tree roots are anchored in a single `RootPointer` (~408 B) inside the superblock. Two slots (`root_a`, `root_b`) alternate with `active_root` selecting the live one — a torn write never produces a corrupt root. Routine mutations land in the WAL; the superblock root is flipped only at checkpoint cadence (§6.4 / ENGINE-DESIGN§1.2, JOURNAL-DESIGN§1.5).
+**Atomic root commit.** All persistent tree roots form one **root list**, carried by `Checkpoint` journal entries; a checkpoint commits atomically with its journal set, so a torn write never produces a corrupt root. The superblock is rewritten only on clean unmount and when the journal's bucket list changes (§6.4 / ENGINE-DESIGN§1.2, JOURNAL-DESIGN§1.5).
 
 **Allocation is bucket-based, not bitmap-based.** Per-disk free space is tracked via two B+ trees (`BucketAllocEntry` table + `FreespaceLruEntry` LRU), rooted in each disk's `DiskDescriptorOnDisk`. A bucket carries `(generation, kind, live_sectors)` in 8 bytes; live sectors are derived from the journal on replay, and generations are held in memory. Pointers (`BlockRef`) are bucket-relative — a disk addresses 4 PiB at the default 1 MiB bucket — and are checked against the destination bucket's generation; a mismatch on a committed pointer is corruption. Tree-node pointers carry `metadata_replicas` copies on different disks. See ALLOCATION-DESIGN§1 and ENGINE-DESIGN§1.2.
 
@@ -561,7 +553,7 @@ The journal is the **redo log** of every mutation, kept in an ordered list of al
 
 **Journal sets.** Each commit writes one new *journal set* — a 64-byte header with sequence number, trim point, base timestamp and one checksum, then a batch of 8-byte-headed binary entries, padded to 4 KiB — and never rewrites it, so a torn write can only lose a set not yet acknowledged. Compression and encryption apply per set (JOURNAL-DESIGN§1.2).
 
-**Commits and checkpoints.** Group commit adapts to load: idle commits go out at once, concurrent ones batch into sets up to 256 KiB, pipelined; one FUA write or flush per commit, with new data extents verified by checksum at recovery instead of a second flush. Callers choose `Sync` or `Buffered { max_delay }` durability. A checkpoint is a `Checkpoint` entry carrying the new root pointer; the superblock's root slots are only a mount hint (JOURNAL-DESIGN§1.5).
+**Commits and checkpoints.** Group commit adapts to load: idle commits go out at once, concurrent ones batch into sets up to 256 KiB, pipelined; one FUA write or flush per commit, with new data extents verified by checksum at recovery instead of a second flush. Callers choose `Sync` or `Buffered { max_delay }` durability. A checkpoint is a `Checkpoint` entry carrying the new root list; the superblock holds only a hint to the newest checkpoint (JOURNAL-DESIGN§1.5).
 
 **History and mirroring.** Retained journal buckets are the oplog that subscriptions replay from (JOURNAL-DESIGN§1.6). With several hot disks, each commit writes the same set to each (JOURNAL-DESIGN§1.7).
 
@@ -779,8 +771,8 @@ enum CompressionAlgo { None, Zstd(i32 /* level 1-22 */), Lz4 }
 
 enum EncryptionMode {
     None,
-    Hctr2 { object_id: u64 },   // wide-block, length-preserving (blob zone)
-    Xts,                        // narrow-block, length-preserving (metadata/index zones)
+    Hctr2 { object_id: u64 },   // wide-block, length-preserving (data buckets)
+    Xts,                        // narrow-block, length-preserving (node buckets)
     AesGcm,                     // authenticated; nonce = 64-bit LSN || 32-bit zero (WAL)
     ChaCha20Poly1305,           // network/sync messages
 }
@@ -818,20 +810,19 @@ Two fundamentally different regimes using the correct cryptographic mode for eac
 
 |Component|Mode|Why|
 |---|---|---|
-|**Blob zone**|HCTR2-AES-128|Wide-block: entire sector changes on any byte edit. Hides internal structure. Length-preserving.|
-|**Metadata zone**|XTS-AES-256|Fast random-access reads. Length-preserving.|
-|**Index zone**|XTS-AES-256|Bulk decrypt at boot.|
+|**Data and packed buckets**|HCTR2-AES-128|Wide-block: entire sector changes on any byte edit. Hides internal structure. Length-preserving.|
+|**Node buckets** (trees, positional regions)|XTS-AES-256|Fast random-access 4 KiB block reads. Length-preserving.|
 |**WAL**|AES-256-GCM|Append-only with monotonic LSN as nonce. Authenticated.|
 |**Sync traffic**|ChaCha20-Poly1305|Network messages. Constant-time on all platforms.|
 |**Fallback**|Adiantum|Wide-block via ChaCha12, for ARM without crypto extensions.|
 
 AES-GCM is **not** used for disk encryption — it expands data, catastrophically fails on nonce reuse (power loss), and requires per-sector stored nonces. XTS and HCTR2 derive all state from sector address and key.
 
-**Tweak construction:** HCTR2 tweaks are `(object_id || block_no_within_extent)` so identical content in different objects encrypts differently. XTS tweaks on metadata/index blocks are `block_no`.
+**Tweak construction:** HCTR2 tweaks are `(object_id || block_no_within_extent)` so identical content in different objects encrypts differently. XTS tweaks on node blocks are the block's address `(disk_id, bucket_no, sector)`.
 
 ⁉️This prevents deduplication though? #todo 
 
-**Integrity:** BLAKE3 checksums on plaintext stored in the metadata zone (different key) detect tampering that XTS/HCTR2 cannot.
+**Integrity:** BLAKE3 checksums on plaintext stored in the object records (node buckets, different key) detect tampering that XTS/HCTR2 cannot.
 
 ### 9.4 Key Hierarchy
 
@@ -847,9 +838,9 @@ User Passphrase / Hardware Key
  Disk Keys                      Message Keys
     │                                │
     ├── XTS-AES-256 (512b)           ├── AES-GCM-256 (WAL)
-    │   metadata + index             └── ChaCha20-Poly1305 (sync)
+    │   node buckets                 └── ChaCha20-Poly1305 (sync)
     ├── HCTR2-AES-128 (128b)
-    │   blob zone pool-wide
+    │   data buckets pool-wide
     └── Per-tag HCTR2 keys (128b)
         HKDF(blob_pool_key, tag_id)
 ```
@@ -1108,7 +1099,7 @@ SUBSCRIBE → ACTIVE (live events) → DORMANT (agent offline, cursor frozen)
                                            → ACTIVE (live events resume)
 ```
 
-Subscriptions persist across reboots (stored in metadata zone). Garbage-collected after retention period expires without reconnection.
+Subscriptions persist across reboots (in the subscriptions tree, SUBSCRIPTIONS-DESIGN§1). Garbage-collected after retention period expires without reconnection.
 
 ### 11.8 Ontology-Aware Subscriptions
 
@@ -1413,7 +1404,7 @@ tier = "hot"
 capacity_bytes = 1073741824
 ```
 
-Index state is currently persisted as CBOR (length-prefixed) in the index zone — chosen over JSON for compactness and over a fully fixed binary layout for current-MVP simplicity. The target on-disk format (B+ trees of 256 KiB large nodes, fixed binary leaves, atomic root commit) is specified in the scope format sections indexed by [format-design.md](format-design.md). Round-trip: `brunnr create` → `mimir tag/query` → `mimir` save/load works end-to-end.
+All engine state persists in the trees of the root list — B+ trees and positional regions of 256 KiB write-once nodes, fixed binary layouts, committed atomically by checkpoints — specified in the scope format sections indexed by [format-design.md](format-design.md).
 
 ---
 
@@ -1774,7 +1765,7 @@ graph TB
 |Derived terms in postings|Rules' results posted at write time, never in forward entries|Read path stays a single posting lookup|
 |Array-indexed metadata|O(1) by object ID|Faster than any tree for sequential IDs|
 |ID non-recycling|48-bit space, never reuse|Eliminates stale-reference bugs across cluster|
-|Separate zones|Index / metadata / blob|Each optimized for its access pattern|
+|Purpose-built layouts in one bucket space|Postings, positional records, extents|Each optimized for its access pattern; no fixed areas to size or grow|
 |HCTR2 for blobs|Wide-block disk encryption|Hides internal structure; correct for at-rest|
 |XTS for metadata|Narrow-block disk encryption|Fast random access; structure leak acceptable|
 |GCM/ChaCha for messages|AEAD for WAL + sync|Authentication + unique nonces in append-only contexts|
@@ -1878,16 +1869,16 @@ The core problem is a sparse matrix: millions of objects, thousands of labels, 5
 | RDF triple stores (Oxigraph, SPARQL) | Transitive ontology queries for free | 10–100× slower for plain tag intersection |
 | Key-value stores with composite keys (sled, RocksDB) | Simple point queries | Boolean combinations need hand-written merge logic |
 | Bloom-filter indexes, ECS archetype storage, vector or full-text engines | Niche pre-filtering or iteration patterns | Not the workload |
-| One embedded B+ tree file for all metadata (redb) | Pure Rust, ACID, mmap'd | A single structure for three access patterns; replaced by raw zones with purpose-built layouts |
+| One embedded B+ tree file for all metadata (redb) | Pure Rust, ACID, mmap'd | A single structure for three access patterns; replaced by purpose-built layouts over raw buckets |
 
-### C.2 Three zones, three layouts
+### C.2 Three layouts, one bucket space
 
-Tag bitmaps (large, read-heavy, rarely mutated), object metadata (small records, point lookups, frequent updates) and blob content (large, streaming, append-mostly) want different representations. Traditional filesystems push all three through inodes and data blocks and pay for it. Hence separate index, metadata and blob zones (§6.1).
+Postings (large, read-heavy, rarely mutated), object records (small records, point lookups, frequent updates) and blob content (large, streaming, append-mostly) want different representations. Traditional filesystems push all three through inodes and data blocks and pay for it. Hence purpose-built layouts — postings trees, positional record pages, extents — that share one bucket space classified by bucket kind (§6.1) instead of fixed zones that must be sized at format time.
 
-- **Index zone in RAM.** A tag on 100 K of 10 M objects serialises to 20–50 KB; all 5 000 tags fit in 100–250 MB, read at boot in a few hundred milliseconds. Keep it resident, persist through the WAL and checkpoints.
-- **Metadata by array index.** IDs are dense and sequential, so `base + id × 128` beats any tree, as ext4's inode table does.
-- **Blob zone: extents over log structure.** A log-structured zone (LFS, F2FS) gives sequential writes but needs garbage collection; extents (XFS, ext4) favour large sequential reads. Extents with a free-space tree suit a general-purpose store.
-- **Metadata path separate from data path.** Queries touch only the fast disk; blob reads go to the capacity tier.
+- **Index read in blocks, not resident.** Posting containers and forward entries are read in place from cached 4 KiB blocks (INDEX-DESIGN§3); no index structure is mirrored whole in memory, so a device with little RAM serves the same pool.
+- **Metadata by array index.** IDs are dense and sequential, so a positional radix of record pages beats a keyed tree, as ext4's inode table does.
+- **Blob data: extents over log structure.** A log-structured store (LFS, F2FS) gives sequential writes but needs garbage collection; extents (XFS, ext4) favour large sequential reads. Extents in append-only buckets with copy GC take both.
+- **Metadata path separate from data path.** Node buckets sit on the fast disks; blob reads go to the capacity tier.
 
 ### C.3 Derived terms: posted, not expanded at query time
 
@@ -1925,7 +1916,7 @@ Content-defined chunking turns one extent read into one lookup per chunk. It pay
 
 **Two regimes.** At-rest data needs length preservation, no per-sector state, safe in-place rewrites and random access: tweakable disk ciphers (XTS, HCTR2, Adiantum). Messages (WAL entries, sync traffic) are append-only with naturally unique nonces and tolerate a small expansion: AEAD (AES-GCM, ChaCha20-Poly1305). AES-GCM is wrong at rest: it expands each sector by 28 bytes, needs stored per-sector nonces (about 750 MB for 1 TB), and a nonce reused after power loss leaks the plaintext XOR and the authentication key.
 
-**Integrity.** XTS and HCTR2 do not authenticate. A BLAKE3 hash of the plaintext in the object record (metadata zone, different key and location), optionally with per-sector hashes for large objects, detects tampering without per-sector tags.
+**Integrity.** XTS and HCTR2 do not authenticate. A BLAKE3 hash of the plaintext in the object record (node buckets, different key and location), optionally with per-sector hashes for large objects, detects tampering without per-sector tags.
 
 **Key hierarchy as proposed.** Passphrase or hardware key → Argon2id → master KEK → disk keys (XTS-AES-256 for index and metadata, HCTR2-AES-128 for blobs, per-tag HCTR2 keys derived by HKDF-SHA256 from the blob key and tag id) and message keys (AES-GCM for the WAL, ChaCha20-Poly1305 for sync). Platform-adaptive selection falls back to Adiantum without AES instructions. Open points: [ENCRYPTION-D3](encryption-decisions.md), [ENCRYPTION-D5](encryption-decisions.md).
 

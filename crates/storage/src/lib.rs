@@ -10,8 +10,8 @@
 //!   check, in-memory `BucketAllocTable` placeholder.
 //!
 //! Not yet implemented: the remaining BTREE-DESIGN§1 B+ tree machinery
-//! (BTREE4–BTREE8), encryption ciphers (ENCRYPTION1, ENCRYPTION4), and
-//! `ZoneMap` continuation chaining (TODO(ENGINE9)).
+//! (BTREE4–BTREE10), encryption ciphers (ENCRYPTION1, ENCRYPTION4); zones and
+//! `ZoneMap` are retired in favour of bucket placement (TODO(ENGINE4)).
 
 mod addressing;
 mod alloc;

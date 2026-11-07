@@ -46,7 +46,7 @@ Independent of each other unless an order is given.
 - [JOURNAL7](journal-implementation-plan.md) — one checksum algorithm (after OPERATIONS-D4).
 - [POOL3](pool-implementation-plan.md), then [POOL7](pool-implementation-plan.md) — pool state through the root pointer; pool assembled from its devices, no `pool.toml`.
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
-- [ENGINE11](engine-implementation-plan.md) — typed chunking defaults in the superblock.
+- [ENGINE12](engine-implementation-plan.md) — superblock and root list (after ALLOCATION9 and JOURNAL12); [ENGINE11](engine-implementation-plan.md) — typed chunking defaults in pool state (after POOL3).
 - [BTREE9](btree-implementation-plan.md) — write-once regions with block-addressable runs; then [BTREE10](btree-implementation-plan.md) — positional page regions, and [BTREE8](btree-implementation-plan.md) — one run format for every tree.
 - [ONTOLOGY2](ontology-implementation-plan.md) — storage errors.
 - [ONTOLOGY10](ontology-implementation-plan.md) (per-record ontology tree, in the encodings group above), then [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator with ad-hoc tags in `local` — and [ONTOLOGY15](ontology-implementation-plan.md) — tag uids and name resolution; [ONTOLOGY11](ontology-implementation-plan.md) — ontology journal ops, after JOURNAL8.
@@ -69,7 +69,7 @@ The term dictionary, postings and forward index replace every index structure, s
 2. [JOURNAL2](journal-implementation-plan.md) — trim respects pins; [JOURNAL10](journal-implementation-plan.md) — group commit and durability levels.
 3. [BTREE5](btree-implementation-plan.md) — append-on-flush with whiteouts.
 4. [ENGINE1](engine-implementation-plan.md) — long-lived nodes per tree.
-5. [JOURNAL4](journal-implementation-plan.md) — checkpoint cadence driver.
+5. [JOURNAL4](journal-implementation-plan.md) — checkpoint cadence driver; then [ENGINE13](engine-implementation-plan.md) — step-driven engine.
 6. [SUBSCRIPTION2](subscriptions-implementation-plan.md) — per-subscription COW check.
 
 ### 5. Copy-on-write allocation
@@ -79,7 +79,7 @@ The term dictionary, postings and forward index replace every index structure, s
 3. [ALLOCATION3](allocation-implementation-plan.md) — resident generations and the dereference check.
 4. [BTREE7](btree-implementation-plan.md), then [ENGINE2](engine-implementation-plan.md) — compaction.
 5. [METADATA1](metadata-implementation-plan.md) — multi-level radix per origin node.
-6. [ENGINE4](engine-implementation-plan.md) — retire fixed index-zone areas.
+6. [ENGINE4](engine-implementation-plan.md) — retire zones and fixed areas.
 7. [SUBSCRIPTION1](subscriptions-implementation-plan.md) — externalized subscription bitmaps.
 8. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md), [ALLOCATION6](allocation-implementation-plan.md) — per-disk allocation trees.
 9. [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup.
@@ -119,7 +119,6 @@ These touch disjoint code and can run whenever their prerequisites hold:
 - **Ontology:** [ONTOLOGY6](ontology-implementation-plan.md) (after INDEX14), then [ONTOLOGY7](ontology-implementation-plan.md) and [ONTOLOGY12](ontology-implementation-plan.md); [ONTOLOGY14](ontology-implementation-plan.md) (after ONTOLOGY11 and ONTOLOGY15), then [ONTOLOGY5](ontology-implementation-plan.md), [ONTOLOGY8](ontology-implementation-plan.md), [ONTOLOGY9](ontology-implementation-plan.md), [ONTOLOGY3](ontology-implementation-plan.md); [ONTOLOGY4](ontology-implementation-plan.md) after ONTOLOGY-D2.
 - **Pool:** [POOL1](pool-implementation-plan.md), [POOL4](pool-implementation-plan.md).
 - **Unix and FUSE:** [UNIX2](unix-implementation-plan.md)–[UNIX6](unix-implementation-plan.md), [UNIX8](unix-implementation-plan.md); [UNIX9](unix-implementation-plan.md) after UNIX-D3; [UNIX10](unix-implementation-plan.md) after BLOB1.
-- **Zone growth:** [ENGINE9](engine-implementation-plan.md).
 - **Tooling:** [TOOLING3](tooling-implementation-plan.md)–[TOOLING8](tooling-implementation-plan.md); TOOLING3 early, since later end-to-end acceptance criteria use it.
 - **Specification:** [SPEC4](specification-implementation-plan.md)–[SPEC23](specification-implementation-plan.md) as their decisions resolve; SPEC21 (trim struct bodies) scope by scope as code lands.
 - **Blob:** [BLOB7](blob-implementation-plan.md).

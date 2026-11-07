@@ -13,7 +13,7 @@ The journal is the durability point for every mutation on any medium — SD card
 
 - **Journal buckets, write-once journal sets.** The journal is an ordered list of allocator buckets named in the superblock. Each commit writes one new *journal set* (jset) — a header and a batch of entries — that is never rewritten, so a torn write loses only the set not yet acknowledged.
 - **Compact entries.** One 64-byte header, one checksum, one compression unit and one AEAD tag per jset; 8 bytes of header per entry. An `AddTag` costs 24 bytes.
-- **The root travels in the journal.** A checkpoint is a `Checkpoint` entry carrying the new `RootPointer`; the superblock's root slots are a mount hint, rewritten only on clean unmount and when the journal's bucket list changes.
+- **The root travels in the journal.** A checkpoint is a `Checkpoint` entry carrying the new root list (ENGINE-DESIGN§1.2); the superblock holds only a hint naming the jset of the newest checkpoint, rewritten on clean unmount and when the journal's bucket list changes.
 - **Adaptive group commit.** Idle commits seal and write at once; under load, commits join the next set and sets grow toward 256 KiB. Sets are pipelined and acknowledged in sequence. FUA where the device offers it, a cache flush otherwise; one flush per commit, with data extents verified by checksum on recovery instead of a second flush.
 - **Caller-chosen durability.** `Sync` returns once durable; `Buffered { max_delay }` becomes durable within a bound.
 - **Data beside the journal.** File data goes to blob extents; only tiny writes ride inside the journal, to be packed later. Streams are append-only objects made durable by periodic `ExtendObject` entries.
@@ -279,7 +279,8 @@ ReconcileScanStep: { scan_id: u64, btree: BtreeKind, cursor_key: bytes }  // res
 
 // WalOpKind 30 unassigned: each run carries its own key format (BTREE-DESIGN§1.6)
 
-Checkpoint       : { new_root: RootPointer, gc_reserve_buckets: u32 }
+Checkpoint       : { gc_reserve_buckets: u32, roots: RootList }   // RootListHead + RootEntry × N
+                   //   (ENGINE-DESIGN§1.2)
                    // Commits a root (JOURNAL-DESIGN§1.5): every tree flushed up to this
                    //   entry's LSN is reachable from new_root. Recovery starts from the newest
                    //   valid Checkpoint and replays the entries after it.
@@ -527,16 +528,16 @@ checksums still turn lost writes into a shorter journal, never corrupt state.
 4. A snapshot is created, so its `RootPointer` materialises a coherent state.
 
 A checkpoint flushes the dirty trees, then commits a jset containing a `Checkpoint` entry with
-the new `RootPointer` (ENGINE-DESIGN§1.2). It writes nothing else: the superblock's root slots are
-rewritten only on clean unmount and when the journal bucket list changes, as a hint that lets a
-clean mount skip the journal scan.
+the new root list (ENGINE-DESIGN§1.2). It writes nothing else: the superblock's checkpoint hint is
+rewritten only on clean unmount and when the journal bucket list changes, and lets a clean mount
+read one jset instead of scanning the journal.
 
 **Recovery:**
 
 1. Read the first jset of every journal bucket (JOURNAL-DESIGN§1.1); order buckets by their first
    `seq`; walk forward from the newest durable `last_seq` through valid, consecutive jsets.
-2. The committed root is the newer of the superblock's root hint and the last `Checkpoint`
-   entry found.
+2. The committed root is the newest `Checkpoint` entry: the one in the jset the superblock's
+   hint names, or a newer one found by the scan.
 3. Verify every extent referenced by entries after that root, in the last jsets written before
    the tail (those whose commit may have been cut between data and barrier), against its
    `extent_sum`. An entry whose extent fails is dropped together with every later entry of its

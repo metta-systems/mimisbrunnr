@@ -75,7 +75,7 @@ When a slice changes or implements something a format section or the system desi
 
 Before implementing a slice, name the decisions it depends on and confirm they are settled in `<scope>-design.md` or the spec. Leave unrelated decisions open in `<scope>-decisions.md` instead of blocking on them or guessing. Decisions that always need the maintainer:
 
-- **On-disk format:** struct layouts and sizes, key and value encodings, codec choice (packed / VARINT / CBOR), region sizes and index-zone offsets, magic and discriminants, CRC coverage.
+- **On-disk format:** struct layouts and sizes, key and value encodings, codec choice (packed / VARINT / CBOR), region sizes, magic and discriminants, CRC coverage.
 - **Recovery semantics:** WAL op kinds and payloads, checkpoint and replay rules, what is persisted versus rebuilt at boot.
 - **Spec amendments** to any format section, `format-design.md`, or the system design (`specification-design.md`).
 - **Crate boundaries and type ownership** (`doc/agentic/operations-design.md`), new workspace dependencies.
@@ -126,12 +126,12 @@ A layout that needs deserialising to answer a lookup, or that a reader cannot bo
 
 - Get identity, durability, crash consistency and spec conformance right first. Do not keep current struct sizes, inline representations or region caps at the expense of a correct design; add fields, records or regions when needed (with format approval).
 - Defer size and performance work to a separate, measured slice.
-- Whenever a layout changes, update together: the `bytemuck` POD struct and its `// [a..b]` offsets, size assertions (`const _: () = assert!(size_of::<T>() == N)`), the `validation/` crate, region sizes and index-zone offset constants, CRC coverage, allocator and footprint accounting, every reader and writer, `bin/analyze`, and the spec tables. Never disable an assertion to make a change fit.
+- Whenever a layout changes, update together: the `bytemuck` POD struct and its `// [a..b]` offsets, size assertions (`const _: () = assert!(size_of::<T>() == N)`), the `validation/` crate, region sizes, CRC coverage, allocator and footprint accounting, every reader and writer, `bin/analyze`, and the spec tables. Never disable an assertion to make a change fit.
 
 ## Keep responsibilities separate
 
 - **`types`:** pure logical types and small pure codecs (`Value` and its codec, IDs). No I/O.
-- **`storage`:** block device, superblock, zones, bucket allocation, B+ tree region envelopes and the packed-key codec. Mechanism only; it knows no index semantics.
+- **`storage`:** block device, superblock, bucket allocation, B+ tree region envelopes and the packed-key codec. Mechanism only; it knows no index semantics.
 - **`wal`:** log format, append, checkpoint, replay, journal pins.
 - **Owning crates (`meta`, `index`, `ontology`, `watch`, `pool`, `unix`, `transform`):** their wire structs, key/value types and invariant-preserving operations, persisted through `storage` regions.
 - **`query`, `sql`:** evaluation over indices; no persistence.

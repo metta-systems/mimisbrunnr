@@ -104,7 +104,7 @@ construction. CRC is computed with the CRC slot itself zeroed.
 enum BlockKind {
     // Filesystem identity, on-disk geometry, and pool composition
     Superblock        = 0,   // per-disk identity + format pointers (ENGINE-DESIGN§1.1)
-    ZoneMap           = 1,   // per-disk extra-extent zone descriptors (ENGINE-DESIGN§1.1)
+    // 1 unassigned (devices have no zones, ENGINE-DESIGN§1)
     PoolStateRoot     = 2,   // pool-wide disk geometry + tunables (POOL-DESIGN§1)
     // 3..=4 unassigned (journal sets carry their own header, JOURNAL-DESIGN§1.2)
     // 5..=9 unassigned (index data lives in BtreeKind trees, INDEX-DESIGN)

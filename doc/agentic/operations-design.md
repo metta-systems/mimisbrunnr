@@ -86,7 +86,7 @@ Workspace-level evidence (`just test`, `just clippy`) backs every claim: a regre
 | Tag | A label, attribute key or relation predicate, named across nodes by its 128-bit `TagUid` and locally by its `u32` `TagId`. |
 | Query | A predicate over assertions evaluated by bitmap algebra (`HasTag`, `HasAttr` with comparisons, `Related`, `And` / `Or` / `Not`, `IsA`), resolving to an ObjectId set. |
 | Ontology | The tags, rules and constraints of a pool, installed as modules; it determines derived terms and the placement, tier, compression and encryption of matching objects. |
-| Pool | One or more block devices formed by `brunnr create`, holding superblock, WAL, metadata zones and blob zones. A Mímir instance operates on exactly one pool. |
+| Pool | One or more block devices formed by `brunnr create`, each holding superblock copies and buckets for the journal, tree nodes and data. A Mímir instance operates on exactly one pool. |
 
 ## Workspace
 
