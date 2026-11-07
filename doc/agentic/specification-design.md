@@ -1054,7 +1054,7 @@ struct Subscription {
     cursor_ns: i64,                 // time of that journal entry
     state: SubscriptionState,       // Active or Dormant
     retention: Retention,           // SUBSCRIPTION-D2
-    // membership as of the cursor: posting containers in their own tree (SUBSCRIPTIONS-DESIGN§1)
+    // membership: posting containers in their own tree (SUBSCRIPTIONS-DESIGN§1)
 }
 
 enum WatchEvent {
@@ -1084,7 +1084,7 @@ struct SubscriptionEngine {
 }
 ```
 
-Cost per mutation: ~microseconds (one lookup per changed term + one evaluation per reached subscription). Delivery is pull-based: `poll` returns events after the cursor, from the buffer or by replaying the journal, and `ack` advances the cursor (SUBSCRIPTIONS-DESIGN "Delivery"). Ops received by cluster sync are local journal entries, so they produce events like local mutations.
+Cost per mutation: ~microseconds (one lookup per changed term + one evaluation per reached subscription). Delivery is pull-based: `poll` returns events after the cursor and `ack` advances the cursor; how events survive a restart is SUBSCRIPTION-D6 (SUBSCRIPTIONS-DESIGN "Delivery"). Ops received by cluster sync are local journal entries, so they produce events like local mutations.
 
 ### 11.4 Atomic Subscribe + Snapshot
 
@@ -1108,11 +1108,9 @@ When an agent reconnects after being dormant:
 
 **Small gap (minutes/hours):** Replay individual ops from cursor — preserves full event sequence, O(ops_missed).
 
-**Large gap (days/weeks):** Diff the current result against the membership stored as of the cursor — two bitmap operations, O(result_set_size); content and tag changes of members are found by comparing their `modified_ns` with the cursor's time. Loses individual event ordering but correct summary in milliseconds instead of seconds.
+**Large gap (days/weeks):** Diff the current result against the membership the subscription last delivered — two bitmap operations, O(result_set_size); content and tag changes of members are found by comparing their `modified_ns` with the cursor's time. Loses individual event ordering but correct summary in milliseconds instead of seconds.
 
 **Journal history trimmed:** Falls back to the result set diff, which doesn't need the journal at all.
-
-Live delivery is the same replay over a gap of a few entries; a reconnecting agent simply polls.
 
 ### 11.6 Batching and Debouncing
 

@@ -13,7 +13,7 @@ A subscription is a saved query plus a cursor into the journal. A consumer polls
 
 - **Term-indexed evaluation.** Subscriptions are indexed by the terms and keys of their compiled queries (QUERY-DESIGN "Evaluation"). A mutation looks up the subscriptions of every term that entered or left the object's closure, so derived changes — a tag that implies one a query names, a value rule, a rule install — reach the subscriptions they affect.
 - **Per-object evaluation.** Whether an object matches is decided against its own terms — forward entry plus closure — without reading postings.
-- **Membership at the cursor** is stored as posting containers in a snapshot-agnostic tree of its own, so a cursor change does not rewrite the membership and membership changes rewrite one container.
+- **Membership** is stored as posting containers in a snapshot-agnostic tree of its own, so a cursor change does not rewrite the membership and membership changes rewrite one container. Whether it is kept as of the cursor or as of the head is [SUBSCRIPTION-D6](subscriptions-decisions.md).
 - **Not snapshot-aware.** Subscriptions watch the head. Creating, deleting or rolling back a snapshot never moves a consumer's cursor or membership.
 - **Pull and acknowledge.** `poll(sub, max)` returns events tagged with their LSN; `ack(lsn)` advances the persisted cursor. Delivery is at least once; consumers deduplicate by LSN. Debouncing and wake-ups run in the engine's `step` (ENGINE-DESIGN "Selected design"); no thread is needed.
 - **Ids are never reused**: removing the subscription with the largest id leaves a high-water marker record (SUBSCRIPTIONS-DESIGN§1).
@@ -96,17 +96,17 @@ poll(sub, max) -> [Event { lsn, hlc, oid, kind }]     // events after the cursor
 ack(sub, lsn)                                         // everything up to lsn is handled
 ```
 
-Membership is stored **as of the cursor**. Events after the cursor come from the journal:
+The mutation path evaluates reached subscriptions (above) into a bounded in-memory buffer per
+subscription; `poll` serves from it. `ack` persists the new cursor and `cursor_ns` (the time of
+the acknowledged entry). A crash between `poll` and `ack` redelivers events; consumers
+deduplicate by LSN. `Buffered` durability (JOURNAL-DESIGN§1.5) applies to acks like any mutation.
 
-- **Live.** The mutation path evaluates reached subscriptions (above) into a bounded in-memory
-  buffer per subscription; `poll` serves from it.
-- **Replay.** When the buffer is gone (restart) or overflowed, `poll` replays journal entries
-  from the cursor through the same evaluation, starting from the stored membership.
-- **Ack** applies the acknowledged events to the stored membership and persists the new cursor
-  and `cursor_ns` (the time of the acknowledged entry) in one journal entry.
-
-A crash between `poll` and `ack` redelivers the same events; consumers deduplicate by LSN.
-`Buffered` durability (JOURNAL-DESIGN§1.5) applies to acks like any mutation.
+> **Proposed, not decided ([SUBSCRIPTION-D6](subscriptions-decisions.md)).** How events
+> survive a restart or a buffer overflow. The proposal: membership is stored as of the cursor,
+> `ack` applies the acknowledged events to it, and `poll` without a buffer replays the journal
+> from the cursor through the same evaluation — so live delivery and catch-up are one
+> mechanism. Its cost: a subscriber that polls without acking holds journal history from its
+> cursor, up to the per-pool retention cap, and past the cap gets only the unordered diff.
 
 ## Offline catch-up
 
@@ -148,7 +148,7 @@ A build system watching sources wants one batch after a save-all, not one event 
 
 ## CLI
 
-Commands: `mimir watch register <name> <query> | list | drain <name> | unsubscribe <name> | stream <name>`. `stream` is a loop of `poll`, print, `ack`, waiting between empty polls. The intended surface, including catch-up reporting, is [SUBSCRIPTION-D4](subscriptions-decisions.md).
+Commands: `mimir watch register <name> <query> | list | drain <name> | unsubscribe <name> | stream <name>`. How `stream` runs is [SUBSCRIPTION-D1](subscriptions-decisions.md). The intended surface, including catch-up reporting, is [SUBSCRIPTION-D4](subscriptions-decisions.md).
 
 ## Rejected alternatives
 
@@ -194,8 +194,9 @@ marker is removed once a larger id exists. This is the pattern of term and tag i
 `BtreeKind::SubscriptionMembers`, snapshot-agnostic, keyed by `(id: u64, high: u64)` with
 `high` the object id shifted right by 16, whose values are posting containers in the
 INDEX-DESIGN§3.2 format (`ContainerHead` and array, bitmap or run payload). The containers of
-one id are the subscription's membership as of its cursor. An `ack` rewrites only the
-containers whose windows its events touch; removing a subscription removes its containers.
+one id are the subscription's membership (as of its cursor or its head, SUBSCRIPTION-D6). A
+change rewrites only the containers whose windows it touches; removing a subscription removes
+its containers.
 
 **One entry per subscription.** A change to one subscription is one replacement entry, appended
 as a new run to its node (BTREE-DESIGN§1.2) without rewriting the others; compaction folds the
