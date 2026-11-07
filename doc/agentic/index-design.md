@@ -73,8 +73,9 @@ A **term** is one thing an object can assert:
 
 **Allocation.** Attribute and relation terms take `TermId`s from a per-pool counter starting at
 2³², assigned in write order and never reused; the counter is not persisted but derived at boot
-as one past the largest key in the term table. WAL replay re-interns values in LSN order, so it
-assigns the same `TermId`s.
+as one past the largest key in the term table, high-water markers included (see
+"Reclamation"). Journal replay re-interns values in LSN order from the counter derived at the
+committed root, so it assigns the same `TermId`s.
 
 **Interning.** Writing an assertion looks its term up in the term dictionary (INDEX-DESIGN§4.1).
 If present, the existing `TermId` is used; otherwise a `TermId` is allocated and a dictionary
@@ -84,8 +85,19 @@ values — so two different values are never the same term.
 **Locality.** `TermId`s are meaningful only within their pool. Nothing that leaves the node
 carries a `TermId`; sync carries values and receivers intern them.
 
-**Reclamation.** A term whose cardinality is zero in every live snapshot has its dictionary and
-term-table entries removed by a background scan; its `TermId` is not reused.
+**Reclamation.** A background scan reclaims a term when both hold:
+
+- its cardinality is zero in every live snapshot, so no tree refers to it; and
+- its dictionary entry's `last_modify_lsn` is older than the oldest retained journal entry
+  (JOURNAL-DESIGN§1.6), so no retained history refers to it either.
+
+Reclaiming removes the term's dictionary entries and its term-table record, journaled as one
+`ReclaimTerms` entry (JOURNAL-DESIGN§1.3) so replay removes exactly the same terms. Its `TermId`
+is never reused: if a reclaimed term holds the largest key in the term table, its record is
+replaced by a **high-water marker** — a `TermRecord` of kind `TERM_KIND_HIGH_WATER` with no
+value — in the same entry, so the boot-time counter cannot fall back below it. A marker is
+removed once a larger key exists, by the next reclamation that touches the table. At most one
+marker exists at a time.
 
 ### 1.3 Scoped values
 
@@ -360,6 +372,8 @@ struct TermRecord {                          // 8-byte head
 //   Attr, inline:       the value's INDEX-DESIGN§1.1 encoding (≤ 96 bytes), padded to 8
 //   Attr, out of line:  BlobRef (16 B) to a blob-zone extent holding the encoding
 //   Relation:           target: u64
+//   TERM_KIND_HIGH_WATER = 0xFF: nothing — a reclaimed term's marker (INDEX-DESIGN§1.2);
+//                        key = 0; no dictionary entry refers to it; lookups never return it
 ```
 
 Tag terms have no term-table entry; the ontology defines tags.

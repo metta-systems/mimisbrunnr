@@ -291,6 +291,13 @@ ExtendObject     : { oid: u64, new_length: u64, extents: [(extent: BlockRef, len
                      extent_sum: u64); N] }                               // WalOpKind 33
                    // Appends extents to an object in the Writing state and makes its first
                    //   new_length bytes durable.
+
+// Term maintenance (INDEX-DESIGN§1.2)
+ReclaimTerms     : { high_water: u64, term_ids: [u64; N] }               // WalOpKind 34
+                   // Removes each listed term's dictionary entries and term-table record.
+                   //   high_water ≠ 0 writes a high-water marker at that TermId; it is
+                   //   0 when the largest term stays live. Any existing marker below the
+                   //   new largest key is removed in the same entry.
 ```
 
 Replay applies entries strictly in LSN order. Each in-memory mutation is idempotent under

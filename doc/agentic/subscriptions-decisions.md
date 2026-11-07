@@ -18,6 +18,10 @@ SPECIFICATION-DESIGN§11.6 configures batching by debounce, maximum delay since 
 
 `bin/mimir` has `register <name> <query>`, `list`, `drain`, `unsubscribe`, `stream <name>`. SPECIFICATION-DESIGN Appendix A uses `mimir watch "<query>" --name <n>`, `list`, `catch-up <name>`, `stream "<query>" --format json`. Candidate additions: `--interest content-changed,created,…` and `--retention 30d` on creation; cursor lag (entries and age) in `list`; `catch-up` reporting the strategy used and event counts; `since <name>` summarising changes by kind; `remove`. Decide names and flags. Shapes [SUBSCRIPTION5](subscriptions-implementation-plan.md) and [SUBSCRIPTION6](subscriptions-implementation-plan.md).
 
+## SUBSCRIPTION-D5 — Subscription ids after removal
+
+`next_id` is derived at boot as the largest loaded `SubscriptionId` (SUBSCRIPTIONS-DESIGN§1). Removing the subscription with the largest id and reopening hands that id out again, so a consumer holding the old id (or an embedder's stored reference) would silently attach to a different subscription. Options: (a) keep a removed subscription's record as a tombstone while it holds the largest id (the term table's high-water pattern, INDEX-DESIGN§1.2); (b) store a high-water id in the subscription tree's header or in the pool state; (c) accept reuse and document that ids are only stable while the subscription exists. Shapes [SUBSCRIPTION7](subscriptions-implementation-plan.md).
+
 ## Future work
 
 - **Richer events.** Report the assertion that caused `Entered` / `Exited`, old and new values for attribute changes (with an `ATTR_CHANGED` interest bit), old and new content hash and size for `ContentChanged`, and the initial assertions for `Created`. Interest groups `MUTATIONS` (tag, attribute, content changes) and `MEMBERSHIP` (entered, exited, created, deleted).

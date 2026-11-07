@@ -30,6 +30,10 @@ SPECIFICATION-DESIGN Appendix A lists `list`, `install`, `remove`, `orphans`, `a
 
 `SyncBundle.ontology_delta: Option<OntologyDelta>` ([cluster-design.md](cluster-design.md)) has no defined type. Options: (a) the whole `OntologyImage` of the bundle's `to_snapshot` (simple, rare, a few MiB); (b) steps — install module (full module), remove module (with scrub policy), upgrade module (new version plus the migration steps applied). Option (b) lets a receiver replay object-side effects (rematerialisation, purge) deterministically; (a) needs the receiver to diff images to find them. Blocks [CLUSTER2](cluster-implementation-plan.md).
 
+## ONTOLOGY-D8 — Tag ids after tag removal
+
+`next_tag_id` is derived at boot from the largest `TagId` in the loaded ontology image. The Purge and RemoveUnique scrub policies (ONTOLOGY-DESIGN "Removal and scrub policies") delete tags, so removing the tag with the largest id and reopening would hand that id out again, while `TagId`s appear in postings history, retained journal entries (`AddTag`) and subscription queries. Options: (a) a `tag_id_high_water: u32` field in `OntologyImage`, raised on every allocation and never lowered, from which the counter is derived; (b) keep a removed tag's `TagDefinition` as a tombstone in the image when it holds the largest id, as the term table's high-water marker does (INDEX-DESIGN§1.2). Shapes [ONTOLOGY1](ontology-implementation-plan.md) and [ONTOLOGY9](ontology-implementation-plan.md).
+
 ## Future work
 
 - Module extensions listed in SPECIFICATION-DESIGN§4.1 / SPECIFICATION-DESIGN§4.2:

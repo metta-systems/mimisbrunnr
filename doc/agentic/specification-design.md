@@ -598,6 +598,7 @@ enum WalOpKind {
     FormatPromote,
     Checkpoint,
     WriteInline, ExtendObject,                 // tiny objects and streams (JOURNAL-DESIGN§1.8)
+    ReclaimTerms,                              // unused attribute terms (INDEX-DESIGN§1.2)
 }
 ```
 
