@@ -13,7 +13,6 @@ Every zone is encrypted with the cipher SPECIFICATION-DESIGN§9.3 assigns it, un
 
 - **Ciphers:** index and metadata blocks XTS-AES-256 (tweak `block_no`); blob extents HCTR2 (tweak `object_id || block_no_within_extent`); WAL AES-256-GCM (AAD `header[0..36]`, nonce `LSN || 0`, 16 B tag before the trailing CRC); sync traffic ChaCha20-Poly1305; Adiantum as the fallback without AES instructions.
 - **Key hierarchy:** `MasterKEK → DiskKey` (SPECIFICATION-DESIGN§9.4); the superblock records `encryption_keyid`.
-- The per-pool SipHash secret for `value_hash` derives from `DiskKey`.
 - Sector padding for XTS/HCTR2 is already in the pipeline; WAL entries compress before they encrypt.
 
 ## Format specification

@@ -87,11 +87,7 @@ struct Superblock {                          // 4096 bytes total
     default_chunking_threshold: u64,         // [1112..1120] objects ≤ this size are never
                                              //              chunked regardless of policy
     default_chunking: ChunkParamsRecord,     // [1120..1136] 16 B (INDEX-DESIGN§4.3)
-    value_hash_secret: [u8; 16],             // [1136..1152] SipHash-2-4 key of value_hash
-                                             //              (INDEX-DESIGN§1.2); identical in
-                                             //              every member's superblock
-
-    _reserved: [u8; 2940],                   // [1152..4092] zeroed, available for future fields
+    _reserved: [u8; 2956],                   // [1136..4092] zeroed, available for future fields
     // trailing CRC32C at [4092..4096] lives inside BlockHeader's frame
 }
 
@@ -159,11 +155,11 @@ struct RootPointer {                         // 408 bytes
     location_table_root:      BlockRef,      //  [48..64]   METADATA-DESIGN§2.1   radix table — current view
     location_history_root:    BlockRef,      //  [64..80]   SNAPSHOTS-DESIGN§1.2  sidecar
     forward_index_root:       BlockRef,      //  [80..96]   INDEX-DESIGN§2
-    tag_index_root:           BlockRef,      //  [96..112]  INDEX-DESIGN§3.1   TagDirectory
-    kv_index_root:            BlockRef,      // [112..128]  INDEX-DESIGN§4.1   KvDirectory (4 KiB block)
-    range_index_root:         BlockRef,      // [128..144]  INDEX-DESIGN§4.2
+    term_dictionary_root:     BlockRef,      //  [96..112]  INDEX-DESIGN§4.1   term dictionary
+    term_table_root:          BlockRef,      // [112..128]  INDEX-DESIGN§4.1   term table (snapshot-agnostic)
+    postings_root:            BlockRef,      // [128..144]  INDEX-DESIGN§3.1   posting containers
     chunk_index_root:         BlockRef,      // [144..160]  INDEX-DESIGN§4.3   content-addressed (snapshot-agnostic)
-    value_spill_root:         BlockRef,      // [160..176]  INDEX-DESIGN§1.1   value table, by value_hash
+    sequences_root:           BlockRef,      // [160..176]  INDEX-DESIGN§3.3   ordered / ranked collection order
     backpointer_root:         BlockRef,      // [176..192]  METADATA-DESIGN§2.2   physical (snapshot-agnostic)
     ontology_root:            BlockRef,      // [192..208]  ONTOLOGY-DESIGN§1  → BTREE-DESIGN§1 region directly (no envelope)
     subscriptions_root:       BlockRef,      // [208..224]  SUBSCRIPTIONS-DESIGN§1
@@ -194,7 +190,7 @@ struct RootPointer {                         // 408 bytes
 self-validating against the destination block's header.
 
 `BlobRef` is `{ disk_id: u16, _pad: u16, block_no: u32, length: u64 }` — also 16 bytes, used to
-address a contiguous payload extent within the blob zone (INDEX-DESIGN§1.1, METADATA-DESIGN§1.2's `OverflowAttr` spill,
+address a contiguous payload extent within the blob zone (INDEX-DESIGN§4.1's out-of-line term values, METADATA-DESIGN§1.2's `OverflowAttr` spill,
 INDEX-DESIGN§4.3's chunk index leaf). Unlike `BlockRef`, it carries an explicit `length` (in bytes) rather
 than a generation; freshness is derived from the owning record's bucket-generation check at
 deref time.
@@ -242,10 +238,8 @@ queries:
 | `ObjectTable` (positional accessor over `BTreeNodeCache`) | METADATA-DESIGN§1 radix tree of `BtreeKind::ObjectTable` leaves; per-record access = (radix descent → leaf `BlockRef`) → cache lookup → 128 B slot at `oid_local % 2044` | leaves cached per `BTreeNodeCache` policy below; no separate resident array (~1.19 GiB at 10 M objects, ≥ TiBs at the 48-bit cap) |
 | `LocationTable` (positional accessor over `BTreeNodeCache`) | METADATA-DESIGN§2.1 radix tree of `BtreeKind::LocationTable` leaves; per-record access = same descent → 48 B slot at `oid_local % 5440` | shares `BTreeNodeCache`; same eviction policy as `ObjectTable` |
 | `ObjectHistory`, `LocationHistory` (snapshot-override sidecars) | SNAPSHOTS-DESIGN§1.2 — `BtreeKind::ObjectHistory` / `BtreeKind::LocationHistory` keyed by `(oid, snapshot)`; consulted only for non-current-snapshot reads | shares `BTreeNodeCache`; typically cold (current-snapshot reads bypass) |
-| `TagIndex { HashMap<TagId, TagStore> }`      | TagDirectory + TagBitmap pages            | mmap-pinned roaring containers |
-| `KvIndex { HashMap<(TagId,u64), RoaringBitmap> }` | KvDirectory + buckets                  | resident, lazy-load buckets |
-| `RangeIndex` (`BTreeMap<(TagId, NormKey), Roaring>`) | B+ tree pages                       | resident, paged in     |
-| `ForwardIndex { HashMap<u64, SmallVec<...>> }` | B+ tree                                  | LRU-cached pages       |
+| Term dictionary, term table, postings, sequences, forward index (accessors over `BTreeNodeCache`) | INDEX-DESIGN§2–§4 trees | no resident mirror; nodes cached per `BTreeNodeCache` policy, posting containers read in place |
+| `TermId` counter                             | derived at boot from the term table       | resident scalar           |
 | `OntologyState`                              | OntologyRoot                              | fully resident         |
 | `ImplicationDag` (`petgraph::Graph<TagId, ()>`) | dag pages                              | fully resident         |
 | `SubscriptionEngine`                         | SubscriptionsRoot                         | fully resident         |

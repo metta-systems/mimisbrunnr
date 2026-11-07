@@ -43,7 +43,7 @@ description: Guide one incremental Mimisbrunnr work slice (storage, WAL, indices
 
 - Create all four files together. The design document starts with the scope's goal and links to the governing spec sections; the plan starts with dependency-ordered sections; the decisions document starts with any open questions and an empty **Future work** section; the completed document starts empty.
 - Add the new scope to the table in `operations-plan.md` and place its items in the sequence.
-- Source comments name pending work only by plan item (`TODO(INDEX2)`, "until SNAPSHOT2"); never introduce phase or tier labels (`Phase 6`, `R1d`, `Tier 3`).
+- Source comments name pending work only by plan item (`TODO(INDEX12)`, "until SNAPSHOT2"); never introduce phase or tier labels (`Phase 6`, `R1d`, `Tier 3`).
 
 ## Specification authority
 
@@ -129,7 +129,7 @@ A layout that needs deserialising to answer a lookup, or that a reader cannot bo
 
 ## Keep responsibilities separate
 
-- **`types`:** pure logical types and small pure codecs (`Value`, `value_hash`, IDs). No I/O.
+- **`types`:** pure logical types and small pure codecs (`Value` and its codec, IDs). No I/O.
 - **`storage`:** block device, superblock, zones, bucket allocation, B+ tree region envelopes and the packed-key codec. Mechanism only; it knows no index semantics.
 - **`wal`:** log format, append, checkpoint, replay, journal pins.
 - **Owning crates (`meta`, `index`, `ontology`, `watch`, `pool`, `unix`, `transform`):** their wire structs, key/value types and invariant-preserving operations, persisted through `storage` regions.

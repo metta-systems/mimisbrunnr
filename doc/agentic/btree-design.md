@@ -43,13 +43,13 @@ compaction (BTREE-DESIGN§1.4) that writes the new node(s) into a fresh bucket r
 
 Two large-node variants share the same outer envelope but differ in their internal layout:
 
-- **B+ tree node** (forward index, range index, alloc table, freespace LRU, ontology, path
-  contexts, subscriptions, tag directory, chunk index, value spill, snapshots, disk descriptors,
+- **B+ tree node** (forward index, term dictionary, term table, postings, sequences, alloc
+  table, freespace LRU, ontology, subscriptions, chunk index, snapshots, disk descriptors,
   placement rules, cluster peers, reconcile queues): a sequence of **sorted runs** of keyed
   records. New updates append a new sorted run; periodic full compaction merges all of a node's
   sorted runs back into one.
 - **Positional region** (object table, location table — radix leaves; *and* `ForwardOverflow`
-  INDEX-DESIGN§2.2, `KvDirectory` spillover INDEX-DESIGN§4.1, `ChunkList` INDEX-DESIGN§4.3): a positional array of fixed-size
+  INDEX-DESIGN§2.2, `ChunkList` INDEX-DESIGN§4.3): a positional array of fixed-size
   records or `BlockRef` slots. No internal sorted runs — for radix leaves the WAL journal (JOURNAL-DESIGN§1.4)
   serves as the per-leaf update log and the leaf is rewritten from the merged in-memory state on
   flush; for the per-object overflow/list regions, growth is a single rewrite and chains via a
@@ -203,9 +203,9 @@ For a 10 M-object pool with 5 000 tags and ~100 snapshots, every tree is shallow
 | ------------------- | ------ | ------ | ------------------------------------------ |
 | Object table (METADATA-DESIGN§1)   | 1      | 2      | 4 893 leaves under 1 inner                 |
 | Location table (METADATA-DESIGN§2.1)| 1     | 2      | 1 839 leaves under 1 inner                 |
-| Forward index (INDEX-DESIGN§2)  | 1      | 2      | 5 082 leaves under 1 inner                 |
-| Tag directory (INDEX-DESIGN§3.1)| 0      | 1      | 5 000 entries fit in a single 7 081-entry leaf |
-| Range index (INDEX-DESIGN§4.2)  | 0–1    | 1–2    | depends on attribute cardinality           |
+| Forward index (INDEX-DESIGN§2)  | 1      | 2      | ~2 500 leaves (~64 B per object) under 1 inner |
+| Term dictionary (INDEX-DESIGN§4.1) | 0–1 | 1–2    | 5 000 tag entries fit one leaf; depth 1 once attribute values number in the millions |
+| Postings (INDEX-DESIGN§3.1)     | 1      | 2      | one entry per (term, 65 536-id window)     |
 
 (See the depth convention in METADATA-DESIGN§1: *depth* counts inner levels above the leaves; *levels* is the
 total count — a depth-*N* tree has *N + 1* levels.) Each node access is a single sequential
@@ -257,7 +257,7 @@ const FIELD_FORMAT_FLAG_MSB_FIRST: u8 = 1 << 1;  // see byte-order note below
 **Byte order.** The unflagged default is **little-endian** (matching FORMAT-DESIGN§1.1's invariant for all
 multi-byte integers). `FIELD_FORMAT_FLAG_MSB_FIRST` selects big-endian / MSB-first packing for
 fields whose ordering must match a byte-wise lexicographic compare on a multi-byte natural
-encoding (e.g. UTF-8 string prefixes inside `NormalisedKey`). For ordinary integer fields the
+encoding (e.g. UTF-8 string prefixes inside `NormalisedValue`). For ordinary integer fields the
 flag is left clear; bit-packed values still compare correctly because the packed form is the
 field's two's-complement value with `base` subtracted, monotonic by construction.
 
@@ -294,22 +294,20 @@ keys still sort the same way regardless of `value_size_kind`.
 sorted run**. The encoder records both the length of the prefix (`common_value_prefix`) and
 its bytes (`value_prefix[..common_value_prefix]`) in the descriptor, so the reader
 reconstructs entry *i*'s full value as `descriptor.value_prefix || value_tail_i` without any
-out-of-band state. For fixed-shape values (e.g. `TagIndexLeafEntry`'s 32-byte value following
-`tag_id`) this is the natural common prefix — typically a few bytes of `store_kind` plus
-zeroed padding when most entries in a leaf share the same store kind. For **variable-shape
-values** (notably INDEX-DESIGN§2.1's `LeafEntry`, where the body is either an inline assertion array
-sized by `header & 0x7FFF` or a 16 B `BlockRef` for the spill case), the common prefix can
-only cover bytes that exist *and* are identical in every variant — in practice the 2-byte
-`header`'s discriminator bits (`is_spill`) are not shared, so `common_value_prefix = 0` is
-the typical setting for `LeafEntry`. Format selection (BTREE-DESIGN§1.4) computes the prefix during
+out-of-band state. For fixed-shape values (e.g. INDEX-DESIGN§4.1's 56-byte `DictEntry`) the
+common prefix is whatever leading bytes every entry in the run shares — often none, since
+`cardinality` comes first. For **variable-shape values** (notably INDEX-DESIGN§2.1's
+`ForwardEntry`, whose arrays vary in length with the object's term count), the common prefix
+can only cover bytes identical in every entry, so `common_value_prefix = 0` is the typical
+setting. Format selection (BTREE-DESIGN§1.4) computes the prefix during
 full compaction by scanning the merged sorted run's values and counting leading bytes shared
 by every entry; if the sorted run mixes shapes, the count is bounded by the shortest value.
 Single-entry sorted runs may set the prefix to the full value length without harm because
 the bytes are persisted in the descriptor.
 
 **Variable-size values.** When a sorted run mixes entries with different value lengths
-(notably INDEX-DESIGN§2.1's `LeafEntry`, which switches between an inline assertion array and a 16 B
-`BlockRef` spill reference, and any other heterogeneous-shape value such as
+(notably INDEX-DESIGN§2.1's `ForwardEntry`, INDEX-DESIGN§3.2's posting containers, and any other
+heterogeneous-shape value such as
 SUBSCRIPTIONS-DESIGN§1 `SubscriptionRecord` blobs that opt into the codec), the encoder sets
 `value_size_kind = 1` (varint mode) and prefixes each per-entry value tail with an unsigned
 LEB128 length giving the *elided tail's* byte count. The full value reconstructs as
@@ -364,7 +362,7 @@ form is then bit-for-bit identical to the unpacked hash bytes.
 inspected per memory fetch during binary search. For runs in `value_size_kind = 1` (varint)
 mode, per-entry overhead is typically 1 B (LEB128 for tail lengths ≤ 127 B). The variable-size
 overhead is dwarfed by the codec's savings over the CBOR fallback for heterogeneous-shape
-values (INDEX-DESIGN§2.1 forward-leaf entries are the canonical example).
+values (INDEX-DESIGN§2.1 forward entries are the canonical example).
 
 ---
 

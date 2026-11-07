@@ -13,7 +13,7 @@ A subscription is a saved query plus a cursor; every mutation updates matching s
 
 - **Per-record tree.** One sorted-run entry per subscription: key `(SubscriptionId: u64, snapshot: u32)` through the packed-key codec, value the CBOR `SubscriptionRecord` under `VARINT` value size.
 - **`next_id` is derived at boot** as `max(loaded ids)` (0 when empty); the allocator pre-bumps, so `next_id` equals the last assigned id.
-- **`cached_result`** is inline in the record until sub-bucket allocation exists; it then moves to an INDEX-DESIGN§3.2 `TagBitmapPage` chain referenced by `BlockRef`, so a cursor-only change does not rewrite the bitmap.
+- **`cached_result`** is inline in the record until sub-bucket allocation exists; it then moves out of line as posting containers (INDEX-DESIGN§3.2), so a cursor-only change does not rewrite the bitmap.
 - Engine mutations call `set_membership` after re-evaluating each affected subscription's query; debounced events flush on `tick`.
 - Format changes are one-way: pools recreate.
 

@@ -4,7 +4,7 @@ Design: [subscriptions-design.md](subscriptions-design.md) · Decisions: [subscr
 
 ## Persistence
 
-- [ ] **SUBSCRIPTION1 — Externalize `cached_result`.** Replace the inline `cached_result: Vec<u8>` with `cached_result_root: BlockRef` to a `TagBitmapPage` chain, and update SUBSCRIPTIONS-DESIGN§1. Prerequisite: [ALLOCATION1](allocation-implementation-plan.md).
+- [ ] **SUBSCRIPTION1 — Externalize `cached_result`.** Replace the inline `cached_result: Vec<u8>` with posting containers (INDEX-DESIGN§3.2) stored out of line, and update SUBSCRIPTIONS-DESIGN§1. Prerequisite: [ALLOCATION1](allocation-implementation-plan.md).
 - [ ] **SUBSCRIPTION2 — Per-subscription copy-on-write.** With append-on-flush, mutating one subscription appends a one-entry run. Prerequisite: [ENGINE1](engine-implementation-plan.md). Acceptance: 1 000 subscriptions, mutate one, only that entry's bytes change on disk.
 - [ ] **SUBSCRIPTION7 — Positional, versioned `SubscriptionRecord`.** The record is written as SUBSCRIPTIONS-DESIGN§1 pins (array, schema version first, query through QUERY11). Prerequisite: [QUERY11](query-implementation-plan.md). Acceptance: a record round-trips through reopen; a record whose version is newer than the reader's fails with a defined `WatchError`; a record missing a trailing field reads with its documented default.
 

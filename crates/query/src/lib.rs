@@ -16,7 +16,7 @@
 //! large-pool support requires either a wider bitmap or sharding by a
 //! high-order key — see the TODO below.
 //!
-//! TODO(INDEX5): replace the 32-bit bitmap with a sharded encoding
+//! TODO(INDEX16): replace the 32-bit bitmap with a sharded encoding
 //! that covers the full 48-bit local-id space and the 16-bit node prefix.
 //!
 //! ## DSL

@@ -4,10 +4,10 @@ Design: [query-design.md](query-design.md) · Decisions: [query-decisions.md](qu
 
 ## Operators
 
-- [ ] **QUERY1 — `Contains`.** Substring index; `QueryExecutor` no longer returns `UnsupportedCmpOp`, and SQL `LIKE '%x%'` executes. Prerequisite: QUERY-D1.
-- [ ] **QUERY2 — `Prefix` without a linear scan.** Prerequisite: QUERY-D1.
-- [ ] **QUERY3 — `Ne` through a per-attribute-key bitmap** instead of a tag-index union universe. Prerequisite: QUERY-D1.
-- [ ] **QUERY4 — `Related` through a reverse relation index.** Prerequisite: QUERY-D1.
+- [ ] **QUERY1 — `Contains`.** By the mechanism QUERY-D1 selects; `QueryExecutor` no longer returns `UnsupportedCmpOp`, and SQL `LIKE '%x%'` executes. Prerequisites: QUERY-D1, [INDEX12](index-implementation-plan.md).
+- [ ] **QUERY2 — Range and prefix through the dictionary.** `Lt`/`Le`/`Gt`/`Ge`/`Prefix` scan the term dictionary between normalised bounds (INDEX-DESIGN§4.2), comparing full values only at non-exact boundary entries. Prerequisite: [INDEX12](index-implementation-plan.md). Acceptance: range and prefix results match a full scan for Int, Float, Timestamp and Text (including texts longer than 14 bytes sharing a prefix).
+- [ ] **QUERY3 — `Ne`.** By the mechanism QUERY-D1 selects. Prerequisites: QUERY-D1, [INDEX12](index-implementation-plan.md).
+- [ ] **QUERY4 — `Related` through relation-term postings**, in both directions (forward from forward entries). Prerequisite: [INDEX13](index-implementation-plan.md).
 
 ## Encoding
 
@@ -15,7 +15,7 @@ Design: [query-design.md](query-design.md) · Decisions: [query-decisions.md](qu
 
 ## SQL
 
-- [ ] **QUERY5 — `ORDER BY`** through ordered collections. Prerequisite: [INDEX2](index-implementation-plan.md).
+- [ ] **QUERY5 — `ORDER BY`** through ordered collections. Prerequisite: [INDEX15](index-implementation-plan.md).
 - [ ] **QUERY6 — `GROUP BY` beyond `COUNT(*)`, and `HAVING`.** Groups by intersecting the result with each KV-index bitmap of the group key; `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(DISTINCT attr)` (QUERY-DESIGN "Post-operations"). Prerequisite: QUERY7. Acceptance: `SELECT artist, COUNT(*), AVG(bpm) FROM objects WHERE tag = 'electronic' GROUP BY artist HAVING COUNT(*) > 5` matches a hand-computed result.
 - [ ] **QUERY7 — Multi-column projections and `SELECT DISTINCT`.** `SqlOutput` gains rows of attribute values read from the forward index.
 - [ ] **QUERY8 — `LIKE` with internal wildcards** (`'mid%dle'`, `_`), as a post-filter over the pushed-down result when no index answers it.

@@ -8,7 +8,7 @@
 //! unambiguous; cluster mode (where `ObjectId.node` is non-zero) and
 //! >4 G-objects pools both require a wider encoding.
 //!
-//! TODO(INDEX5): replace the 32-bit bitmap with a sharded encoding
+//! TODO(INDEX16): replace the 32-bit bitmap with a sharded encoding
 //! that covers the full 48-bit local-id space and the 16-bit node prefix.
 //!
 //! ## Universe
@@ -88,7 +88,7 @@ impl<'a> QueryExecutor<'a> {
     /// rebuilds [`ObjectId`]s by zero-extending them to 48 bits and treating
     /// the node id as 0.
     ///
-    /// TODO(INDEX5): once the bitmap representation grows beyond 32
+    /// TODO(INDEX16): once the bitmap representation grows beyond 32
     /// bits, plumb the node id through (likely via a side `objid_table` the
     /// engine maintains).
     pub fn evaluate_full(&self, query: &Query) -> Result<Vec<ObjectId>, QueryError> {
@@ -351,7 +351,7 @@ fn oid_low32(oid_raw: u64) -> Option<u32> {
     // Single-node clusters never set bits 32..48, so the cast is faithful.
     let local48 = oid_raw & 0x0000_ffff_ffff_ffff;
     if local48 > u32::MAX as u64 {
-        // Caller-side TODO(INDEX5): widen the bitmap.
+        // Caller-side TODO(INDEX16): widen the bitmap.
         None
     } else {
         Some(local48 as u32)

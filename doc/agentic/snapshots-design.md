@@ -12,7 +12,7 @@ A snapshot captures the assertion graph (tags, attributes, relations, ontology) 
 ## Selected design
 
 - Snapshots are per node; there is no cluster-wide snapshot coordination.
-- Every snapshot-aware tree (forward, tag directory, range, KV, ontology, subscriptions) keys by `(…, snapshot)`; the `snapshot` field is 0 until this scope lands.
+- Every snapshot-aware tree (forward, term dictionary, postings, sequences, ontology, subscriptions) keys by `(…, snapshot)`; the `snapshot` field is 0 until this scope lands.
 - Object and location history live in sidecar trees (`ObjectHistory`, `LocationHistory`); the main tables hold the current view.
 - Queries take an optional `snapshot_id` and resolve visibility through the snapshot tree's ancestor bitmap.
 
@@ -86,21 +86,22 @@ section's struct definitions show the field explicitly.
 
 **Where the field appears.** Every leaf-entry struct in this document marked snapshot-aware
 below carries a `snapshot: u32` field immediately after the kind-specific sort-key fields
-(e.g. `oid` for Forward, `tag_id` for TagDirectory, `(attr_id, value, oid)` for Range). The
+(e.g. `oid` for Forward, `(term_id, high)` for Postings, `(kind, key, context, value, term_id)`
+for TermDictionary). The
 field is part of the **key**, not the value — it participates in ordering and is what the
 BTREE-DESIGN§1.6 format descriptor packs to ~0 bits when one snapshot dominates.
 
-**Inheritance for nested structures.** Snapshot-aware *directory* entries inherit the field
-on the directory key. The objects they point at — bitmap pages, value-spill blobs — are
-content-addressed and shared across snapshots; only the directory entry that selects them
-carries the snapshot id.
+**Inheritance for nested structures.** Out-of-line data a snapshot-aware entry points at —
+an out-of-line term value, a forward-overflow chain — is shared across snapshots; only the
+entry that selects it carries the snapshot id.
 
 | Btree              | Snapshot-aware? | Notes                                         |
 | ------------------ | --------------- | --------------------------------------------- |
-| `Forward`          | yes             | per-object assertions diverge across snapshots |
-| `Range`            | yes             | per-object attributes diverge                  |
-| `KvIndex`          | no              | content-addressed by `(tag_id, value_hash)`; per-snapshot views come from intersecting with the per-snapshot tag bitmap |
-| `TagDirectory`     | yes             | directory entries are `(tag_id, snapshot)`; pointed-at bitmap blocks are not snapshot-aware |
+| `Forward`          | yes             | per-object terms diverge across snapshots      |
+| `TermDictionary`   | yes             | per-term statistics and inline postings diverge |
+| `Postings`         | yes             | one container per `(term_id, high, snapshot)`; a change diverges one container |
+| `Sequences`        | yes             | collection order diverges                      |
+| `TermTable`        | no              | a term never changes once created              |
 | `ChunkIndex`       | no              | content-addressed; refcount handles divergence |
 | `Backpointer`      | no              | physical state, not logical                    |
 | `BucketAlloc`, `FreespaceLru` | no | physical state                              |
@@ -108,7 +109,6 @@ carries the snapshot id.
 | `Subscriptions`    | yes             | per-snapshot watch state                       |
 | `ObjectHistory`    | yes             | sidecar for `ObjectTable` (METADATA-DESIGN§1) — current view in the radix, per-snapshot overrides here |
 | `LocationHistory`  | yes             | sidecar for `LocationTable` (METADATA-DESIGN§2.1) — same pattern |
-| `ValueSpill`       | no              | content-addressed by `value_hash`              |
 
 For the **positional radix tables** (`ObjectTable` METADATA-DESIGN§1, `LocationTable` METADATA-DESIGN§2.1), snapshot-versioning
 uses a sidecar btree per radix (`BtreeKind::ObjectHistory` for METADATA-DESIGN§1; `BtreeKind::LocationHistory`
@@ -118,23 +118,23 @@ falling through to the radix only if no shadowing record applies. This keeps the
 (current-snapshot reads) at single-radix-lookup cost while preserving the snapshot model for
 older views.
 
-For **roaring tag bitmaps** (INDEX-DESIGN§3.2), each tag's `store_root` resolves through the snapshot tree:
-the `TagDirectory` is snapshot-aware (the directory itself has snapshot-tagged keys), so each
-snapshot has its own pointer to a (possibly shared) bitmap. New writes that diverge a tag bitmap
-allocate a fresh `TagBitmap` region and update the directory at the writing snapshot's ID.
+For **posting lists** (INDEX-DESIGN§3.1), each container is its own snapshot-tagged entry: a
+write that changes one 65 536-id window of a term writes one new container at the writing
+snapshot's id, and every other window stays shared with the ancestor snapshots.
 
 ### 1.3 Visibility rules (snapshot iteration)
 
 A **whiteout** is a tombstone marking that a key is **explicitly deleted** at a snapshot.
 The snapshot-aware leaves do not share a common discriminator slot — their value shapes
-were chosen for their query-hot fields (e.g. `TagIndexLeafEntry` puts `last_modify_lsn`
-at offset 0 for cache-line packing) — so the whiteout encoding is **per leaf shape**:
+were chosen for their query-hot fields (e.g. `DictEntry` puts `cardinality` at offset 0) —
+so the whiteout encoding is **per leaf shape**:
 
 | Btree | Whiteout sentinel |
 | ----- | ----------------- |
-| `Forward` (INDEX-DESIGN§2.1) | `LeafEntry.header == LEAF_ENTRY_SPILL_FLAG` (spill bit set, total = 0); body absent. The shape is otherwise meaningless — a spill implies > 8 assertions. |
-| `Range` (INDEX-DESIGN§4.2) | leaf BlockRef value zeroed (`disk_id = block_no = generation = 0`) — never a valid bitmap pointer. |
-| `TagDirectory` (INDEX-DESIGN§3.1) | `store_kind = 0xFF` (`STORE_KIND_WHITEOUT`, reserved) with `store_root` zeroed. |
+| `Forward` (INDEX-DESIGN§2.1) | a `ForwardHead` with bit 7 of `flags` set (`FORWARD_FLAG_WHITEOUT`), both counts 0, and no arrays. |
+| `Postings` (INDEX-DESIGN§3.2) | a `ContainerHead` with `kind = 0xFF` (`CONTAINER_WHITEOUT`) and no payload. |
+| `TermDictionary` (INDEX-DESIGN§4.1) | a `DictEntry` with bit 7 of `flags` set (`DICT_FLAG_WHITEOUT`) and every other field zero. |
+| `Sequences` (INDEX-DESIGN§3.3) | ordered: the value `oid = u64::MAX`, never a valid id; ranked: the 1-byte value `0xFF` in place of `0x00`. |
 | `Ontology`, `Subscriptions` (ONTOLOGY-DESIGN§1, SUBSCRIPTIONS-DESIGN§1) | a CBOR null (`0xF6`) at the value position, in place of the usual record. |
 | `ObjectHistory`, `LocationHistory` (SNAPSHOTS-DESIGN§1.2) | a 1-byte discriminator precedes the shadowed record; `0xFF` (`KEY_TYPE_whiteout`) means whiteout, otherwise the record follows. |
 
@@ -213,9 +213,9 @@ and its existing backpointer is valid for both snapshots. Backpointers are physi
 Deleting a snapshot is **two operations**: a small synchronous step that takes the snapshot
 out of visibility, and a long-running background scan that physically reclaims the keys.
 The synchronous step's WAL cost is `1 + N` entries (one `SnapshotDelete` plus one
-`ReconcileEnqueue` per snapshot-aware btree — N = 7 in the current format, every
-yes-row of SNAPSHOTS-DESIGN§1.2's table: `Forward`, `Range`, `TagDirectory`, `Ontology`,
-`Subscriptions`, plus the two radix sidecars `ObjectHistory` and `LocationHistory`).
+`ReconcileEnqueue` per snapshot-aware btree — N = 8 in the current format, every
+yes-row of SNAPSHOTS-DESIGN§1.2's table: `Forward`, `TermDictionary`, `Postings`, `Sequences`,
+`Ontology`, `Subscriptions`, plus the two radix sidecars `ObjectHistory` and `LocationHistory`).
 The scan's WAL cost is a handful of cursor checkpoints, regardless of how many keys
 are involved.
 

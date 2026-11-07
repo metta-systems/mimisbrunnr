@@ -601,7 +601,7 @@ impl<'a> TagVfs<'a> {
 /// they pack object ids into roaring bitmaps. See `mimisbrunnr_query`'s
 /// module docs for the rationale.
 ///
-/// TODO(INDEX5): the 32-bit truncation is a shared limitation; this
+/// TODO(INDEX16): the 32-bit truncation is a shared limitation; this
 /// will lift when the bitmap representation widens.
 fn low32_of(oid: ObjectId) -> u32 {
     (oid.local_seq() & 0xffff_ffff) as u32

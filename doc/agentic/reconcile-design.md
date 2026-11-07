@@ -134,8 +134,8 @@ Work is processed strictly in this order:
 5. `ReconcilePending` — retries (only when prerequisite device-config event has fired).
 
 Tiers 1 and 2 share the `ReconcileHighPrio` btree; the worker discriminates by inspecting
-`WorkItem.target_kind` (an `OwnerKind` from METADATA-DESIGN§2.2). `OwnerKind ∈ { BtreeNode, OverflowRecord,
-TagBitmapExtent }` is metadata (tier 1); `OwnerKind ∈ { BlobExtent, Chunk }` is data
+`WorkItem.target_kind` (an `OwnerKind` from METADATA-DESIGN§2.2). `OwnerKind ∈ { BtreeNode, OverflowRecord }`
+is metadata (tier 1); `OwnerKind ∈ { BlobExtent, Chunk }` is data
 (tier 2). Workers consume the btree in `target_kind`-priority order rather than via two
 separate scans, so the on-disk shape stays a single tree.
 
@@ -166,7 +166,6 @@ ReconcileMove { from_loc, to_loc, owner_key }
         OwnerKind::BlobExtent      → ObjectLocation.replicas[i] (METADATA-DESIGN§2.1)
         OwnerKind::Chunk           → ChunkIndex entry's BlobRef (INDEX-DESIGN§4.3)
         OwnerKind::BtreeNode       → parent inner node's BlockRef (BTREE-DESIGN§1)
-        OwnerKind::TagBitmapExtent → TagDirectory entry's store_root (INDEX-DESIGN§3.1)
         OwnerKind::OverflowRecord  → ObjectRecord.overflow_offset (METADATA-DESIGN§1.2)
 ```
 
@@ -183,7 +182,7 @@ types for compactness. Replay demotes `to_loc: BlockRef` into the target's shape
   the METADATA-DESIGN§2.1 conversion; drop `generation` (recoverable on demand from `BucketAllocEntry`).
 - `BlobRef` (INDEX-DESIGN§4.3, `Chunk`): drop `generation`; copy `length` from the *previous* owner
   record's `BlobRef.length` — moves preserve extent length, so the field is unchanged.
-- `BlockRef` (`BtreeNode`, `TagBitmapExtent`): copy verbatim.
+- `BlockRef` (`BtreeNode`): copy verbatim.
 - raw `u64` (`OverflowRecord`): take `block_no`.
 
 Writers do the inverse promotion when emitting `ReconcileMove`: they read the destination

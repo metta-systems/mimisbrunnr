@@ -10,7 +10,7 @@ Design: [engine-design.md](engine-design.md) · Decisions: [engine-decisions.md]
 ## Copy-on-write commit
 
 - [ ] **ENGINE3 — COW region placement.** Each flushed tree gets a freshly allocated region; the previous root's regions are freed after `commit_root`. Prerequisite: [ALLOCATION1](allocation-implementation-plan.md). Acceptance: two consecutive commits produce different `BlockRef`s; a crash after `save_index_state` but before `commit_root` reopens on the previous root intact; `bin/analyze` shows every named tree at a real bucket.
-- [ ] **ENGINE4 — Retire fixed index-zone areas.** The fixed forward-overflow area (8 MiB offset, 32 regions), tag-bitmap area (4 MiB, 1 024 slots) and the fixed-offset region slots give way to allocator placement, lifting their caps and the 32 MiB `FMT_INDEX_ZONE_SIZE` assumption. Prerequisites: ENGINE3, [INDEX4](index-implementation-plan.md).
+- [ ] **ENGINE4 — Retire fixed index-zone areas.** The fixed forward-overflow area (8 MiB offset, 32 regions), tag-bitmap area (4 MiB, 1 024 slots) and the fixed-offset region slots give way to allocator placement, lifting their caps and the 32 MiB `FMT_INDEX_ZONE_SIZE` assumption. Prerequisites: ENGINE3, [INDEX13](index-implementation-plan.md), [INDEX14](index-implementation-plan.md).
 - [ ] **ENGINE5 — Wire `BackpointerTable` into the engine.** Engine field, flush and load through `RootPointer`, mutations maintained alongside location changes. Prerequisite: [BLOB1](blob-implementation-plan.md) (first producer of backpointers).
 
 ## Retire the legacy blob

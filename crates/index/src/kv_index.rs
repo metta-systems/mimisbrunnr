@@ -98,7 +98,7 @@ pub struct KvIndex {
     entries: HashMap<(TagId, u64), RoaringBitmapSerde>,
     /// 16-byte secret used to hash values. Defaults to all-zero; the engine
     /// is expected to plumb the real per-pool secret.
-    /// TODO(ENCRYPTION6): plumb the per-pool secret from `Superblock`.
+    /// TODO(INDEX12): the term dictionary replaces hashed values and this secret.
     #[serde(default = "default_secret")]
     secret: [u8; 16],
 }
@@ -189,7 +189,7 @@ impl KvIndex {
     /// map ciborium errors to [`IndexError`]; callers may equally reach for
     /// `ciborium::ser::into_writer` directly.
     ///
-    /// TODO(INDEX4): replace with the extendible-hash on-disk
+    /// TODO(INDEX12): replace with the term dictionary; formerly the extendible-hash on-disk
     /// backing.
     pub fn serialise(&self) -> Result<Vec<u8>, IndexError> {
         let mut buf = Vec::new();
@@ -220,7 +220,7 @@ impl KvIndex {
     /// The node uses [`BtreeKind::KvDirectory`] (the spec doesn't yet
     /// allocate a dedicated `BtreeKind::KvIndex` — see TODO below) and the
     /// spec's 18-bit (256 KiB) region size.
-    /// TODO(INDEX4): once `BtreeKind::KvIndex` exists in the
+    /// TODO(INDEX12): superseded by the term dictionary; once `BtreeKind::KvIndex` exists in the
     /// storage spec, switch to it.
     pub fn to_loaded_node(&self) -> LoadedNode<KvIndexKey, KvIndexValue> {
         let mut entries: Vec<(KvIndexKey, KvIndexValue)> = self

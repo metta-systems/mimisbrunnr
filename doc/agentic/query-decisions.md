@@ -2,9 +2,14 @@
 
 Design: [query-design.md](query-design.md) · Plan: [query-implementation-plan.md](query-implementation-plan.md)
 
-## QUERY-D1 — On-disk shape of the query-support indices
+## QUERY-D1 — `Contains` and `Ne` over the term index
 
-`Contains` needs a substring index, `Prefix` a sorted range or trie, `Ne` a per-attribute-key bitmap, `Related` a `(predicate, target) → oids` reverse index. None is defined in IMPLEMENTATION. Decide which of them are persisted structures (needing spec sections, `BtreeKind` slots and footprint entries) and which are derived in memory at boot. Blocks [QUERY1](query-implementation-plan.md)–[QUERY4](query-implementation-plan.md).
+Prefix and range scans are dictionary scans and `Related` reads relation-term postings (INDEX-DESIGN§4.1–4.2); two operators remain undefined:
+
+- **`Contains`** (substring). Options: (a) derived n-gram terms — term kind `3`, `(key, trigram)` — interned and posted like any term on every text write, queried by intersecting the substring's trigrams and confirming candidates against the term table; (b) a scan of the attribute's dictionary entries comparing full values, with no extra storage.
+- **`Ne`** (has the attribute, with a different value). Options: (a) a per-key presence term `(key, *)` posted on every attribute write, so `Ne v` = presence minus `Eq v`; (b) union the postings of every dictionary entry of the key, minus `Eq v`.
+
+Each (a) adds postings on every write; each (b) costs a scan per query. Blocks [QUERY1](query-implementation-plan.md), [QUERY3](query-implementation-plan.md).
 
 ## QUERY-D2 — SQL spelling of Mímisbrunnr-specific operations
 

@@ -109,13 +109,7 @@ enum BlockKind {
     // WAL framing
     WalSegment        = 3,   // WAL header / segment marker
     Checkpoint        = 4,   // checkpoint block within the WAL
-    // Tag-store pages
-    TagBitmapPage     = 5,   // roaring bitmap framing (4 KiB; INDEX-DESIGN§3.2)
-    SequencePage      = 6,   // INDEX-DESIGN§3.3 OrderedStore page (singly-linked chain)
-    RankedPage        = 7,   // INDEX-DESIGN§3.3 RankedStore page (singly-linked chain)
-    // KV equality pages
-    KvHashDirectory   = 8,   // extendible-hash directory (4 KiB; INDEX-DESIGN§4.1)
-    KvHashBucket      = 9,   // extendible-hash bucket (4 KiB; INDEX-DESIGN§4.1)
+    // 5..=9 unassigned (index data lives in BtreeKind trees, INDEX-DESIGN)
     // Per-object metadata overflow
     OverflowRecord    = 10,  // per-object tag/attr overflow (4 KiB; METADATA-DESIGN§1.2)
 }
@@ -134,15 +128,14 @@ enum BtreeKind {
     ObjectHistory         = 1,   // SNAPSHOTS-DESIGN§1.2 sidecar: (oid, snapshot) → ObjectRecord overrides
     LocationTable         = 2,   // METADATA-DESIGN§2.1 radix leaves & inners (current view)
     LocationHistory       = 3,   // SNAPSHOTS-DESIGN§1.2 sidecar: (oid, snapshot) → ObjectLocation overrides
-    // Forward index family (oid → assertions)
+    // Forward index (oid → TermIds)
     Forward               = 4,   // INDEX-DESIGN§2 forward index B+ tree (snapshot-aware key)
-    ForwardOverflow       = 5,   // INDEX-DESIGN§2.2 per-object assertion spill (positional, no sorted runs)
-    // Inverted / range indexes
-    TagDirectory          = 6,   // INDEX-DESIGN§3.1 tag directory B+ tree (snapshot-aware)
-    Range                 = 7,   // INDEX-DESIGN§4.2 range index B+ tree (snapshot-aware)
-    // KV equality + value storage
-    KvDirectory           = 8,   // INDEX-DESIGN§4.1 extendible-hash directory spillover (positional, no sorted runs)
-    ValueSpill            = 9,   // INDEX-DESIGN§1.1 value table: value_hash → value; content-addressed
+    ForwardOverflow       = 5,   // INDEX-DESIGN§2.2 forward arrays of very large entries (positional, no sorted runs)
+    // Inverted index (terms → objects)
+    TermDictionary        = 6,   // INDEX-DESIGN§4.1 term dictionary B+ tree (snapshot-aware)
+    Postings              = 7,   // INDEX-DESIGN§3.1 postings B+ tree, one container per entry (snapshot-aware)
+    TermTable             = 8,   // INDEX-DESIGN§4.1 term table: term_id → kind, key, full value (snapshot-agnostic)
+    Sequences             = 9,   // INDEX-DESIGN§3.3 ordered / ranked collection order (snapshot-aware)
     // Chunk content-addressing
     ChunkIndex            = 10,  // INDEX-DESIGN§4.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
     ChunkList             = 11,  // INDEX-DESIGN§4.3 per-object FastCDC chunk-list region (positional, no sorted runs)
@@ -220,9 +213,9 @@ Specified in [ENGINE-DESIGN§1](engine-design.md#1-superblock-and-atomic-root).
 
 Specified in [JOURNAL-DESIGN§1](journal-design.md#1-write-ahead-log).
 
-## 4. Heterogeneous Value Encoding
+## 4. Values and Terms
 
-Specified in [INDEX-DESIGN§1](index-design.md#1-heterogeneous-value-encoding).
+Specified in [INDEX-DESIGN§1](index-design.md#1-values-and-terms).
 
 ## 5. Object Record Table
 
@@ -236,13 +229,13 @@ Specified in [METADATA-DESIGN§2](metadata-design.md#2-location-and-backpointer-
 
 Specified in [INDEX-DESIGN§2](index-design.md#2-forward-index).
 
-## 8. Tag Inverted Index
+## 8. Postings
 
-Specified in [INDEX-DESIGN§3](index-design.md#3-tag-inverted-index).
+Specified in [INDEX-DESIGN§3](index-design.md#3-postings).
 
-## 9. KV Equality Index, Range Index, Chunk Index
+## 9. Term Dictionary, Range Scans, Chunk Index
 
-Specified in [INDEX-DESIGN§4](index-design.md#4-kv-equality-index-range-index-chunk-index).
+Specified in [INDEX-DESIGN§4](index-design.md#4-dictionary-range-scans-and-chunks).
 
 ## 10. Subscriptions, Path Contexts, Ontology
 
@@ -409,15 +402,14 @@ forward index roughly in half (~660 MiB at this scale).
 | Object table (radix)   | < 1 MiB   | Single inner node (depth 1 total)                  |
 | Location table         | ~460 MiB  | Positional — no key packing; 1 839 leaves × 256 KiB |
 | Backpointers           | ~267 MiB  | METADATA-DESIGN§2.2 — 10 M extents × ~28 B packed                 |
-| Forward index          | ~1.24 GiB | INDEX-DESIGN§2 / BTREE-DESIGN§1 B+ tree, 1 968 entries/leaf at 8 assertions/object → 5 082 leaves + 1 inner. Includes any `unix-path` and other path-projection attributes (UNIX-DESIGN§1) — those are ordinary `Attr` assertions. |
-| Tag inverted index     | 200–400 MiB | Roaring bitmaps (4 KiB framed), 5 000 tags       |
-| KV index               | ~100 MiB  | Extendible hash + roaring bitmaps                  |
-| Range index            | ~20 MiB   | BTREE-DESIGN§1 B+ tree, packed (`attr_id` constant per leaf) |
+| Forward index          | ~0.6 GiB  | INDEX-DESIGN§2 — ~64 B per object at 8 assertions/object (24 B head + frame-of-reference term arrays + origin bits). Includes any `unix-path` and other path-projection attributes (UNIX-DESIGN§1) — those are ordinary `Attr` terms. |
+| Postings               | 200–400 MiB | INDEX-DESIGN§3 — roaring containers, one tree entry per (term, 65 536-id window); 5 000 tags |
+| Term dictionary + term table | 0.1–1 GiB | INDEX-DESIGN§4.1 — ~100 B per distinct attribute value; the upper end is one unique value per object |
 | Ontology               | <10 MiB   | One CBOR(OntologyImage) per snapshot — modules + tag definitions + relations + implications (ONTOLOGY-DESIGN§1) |
 | Subscriptions          | ~700 KiB  | Per 1 000 subs with packed `sub_id`                |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
-| Snapshot key overhead  | ~50 MiB   | Per-snapshot divergent keys across the 7 snapshot-aware btrees (see breakdown below) |
-| **Total metadata**     | **~4.0 GiB** | Replicated to every node; dominated by object records (1.19 GiB) and forward index (1.24 GiB) |
+| Snapshot key overhead  | ~80 MiB   | Per-snapshot divergent keys across the 8 snapshot-aware btrees (see breakdown below) |
+| **Total metadata**     | **~3.3–4.4 GiB** | Replicated to every node; dominated by object records (1.19 GiB), the forward index and, with many distinct attribute values, the term dictionary |
 
 **Snapshot key overhead breakdown.** "Snapshot key overhead" is the sum of *divergent* keys —
 keys whose value at one snapshot differs from its value at an ancestor. Shared keys cost nothing
@@ -431,12 +423,12 @@ snapshot, typical for sync-driven snapshotting):
 | `ObjectHistory` sidecar (oid, snap → ObjectRecord override) | ~5 000 × 128 B = ~640 KiB | ~64 MiB |
 | `LocationHistory` sidecar (oid, snap → ObjectLocation override) | ~5 000 × 48 B = ~240 KiB | ~24 MiB |
 | `Forward` divergent leaf entries     | ~5 000 × ~20 B packed = ~100 KiB | ~10 MiB |
-| `Range` divergent leaf entries       | ~1 000 × ~25 B packed = ~25 KiB  | ~2.5 MiB |
-| `TagDirectory` divergent entries     | ~50 × 48 B = ~2.5 KiB (tags rarely diverge per snapshot)  | ~250 KiB |
+| `Postings` divergent containers      | ~1 000 × ~0.5 KiB = ~500 KiB (one container per changed term window) | ~50 MiB |
+| `TermDictionary` divergent entries   | ~1 000 × ~90 B = ~90 KiB (statistics of changed terms) | ~9 MiB |
 | `Ontology`, `Subscriptions`         | usually 0 (catalogs change rarely)         | <1 MiB combined |
-| **Sum** (≈ 1 MiB / snap × 100)       |                   | **~100 MiB raw** |
+| **Sum** (≈ 1.6 MiB / snap × 100)     |                   | **~160 MiB raw** |
 
-The raw arithmetic gives ~100 MiB; the table's ~50 MiB figure accounts for BTREE-DESIGN§1.6 packing
+The raw arithmetic gives ~160 MiB; the table's ~80 MiB figure accounts for BTREE-DESIGN§1.6 packing
 benefits (the trailing `snapshot` field packs to ~0 bits when one snapshot dominates a sorted
 run) and the fact that not every divergent oid touches every snapshot-aware tree. Workloads
 with **lower mutation rates** (cold archive snapshots taken daily) drop into the single-digit

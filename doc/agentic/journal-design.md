@@ -91,8 +91,8 @@ Entries are byte-packed and **never cross a 4 KiB sector boundary**: each entry 
 `WalEntryHeader`+payload+CRC frame within a single sector. The bound on `payload_length` is
 `4096 − WalEntryHeader (40) − framing CRC32C (4) = 4052 B` plaintext; encrypted entries pay an
 additional 16 B GCM tag and so cap at 4036 B. An attempted append exceeding the bound is a
-programming error: the producer must spill bulk data through the blob zone (INDEX-DESIGN§1.1) and reference it
-by hash, not embed it in a WAL op. Sector-aligned framing makes recovery trivial — a torn 4 KiB
+programming error: the producer must write bulk data to the blob zone and reference it, not
+embed it in a WAL op. Sector-aligned framing makes recovery trivial — a torn 4 KiB
 write loses at most one entry, and replay never has to reassemble fragments across sectors.
 
 ```rust
@@ -203,7 +203,7 @@ DeleteObject     : { oid: u64, lsn: u64 }
 AddTag           : { oid: u64, tag: u32, origin: u8 }
 RemoveTag        : { oid: u64, tag: u32 }
 SetAttr          : { oid: u64, key: u32, value: Value }       // Value tagged-union (INDEX-DESIGN§1)
-RemoveAttr       : { oid: u64, key: u32, value_hash: u64 }
+RemoveAttr       : { oid: u64, term_id: u64 }                   // the attribute term (INDEX-DESIGN§1.2)
 AddRelation      : { oid: u64, predicate: u32, target: u64 }
 RemoveRelation   : { oid: u64, predicate: u32, target: u64 }
 WriteBlob        : { oid: u64, content_hash: [u8;32], extent: BlockRef, size: u64 }
@@ -251,21 +251,9 @@ BackpointerRemove: { key: BackpointerKey }                                // exp
 // Implicit removal: a BucketGenBump invalidates all of that bucket's backpointers lazily
 // (stale entries detected by gen mismatch on the next scan, no per-bp WAL op needed).
 
-// Tag bitmap allocation lifecycle (INDEX-DESIGN§3.1, INDEX-DESIGN§3.2)
-TagBitmapGrow    : { tag_id: u32, snapshot: u32, store_kind: u8, new_root: BlockRef }
-                   // A tag's bitmap was allocated, relocated, or extended into a new
-                   //   region. Replay sets the matching TagDirectory entry's store_root
-                   //   (and store_kind) to new_root. Emitted on first AddTag for a new
-                   //   (tag, snapshot) pair, on bitmap region growth past 4 KiB, and
-                   //   after reconcile-driven moves of a tag-bitmap extent.
-TagBitmapShrink  : { tag_id: u32, snapshot: u32 }
-                   // A tag's bitmap is now empty (cardinality dropped to 0). Replay
-                   //   removes the TagDirectory entry; the bitmap region is reclaimed
-                   //   via bucket-gen bump. Emitted by the last RemoveTag for the
-                   //   (tag, snapshot) pair.
-// AddTag / RemoveTag (above) carry membership changes; TagBitmapGrow / TagBitmapShrink
-// carry pointer / lifecycle changes. The split decouples WAL replay from the
-// TagDirectory leaf shape — recovery never has to mimic the runtime allocation policy.
+// Postings need no ops of their own: AddTag / SetAttr / AddRelation and their removals
+// change term postings, which live in ordinary B+ tree entries (INDEX-DESIGN§3.1) and
+// replay like any other entry. Op kinds 20 and 21 are unassigned.
 
 // Snapshot lifecycle (SNAPSHOTS-DESIGN§1)
 SnapshotCreate   : { new_id: u32, parent_id: u32, current_replacement: u32, label: Option<String> }

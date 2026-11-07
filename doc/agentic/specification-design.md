@@ -429,65 +429,36 @@ Core principle: **data outlives apps.** Tags your music app created are still yo
 
 ## 5. Index Layer
 
-Five index structures. On disk they are persistent B+ trees of 256 KiB large nodes with WAL-fronted updates (BTREE-DESIGN§1, INDEX-DESIGN§2–§4); in memory each carries a hot mirror over the loaded nodes' merged views. The shapes below describe the logical / in-memory form:
+The index is an **inverted index over terms**, the structure search engines use: a sorted dictionary of every distinct thing objects assert, a posting list per term saying which objects assert it, and a forward list per object. All of it lives in B+ trees of large nodes with WAL-fronted updates (BTREE-DESIGN§1), specified in INDEX-DESIGN§1–§4, and is read through a bounded page cache rather than mirrored in memory.
 
-### 5.1 Tag Inverted Index
+### 5.1 Terms
 
-One roaring bitmap per tag. The core structure for all tag queries.
+Every assertion is a **term**: a tag `t`, an attribute value `(key, value)`, or a relation `(predicate, target)`. Tags use their `TagId` as `TermId`; attribute and relation terms get a dense `TermId` the first time they are written. Identity is exact — the dictionary compares full values — so there is no value hash and no collision case. `TermId`s are local to their pool; sync carries values (INDEX-DESIGN§1.2).
+
+### 5.2 Postings
+
+A term's **posting list** is the set of objects asserting it, stored as roaring containers: one per 65 536-id window, as a sorted `u16` array, an 8 KiB bitmap or a run list, whichever is smallest. Lists of up to four objects sit inline in the dictionary entry.
 
 ```
-tag "electronics" → RoaringBitmap { 1, 5, 42, 99, 107, ... }
-tag "portable"    → RoaringBitmap { 5, 42, 200, ... }
+tag "electronics" → containers { window 0: [1, 5, 42, 99, 107, …], window 3: […] }
+tag "portable"    → containers { window 0: [5, 42, 200, …] }
 
-electronics AND portable → bitmap AND → { 5, 42 }
+electronics AND portable → window-by-window intersection → { 5, 42 }
 ```
 
-10M objects, 5000 tags, 20 tags/object: ~200–400 MB total. Intersections return in sub-millisecond time.
+Containers are keyed by the high 48 bits of the object id, so ids keep their full node and local identity, an update rewrites one container, and snapshot diffs and sync deltas work per container. 10 M objects, 20 tags per object: ~200–400 MB of postings for direct tags (INDEX-DESIGN§3).
 
-### 5.2 Tag Store Variants
+### 5.3 Term dictionary
 
-Most tags are simple bitmaps. Ordered collections carry additional structure because the ontology says they should:
+The dictionary is sorted by `(kind, key, context, normalised value)`, where the normalised value is an order-preserving 16-byte encoding. An equality query is one lookup; a range or prefix query (`year > 2020`, `size BETWEEN 1MB AND 10MB`, `name LIKE 'cargo%'`) is one scan that unions the postings it passes. Each entry carries the term's cardinality and change counters for query planning and sync (INDEX-DESIGN§4).
 
-```rust
-enum TagStore {
-    Simple(RoaringBitmap),
-    Ordered {
-        members: RoaringBitmap,
-        sequence: Vec<ObjectId>,
-    },
-    Ranked {
-        members: RoaringBitmap,
-        ranked: Vec<(ObjectId, f32)>,
-    },
-}
-```
+### 5.4 Ordered and ranked collections
 
-A playlist with 500 tracks: 4 KB sequence + 2 KB bitmap. 10,000 playlists: ~40 MB.
+Tags whose semantics are `OrderedCollection` keep membership in postings like any term and their order in a separate sequence tree keyed by `(term, position)` or `(term, score)` (INDEX-DESIGN§3.3). A playlist with 500 tracks costs its postings plus 500 sequence entries.
 
-### 5.3 KV Equality Index
+### 5.5 Forward index
 
-Treats `(tag_id, value_hash)` as a compound key mapping to a roaring bitmap of matching objects. Implemented as `HashMap<(TagId, u64), RoaringBitmap>` where the `u64` is a `DefaultHasher` hash of the value with a type discriminator for collision avoidance. Supports exact-match queries and faceted exploration (enumerating distinct value hashes per tag).
-
-### 5.4 Range B+ Tree
-
-For ordered queries (`year > 2020`, `size BETWEEN 1MB AND 10MB`). Keyed by `(attr_id, value, obj_id)`, producing roaring bitmaps via range scans.
-
-### 5.5 Forward Index
-
-Object → all its assertions. Used for tag listing, faceted exploration, sync, and distinguishing direct from materialized tags.
-
-```rust
-struct ForwardEntry {
-    assertion: Assertion,
-    origin: TagOrigin,   // Direct or Materialized
-}
-
-struct ForwardIndex {
-    entries: HashMap<u64, Vec<ForwardEntry>>,  // keyed by ObjectId raw value
-}
-```
-
-Methods: `direct_tags(oid)` and `materialized_tags(oid)` for per-origin filtering.
+Object → the `TermId`s it asserts, each marked Direct or Materialized. Used for listing an object's tags and attributes, deletion cleanup, sync, and distinguishing direct from materialized tags. Term ids are stored as frame-of-reference arrays: about 64 bytes for an object with a dozen tags (INDEX-DESIGN§2).
 
 ### 5.6 Faceted Exploration
 
@@ -507,7 +478,7 @@ The filesystem operates directly on raw block devices. Each disk is divided into
  ...                  Write-Ahead Log (64 MiB circular buffer)
                       ┌───────────────────────────────────┐
                       │  Zone 1: INDEX ZONE               │
-                      │  Tag bitmaps, ontology, KV index  │
+                      │  Term index, postings, ontology   │
                       │  3% of usable space (first extent)│
                       ├───────────────────────────────────┤
                       │  Zone 2: METADATA ZONE            │
@@ -625,7 +596,6 @@ enum WalOpKind {
     ChunkListReplace, ChunkListShrink, ChunkObjectFinalize,
     BucketAlloc, BucketWrite, BucketGenBump, BucketDiscard,    // §6.1 allocation
     BackpointerInsert, BackpointerRemove,
-    TagBitmapGrow, TagBitmapShrink,
     SnapshotCreate, SnapshotDelete,
     SnapshotUnlink, SnapshotDepthUpdate,
     ReconcileEnqueue, ReconcileDequeue, ReconcileMove, ReconcileScanStep,
@@ -1230,8 +1200,8 @@ Path projections reuse the existing tag/attribute machinery:
   assertion. Unscoped values (plain `Text(...)`) are visible in every context as the default.
 - **Per-context overrides** (mode, uid, gid): same `Scoped` form, applied to the matching
   attribute.
-- **Ordered manifest** (for tarball export): the existing `Ordered` tag-store on the
-  context tag (INDEX-DESIGN§3.3).
+- **Ordered manifest** (for tarball export): the context tag's sequence in the sequences
+  tree (INDEX-DESIGN§3.3).
 
 See UNIX-DESIGN§1 for the full encoding contract and INDEX-DESIGN§1.3 for `Value::Scoped`.
 
@@ -1270,10 +1240,8 @@ The FUSE VFS provides two navigation modes:
 
 ```rust
 struct TagVfs {
-    // Indices (cloned from engine state)
-    tag_index: TagIndex,
-    kv_index: KvIndex,
-    forward_index: ForwardIndex,
+    // Index access (paged through the engine's node cache; INDEX-DESIGN)
+    index: TermIndex,                 // term dictionary, postings, forward index
     dag: ImplicationDag,
     // Context VFS trees
     context_trees: HashMap<String, VfsTree>,
@@ -1408,9 +1376,7 @@ The `Engine` struct is the central coordinator, holding all in-memory indices:
 ```rust
 struct Engine {
     object_table: ObjectTable,
-    tag_index: TagIndex,
-    forward_index: ForwardIndex,
-    kv_index: KvIndex,
+    index: TermIndex,                 // term dictionary, term table, postings, forward, sequences
     dag: ImplicationDag,
     oplog: OpLog,
     clock: HybridTimestamp,
@@ -1484,11 +1450,11 @@ Index state is currently persisted as CBOR (length-prefixed) in the index zone �
         │               │              │
 ┌───────▼───────┐ ┌─────▼───────┐ ┌────▼──────────┐
 │  ONTOLOGY     │ │ INDEX LAYER │ │ METADATA      │
-│               │ │ (RAM +WAL)  │ │ LAYER         │
+│               │ │ (paged+WAL) │ │ LAYER         │
 │ Module system │ │             │ │               │
-│ Implication   │ │ Tag Bitmap  │ │ Object Table  │
-│ DAG           │ │ KV Index    │ │ Location Table│
-│ Materializer  │ │ Range B+    │ │               │
+│ Implication   │ │ Term dict   │ │ Object Table  │
+│ DAG           │ │ Postings    │ │ Location Table│
+│ Materializer  │ │ Sequences   │ │               │
 │               │ │ Forward Idx │ │               │
 └───────┬───────┘ └─────┬───────┘ └────┬──────────┘
         │               │              │
@@ -1569,11 +1535,11 @@ graph TB
     Aliases --> Planner
     MutexGroups --> Materializer
 
-    subgraph IndexLayer["Index Layer (RAM-resident, WAL-persisted)"]
-        TagIndex["Tag Inverted Index<br/><i>TagId → RoaringBitmap<br/>5000 tags × ~20-50KB each</i>"]
-        KVIndex["KV Equality Index<br/><i>(key, value_hash) → RoaringBitmap<br/>compound tag approach</i>"]
-        RangeIndex["Range B+ Tree<br/><i>(attr_id, value, obj_id)<br/>ordered scans for &lt; &gt; BETWEEN</i>"]
-        ForwardIndex["Forward Index<br/><i>ObjectId → Vec&lt;TagId&gt;<br/>for getattr / tag listing</i>"]
+    subgraph IndexLayer["Index Layer (paged B+ trees, WAL-persisted)"]
+        TagIndex["Postings<br/><i>(TermId, id window) → roaring container<br/>tags, attribute values, relations</i>"]
+        KVIndex["Term Dictionary<br/><i>(kind, key, context, normalised value) → TermId, stats<br/>equality, range and prefix scans</i>"]
+        RangeIndex["Sequences<br/><i>(TermId, position | score) → ObjectId<br/>ordered and ranked collections</i>"]
+        ForwardIndex["Forward Index<br/><i>ObjectId → TermIds + origin<br/>for getattr / tag listing</i>"]
     end
 
     Executor --> TagIndex

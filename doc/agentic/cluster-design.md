@@ -16,7 +16,7 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, and co
 - Snapshot diffs are the unit of sync; sync waits for [snapshots-design.md](snapshots-design.md).
 - Ordering across nodes uses `HybridTimestamp` (SPECIFICATION-DESIGN§10.4).
 - ObjectIds carry the writing node's `NodeId` in their top 16 bits.
-- **`value_hash` stays on its node.** Each pool hashes attribute values with its own secret (INDEX-DESIGN§1.2). Sync payloads carry attribute values, never `value_hash`; a receiver hashes them with its own secret. Bitmap-delta sync covers tag bitmaps only; KV index state converges through the assertion ops. No key is distributed between nodes.
+- **`TermId`s stay on their node.** Each pool numbers its attribute and relation terms itself (INDEX-DESIGN§1.2). Sync payloads name terms by value — a tag id, or an attribute key and `Value` — never by `TermId`; a receiver interns them into its own dictionary.
 
 ## Format specification
 
@@ -53,7 +53,8 @@ SyncBundle (CBOR):
    from_node: NodeId
    ops: [SyncOp]                       // canonical, HLC-ordered
    ontology_delta: Option<OntologyDelta>
-   bitmap_deltas: [{ tag_id, snapshot, added/removed }]   // for tag bitmap divergences
+   posting_deltas: [{ term, high, snapshot, container }]  // per-container divergences (INDEX-DESIGN§3.1);
+                                                          //   term = tag id or (key, Value), never a TermId
 ```
 
 The bundle is signed and shipped to peers (per the SPECIFICATION-DESIGN§9.4 key hierarchy).

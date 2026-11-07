@@ -196,7 +196,7 @@ pub fn replay_wal_op(
 /// `Attr` payloads. Wraps [`mimisbrunnr_types::value_hash`] so callers don't
 /// have to plumb the per-pool secret. Today we use the all-zero secret per
 /// the INDEX-DESIGN§1.2 TODO; replace once the per-pool secret is wired.
-// TODO(ENCRYPTION6): plumb the per-pool secret from `Superblock`.
+// TODO(INDEX12): the term dictionary replaces hashed values and this secret.
 pub fn engine_value_hash(value: &mimisbrunnr_types::Value) -> u64 {
     value_hash(value, &[0u8; 16])
 }

@@ -16,7 +16,7 @@ pub enum QueryError {
     /// the engine ever asks for an `ObjectId` whose local sequence exceeds
     /// `u32::MAX` we surface this rather than silently aliasing two IDs.
     #[error(
-        "ObjectId local sequence {local} exceeds 32 bits (TODO(INDEX5): wider bitmap)"
+        "ObjectId local sequence {local} exceeds 32 bits (TODO(INDEX16): wider bitmap)"
     )]
     ObjectIdTooLarge { local: u64 },
 

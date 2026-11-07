@@ -34,7 +34,8 @@ Steps 1–7 replace the prototype's shortcuts with the specified binary formats 
 Each fixes a layout that later steps write; decide them first.
 
 - [OPERATIONS-D4](operations-decisions.md) — checksum algorithm.
-- [INDEX-D1](index-decisions.md) — object ids in bitmaps.- [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes.
+- [INDEX-D4](index-decisions.md) — materialized terms in forward entries.
+- [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md), [BTREE-D3](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes, aligned values in sorted runs.
 - [ALLOCATION-D1](allocation-decisions.md) — sub-bucket regions.
 - [ENGINE-D1](engine-decisions.md) — oplog persistence.
 
@@ -47,20 +48,19 @@ Independent of each other unless an order is given.
 - [JOURNAL7](journal-implementation-plan.md) — one checksum algorithm (after OPERATIONS-D4).
 - [POOL3](pool-implementation-plan.md), then [POOL7](pool-implementation-plan.md) — pool state through the root pointer; pool assembled from its devices, no `pool.toml`.
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
-- [INDEX1](index-implementation-plan.md) — four-field range key.
-- [INDEX2](index-implementation-plan.md), [INDEX3](index-implementation-plan.md) — ordered and ranked tag stores.
-- [INDEX7](index-implementation-plan.md) — value table.
-- [INDEX8](index-implementation-plan.md) — tag bitmaps beyond one page.
-- [INDEX10](index-implementation-plan.md) — stored `value_hash` secret; then [INDEX11](index-implementation-plan.md) (after INDEX7) — colliding values rejected on write.
 - [ENGINE11](engine-implementation-plan.md) — typed chunking defaults in the superblock.
 - [BTREE8](btree-implementation-plan.md) — codec-transparent region read.
 - [ONTOLOGY2](ontology-implementation-plan.md) — storage errors.
 - [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator (after ONTOLOGY-D1).
 - [ALLOCATION2](allocation-implementation-plan.md) — freelist seeding at format time.
 
-### 3. Bitmap representation
+### 3. Term index
 
-[INDEX5](index-implementation-plan.md) after INDEX-D1. It changes every on-disk bitmap, so it lands before the tree machinery that writes them.
+The term dictionary, postings and forward index replace every index structure, so they land before the tree machinery that writes them (INDEX-DESIGN).
+
+1. [INDEX12](index-implementation-plan.md) — term dictionary, term table and interning (after INDEX9).
+2. [INDEX13](index-implementation-plan.md) — postings containers (after BTREE-D3); [INDEX14](index-implementation-plan.md) — forward index by `TermId` (after INDEX-D4).
+3. [INDEX15](index-implementation-plan.md) — sequences; [INDEX16](index-implementation-plan.md) — queries, faceting, FUSE and watch over containers.
 
 ### 4. Live tree machinery
 
@@ -79,12 +79,11 @@ Independent of each other unless an order is given.
 3. [ALLOCATION3](allocation-implementation-plan.md) — generation check on read.
 4. [BTREE7](btree-implementation-plan.md), then [ENGINE2](engine-implementation-plan.md) — compaction.
 5. [METADATA1](metadata-implementation-plan.md), then [METADATA2](metadata-implementation-plan.md) — multi-level radix tables.
-6. [INDEX4](index-implementation-plan.md) — KV index full capacity.
-7. [ENGINE4](engine-implementation-plan.md) — retire fixed index-zone areas.
-8. [SUBSCRIPTION1](subscriptions-implementation-plan.md) — externalized subscription bitmaps.
-9. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md), [ALLOCATION6](allocation-implementation-plan.md) — per-disk allocation trees.
-10. [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup; [METADATA5](metadata-implementation-plan.md) — overflow records (after SPEC3).
-11. [INDEX6](index-implementation-plan.md) — footprint benchmark.
+6. [ENGINE4](engine-implementation-plan.md) — retire fixed index-zone areas.
+7. [SUBSCRIPTION1](subscriptions-implementation-plan.md) — externalized subscription bitmaps.
+8. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md), [ALLOCATION6](allocation-implementation-plan.md) — per-disk allocation trees.
+9. [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup; [METADATA5](metadata-implementation-plan.md) — overflow records (after SPEC3).
+10. [INDEX6](index-implementation-plan.md) — footprint benchmark.
 
 ### 6. Blob zone and legacy blob retirement
 
@@ -103,7 +102,7 @@ Independent of each other unless an order is given.
 
 ### 9. Reconcile and allocation completeness
 
-[RECONCILE1](reconcile-implementation-plan.md) through [RECONCILE8](reconcile-implementation-plan.md), with [ALLOCATION7](allocation-implementation-plan.md), [ALLOCATION8](allocation-implementation-plan.md) and [POOL6](pool-implementation-plan.md) (disk evacuation); then [POOL2](pool-implementation-plan.md).
+[RECONCILE1](reconcile-implementation-plan.md) through [RECONCILE8](reconcile-implementation-plan.md), [INDEX17](index-implementation-plan.md) (term reclamation), with [ALLOCATION7](allocation-implementation-plan.md), [ALLOCATION8](allocation-implementation-plan.md) and [POOL6](pool-implementation-plan.md) (disk evacuation); then [POOL2](pool-implementation-plan.md).
 
 ### 10. Cluster sync
 
@@ -113,9 +112,9 @@ Independent of each other unless an order is given.
 
 These touch disjoint code and can run whenever their prerequisites hold:
 
-- **Encryption:** [ENCRYPTION1](encryption-implementation-plan.md)–[ENCRYPTION4](encryption-implementation-plan.md) any time; [ENCRYPTION6](encryption-implementation-plan.md) after INDEX10; [ENCRYPTION5](encryption-implementation-plan.md) after BLOB1.
+- **Encryption:** [ENCRYPTION1](encryption-implementation-plan.md)–[ENCRYPTION4](encryption-implementation-plan.md) any time; [ENCRYPTION5](encryption-implementation-plan.md) after BLOB1.
 - **Journal flags:** [JOURNAL5](journal-implementation-plan.md), [JOURNAL6](journal-implementation-plan.md).
-- **Query and SQL:** [QUERY1](query-implementation-plan.md)–[QUERY10](query-implementation-plan.md) (QUERY5 after INDEX2; QUERY6 and QUERY9 after QUERY7; QUERY10 after QUERY4 and QUERY-D2).
+- **Query and SQL:** [QUERY1](query-implementation-plan.md)–[QUERY10](query-implementation-plan.md) (QUERY1–QUERY3 after INDEX12; QUERY4 after INDEX13; QUERY5 after INDEX15; QUERY6 and QUERY9 after QUERY7; QUERY10 after QUERY4 and QUERY-D2).
 - **Subscriptions:** [SUBSCRIPTION3](subscriptions-implementation-plan.md)–[SUBSCRIPTION6](subscriptions-implementation-plan.md).
 - **Ontology:** [ONTOLOGY3](ontology-implementation-plan.md), [ONTOLOGY4](ontology-implementation-plan.md), [ONTOLOGY5](ontology-implementation-plan.md); [ONTOLOGY6](ontology-implementation-plan.md), then [ONTOLOGY7](ontology-implementation-plan.md), then [ONTOLOGY8](ontology-implementation-plan.md) and [ONTOLOGY9](ontology-implementation-plan.md).
 - **Pool:** [POOL1](pool-implementation-plan.md), [POOL4](pool-implementation-plan.md).

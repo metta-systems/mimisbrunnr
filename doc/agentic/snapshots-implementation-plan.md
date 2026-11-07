@@ -2,7 +2,7 @@
 
 Design: [snapshots-design.md](snapshots-design.md) · Decisions: [snapshots-decisions.md](snapshots-decisions.md) · Order: [operations-plan.md](operations-plan.md)
 
-Prerequisites for the whole scope: [ENGINE3](engine-implementation-plan.md), [METADATA2](metadata-implementation-plan.md), [INDEX5](index-implementation-plan.md), [BLOB2](blob-implementation-plan.md).
+Prerequisites for the whole scope: [ENGINE3](engine-implementation-plan.md), [METADATA2](metadata-implementation-plan.md), [INDEX13](index-implementation-plan.md), [BLOB2](blob-implementation-plan.md).
 
 - [ ] **SNAPSHOT1 — Snapshot tree.** `SnapshotNode`, ancestor bitmap and skiplist (SNAPSHOTS-DESIGN§1.1).
 - [ ] **SNAPSHOT2 — Snapshot-aware key positions.** Thread the snapshot id through every snapshot-aware tree (SNAPSHOTS-DESIGN§1.2).

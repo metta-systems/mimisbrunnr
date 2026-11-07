@@ -104,7 +104,6 @@ Workspace-level evidence (`just test`, `just clippy`) backs every claim: a regre
 | TOML | Human-edited configuration only (`pool.toml`, ontology modules). |
 | Content hash | BLAKE3. |
 | Block and sorted-run CRC | CRC32C (`crc32c`). |
-| KV value hash | SipHash-2-4 keyed by the per-pool secret, 64-bit. |
 | Fixed-size on-disk structs | `bytemuck::{Pod, Zeroable}`, `#[repr(C)]`, naturally aligned. |
 | Bitfields | `bitbybit` + `arbitrary-int`. |
 | Endianness | Little-endian on disk; big-endian hosts are out of scope. |
@@ -121,7 +120,7 @@ Logical types live in `mimisbrunnr-types`; each on-disk wire struct lives in the
 
 | Concept | Crate |
 |---|---|
-| IDs (`ObjectId`, `TagId`, `NodeId`, `DiskId`, `SubscriptionId`, `ModuleId`), `Assertion`, `Value`, `Query`, tag definitions and storage policy types, disk and tier types, watch event types, `HybridTimestamp`, `ContentPresence`, object state enums, value CBOR codec and `value_hash` | types |
+| IDs (`ObjectId`, `TagId`, `NodeId`, `DiskId`, `SubscriptionId`, `ModuleId`), `Assertion`, `Value`, `Query`, tag definitions and storage policy types, disk and tier types, watch event types, `HybridTimestamp`, `ContentPresence`, object state enums, value CBOR codec | types |
 | Block headers and kinds, `BtreeNodeHeader`, sorted-run headers and formats, superblock, zone map, `RootPointer`, `BlockRef`, `BlobRef`, bucket allocation, `LoadedNode`, `JournalPin` | storage |
 | WAL header, entry header and flags, ops | wal |
 | `ObjectRecord`, object table, `ObjectLocation`, replica and backpointer types | meta |

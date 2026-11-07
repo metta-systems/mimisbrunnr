@@ -15,7 +15,7 @@
 //! INDEX1 moves the oids into the key, RangeIndex flushes
 //! through the CBOR run codec.
 //!
-//! TODO(INDEX1): switch to the four-field key through the packed codec;
+//! TODO(INDEX12): replaced by term-dictionary scans; the old plan was to switch to the four-field key through the packed codec;
 //! with oids in the key the value side is fixed-shape, and a packed key
 //! buys O(20%) payload savings.
 

@@ -29,14 +29,14 @@ Object records and locations are positional: `oid_local` addresses a slot in a c
 
 ### Why ids are never recycled
 
-An `ObjectId` is referenced from every tag bitmap the object is in, the forward index, its object and location records, the chunk index, ordered-collection sequences, peers' copies of all of these, and sync ops still in flight. If id 42 were reused while a peer had not yet seen the deletion, tags meant for the new 42 would land on the old 42's state. A node's 48-bit local sequence holds 2⁴⁸ ≈ 2.8 × 10¹⁴ ids; at 1 000 creates per second that lasts about 8 900 years, so ids are never reused (SPECIFICATION-DESIGN§7.3). `ObjectRecord.generation` remains as insurance should reuse ever be introduced.
+An `ObjectId` is referenced from every posting list the object is in, the forward index, its object and location records, the chunk index, ordered-collection sequences, peers' copies of all of these, and sync ops still in flight. If id 42 were reused while a peer had not yet seen the deletion, tags meant for the new 42 would land on the old 42's state. A node's 48-bit local sequence holds 2⁴⁸ ≈ 2.8 × 10¹⁴ ids; at 1 000 creates per second that lasts about 8 900 years, so ids are never reused (SPECIFICATION-DESIGN§7.3). `ObjectRecord.generation` remains as insurance should reuse ever be introduced.
 
 ### Phases
 
 Deletion walks `ObjectRecord.state` (`ObjectState`, discriminants pinned: `Active = 0`, `Tombstoned = 1`, `BlobReclaim = 2`, `Cleared = 3`) through the four phases of SPECIFICATION-DESIGN§7.1:
 
 1. **Tombstone.** `state = Tombstoned`, `modified_ns` = deletion time; the `DeleteObject` WAL entry and oplog op are written and subscribers get `Deleted`. The object is invisible to queries from here on. O(1).
-2. **Index cleanup.** The forward entry lists exactly what to undo, so cost is O(assertions on the object), not O(tags in the pool): each `Tag` leaves its bitmap and, for `Ordered` / `Ranked` stores, its sequence; each `Attr` leaves the KV and range indexes; each `Relation` leaves the relation indexes; then the forward entry goes. Twenty tags are about 2 µs, so the work is not parallelised.
+2. **Index cleanup.** The forward entry lists exactly what to undo, so cost is O(terms on the object), not O(terms in the pool): the object leaves the postings of every term in its forward entry (one container each, INDEX-DESIGN§3.1) and, for ordered or ranked collections, their sequences (INDEX-DESIGN§3.3); each term's dictionary statistics are updated; then the forward entry goes. Twenty terms are about 2 µs, so the work is not parallelised.
 3. **Blob reclaim**, once every peer has seen the deletion (step 4's watermark condition): `state = BlobReclaim`; a direct blob's extents are freed through the allocator (ALLOCATION-DESIGN§1), a chunked blob's chunk references are decremented and chunks reaching zero are freed (INDEX-DESIGN§4.3), and the location record is cleared. Waiting protects a peer still hydrating the blob, and freeing in the same commit that clears the location keeps a crash from leaving a committed location that points at freed space.
 4. **Tombstone expiry**, when every peer's sync watermark is past the deletion and the minimum grace period has elapsed (SPECIFICATION-DESIGN§7.2): `state = Cleared` and the rest of the record is zeroed. The slot stays allocated and the id is not reused; accumulation of cleared slots is [METADATA-D1](metadata-decisions.md).
 
@@ -63,7 +63,7 @@ The full per-assertion conflict rules are [CLUSTER-D2](cluster-decisions.md).
 
 ### Deleting a tag
 
-Deleting a tag is cheaper than deleting objects: its bitmap is the member list. Each member's forward entry drops the `Tag` assertion, the bitmap goes, the ontology drops the tag, and one sync op records the deletion. Member objects are untouched — deleting a playlist removes the grouping, not the music (SPECIFICATION-DESIGN§7.5). The per-object tag count is [METADATA-D2](metadata-decisions.md); removing a module's tags is the Purge policy (ONTOLOGY-DESIGN "Removal and scrub policies", [ontology-design.md](ontology-design.md)).
+Deleting a tag is cheaper than deleting objects: its posting list is the member list. Each member's forward entry drops the tag's `TermId`, the postings and the dictionary entry go, the ontology drops the tag, and one sync op records the deletion. Member objects are untouched — deleting a playlist removes the grouping, not the music (SPECIFICATION-DESIGN§7.5). The per-object tag count is [METADATA-D2](metadata-decisions.md); removing a module's tags is the Purge policy (ONTOLOGY-DESIGN "Removal and scrub policies", [ontology-design.md](ontology-design.md)).
 
 ### Rejected alternatives
 
@@ -244,7 +244,7 @@ struct OverflowAttr {                        // 32 bytes (spill) or 112 bytes (i
     flags: u8,                               // [0..1]   OVERFLOW_ATTR_FLAG_*
     _pad0: [u8; 3],                          // [1..4]   align `key` to u32
     key: u32,                                // [4..8]   attribute id
-    value_hash: u64,                         // [8..16]  SipHash, INDEX-DESIGN§1.2
+    term_id: u64,                            // [8..16]  the attribute term, INDEX-DESIGN§1.2
     // [16..) — body, discriminated by `flags & OVERFLOW_ATTR_FLAG_SPILL`:
     //   spilled (flag set):    spill: BlobRef               (16 B; total record = 32 B)
     //   inline (flag clear):   inline_value: [u8; 96]       (96 B; total record = 112 B)
@@ -255,8 +255,7 @@ const OVERFLOW_ATTR_FLAG_SPILL: u8 = 1 << 0;  // body is 16 B BlobRef, not 96 B 
 ```
 
 `OverflowAttr.flags` is the discriminator that tells a reader how many bytes to consume for the
-body — without it the variant is unrecoverable. The pattern mirrors INDEX-DESIGN§2.1's `LeafEntry.header`
-spill bit. Other `flags` bits are reserved for future per-attr metadata (e.g. compression
+body — without it the variant is unrecoverable. Other `flags` bits are reserved for future per-attr metadata (e.g. compression
 hints) and zeroed in `format_version = 1`.
 
 If an object outgrows a single 4 KiB overflow record, the chain extends through `next_overflow`
@@ -409,13 +408,13 @@ enum OwnerKind {
     BlobExtent       = 1,                    // owner_key = ObjectId (u64) + extent_index (u64)
     Chunk            = 2,                    // owner_key = first 16 B of chunk_hash (BLAKE3 prefix)
     BtreeNode        = 3,                    // owner_key = (BtreeKind, level, min_key prefix)
-    TagBitmapExtent  = 4,                    // owner_key = TagId (u32) + container_idx (u32)
+    // 4 unassigned (posting containers live in B+ tree nodes, covered by BtreeNode)
     OverflowRecord   = 5,                    // owner_key = ObjectId (u64)
 }
 ```
 
 **`owner_key` padding.** Variants whose logical key is shorter than 16 bytes
-(`TagBitmapExtent` and `OverflowRecord` use 8; `BtreeNode` may use less, depending on
+(`OverflowRecord` uses 8; `BtreeNode` may use less, depending on
 the `min_key prefix` length) must **zero the trailing bytes** of `owner_key`. Equality
 of two `BackpointerValue` records is byte-wise over the full 16 B, and replay of a
 `ReconcileMove` (JOURNAL-DESIGN§1.3, RECONCILE-DESIGN§1.5) decomposes into `BackpointerRemove(old_key) ∘

@@ -1,32 +1,47 @@
 # Indices — design
 
-Scope: `crates/index` (forward, tag, KV, range, chunk indices; tag bitmap pages; KV directory and buckets), and the bitmap representation shared with `crates/query`, `crates/fuse`, `crates/watch`.
-Governing spec: INDEX-DESIGN§2 (forward), INDEX-DESIGN§3 (tag inverted index, stores, bitmap pages), INDEX-DESIGN§4 (KV equality, range, chunk), SPECIFICATION-DESIGN§5.
+Scope: `crates/index` (term dictionary, term table, postings, forward index, sequences, chunk index and chunk lists), and the posting-container representation shared with `crates/query`, `crates/fuse`, `crates/watch`.
+Governing spec: INDEX-DESIGN§1 (values and terms), INDEX-DESIGN§2 (forward), INDEX-DESIGN§3 (postings and sequences), INDEX-DESIGN§4 (dictionary, range scans, chunks), SPECIFICATION-DESIGN§5.
 
 Plan: [index-implementation-plan.md](index-implementation-plan.md) · Open decisions: [index-decisions.md](index-decisions.md) · Completed: [index-completed.md](index-completed.md) · Order: [operations-plan.md](operations-plan.md)
 
 ## Goal
 
-Every index persists in the spec's native byte layout through the packed-key codec, so footprint and copy-on-write granularity match FORMAT-DESIGN§16.
+Every assertion an object makes is a **term**; the index is an inverted index over terms — a sorted term dictionary and per-term posting lists — plus a forward list per object, all in one B+ tree format, read in place from mapped sectors with memory bounded independently of pool size.
 
 ## Selected design
 
-- **Forward index.** One packed `VARINT` sorted-run entry per `(oid, snapshot)` whose value is the §7.1 `LeafEntry` byte image; more than 8 assertions spill into a chain of 256 KiB `ForwardOverflow` regions linked by a trailing `next_page`. `PackedAssertion` is 16 B with `b: u64`.
-- **Tag index.** Directory entries are 48 B `TagIndexLeafEntry` (8 B packed key + 40 B value) whose `store_root` points at a chain of 4 KiB `TagBitmapPage`s (Simple), `SequencePage`s (Ordered) or `RankedPage`s (Ranked).
-- **KV index.** Native extendible hash: 4 KiB `KvDirectory` (inline 252 `BlockRef`s, `global_depth ≤ 7`, spillover region beyond), 4 KiB `KvBucket` blocks of 144 entries, bitmaps in `TagBitmapPage`s.
-- **Range index.** Key `(attr_id, value: NormalisedKey, oid, snapshot)` per INDEX-DESIGN§4.2.
-- **Chunk index.** 32 B hash key + 24 B value tail (`ref_count`, `length`, `BlobRef`) reproducing the 56 B `ChunkIndexLeafEntry`.
-- `snapshot` is 0 in every key until [snapshots-design.md](snapshots-design.md) lands.
+- **Terms.** A tag, an attribute value under its key, and a relation to a target are terms. Tags keep their `TagId` as `TermId`; attribute and relation terms get dense `TermId`s when first written. A term is identified exactly by its dictionary key and value: there is no value hash, no hash secret and no collision case.
+- **Six trees**, all BTREE-DESIGN§1 large-node trees:
+
+  | Tree | Key → value | Section |
+  |---|---|---|
+  | Term dictionary | `(kind, key, context, NormalisedValue, term_id, snapshot)` → statistics + inline postings | INDEX-DESIGN§4.1 |
+  | Term table | `term_id` → kind, key and full value | INDEX-DESIGN§4.1 |
+  | Postings | `(term_id, id >> 16, snapshot)` → one roaring container | INDEX-DESIGN§3.1–3.2 |
+  | Forward | `(oid, snapshot)` → the object's term ids | INDEX-DESIGN§2 |
+  | Sequences | `(term_id, position, snapshot)` → oid | INDEX-DESIGN§3.3 |
+  | Chunk index, chunk lists | chunk hash → extent; per-object chunk recipe | INDEX-DESIGN§4.3 |
+
+- **Equality, range and prefix** queries are all dictionary lookups or scans: one ordered structure replaces a hash index and a separate range tree.
+- **Posting lists** are roaring containers keyed by the high 48 bits of the object id, so ids carry full node and local identity, a small update rewrites one container, and snapshot diffs and sync deltas work per container. Lists of up to four objects live inline in their dictionary entry.
+- **Bounded memory.** Readers walk trees through a page cache; no index is mirrored whole in memory.
+- **TermIds are local to their pool.** Sync carries values, never term ids ([cluster-design.md](cluster-design.md)).
 
 ## Invariants
 
-- Bitmaps carry the full object identity; no index assumes `node = 0` or truncates `ObjectId.local` (48 bits).
+- Every posting of a term is in exactly one place: its dictionary entry's inline list or the postings tree, never both.
+- Postings and forward lists agree: an object is in a term's postings iff the term is in the object's forward list (for the same snapshot).
+- A term's `TermId` is never reused, and two dictionary entries never denote the same term.
+- Posting ids are full `ObjectId`s (16-bit node, 48-bit local).
 
 ## Format specification
 
 The numbered sections below are the normative on-disk and algorithmic specification for this scope; [format-design.md](format-design.md) lists every scope's sections in format order.
 
-## 1. Heterogeneous Value Encoding
+## 1. Values and terms
+
+### 1.1 Value encoding
 
 `Value` (the contents of attributes) is the only data type whose shape varies enough that fixed
 binary layout is wasteful. It is encoded as positional **CBOR** (FORMAT-DESIGN§1.6): a
@@ -37,443 +52,299 @@ Value ::= [0, text]                      // Text(string)      payload: CBOR majo
         | [1, int]                       // Int(i64)          payload: CBOR major type 0/1
         | [2, float]                     // Float(f64)        payload: CBOR major type 7, 64-bit
         | [3, int]                       // Timestamp(i64)    payload: CBOR major type 0/1
-        | [4, bytes]                     // Blob(bytes)       payload: CBOR major type 2; large values spill — see below
+        | [4, bytes]                     // Blob(bytes)       payload: CBOR major type 2
         | [5, context, inner]            // Scoped { context: TagId (u32), inner: Value }  INDEX-DESIGN§1.3
 ```
 
 Integers use the shortest CBOR form; a float is always written as a 64-bit CBOR float, so one
-`Value` has exactly one encoding. `encode(v)` below means this encoding.
+`Value` has exactly one encoding. Floats are canonicalised before encoding: `-0.0` becomes
+`0.0`, and NaN is rejected as an attribute value.
 
-`Scoped` is the canonical way to carry "this attribute applies in the context of tag *C*" —
-e.g. an object's `unix-path` value scoped by a `unix-path-context:rpi4-sdcard` tag. It is
-recursive (the inner Value can be any variant *except* another `Scoped` — nested scopes are a
-format error). The pattern generalises: any attribute can be scoped by any tag, not only the
-unix-path projection use case.
+### 1.2 Terms and TermIds
 
-### 1.1 Value table
+A **term** is one thing an object can assert:
 
-Indices identify an attribute value by its `value_hash` (INDEX-DESIGN§1.2): KV entries and
-forward-index assertions carry the hash, never the value. Every distinct value is stored once, in
-the **value table** — a BTREE-DESIGN§1 large-node tree of `BtreeKind::ValueSpill`, rooted at
-`RootPointer.value_spill_root`, keyed by `value_hash`:
+| Kind | Term | `TermId` |
+|---|---|---|
+| `0` Tag | tag `t` | `t` (the `TagId`, `< 2³²`) |
+| `1` Attr | `(key: TagId, value: Value)` | allocated, `≥ 2³²` |
+| `2` Relation | `(predicate: TagId, target: ObjectId)` | allocated, `≥ 2³²` |
+| `3`–`255` | reserved (derived terms such as substring n-grams) | allocated |
 
-- A value whose encoding is ≤ 96 bytes is stored **inline** as the entry's value tail. The
-  96-byte threshold keeps ≥ 16 entries per 4 KiB of leaf.
-- A larger value is stored **out of line**: the entry holds `BlobRef { disk_id, block_no,
-  length }` and the encoding lives as a blob-zone extent.
+**Allocation.** Attribute and relation terms take `TermId`s from a per-pool counter starting at
+2³², assigned in write order and never reused; the counter is not persisted but derived at boot
+as one past the largest key in the term table. WAL replay re-interns values in LSN order, so it
+assigns the same `TermId`s.
 
-**The hash is the value's identity.** Writing an attribute computes its `value_hash` and probes
-the value table. No entry: the value is inserted. An entry holding an equal value: it is reused.
-An entry holding a *different* value: the write fails with a defined collision error and changes
-nothing, so a hash names exactly one value pool-wide and no read path compares values. Entries
-that no assertion references any longer are reclaimable; finding them is a background scan.
+**Interning.** Writing an assertion looks its term up in the term dictionary (INDEX-DESIGN§4.1).
+If present, the existing `TermId` is used; otherwise a `TermId` is allocated and a dictionary
+entry and a term-table entry are inserted. Identity is exact — the dictionary compares full
+values — so two different values are never the same term.
 
-### 1.2 Value hash for KV index
+**Locality.** `TermId`s are meaningful only within their pool. Nothing that leaves the node
+carries a `TermId`; sync carries values and receivers intern them.
 
-`value_hash(v) = SipHash-2-4(domain="mimir-kv", encode(v))` truncated to 64 bits. The type tag
-at the head of `encode(v)` keeps `Int(42)` from colliding with `Text("42")`. SipHash-2-4 is keyed
-by a 16-byte per-pool secret to defeat hash flooding: random bytes generated when the pool is
-created, stored as `Superblock.value_hash_secret` (ENGINE-DESIGN§1.1) identically in every
-member's superblock, and never changed, since every stored hash depends on it. The secret is
-local to the pool: `value_hash` never appears in data sent to other nodes
-([cluster-design.md](cluster-design.md)).
+**Reclamation.** A term whose cardinality is zero in every live snapshot has its dictionary and
+term-table entries removed by a background scan; its `TermId` is not reused.
 
 ### 1.3 Scoped values
 
 `Value::Scoped { context, inner }` lets the same attribute key carry different values under
-different scopes without inflating the tag namespace. The hash and comparison rules are:
+different scopes without inflating the tag namespace — e.g. an object's `unix-path` value
+scoped by a `unix-path-context:rpi4-sdcard` tag. The pattern generalises: any attribute can be
+scoped by any tag.
 
-- `value_hash(Scoped { context, inner })` is the same function over `[5, context, inner]`.
-  Two scoped values with the same `context` and equal inner values hash identically; differing
-  contexts hash differently. KV equality lookups against a scoped attribute key (e.g. "find every
-  object whose `unix-path` value is `Scoped(rpi4, "/boot/vesper")`") are therefore exact hash hits.
-- For range / prefix scans, `NormalisedKey` (INDEX-DESIGN§4.2) prepends the 4-byte `context` TagId before the
-  inner value's normalised encoding. Prefix scans over `(context, *)` give the manifest of every
-  scoped value under one context — no separate manifest tree needed.
-- The query optimiser is free to rewrite `attr=K AND scope=C` as a KV/Range probe with a synthetic
-  `Scoped { C, * }` key.
+- A scoped value is its own term: `(key, Scoped { C, v })` and `(key, v)` are different terms,
+  so they have different postings without branching at the lookup site.
+- The dictionary key carries the scope in its `context` field (INDEX-DESIGN§4.1; `0` for unscoped
+  values), ahead of the normalised inner value. A scan over `(Attr, key, context, *)` therefore
+  lists every scoped value under one context — the manifest of a path projection — with no
+  separate manifest structure.
+- The query optimiser may rewrite `attr = K AND scope = C` as a lookup of `Scoped { C, K }`.
 
-A `Scoped` whose inner is also `Scoped` is rejected at parse time. Attributes that are *never*
-context-scoped (e.g. `created_ns`) simply never use this variant; readers see plain values and
-do not need to be scope-aware.
+A `Scoped` whose inner value is also `Scoped` is a format error. Attributes that are never
+context-scoped (e.g. `created_ns`) never use this variant.
 
 **Type validation.** `Scoped` is **transparent to ontology type-checking**: an attribute
 declared with `value_type = "text"` accepts both `Text(...)` and `Scoped { context, inner: Text(...) }`.
-The validator strips the `Scoped` wrapper and recurses on `inner`. Scoping is therefore
-**orthogonal** to value-type — any attribute can be scoped without altering its declared
-type, and the ontology does not need a separate `scopable` flag. The validator additionally
-checks that `context` is a `TagId` whose definition has `Grouping` semantics; non-grouping
-tags cannot be used as scopes.
+The validator strips the `Scoped` wrapper and checks `inner`. It additionally checks that
+`context` is a `TagId` whose definition has `Grouping` semantics; non-grouping tags cannot be
+used as scopes.
 
 ---
 
-## 2. Forward Index
+## 2. Forward index
 
-The forward index maps `oid → [ForwardEntry]` and must support fast per-object listing and
-per-object diffing for sync.
+The forward index maps each object to the `TermId`s it asserts. It answers "everything about
+object X" (projection, inspection) and drives cleanup on deletion (METADATA-DESIGN "Object
+deletion"), which must undo exactly the postings the object is in.
 
-On disk it is a **B+ tree of large nodes** (BTREE-DESIGN§1), keyed by `oid`. Each node uses the standard
-multi-run envelope: new mutations are appended as a fresh sorted run; lookups merge-search across
-all sorted runs in the node.
+### 2.1 Entry layout
 
-### 2.1 Node layout
-
-Both inner and leaf sorted runs use the BTREE-DESIGN§1.6 packed-key encoding. Within a single leaf, all `oid`
-keys share the leaf's key range (typically a span of 10⁴ – 10⁵ contiguous ids), so the format
-descriptor's `bit_width` settles around 16–20 bits — encoding `oid` as 2–3 bytes versus the
-unpacked 8 bytes.
-
-- **Inner node** (`BtreeKind::Forward`, level ≥ 1): one or more sorted runs of
-  `(packed_(oid, snapshot)_key, child: BlockRef)` pairs. The `snapshot` field is part of the
-  separator key — without it, an oid whose `(oid, *)` cluster spans a leaf boundary would be
-  unrepresentable (the inner separator would collide with the same `oid` on both sides). With
-  BTREE-DESIGN§1.6 packing the trailing `snapshot` packs to ~0 bits when one snapshot dominates a sorted
-  run, so the cost is marginal: a 3 B ceiled key + 16 B BlockRef = 19 B per entry; one full
-  sorted run packs 13 789 children (⌊262 008 / 19⌋). Tree at 10 M objects: **depth 1** (1 inner
-  level + leaves; 2 levels total).
-- **Leaf node** (level 0): sorted runs of `LeafEntry` records:
+A BTREE-DESIGN§1 tree of `BtreeKind::Forward`, keyed by `(oid: u64, snapshot: u32)` through the
+packed-key codec (BTREE-DESIGN§1.6), with `VARINT` value sizes. Each value is a `ForwardEntry`:
+the object's terms in ascending `TermId` order, split into tag terms (`< 2³²`) and other terms,
+each run stored as a frame of reference — a base plus fixed-width offsets — so the arrays are
+aligned, binary-searchable in place and compact.
 
 ```rust
-// Logical (unpacked) shape; on-disk uses the BTREE-DESIGN§1.6 packed encoding.
-struct LeafEntry {                           // variable length on disk
-    oid: u64,                                // sort key — packed via SortedRunKeyFormat
-    snapshot: u32,                           // sort key (SNAPSHOTS-DESIGN§1.2) — packs to ~0 bits when one
-                                             //   snapshot dominates a sorted run
-    header: u16,                             // bitfield: see below
-    body: union {                            // discriminated by header & LEAF_ENTRY_SPILL_FLAG
-        inline: [PackedAssertion; header & LEAF_ENTRY_TOTAL_MASK],   // !is_spill
-        spill_ref: BlockRef,                                         //  is_spill; chain via
-                                                                     //  spill region's trailing
-                                                                     //  BlockRef slot per INDEX-DESIGN§2.2
-    },
+#[repr(C)]
+struct ForwardHead {                         // 24 bytes
+    tag_count:   u16,                        //  [0..2]   tag terms
+    other_count: u16,                        //  [2..4]   attribute and relation terms
+    tag_width:   u8,                         //  [4..5]   bytes per tag offset: 1, 2 or 4
+    other_width: u8,                         //  [5..6]   bytes per other offset: 1, 2, 4 or 8
+    flags:       u8,                         //  [6..7]   FORWARD_FLAG_*
+    _pad0:       u8,                         //  [7..8]
+    tag_base:    u32,                        //  [8..12]  smallest tag TermId
+    _pad1:       u32,                        // [12..16]
+    other_base:  u64,                        // [16..24]  smallest other TermId
 }
+// followed by, each zero-padded to a multiple of 8 bytes:
+//   tag_offsets:   [u{8·tag_width};   tag_count]     TermId = tag_base + offset
+//   other_offsets: [u{8·other_width}; other_count]   TermId = other_base + offset
+//   origin:        [u8; ⌈(tag_count + other_count) / 8⌉]
+//                  bit i set = term i (tags first, then others) is Materialized
 
-// LeafEntry.header bitfield
-const LEAF_ENTRY_SPILL_FLAG: u16 = 1 << 15;  // body is spill_ref (BlockRef) when set
-const LEAF_ENTRY_TOTAL_MASK: u16 = 0x7FFF;   // bits 0..14: total assertion count
+const FORWARD_FLAG_OVERFLOW:  u8 = 1 << 0;   // arrays live in a ForwardOverflow chain
+const FORWARD_FLAG_WHITEOUT:  u8 = 1 << 7;   // snapshot whiteout (SNAPSHOTS-DESIGN§1.3)
 ```
 
-The 16-bit `header` is a single bitfield carrying both the spill flag and the assertion
-count:
+Each width is the smallest of the allowed widths that holds `max − base` for its run. A typical
+object with 12 tags (ids within a few thousand of each other) and 3 attributes costs
+24 + 24 (12 × u16, padded) + 8 (3 × u16, padded) + 8 (origin) = **64 bytes**.
 
-```
-header: u16
-  LEAF_ENTRY_SPILL_FLAG (bit 15)   1 = body is `spill_ref` (BlockRef into a ForwardOverflow
-                                       chain)
-                                   0 = body is the inline `[PackedAssertion; total]` array
-  LEAF_ENTRY_TOTAL_MASK (bits 0..14)  total — object's total assertion count, regardless
-                                       of is_spill:
-                                         not spilled → total inline assertions (typical
-                                                       0..8, hard cap ~16 before next-
-                                                       mutation spill)
-                                         spilled     → total assertions across the entire
-                                                       spill chain (up to 32 K)
-```
+`Materialized` terms are the ontology's implications (ONTOLOGY-DESIGN, SPECIFICATION-DESIGN§3.3);
+`Direct` terms were asserted by a caller. The origin bit lets de-materialisation and deletion
+cleanup tell them apart.
 
-**Total cardinality** is therefore `header & LEAF_ENTRY_TOTAL_MASK` — a single masked read,
-no branching on the spill bit. The query optimiser uses this for intersection planning (INDEX-DESIGN§4), where
-the smaller-cardinality side is iterated first. The 15-bit ceiling (32 K) is comfortably
-above the >200-tag pathological case mentioned in METADATA-DESIGN§1.2; objects exceeding 32 K assertions
-take the per-object B+ tree escape hatch.
+### 2.2 Overflow
 
-The merge — a single `header` field rather than separate `count` and `spill` — saves 2 bytes
-per `LeafEntry` and removes the "either count or spill_count is zero" implicit invariant of
-the previous two-field form.
-
-The directory's sorted-run encoding sets `SORTED_RUN_FLAG_PACKED_KEYS` with the 2-field
-key `(oid, snapshot)` and `value_size_kind = VALUE_SIZE_KIND_VARINT` (BTREE-DESIGN§1.6), since the
-`LeafEntry` value tail is variable-length: 2 B `header` followed by either a
-`[PackedAssertion; total]` inline body (sized `16 × total` bytes) or a 16 B spill
-`BlockRef`. The codec's per-entry varint length prefix adds 1–2 B per leaf entry —
-dwarfed by the savings over the CBOR fallback for this shape.
+An entry whose arrays exceed 4 KiB (around 2 000 terms) sets `FORWARD_FLAG_OVERFLOW`: the value
+holds only the `ForwardHead` followed by a `BlockRef`, and the arrays — laid out exactly as
+above — fill one or more `ForwardOverflow` regions:
 
 ```rust
-struct PackedAssertion {                     // 16 bytes (not key-packed; values stay byte-aligned)
-    kind: u8,                                // 0=Tag, 1=Attr, 2=Relation
-    origin: u8,                              // 0=Direct, 1=Materialized
-    _pad: u16,
-    a: u32,                                  // tag id (Tag/Attr) or predicate (Relation)
-    b: u64,                                  // value_hash (Attr), target oid (Relation), 0 (Tag)
-}
-```
-
-The **key** (`oid`) is packed; the **value** (`header`, body) stays byte-aligned. Per-leaf
-format descriptor records `oid_base = leaf.min_oid` and `oid_bits = ⌈log₂(leaf.max_oid −
-leaf.min_oid + 1)⌉`.
-
-At "8 assertions per object" (the INDEX-DESIGN§2.2 inline-spill threshold; per-entry = 3 B ceiled
-`(oid, snapshot)` key (the average is 2.5 B; integer math uses the ceiling) + 2 B header
-+ 128 B inline body = 133 B), a leaf packs 1 969 entries total. Sorted runs share the region's payload bytes (BTREE-DESIGN§1.2 appends them into the same 256 KiB
-region), so adding sorted runs does not multiply capacity — each new run consumes 72 B of
-overhead (32 B `SortedRunHeader` + 40 B `SortedRunKeyFormat` for the 2-field key) and slightly
-reduces the entry budget. With 4 active sorted runs the leaf still carries 1 968 entries
-before BTREE-DESIGN§1.4 triggers full compaction. Smaller objects pack denser: 4 assertions per entry
-→ 3 797 entries per leaf (3 794 with 4 active sorted runs).
-
-### 2.2 Spill
-
-Objects with more than 8 assertions store a `BlockRef` to a `ForwardOverflow` region (also a
-256 KiB large-node region; positional, no sorted runs — single rewrite on growth). Each
-overflow region holds up to 16 379 × `PackedAssertion` and chains to the next via a fixed
-trailing `BlockRef` slot.
-
-```rust
-#[repr(C, packed)]
+#[repr(C)]
 struct ForwardOverflowRegion {               // 262 144 B = 256 KiB
-    header:    BtreeNodeHeader,              //      [0..64]      kind = ForwardOverflow;
-                                             //                   payload_used = live_count × 16
-    entries:   [PackedAssertion; 16_379],    //     [64..262_128] 16 379 × 16 B = 262 064 B
+    header:    BtreeNodeHeader,              //      [0..64]       kind = ForwardOverflow;
+                                             //                    payload_used = bytes of arrays held
+    payload:   [u8; 262_064],                //     [64..262_128]  continuation of the arrays
     next_page: BlockRef,                     // [262_128..262_144] ZERO = tail of chain
 }
 ```
 
-The region is **positional**, not a sorted-run BTREE-DESIGN§1 node — `BtreeNodeHeader.payload_used`
-records `live_count × 16` so partially-filled tail regions are unambiguous. The `next_page`
-link sits at the fixed offset `262 128` regardless of `payload_used`. Reconstruction of an
-object's full assertion list walks the chain, consuming up to `payload_used / 16` entries
-per region, until the leaf entry's `total` is exhausted; the tail region's `next_page` must
-equal `BlockRef::zeroed()` for a consistent chain — a mismatch signals format corruption.
+The arrays are the concatenation of each region's `payload[..payload_used]` in chain order; the
+tail's `next_page` is zero, and a chain whose total length disagrees with the counts in the head
+is a format error.
 
-### 2.3 Sorted-run behaviour
+### 2.3 Behaviour
 
-- **Append on flush.** When journal-reclaim flushes a forward-index leaf, only the new sorted run is
-  written — typically a few KB to a few tens of KB, not the whole 256 KiB node.
-- **In-memory merge.** `LoadedNode.merged_view` builds a `BTreeMap<u64, SmallVec<[PackedAssertion;
-  8]>>` lazily on first lookup; subsequent lookups are direct hits.
-- **Full compaction** triggers when `payload_used > 75%` or `sorted_run_count > 4`, rewriting the node
-  into a fresh region with a single merged sorted run.
-
-For attributes whose actual `Value` matters (not just its hash), the `value_hash` indirects into
-the value table (INDEX-DESIGN§1.1), shared with the KV index (INDEX-DESIGN§4.1). Tag and Relation
-entries are self-contained.
-
-### 2.4 Properties
-
-- O(log N) lookup by oid (depth 1 at 10 M scale ⇒ ≤ 2 large-node loads: 1 inner + 1 leaf).
-- O(1) per-assertion diffing via `SortedRunHeader.journal_seq` — sync streams sorted runs newer than
-  the peer's watermark, exactly the journal-streaming fast path of SNAPSHOTS-DESIGN§1.2.
-- Compact in-memory mirror: a `HashMap<u64, SmallVec<[PackedAssertion; 8]>>` over the loaded
-  node's `merged_view`.
+- **Append on flush.** A flush writes only a new sorted run holding the changed entries
+  (BTREE-DESIGN§1.2); full compaction (BTREE-DESIGN§1.4) folds runs.
+- **Lookup** is one tree descent; listing an object's values goes through the term table
+  (INDEX-DESIGN§4.1) for each non-tag term.
+- **Diffing** for sync streams sorted runs newer than the peer's watermark (SNAPSHOTS-DESIGN§1.2).
 
 ---
 
-## 3. Tag Inverted Index
+## 3. Postings
 
-The tag index is the heart of query performance. Its on-disk form must:
+### 3.1 Postings tree
 
-- Look up a tag's bitmap quickly.
-- Allow per-tag COW updates without rewriting unrelated tags.
-- Support delta-sync: cheap diff between two snapshots of the same bitmap.
-
-### 3.1 TagDirectory
-
-A **B+ tree of large nodes** (BTREE-DESIGN§1) keyed by `(TagId: u32, snapshot: u32)` — snapshot-aware per
-SNAPSHOTS-DESIGN§1.2. Leaf entries are 48 B, with fields reordered so every multi-byte field sits at its
-natural alignment (8-byte struct alignment; no `#[repr(packed)]` — the entry is read repeatedly
-during query bitmap algebra and unaligned loads on `last_modify_lsn` / `store_root` would be a
-measurable overhead):
+A term's **posting list** is the set of objects asserting it. Lists of up to
+`INLINE_POSTINGS_MAX = 4` objects live inline in the term's dictionary entry (INDEX-DESIGN§4.1).
+Longer lists live in the postings tree, a BTREE-DESIGN§1 tree of `BtreeKind::Postings` keyed by
 
 ```
-#[repr(C)]
-TagIndexLeafEntry {                          // 48 bytes
-    last_modify_lsn: u64,                    //  8  @  0   (8-aligned)
-    store_root:      BlockRef,               // 16  @  8   INDEX-DESIGN§3.2 / INDEX-DESIGN§3.3 — contains a u64 generation
-    tag_id:          u32,                    //  4  @ 24   sort key (with `snapshot`, SNAPSHOTS-DESIGN§1.2)
-    snapshot:        u32,                    //  4  @ 28   sort key (suffix); ~0 bits packed
-                                             //                       when one snapshot dominates
-    cardinality:     u32,                    //  4  @ 32   for fast query-planner stats
-    generation:      u32,                    //  4  @ 36   bumped on bitmap rewrite
-    store_kind:      u8,                     //  1  @ 40   Simple / Ordered / Ranked
-    _pad:            [u8; 7],                //  7  @ 41   (8-byte alignment tail)
-                                             // 48 total
-}
+(term_id: u64, high: u64, snapshot: u32)     // high = ObjectId >> 16  (48 significant bits)
 ```
 
-The hot key+pointer pair still lands within a single 64-byte cache line: a query that loads a
-leaf entry to dispatch a bitmap fetch gets `store_root`, `tag_id`, `snapshot`, `cardinality`,
-`generation`, and `store_kind` all in `[0..48]` — one 64 B fetch.
+through the packed-key codec, one entry per non-empty 65 536-id window of the list. The value is
+the window's **container** (INDEX-DESIGN§3.2).
 
-On-disk, leaf sorted runs use the BTREE-DESIGN§1.6 packed-key encoding with **two key fields**
-(`tag_id`, `snapshot`); the format descriptor occupies 8 + 2 × 16 = **40 B per sorted run**
-(down from 56 B for a 3-field shape). `tag_id` typically packs to 2–3 bytes per leaf (sparse
-but clustered ids); `snapshot` packs to ~0 bits when one snapshot dominates, a few bits
-otherwise. The 40 bytes of value following the key stay byte-aligned. Per-key on-disk cost is
-~37 B. A 256 KiB leaf sorted run (262 144 − 64 − 32 − 40 = 262 008 B payload) holds
-**7 081 entries**. For 5 000 tags × ~100 snapshots without divergence (one entry per tag,
-shared across snapshots) the full directory fits in **a single leaf** (depth 0); pools where
-many tags diverge across snapshots, or pools with hundreds of thousands of tags, extend the
-tree to depth 1 (~115 M-entry capacity).
+- A list moves from inline to the tree when it gains its fifth object, and back to inline when
+  it falls to two; the dictionary entry's `INLINE` flag says which holds it.
+- Adding or removing one object rewrites one container entry. An empty container is removed.
+- All entries of one term are contiguous in key order, so a query reads a term's containers in
+  id order with one range scan, and two terms intersect by walking both scans in step and
+  skipping windows absent from either.
+- Snapshot diffs and bitmap-delta sync compare containers per `(term_id, high)`; the
+  dictionary entry's `generation` and `last_modify_lsn` say whether a term changed at all.
 
-`(cardinality, last_modify_lsn, generation)` enables fast snapshot diffing without dereferencing
-the bitmap — the directory's sorted run stream alone tells a peer which tags changed and how.
+### 3.2 Containers
 
-### 3.2 Roaring bitmaps on disk
-
-Roaring bitmaps stay on the **4 KiB block format** (not 256 KiB nodes) because:
-
-- The portable Roaring spec is already container-addressable and mmap-friendly at any offset.
-- Per-tag bitmaps vary from a few hundred bytes to many megabytes; the 4 KiB granularity matches
-  Roaring's natural 4 KiB-class bitmap container.
-- Bitmaps are referenced as opaque blobs from the directory; their internal format is a stable
-  external standard (Apache Lucene + the `roaring` crate).
-
-We adopt the **Roaring portable serialization spec** as the on-the-wire bitmap image, split
-across a singly-linked chain of `BlockHeader`-prefixed 4 KiB pages. Each `TagBitmapPage`
-carries a slice of the full roaring byte image plus a `next_page` pointer (zero on the tail):
+A container holds the low 16 bits of each object id in its window, in the smallest of three
+forms (the roaring container rules):
 
 ```rust
-#[repr(C, packed)]
-struct TagBitmapPage {                       // 4 096 bytes
-    header:       BlockHeader,               //    [0..32]   kind = TagBitmapPage
-    bitmap_len:   u32,                       //   [32..36]   bytes carried in this page
-                                             //               (0..=4036)
-    next_page:    BlockRef,                  //   [36..52]   ZERO = tail of chain
-    bitmap_bytes: [u8; 4036],                //   [52..4088] roaring portable bytes;
-                                             //               trailing bytes zeroed
-    _pad:         [u8; 4],                   // [4088..4092]
-    crc:          u32,                       // [4092..4096] CRC32C over [0..4092]
+#[repr(C)]
+struct ContainerHead {                       // 8 bytes
+    kind:          u8,                       // [0..1]  CONTAINER_ARRAY | _BITMAP | _RUN
+    _pad:          u8,                       // [1..2]
+    entries_m1:    u16,                      // [2..4]  entries − 1 (array: ids; run: runs; bitmap: 1023)
+    cardinality:   u32,                      // [4..8]  ids in this container, 1..=65 536
 }
+// followed by the payload, starting 8-byte aligned:
+//   CONTAINER_ARRAY  = 0:  [u16; entries]                  ascending ids, padded to 8 bytes
+//   CONTAINER_BITMAP = 1:  [u64; 1024]                     bit i of word w = id 64·w + i
+//   CONTAINER_RUN    = 2:  [(start: u16, len_m1: u16); entries]  ascending, non-overlapping
+//   CONTAINER_WHITEOUT = 0xFF: no payload — snapshot whiteout (SNAPSHOTS-DESIGN§1.3)
 ```
 
-Bitmaps that fit in a single page set `next_page = BlockRef::ZERO` and carry the full
-portable image in `bitmap_bytes[..bitmap_len]`. Larger bitmaps split the portable image
-across N pages in order: page *i* holds `image[i_start..i_end]`, the head page is the one
-reachable via the tag-directory leaf's `store_root`, and the chain terminates at the page
-whose `next_page` is zero. Reconstruction concatenates each page's
-`bitmap_bytes[..bitmap_len]` slice in chain order and feeds the result to
-`roaring::RoaringBitmap::deserialize_from`. Per-page payload cap is 4 036 B, so an N-page
-chain holds up to 4 036 × N bytes of roaring image.
+| Form | Used when | Cost |
+|---|---|---|
+| array | cardinality ≤ 4 096 and smaller than the run form | 2 B per id |
+| run | 4 × runs < the array or bitmap size | 4 B per run |
+| bitmap | otherwise | 8 KiB |
 
-### 3.3 Ordered & ranked stores
+The writer picks the smallest form after every change, so one set has one encoding. Every
+payload is an aligned array of `u16` or `u64`: readers borrow it in place from the mapped node
+(FORMAT-DESIGN goal 1) and evaluate set operations with integer loads only. This requires the
+postings tree's values to start 8-byte aligned within their node.
 
-```
-OrderedStore root block:
-  members:        BlockRef → TagBitmap
-  sequence_head:  BlockRef → first SequencePage in a singly-linked chain
-  sequence_count: u64                  // total ObjectIds across the chain
+### 3.3 Ordered and ranked collections
 
-RankedStore root block:
-  members:        BlockRef → TagBitmap
-  ranked_head:    BlockRef → first RankedPage in a singly-linked chain
-  ranked_count:   u64                  // total entries across the chain
-```
+Tags with `OrderedCollection` semantics (SPECIFICATION-DESIGN§3.1) keep their membership in
+postings like any term, and their order in the sequences tree, a BTREE-DESIGN§1 tree of
+`BtreeKind::Sequences`:
 
-Each `SequencePage` / `RankedPage` ends with a `next: BlockRef` slot (zero on the tail page);
-walking the logical array is a forward chain traversal. Pages are sized to hold a whole 4 KiB
-block of entries; appending to the array writes a new page (when the tail is full) and updates
-the previous tail's `next` pointer in the same checkpoint as the new page.
-
-Each `SequencePage` and `RankedPage` is a 4 KiB block under the standard FORMAT-DESIGN§1.3 framing
-(`BlockHeader` + payload + trailing CRC32C):
-
-```
-SequencePage (4 KiB):
-  BlockHeader  { kind = SequencePage, format_version = 1 }        // 32 B
-  entry_count: u16                                                //  2 B
-  _pad: [u8; 6]                                                   //  6 B
-  next: BlockRef                   // 0 = tail of chain            // 16 B
-  entries: [u64; 504]              // ObjectIds                    // 4032 B
-  _pad_tail: [u8; 4]                                              //  4 B
-  trailing CRC32C                                                 //  4 B
-                                                                  // = 4096 B
-
-RankedPage (4 KiB):
-  BlockHeader  { kind = RankedPage, format_version = 1 }          // 32 B
-  entry_count: u16                                                //  2 B
-  _pad: [u8; 6]                                                   //  6 B
-  next: BlockRef                   // 0 = tail of chain            // 16 B
-  entries: [{ oid: u64, score: f32, _pad: u32 }; 252]   // 16 B   // 4032 B
-  _pad_tail: [u8; 4]                                              //  4 B
-  trailing CRC32C                                                 //  4 B
-                                                                  // = 4096 B
-```
-
-The sequence pages form a logical array; updates use a packed log + periodic compaction (small
-appends are appended to a tail page, occasional rewrites compact, both COW and reflected in the
-checkpoint).
+- **Ordered:** key `(term_id: u64, position: u64, snapshot: u32)` → `oid: u64`. Positions are
+  sparse: appending takes the last position plus 2²⁰; inserting between two members takes the
+  midpoint; when neighbours are adjacent, the term's positions are renumbered at 2²⁰ spacing in
+  one rewrite.
+- **Ranked:** key `(term_id: u64, score: u32, oid: u64, snapshot: u32)` → the byte `0x00`, where `score` is
+  the order-preserving encoding of an `f32` (sign bit flipped for positives, all bits flipped for
+  negatives), so a scan yields members by score.
 
 ---
 
-## 4. KV Equality Index, Range Index, Chunk Index
+## 4. Dictionary, range scans and chunks
 
-### 4.1 KV Equality Index
+### 4.1 Term dictionary and term table
 
-Hash-based on disk via **extendible hashing** keyed by `(tag_id, value_hash)`. The KV index is
-the one structure that does **not** use the BTREE-DESIGN§1 large-node B+ tree format — point-equality
-lookups benefit more from hash-bucket addressing.
-
-`value_hash` is computed transparently over `Value::Scoped` wrappers — see INDEX-DESIGN§1.3. A scoped
-attribute and an unscoped one with the same inner content hash to **different** values, so
-they land in different KV buckets without any branching at the lookup site.
+**Term dictionary.** A BTREE-DESIGN§1 tree of `BtreeKind::TermDictionary`, keyed by
 
 ```
-KvDirectory (single 4 KiB block, addressed by RootPointer.kv_index_root):
-   header (BlockHeader, kind = KvHashDirectory)                                        // 32 B
-   global_depth: u8                                                                    //  1 B
-   _pad0: [u8; 3]                                                                      //  3 B
-   bucket_count: u32                  // = 1 << global_depth                           //  4 B
-   entries: [BlockRef; 252]           // local-depth tagged buckets                    // 4032 B
-   spillover_root: BlockRef           // 0 unless global_depth ≥ 8 (see below)         //  16 B
-   _pad_tail: [u8; 4]                                                                  //  4 B
-   trailing CRC32C                                                                     //  4 B
-                                                                                        // = 4096 B
-
-KvBucket (4 KiB):
-   header (BlockHeader, kind = KvHashBucket)                                           // 32 B
-   local_depth: u8                                                                     //  1 B
-   entry_count: u16                                                                    //  2 B
-   _pad: u8                                                                            //  1 B
-   entries: [{ tag_id: u32, value_hash: u64, bitmap_ref: BlockRef }; 144]              // 4032 B
-   _pad_tail: [u8; 24]                                                                 // 24 B
-   trailing CRC32C                                                                     //  4 B
-                                                                                        // = 4096 B
+(kind: u8, key: u32, context: u32, value: NormalisedValue, term_id: u64, snapshot: u32)
 ```
 
-The inline directory holds 252 entries — sufficient for `global_depth ≤ 7` (i.e. up to 128
-hash buckets). At `global_depth ≥ 8`, `spillover_root` points at a BTREE-DESIGN§1 large-node positional
-region (`BtreeKind::KvDirectory`, level 0) holding the full `2^global_depth`-sized BlockRef
-array; the inline `entries` array is then ignored. Each 256 KiB spillover region holds 16 380
-entries, supporting `global_depth` up to 13 (8 192 buckets) before chaining to a deeper region.
+through the packed-key codec.
 
-The bitmap referenced by each entry is a `TagBitmap` (INDEX-DESIGN§3.2), reused via the same machinery.
+- Tag terms: `kind = 0`, `key` = the tag, `context = 0`, `value` all zero, `term_id` = the tag.
+- Attribute terms: `kind = 1`, `key` = the attribute's key tag, `context` = the scope tag of a
+  `Scoped` value or `0`, `value` = `NormalisedValue` of the (inner) value (INDEX-DESIGN§4.2).
+- Relation terms: `kind = 2`, `key` = the predicate, `context = 0`, `value` = the target's
+  `ObjectId` big-endian in bytes `[0..8]`, zero elsewhere.
+- `term_id` ends the key so that distinct values sharing a normalised prefix stay distinct
+  entries, adjacent in key order.
 
-The value behind each `value_hash` is in the value table (INDEX-DESIGN§1.1), for display, faceted
-enumeration and range comparisons. Because a hash names one value (INDEX-DESIGN§1.1), an
-equality lookup returns its entry's bitmap without comparing values.
+Each value is a `DictEntry`:
 
-### 4.2 Range Index
+```rust
+#[repr(C)]
+struct DictEntry {                           // 56 bytes
+    cardinality:     u64,                    //  [0..8]   objects asserting the term
+    last_modify_lsn: u64,                    //  [8..16]  LSN of the last change to its postings
+    generation:      u32,                    // [16..20]  bumped on every change to its postings
+    flags:           u8,                     // [20..21]  DICT_FLAG_*
+    inline_count:    u8,                     // [21..22]  0..=INLINE_POSTINGS_MAX when INLINE
+    _pad:            u16,                    // [22..24]
+    inline:          [u64; 4],               // [24..56]  ObjectIds when INLINE, ascending; else zero
+}
 
-A **B+ tree of large nodes** (BTREE-DESIGN§1) keyed by `(attr_id: u32, value: NormalisedKey, oid: u64,
-snapshot: u32)` — 32 B unpacked (snapshot-aware per SNAPSHOTS-DESIGN§1.2). For scoped attribute values
-(INDEX-DESIGN§1.3), `NormalisedKey` prepends the 4-byte context `TagId` before the inner value's
-encoding, so prefix scans over `(attr_id, context, *)` give the manifest of every scoped
-value under one context — no separate manifest tree needed.
+const DICT_FLAG_EXACT:  u8 = 1 << 0;         // NormalisedValue holds the whole value
+const DICT_FLAG_INLINE: u8 = 1 << 1;         // postings are `inline`, not in the postings tree
+const DICT_FLAG_WHITEOUT: u8 = 1 << 7;       // snapshot whiteout (SNAPSHOTS-DESIGN§1.3)
+```
 
-With per-run key packing (BTREE-DESIGN§1.6) this is the structure that benefits most:
+`(cardinality, generation, last_modify_lsn)` let the query planner order intersections and let a
+peer see which terms changed without reading postings.
 
-- `attr_id` is almost always **constant** within a leaf (a leaf covers one or two adjacent
-  attributes) → 0 bits per key.
-- `value` (16 B `NormalisedKey`) gets a per-run base + bit-width; for numeric attributes the
-  span within a leaf typically fits in 24–40 bits.
-- `oid` packs identically to forward-index keys: 16–20 bits.
-- `snapshot` packs to ~0 bits when one snapshot dominates a sorted run (SNAPSHOTS-DESIGN§1.2).
+**Term table.** A BTREE-DESIGN§1 tree of `BtreeKind::TermTable`, keyed by `term_id: u64`
+(snapshot-agnostic: a term never changes once created), holding what the dictionary key cannot:
 
-Net per-key size: typically **8–12 B** packed. Leaf sorted runs store key → `BlockRef` to a
-roaring bitmap (16 B value), so per-entry on-disk cost is 24–28 B. Per-run payload budget is
-`262 144 − 64 (BtreeNodeHeader) − 32 (SortedRunHeader) − 72 (4-field SortedRunKeyFormat:
-attr_id, value, oid, snapshot) = 261 976 B`, holding **~9 350–10 900 entries per sorted run**
-depending on key-packing efficiency.
+```rust
+#[repr(C)]
+struct TermRecord {                          // 8-byte head
+    kind:  u8,                               // [0..1]  as in the dictionary key
+    flags: u8,                               // [1..2]  TERM_FLAG_OUT_OF_LINE
+    _pad:  u16,                              // [2..4]
+    key:   u32,                              // [4..8]  attribute key or predicate
+}
+// followed by:
+//   Attr, inline:       the value's INDEX-DESIGN§1.1 encoding (≤ 96 bytes), padded to 8
+//   Attr, out of line:  BlobRef (16 B) to a blob-zone extent holding the encoding
+//   Relation:           target: u64
+```
 
-`NormalisedKey` is a fixed-size order-preserving encoding:
+Tag terms have no term-table entry; the ontology defines tags.
 
-| ValueType | Encoding (16 bytes)                                                                       |
-| --------- | ----------------------------------------------------------------------------------------- |
-| Int/Time  | `i64` flipped sign bit (so unsigned compare = signed compare), zero-padded.               |
-| Float     | IEEE 754 with sign-bit-flipped trick: positives flip top bit, negatives flip all bits.    |
-| Text      | First 14 bytes of UTF-8, length byte, continuation flag; long strings spill via `value_hash`. |
-| Blob      | Stored only by hash; not range-indexed.                                                   |
+**Equality lookup** of `(key, v)`: normalise `v`; seek to `(1, key, context, norm, 0)`; for every
+entry with that prefix, an `EXACT` entry matches outright, otherwise the term table's full value
+is compared. The matching entry's postings are its inline list or its postings-tree range. Most
+values (integers, floats, timestamps, text up to 14 bytes) are exact and take one descent.
 
-Leaf values are roaring bitmaps (per `(attr_id, value_prefix)`), enabling cheap range scans.
+**Interning** (INDEX-DESIGN§1.2) is the same lookup on the write path; a miss inserts the
+dictionary entry and the term record.
+
+### 4.2 Normalised values, range and prefix scans
+
+`NormalisedValue` is a 16-byte order-preserving encoding: comparing two as unsigned byte strings
+orders the values they encode.
+
+| ValueType | Encoding (16 bytes) | Exact when |
+|---|---|---|
+| Int / Timestamp | big-endian `i64` with the sign bit flipped, then zeros | always |
+| Float | big-endian IEEE 754 bits — positives with the sign bit flipped, negatives with all bits flipped — then zeros | always |
+| Text | first 14 bytes of UTF-8, then `min(length, 255)`, then `1` if longer than 14 bytes else `0` | length ≤ 14 |
+| Blob | first 14 bytes, then `min(length, 255)`, then a continuation byte as for Text | length ≤ 14 |
+
+A **range** query `lo ≤ key < hi` scans the dictionary from `(1, key, context, norm(lo))` to
+`(1, key, context, norm(hi))` and unions the postings of the entries it passes; entries whose
+normalised value equals a bound's and are not `EXACT` are compared against the term table's full
+value. A **prefix** query on text is the range from the prefix to its successor. Blob values are
+equality-only: a range over Blob values is rejected by the query layer.
 
 ### 4.3 Chunk Index and Chunk List (for FastCDC objects)
 
@@ -533,7 +404,7 @@ the header — recording the chunking parameters used to produce the chain. Chai
 from the head.
 
 ```rust
-#[repr(C, packed)]
+#[repr(C)]
 struct ChunkParamsRecord {                   // 16 bytes — head region only
     algo: u8,                                //  [0..1]   ChunkingAlgo discriminant
     flags: u8,                               //  [1..2]   reserved
@@ -598,3 +469,16 @@ shared prefix is reachable from both).
 
 ---
 
+## Footprint at scale
+
+For 10 M objects with 5–20 tags each (125–200 M tag postings) and one unique `name` attribute
+per object:
+
+| Structure | Estimate |
+|---|---|
+| Postings | 150–400 MB for direct tags (2 B per id in arrays, ~1.25 B in dense bitmaps, far less in runs); × (1 + k) when each tag implies k ancestors |
+| Forward | ~55–90 B per object → ~0.6–0.9 GB |
+| Dictionary + term table | ~10 M attribute terms × ~100 B (key, entry with inline posting, term record) → ~1 GB; tags negligible |
+
+Roughly 100–250 B per object in all. These are estimates from the layouts above and assumed tag
+distributions.
