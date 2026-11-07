@@ -819,11 +819,9 @@ Two fundamentally different regimes using the correct cryptographic mode for eac
 |**Sync traffic**|ChaCha20-Poly1305|Network messages. Constant-time on all platforms.|
 |**Fallback**|Adiantum|Wide-block via ChaCha12, for ARM without crypto extensions.|
 
-AES-GCM is **not** used for disk encryption — it expands data, catastrophically fails on nonce reuse (power loss), and requires per-sector stored nonces. XTS and HCTR2 derive all state from sector address and key.
+AES-GCM is **not** used for disk encryption — it expands data, catastrophically fails on nonce reuse (power loss), and requires per-sector stored nonces. XTS and HCTR2 derive all state from a tweak and the key.
 
-**Tweak construction:** HCTR2 tweaks are `(object_id || block_no_within_extent)` so identical content in different objects encrypts differently. XTS tweaks on node blocks are the block's address `(disk_id, bucket_no, sector)`.
-
-⁉️This prevents deduplication though? #todo 
+**Tweak construction:** HCTR2 tweaks come from the owner of the bytes, never their location, so moves copy ciphertext unchanged: `(object_id || block_no_within_object)` for an object's own extents, so identical content in different objects encrypts differently; `(chunk_hash[0..8] || block_no_within_chunk)` for chunks, which are deduplicated at the chunk index before encryption and stored once for every object sharing them; the block identifier for packed small-object blocks. XTS tweaks on node blocks are the block's address `(disk_id, bucket_no, sector)` (ENCRYPTION-DESIGN§1).
 
 **Integrity:** BLAKE3 checksums on plaintext stored in the object records (node buckets, different key) detect tampering that XTS/HCTR2 cannot.
 

@@ -6,3 +6,4 @@
 - SPEC1: format sections carry no phase labels, item IDs, TODOs or history wording (SUBSCRIPTIONS-DESIGN§1, BTREE-DESIGN§1.1, INDEX-DESIGN chunk-list layout, ONTOLOGY-DESIGN§1).
 - SPEC2: BTREE-DESIGN§1.3 specifies `min_key` / `max_key` maintenance per write kind, without naming code.
 - SPEC3: SPECIFICATION-DESIGN§6.2–6.3 summarise the object record and its content locator (all content kinds, `modified_ns` / `state_ns`) and link METADATA-DESIGN§1.1–1.2.
+- SPEC9: SPECIFICATION-DESIGN§9.3 states the owner-derived HCTR2 tweaks (object, chunk hash, packed block) and how chunk deduplication precedes encryption.

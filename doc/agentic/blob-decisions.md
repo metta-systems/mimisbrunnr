@@ -8,7 +8,7 @@ LZ4 needs a new workspace dependency (`lz4_flex`). Decide whether to add LZ4 nex
 
 ## BLOB-D2 — Compression granularity
 
-SPECIFICATION-DESIGN§9.2 says compression applies from file to block granularity without defining how the unit is chosen or framed on disk. Decide the unit per storage class and its framing. Blocks [SPEC7](specification-implementation-plan.md).
+SPECIFICATION-DESIGN§9.2 says compression applies from file to block granularity without defining how the unit is chosen or framed on disk. Decide the unit per storage class and its framing. Proposed shape: an extent is compressed as a sequence of independently decodable frames of a fixed plaintext size (about 64 KiB; one frame for tiny and packed objects), and the frame offsets within the stored extent are recorded with it — in the extent-list entry, or in a small frame table at the start of a single extent — so a read at any offset decompresses one frame, not the extent from its start. Open: the frame size per storage class, whether chunks (already 4–64 KiB) are always one frame, and where a single extent's frame table lives. Blocks [SPEC7](specification-implementation-plan.md).
 
 ## BLOB-D3 — Compression on the device
 

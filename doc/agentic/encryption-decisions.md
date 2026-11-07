@@ -6,10 +6,6 @@ Design: [encryption-design.md](encryption-design.md) · Plan: [encryption-implem
 
 Adding `aes`, `xts-mode`, `hctr2`, `aes-gcm` and `chacha20poly1305` is a workspace dependency change. Approve the crate set (and an Adiantum implementation if the fallback is in scope now). Blocks [ENCRYPTION1](encryption-implementation-plan.md).
 
-## ENCRYPTION-D2 — Blob tweak versus deduplication
-
-An HCTR2 tweak that includes `object_id` makes identical content encrypt differently per object, which defeats block-level deduplication of encrypted extents (SPECIFICATION-DESIGN§9.3). Decide between per-object tweaks (no cross-object dedup of ciphertext), content-derived tweaks for chunk-level dedup, or dedup before encryption at the chunk index only.
-
 ## ENCRYPTION-D3 — Where keys are stored
 
 SPECIFICATION-DESIGN§9.4 shows the key hierarchy but no on-disk home for wrapped keys. Decide the storage location (superblock fields, a key block in the pool state, an external keystore) and the rewrap procedure.

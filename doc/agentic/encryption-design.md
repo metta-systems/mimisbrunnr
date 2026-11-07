@@ -11,7 +11,7 @@ Every zone is encrypted with the cipher SPECIFICATION-DESIGN§9.3 assigns it, un
 
 ## Selected design
 
-- **Ciphers:** index and metadata blocks XTS-AES-256 (tweak `block_no`); blob extents HCTR2 (tweak `object_id || block_no_within_extent`); WAL AES-256-GCM (AAD `header[0..36]`, nonce `LSN || 0`, 16 B tag before the trailing CRC); sync traffic ChaCha20-Poly1305; Adiantum as the fallback without AES instructions.
+- **Ciphers:** node-bucket blocks XTS-AES-256 (tweak = block address); data extents HCTR2 (tweak from the owner: `object_id`, or the chunk hash for shared chunks, ENCRYPTION-DESIGN§1); WAL AES-256-GCM (AAD `header[0..36]`, nonce `LSN || 0`, 16 B tag before the trailing CRC); sync traffic ChaCha20-Poly1305; Adiantum as the fallback without AES instructions.
 - **Key hierarchy:** `MasterKEK → DiskKey` (SPECIFICATION-DESIGN§9.4); the superblock records `encryption_keyid`.
 - Sector padding for XTS/HCTR2 is already in the pipeline; WAL entries compress before they encrypt.
 
@@ -27,8 +27,15 @@ The on-disk layout is encryption-aware but encryption-agnostic:
   with **XTS-AES-256**, tweak = the block's address `(disk_id, bucket_no, sector)`. Fixed layout
   is preserved (no expansion). Headers are encrypted along with payload — verifiers decrypt then
   check magic.
-- **Data and packed buckets**: encrypted with **HCTR2-AES-128**, tweak = `(object_id ||
-  block_no_within_extent)`. Length-preserving.
+- **Data and packed buckets**: encrypted with **HCTR2-AES-128**, length-preserving. The tweak
+  depends on who owns the bytes, never on where they are, so moves (RECONCILE-DESIGN§1.5) copy
+  ciphertext without re-encrypting:
+  - an object's own extent: `(object_id || block_no_within_object)`;
+  - a chunk (INDEX-DESIGN§4.3): `(chunk_hash[0..8] || block_no_within_chunk)`. Deduplication
+    happens at the chunk index before encryption, so each distinct chunk is stored and encrypted
+    once and is shared by every object that references it;
+  - a packed small-object block: `(block_id || block_no)`, with the block identifier BLOB-D4
+    defines, stable across moves.
 - **Journal**: each journal set's entries are **AES-256-GCM** authenticated as one unit when
   `JSET_FLAG_ENCRYPTED` is set (JOURNAL-DESIGN§1.2).
   - **Key**: the pool's journal key from the key hierarchy — one key for the whole journal, so
