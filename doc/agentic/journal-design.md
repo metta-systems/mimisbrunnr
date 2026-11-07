@@ -17,7 +17,7 @@ The journal is the durability point for every mutation on any medium — SD card
 - **Adaptive group commit.** Idle commits seal and write at once; under load, commits join the next set and sets grow toward 256 KiB. Sets are pipelined and acknowledged in sequence. FUA where the device offers it, a cache flush otherwise; one flush per commit, with data extents verified by checksum on recovery instead of a second flush.
 - **Caller-chosen durability.** `Sync` returns once durable; `Buffered { max_delay }` becomes durable within a bound.
 - **Data beside the journal.** File data goes to blob extents; only tiny writes ride inside the journal, to be packed later. Streams are append-only objects made durable by periodic `ExtendObject` entries.
-- **Retention is the oplog.** Journal buckets are kept past the trim point while subscriptions need history, within a cap.
+- **Optional retained history.** Journal buckets may be kept past the trim point within a per-pool cap (default none); subscriptions do not depend on it — they keep their own pending events.
 - **Journal pins.** Each `LoadedNode` holds one `JournalPin { lsn_min, lsn_max, count }` over its pending journal; the trim point is the lowest live pin or the last checkpoint. `JournalPin` lives in `mimisbrunnr-storage`, beside `LoadedNode`.
 - **The engine starts no thread.** It exposes `commit`, `checkpoint` and a non-blocking query of what is due; the embedder drives them — a `std`-gated helper thread on the host, the filesystem server's own thread or event loop on Vesper.
 
@@ -551,12 +551,12 @@ that tail, never to the pool.
 
 ### 1.6 Retention
 
-Jsets are self-describing, so history is kept by not freeing journal buckets yet. The trim point
-(JOURNAL-DESIGN§1.4) is held back to the oldest subscription cursor that wants op replay
-(SUBSCRIPTIONS-DESIGN "Offline catch-up"), within a cap on retained bytes and age set per pool.
-A subscription whose cursor falls behind the cap catches up by result-set diff instead. The
-retained journal is the oplog: nothing else records mutation history, and cluster sync reads
-snapshot diffs, never the journal (CLUSTER-DESIGN).
+Jsets are self-describing, so history is kept by not freeing journal buckets yet. A pool may
+retain journal history past the trim point (JOURNAL-DESIGN§1.4) within a cap on retained bytes
+and age set per pool, by default none, for tools that read mutation history. Nothing in the
+engine depends on retained history: subscriptions keep their own pending events
+(SUBSCRIPTIONS-DESIGN "Delivery") and never hold the trim point, and cluster sync reads snapshot
+diffs, never the journal (CLUSTER-DESIGN).
 
 ### 1.7 Mirroring
 

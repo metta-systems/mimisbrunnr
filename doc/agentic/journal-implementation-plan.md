@@ -18,7 +18,7 @@ Design: [journal-design.md](journal-design.md) · Decisions: [journal-decisions.
 
 ## History and mirroring
 
-- [ ] **JOURNAL13 — Retention as the oplog.** The trim point is held back to the oldest subscription cursor wanting replay, within per-pool byte and age caps; a reader iterates retained entries from a cursor (JOURNAL-DESIGN§1.6). Prerequisite: JOURNAL2. Acceptance: a dormant subscription within the cap replays every entry since its cursor after reopen; one beyond the cap is told to use the diff; retained buckets are freed once no cursor needs them.
+- [ ] **JOURNAL13 — Optional retained history.** Journal buckets are kept past the trim point within per-pool byte and age caps (default none); a reader iterates retained entries from an LSN (JOURNAL-DESIGN§1.6). Prerequisite: JOURNAL2. Acceptance: with a cap set, entries within it are readable after reopen and buckets beyond it are freed; with the default, buckets are freed as soon as the trim point passes them; no subscription state changes the trim point.
 - [ ] **JOURNAL6 — Journal mirroring across hot disks.** Prerequisite: JOURNAL-D1.
 
 ## Payload transforms

@@ -108,7 +108,7 @@ entry that selects it carries the snapshot id.
 | `Backpointer`      | no              | physical state, not logical                    |
 | `BucketAlloc`, `FreespaceLru` | no | physical state                              |
 | `Ontology`         | yes             | snapshot freezes the ontology version          |
-| `Subscriptions`, `SubscriptionMembers` | no | consumers watch the head; a rollback never moves a cursor (SUBSCRIPTIONS-DESIGN) |
+| `Subscriptions`, `SubscriptionMembers`, `SubscriptionEvents` | no | consumers watch the head; a rollback never moves a cursor (SUBSCRIPTIONS-DESIGN) |
 | `ObjectHistory`    | yes             | sidecar for `ObjectTable` (METADATA-DESIGN§1) — current view in the radix, per-snapshot overrides here |
 | `ObjectRoots`, `ExtentList` | no     | roots and high-water are physical; extent lists are reached from a record version |
 

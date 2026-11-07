@@ -578,7 +578,7 @@ The journal is the **redo log** of every mutation, kept in an ordered list of al
 
 **Commits and checkpoints.** Group commit adapts to load: idle commits go out at once, concurrent ones batch into sets up to 256 KiB, pipelined; one FUA write or flush per commit, with new data extents verified by checksum at recovery instead of a second flush. Callers choose `Sync` or `Buffered { max_delay }` durability. A checkpoint is a `Checkpoint` entry carrying the new root list; the superblock holds only a hint to the newest checkpoint (JOURNAL-DESIGN§1.5).
 
-**History and mirroring.** Retained journal buckets are the oplog that subscriptions replay from (JOURNAL-DESIGN§1.6). With several hot disks, each commit writes the same set to each (JOURNAL-DESIGN§1.7).
+**History and mirroring.** A pool may retain journal buckets past the trim point as mutation history, within a cap (JOURNAL-DESIGN§1.6); subscriptions keep their own pending events and do not depend on it. With several hot disks, each commit writes the same set to each (JOURNAL-DESIGN§1.7).
 
 **Data paths.** File data goes to blob extents beside the journal; tiny objects ride inside it until packed; streams are append-only objects made durable step by step (JOURNAL-DESIGN§1.8).
 
@@ -1031,8 +1031,8 @@ Mímisbrunnr replaces inotify with **query-based subscriptions** — persistent,
 |---|---|
 |Watches paths|Watches queries over tags|
 |Must know paths in advance|Query matches future objects|
-|Misses events while offline|Cursor-based catch-up from oplog|
-|Queue overflow = lost events|Oplog is persistent|
+|Misses events while offline|Pending events persist until acknowledged|
+|Queue overflow = lost events|Past a per-subscription bound, a result-set diff reports the net change|
 |Recursive watch is expensive|Bitmap intersection is O(1)|
 |No semantic filtering|Query IS the filter|
 
@@ -1084,7 +1084,7 @@ struct SubscriptionEngine {
 }
 ```
 
-Cost per mutation: ~microseconds (one lookup per changed term + one evaluation per reached subscription). Delivery is pull-based: `poll` returns events after the cursor and `ack` advances the cursor; how events survive a restart is SUBSCRIPTION-D6 (SUBSCRIPTIONS-DESIGN "Delivery"). Ops received by cluster sync are local journal entries, so they produce events like local mutations.
+Cost per mutation: ~microseconds (one lookup per changed term + one evaluation per reached subscription). Delivery is pull-based: `poll` returns events after the cursor and `ack` advances the cursor. Events are persisted per subscription with the mutation that produces them and survive restarts until acknowledged, up to the subscription's own bound (SUBSCRIPTIONS-DESIGN "Delivery"); no subscriber holds the journal back. Ops received by cluster sync are local journal entries, so they produce events like local mutations.
 
 ### 11.4 Atomic Subscribe + Snapshot
 
@@ -1106,11 +1106,9 @@ fn subscribe(query: Query, interest: ChangeInterest)
 
 When an agent reconnects after being dormant:
 
-**Small gap (minutes/hours):** Replay individual ops from cursor — preserves full event sequence, O(ops_missed).
+**Within the subscription's bound:** its pending events, written as the changes happened — the full event sequence in commit order, O(events missed).
 
-**Large gap (days/weeks):** Diff the current result against the membership the subscription last delivered — two bitmap operations, O(result_set_size); content and tag changes of members are found by comparing their `modified_ns` with the cursor's time. Loses individual event ordering but correct summary in milliseconds instead of seconds.
-
-**Journal history trimmed:** Falls back to the result set diff, which doesn't need the journal at all.
+**Past the bound (the subscription overflowed):** Diff the current result against the membership as of the cursor — two bitmap operations, O(result_set_size); content and tag changes of members are found by comparing their `modified_ns` with the cursor's time. Loses individual event ordering but gives a correct summary in milliseconds.
 
 ### 11.6 Batching and Debouncing
 
@@ -1462,7 +1460,7 @@ All engine state persists in the trees of the root list — B+ trees and positio
 ├──────────────────────────────────────────────────────────────────┤
 │                   TRANSACTION LAYER                              │
 │   Journal sets (mirrored) → Checkpoint → Recovery                │
-│   Retained journal buckets are the oplog for subscriptions       │
+│   Subscriptions keep their own pending events                    │
 ├──────────────────────────────────────────────────────────────────┤
 │                     POOL MANAGER                                 │
 │   Topology │ Rebalancer │ Resilverer │ Health Monitor            │
@@ -1489,7 +1487,7 @@ flowchart TB
 
     subgraph Journal["Journal (JOURNAL-DESIGN)"]
         JSets["Journal sets<br/><i>write-once, group commit,<br/>mirrored on hot devices</i>"]
-        History["Retained history<br/><i>the oplog</i>"]
+        History["Retained history<br/><i>optional, per-pool cap</i>"]
         JSets --> History
     end
 
@@ -1535,7 +1533,7 @@ flowchart TB
     end
 
     Snapshots["Snapshot tree + ObjectHistory sidecar<br/><i>snapshot id in snapshot-aware keys</i>"]
-    Subs["Subscriptions"]
+    Subs["Subscriptions<br/><i>records, membership at cursor,<br/>pending events</i>"]
     Reconcile["Reconcile<br/><i>copygc, tiering, repair, rule rework</i>"]
     Peers["Cluster peers<br/><i>ops by uid and value</i>"]
 
@@ -1570,8 +1568,8 @@ flowchart TB
     Snapshots -.-> Postings
     Snapshots -.-> Forward
     Snapshots -.-> ObjTable
-    History --> Subs
-    History --> Peers
+    API -->|"events of reached<br/>subscriptions"| Subs
+    Snapshots -.->|"snapshot diffs"| Peers
     OntTree -.->|"uids"| Peers
 ```
 
@@ -1855,7 +1853,7 @@ The design began as a list of properties for an associative persistent filesyste
 | Journalled, atomic updates | WAL and atomic root commit (§6.4, ENGINE-DESIGN§1, JOURNAL-DESIGN§1) |
 | ACLs (users and groups per file) | Out of scope: access control comes from the Mettā security model |
 | Versioning and snapshots storing only changed blocks and metadata | Key-level snapshots (SNAPSHOTS-DESIGN§1) |
-| File change logs, replacing `atime` | Query subscriptions and the oplog (§11) |
+| File change logs, replacing `atime` | Query subscriptions and their pending events (§11) |
 | On-disk format upgradeable while mounted (after VxFS) | Format versioning and migration (FORMAT-DESIGN§15) |
 | Encryption (LRW, XTS, HCTR2, HBSH) | §9.3, §9.4 |
 | Content-addressable storage | BLAKE3 content hashes and exact-content dedup (§9) |

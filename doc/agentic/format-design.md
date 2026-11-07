@@ -161,6 +161,7 @@ enum BtreeKind {
     PoolState             = 29,  // POOL-DESIGN§1.2 single-entry pool state record
     // Subscriptions
     SubscriptionMembers   = 30,  // SUBSCRIPTIONS-DESIGN§1 (id, window) → membership container (snapshot-agnostic)
+    SubscriptionEvents    = 31,  // SUBSCRIPTIONS-DESIGN§1 (id, lsn, index) → pending event (snapshot-agnostic)
 }
 ```
 
@@ -406,7 +407,7 @@ forward index roughly in half (~660 MiB at this scale).
 | Postings               | 200–400 MiB | INDEX-DESIGN§3 — roaring containers, one tree entry per (term, 65 536-id window); 5 000 tags |
 | Term dictionary + term table | 0.1–1 GiB | INDEX-DESIGN§4.1 — ~100 B per distinct attribute value; the upper end is one unique value per object |
 | Ontology               | <10 MiB   | One positional CBOR record per tag, rule, constraint and module, snapshot-tagged (ONTOLOGY-DESIGN§1) |
-| Subscriptions          | ~700 KiB + membership | Per 1 000 subs with packed `sub_id`; membership as posting containers, ~2 B per member (SUBSCRIPTIONS-DESIGN§1) |
+| Subscriptions          | ~700 KiB + membership + pending events | Per 1 000 subs with packed `sub_id`; membership as posting containers, ~2 B per member; ~32 B per pending event, bounded per subscription (SUBSCRIPTIONS-DESIGN§1) |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
 | Snapshot key overhead  | ~80 MiB   | Per-snapshot divergent keys across the 6 snapshot-aware btrees (see breakdown below) |
 | **Total metadata**     | **~2.9–3.9 GiB** | Replicated to every node; dominated by object records (1.19 GiB), the forward index and, with many distinct attribute values, the term dictionary |

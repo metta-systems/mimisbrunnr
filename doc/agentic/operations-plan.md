@@ -90,7 +90,7 @@ The term dictionary, postings and forward index replace every index structure, s
 1. [BLOB1](blob-implementation-plan.md), [BLOB2](blob-implementation-plan.md), [BLOB5](blob-implementation-plan.md); then [JOURNAL11](journal-implementation-plan.md) — one barrier per commit with extent verification.
 2. [ENGINE5](engine-implementation-plan.md) — backpointers in the engine; [METADATA8](metadata-implementation-plan.md) — extent lists; then [METADATA6](metadata-implementation-plan.md) — blob reclaim and tombstone expiry (after METADATA-D3).
 3. [BLOB3](blob-implementation-plan.md), [BLOB4](blob-implementation-plan.md) — chunked objects, selective chunking; then [BLOB8](blob-implementation-plan.md) — tiny objects (after BLOB-D4) and [BLOB9](blob-implementation-plan.md) — streaming objects.
-4. [JOURNAL13](journal-implementation-plan.md) — retention as the oplog; then [BLOB6](blob-implementation-plan.md), [UNIX1](unix-implementation-plan.md), [ENGINE6](engine-implementation-plan.md), [ENGINE7](engine-implementation-plan.md), then [ENGINE8](engine-implementation-plan.md) — no legacy blob.
+4. [JOURNAL13](journal-implementation-plan.md) — optional retained history; then [BLOB6](blob-implementation-plan.md), [UNIX1](unix-implementation-plan.md), [ENGINE6](engine-implementation-plan.md), [ENGINE7](engine-implementation-plan.md), then [ENGINE8](engine-implementation-plan.md) — no legacy blob.
 
 ### 7. Device target
 
