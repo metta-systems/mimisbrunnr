@@ -12,7 +12,7 @@ A snapshot captures the assertion graph (tags, attributes, relations, ontology) 
 ## Selected design
 
 - Snapshots are per node; there is no cluster-wide snapshot coordination.
-- Every snapshot-aware tree (forward, term dictionary, postings, sequences, ontology, subscriptions) keys by `(…, snapshot)`; the `snapshot` field is 0 until this scope lands.
+- Every snapshot-aware tree (forward, term dictionary, postings, sequences, ontology, object history) keys by `(…, snapshot)`; subscriptions watch the head and are not snapshot-aware; the `snapshot` field is 0 until this scope lands.
 - Object record history (content locator included) lives in the `ObjectHistory` sidecar tree; the object table holds the current view.
 - Queries take an optional `snapshot_id` and resolve visibility through the snapshot tree's ancestor bitmap.
 
@@ -108,7 +108,7 @@ entry that selects it carries the snapshot id.
 | `Backpointer`      | no              | physical state, not logical                    |
 | `BucketAlloc`, `FreespaceLru` | no | physical state                              |
 | `Ontology`         | yes             | snapshot freezes the ontology version          |
-| `Subscriptions`    | yes             | per-snapshot watch state                       |
+| `Subscriptions`, `SubscriptionMembers` | no | consumers watch the head; a rollback never moves a cursor (SUBSCRIPTIONS-DESIGN) |
 | `ObjectHistory`    | yes             | sidecar for `ObjectTable` (METADATA-DESIGN§1) — current view in the radix, per-snapshot overrides here |
 | `ObjectRoots`, `ExtentList` | no     | roots and high-water are physical; extent lists are reached from a record version |
 
@@ -145,7 +145,7 @@ so the whiteout encoding is **per leaf shape**:
 | `Postings` (INDEX-DESIGN§3.2) | a `ContainerHead` with `kind = 0xFF` (`CONTAINER_WHITEOUT`) and no payload. |
 | `TermDictionary` (INDEX-DESIGN§4.1) | a `DictEntry` with bit 7 of `flags` set (`DICT_FLAG_WHITEOUT`) and every other field zero. |
 | `Sequences` (INDEX-DESIGN§3.3) | ordered: the value `oid = u64::MAX`, never a valid id; ranked: the 1-byte value `0xFF` in place of `0x00`. |
-| `Ontology`, `Subscriptions` (ONTOLOGY-DESIGN§1, SUBSCRIPTIONS-DESIGN§1) | a CBOR null (`0xF6`) at the value position, in place of the usual record. |
+| `Ontology` (ONTOLOGY-DESIGN§1) | a CBOR null (`0xF6`) at the value position, in place of the usual record. |
 | `ObjectHistory` (SNAPSHOTS-DESIGN§1.2) | a 1-byte discriminator precedes the shadowed record; `0xFF` (`KEY_TYPE_whiteout`) means whiteout, otherwise the record follows. |
 
 Whiteouts carry no payload beyond the sentinel — the entry's length stops there.
@@ -224,7 +224,7 @@ Deleting a snapshot is **two operations**: a small synchronous step that takes t
 out of visibility, and a background cleanup that physically reclaims its keys. Deletions are
 **batched**: every snapshot marked deleted joins one pending set, and one cleanup pass over the
 snapshot-aware btrees — `Forward`, `TermDictionary`, `Postings`, `Sequences`, `Ontology`,
-`Subscriptions`, `ObjectHistory`, the yes-rows of SNAPSHOTS-DESIGN§1.2's table — serves every
+`ObjectHistory`, the yes-rows of SNAPSHOTS-DESIGN§1.2's table — serves every
 snapshot in the set. A burst of sync-snapshot expiries costs one pass, not one per snapshot.
 
 **Synchronous step (`SnapshotDelete` WAL op).**

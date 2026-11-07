@@ -18,6 +18,7 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, and co
 - ObjectIds carry the writing node's `NodeId` in their top 16 bits.
 - **Only direct assertions are synced.** Derived terms are computed on each node from the synced ontology (INDEX-DESIGN§2.4), so peers never exchange them and cannot disagree about them.
 - **Local ids stay on their node.** Each pool numbers its tags (`TagId`) and its attribute and relation terms (`TermId`) itself (ONTOLOGY-DESIGN§1, INDEX-DESIGN§1.2). Sync payloads name tags by `TagUid` and terms by value — a tag uid, or an attribute key's uid and a `Value` — never by a local id; a receiver resolves uids to its own `TagId`s and interns values into its own dictionary.
+- **Received ops are local operations.** A receiver applies a bundle's ops by journalling them as ordinary local entries and replaying them through the same mutation path, so indexes, rules, constraints and subscriptions (SUBSCRIPTIONS-DESIGN "Selected design") treat them exactly as local mutations; each keeps its origin's hybrid timestamp.
 - **The ontology syncs as ops.** A bundle's ontology changes are its `OntologyPut` / `OntologyDelete` entries with local ids replaced by uids, in HLC order ahead of the bundle's other ops (ONTOLOGY-DESIGN "Cluster propagation"). Declarations edited on two nodes merge by union of provenance, other fields last-writer-wins by HLC.
 
 ## Format specification

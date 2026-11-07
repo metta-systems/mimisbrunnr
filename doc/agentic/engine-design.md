@@ -135,7 +135,7 @@ Throughout the documents, `RootPointer.<name>_root` names the root-list entry of
 | `chunk_index_root` | `ChunkIndex` | INDEX-DESIGN§4.3 |
 | `backpointer_root` | `Backpointer` | METADATA-DESIGN§2.2 |
 | `ontology_root` | `Ontology` | ONTOLOGY-DESIGN§1 |
-| `subscriptions_root` | `Subscriptions` | SUBSCRIPTIONS-DESIGN§1 |
+| `subscriptions_root`, `subscription_members_root` | `Subscriptions`, `SubscriptionMembers` | SUBSCRIPTIONS-DESIGN§1 |
 | `snapshot_chain_root` | `Snapshots` | SNAPSHOTS-DESIGN§1.1 |
 | `pool_state_root`, `disk_descriptors_root`, `placement_rules_root`, `cluster_peers_root` | `PoolState`, `DiskDescriptors`, `PlacementRules`, `ClusterPeers` | POOL-DESIGN§1 |
 | `reconcile_work_root`, `reconcile_pending_root`, `reconcile_scan_root` | `ReconcileWork`, `ReconcilePending`, `ReconcileScan` | RECONCILE-DESIGN§1.2 |
@@ -217,7 +217,7 @@ resident tables:
 | Term dictionary, term table, postings, sequences, forward index (accessors over `BTreeNodeCache`) | INDEX-DESIGN§2–§4 trees | no resident mirror; posting containers and forward entries read in place from cached blocks |
 | `TermId` counter                             | derived at boot from the term table       | resident scalar           |
 | `OntologyState` (name and uid maps, closure tables) | ONTOLOGY-DESIGN§1 ontology tree      | fully resident; closure tables rebuilt when `rules_epoch` advances |
-| `SubscriptionEngine`                         | SUBSCRIPTIONS-DESIGN§1 subscriptions tree | fully resident         |
+| `SubscriptionEngine` (records, compiled queries, `term_to_subs` / `key_to_subs`, event buffers) | SUBSCRIPTIONS-DESIGN§1 subscriptions tree | resident; membership containers read on demand |
 | `PoolManager`                                | POOL-DESIGN§1 pool state and disk descriptors | fully resident     |
 | Bucket generations (`Vec<u32>` per disk) | ALLOCATION-DESIGN§1.3, per-disk alloc table | fully resident (4 B per bucket) |
 | `WritePoints` (`(disk, bucket kind, stream tag) → open bucket`) | derived; opens journalled as `BucketAlloc` | resident; ~hundreds of entries |

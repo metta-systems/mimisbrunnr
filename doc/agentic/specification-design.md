@@ -1046,14 +1046,15 @@ struct ChangeInterest(u32);
 enum SubscriptionState { Active, Dormant }
 
 struct Subscription {
-    id: SubscriptionId,
+    id: SubscriptionId,             // never reused
     name: String,
-    query: Query,
+    query: Query,                   // stored form: tags by TagUid (§2.3)
     interest: ChangeInterest,
-    cursor: u64,                    // OpLog LSN position
+    cursor: u64,                    // journal LSN of the last acknowledged event
+    cursor_ns: i64,                 // time of that journal entry
     state: SubscriptionState,       // Active or Dormant
-    retention: Duration,
-    cached_result: RoaringBitmap,   // cached query result set for diff-based catch-up
+    retention: Retention,           // SUBSCRIPTION-D2
+    // membership as of the cursor: posting containers in their own tree (SUBSCRIPTIONS-DESIGN§1)
 }
 
 enum WatchEvent {
@@ -1071,18 +1072,19 @@ The key events `ENTERED` and `EXITED` don't exist in inotify. When a file gains 
 
 ### 11.3 Inverted Subscription Index
 
-Subscriptions are indexed by which tags they reference. When tag X changes, only subscriptions mentioning tag X are evaluated — not all subscriptions:
+Subscriptions are indexed by the terms and keys their compiled queries read. A mutation reaches the subscriptions of every term that entered or left the object's closure — so tagging an object `flac` reaches a subscription on `audio` — and each is evaluated against the object's own terms, without reading postings:
 
 ```rust
 struct SubscriptionEngine {
     subscriptions: HashMap<SubscriptionId, Subscription>,
-    tag_to_subs: HashMap<TagId, Vec<SubscriptionId>>,  // inverted index
-    pending_events: HashMap<SubscriptionId, Vec<WatchEvent>>,
-    next_id: SubscriptionId,
+    term_to_subs: HashMap<TermId, Vec<SubscriptionId>>,  // terms the compiled queries read
+    key_to_subs: HashMap<TagId, Vec<SubscriptionId>>,    // keys read by range, HasKey, Contains, Under
+    content_subs: Vec<SubscriptionId>,                   // interested in content changes
+    buffers: HashMap<SubscriptionId, Vec<WatchEvent>>,   // live events not yet polled
 }
 ```
 
-Cost per mutation: ~microseconds (hash lookup + bitmap contains + conditional query evaluation).
+Cost per mutation: ~microseconds (one lookup per changed term + one evaluation per reached subscription). Delivery is pull-based: `poll` returns events after the cursor, from the buffer or by replaying the journal, and `ack` advances the cursor (SUBSCRIPTIONS-DESIGN "Delivery"). Ops received by cluster sync are local journal entries, so they produce events like local mutations.
 
 ### 11.4 Atomic Subscribe + Snapshot
 
@@ -1092,8 +1094,8 @@ No race condition between setup and initial state (unlike inotify + readdir):
 fn subscribe(query: Query, interest: ChangeInterest)
     -> (SubscriptionId, Vec<ObjectId>)
 {
-    // Atomic: snapshot cursor and result set at same moment
-    let cursor = oplog.latest_timestamp();
+    // Atomic: cursor and result set taken at the same LSN
+    let cursor = journal.latest_lsn();
     let initial = execute_query(&query);
     // Any mutation after cursor will be delivered as an event
     (register(query, interest, cursor), initial)
@@ -1106,9 +1108,11 @@ When an agent reconnects after being dormant:
 
 **Small gap (minutes/hours):** Replay individual ops from cursor — preserves full event sequence, O(ops_missed).
 
-**Large gap (days/weeks):** Diff current vs cached result set — two bitmap operations, O(result_set_size). Loses individual event ordering but correct summary in milliseconds instead of seconds.
+**Large gap (days/weeks):** Diff the current result against the membership stored as of the cursor — two bitmap operations, O(result_set_size); content and tag changes of members are found by comparing their `modified_ns` with the cursor's time. Loses individual event ordering but correct summary in milliseconds instead of seconds.
 
-**Oplog expired:** Falls back to result set diff, which doesn't need the oplog at all.
+**Journal history trimmed:** Falls back to the result set diff, which doesn't need the journal at all.
+
+Live delivery is the same replay over a gap of a few entries; a reconnecting agent simply polls.
 
 ### 11.6 Batching and Debouncing
 
@@ -1141,8 +1145,10 @@ let (sub, sources) = mimir.subscribe(
 );
 
 loop {
-    let batch = mimir.recv_batch(sub).await;
+    let batch = mimir.poll(sub, 1000);          // events after the cursor, debounced
+    if batch.is_empty() { wait_for_wakeup(); continue; }
     trigger_incremental_build(&batch);
+    mimir.ack(sub, batch.last().unwrap().lsn);  // at-least-once: a crash before ack redelivers
 }
 ```
 

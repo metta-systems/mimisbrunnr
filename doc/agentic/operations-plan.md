@@ -80,7 +80,7 @@ The term dictionary, postings and forward index replace every index structure, s
 4. [BTREE7](btree-implementation-plan.md), then [ENGINE2](engine-implementation-plan.md) — compaction.
 5. [METADATA1](metadata-implementation-plan.md) — multi-level radix per origin node.
 6. [ENGINE4](engine-implementation-plan.md) — retire zones and fixed areas.
-7. [SUBSCRIPTION1](subscriptions-implementation-plan.md) — externalized subscription bitmaps.
+7. [SUBSCRIPTION1](subscriptions-implementation-plan.md) — membership containers (after INDEX13).
 8. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md), [ALLOCATION6](allocation-implementation-plan.md) — per-disk allocation trees.
 9. [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup.
 10. [INDEX6](index-implementation-plan.md) — footprint benchmark.
@@ -115,7 +115,7 @@ These touch disjoint code and can run whenever their prerequisites hold:
 - **Encryption:** [ENCRYPTION1](encryption-implementation-plan.md)–[ENCRYPTION4](encryption-implementation-plan.md) any time; [ENCRYPTION5](encryption-implementation-plan.md) after BLOB1.
 - **Journal flags:** [JOURNAL5](journal-implementation-plan.md), [JOURNAL6](journal-implementation-plan.md).
 - **Query and SQL:** [QUERY13](query-implementation-plan.md) (after INDEX14, ONTOLOGY16 and ONTOLOGY17), then [QUERY14](query-implementation-plan.md) (after INDEX16); [QUERY15](query-implementation-plan.md) after METADATA7; [QUERY1](query-implementation-plan.md)–[QUERY10](query-implementation-plan.md), [QUERY12](query-implementation-plan.md) (QUERY1–QUERY3 after INDEX12, QUERY1's n-gram path after INDEX19; QUERY12 after INDEX18 and QUERY1; QUERY4 after INDEX13; QUERY5 after INDEX15; QUERY6 and QUERY9 after QUERY7; QUERY10 after QUERY4 and QUERY-D2).
-- **Subscriptions:** [SUBSCRIPTION3](subscriptions-implementation-plan.md)–[SUBSCRIPTION6](subscriptions-implementation-plan.md).
+- **Subscriptions:** [SUBSCRIPTION3](subscriptions-implementation-plan.md) (after QUERY14), then [SUBSCRIPTION8](subscriptions-implementation-plan.md) (after SUBSCRIPTION1), then [SUBSCRIPTION4](subscriptions-implementation-plan.md)–[SUBSCRIPTION6](subscriptions-implementation-plan.md).
 - **Ontology:** [ONTOLOGY6](ontology-implementation-plan.md) (after INDEX14), then [ONTOLOGY7](ontology-implementation-plan.md), [ONTOLOGY17](ontology-implementation-plan.md) (after METADATA7) and [ONTOLOGY12](ontology-implementation-plan.md); [ONTOLOGY14](ontology-implementation-plan.md) (after ONTOLOGY11 and ONTOLOGY15), then [ONTOLOGY5](ontology-implementation-plan.md), [ONTOLOGY8](ontology-implementation-plan.md), [ONTOLOGY9](ontology-implementation-plan.md), [ONTOLOGY3](ontology-implementation-plan.md); [ONTOLOGY4](ontology-implementation-plan.md) after ONTOLOGY-D2.
 - **Pool:** [POOL4](pool-implementation-plan.md).
 - **Unix and FUSE:** [UNIX2](unix-implementation-plan.md)–[UNIX6](unix-implementation-plan.md), [UNIX8](unix-implementation-plan.md); [UNIX9](unix-implementation-plan.md) after UNIX-D3; [UNIX10](unix-implementation-plan.md) after BLOB1.

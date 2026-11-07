@@ -2,13 +2,9 @@
 
 Design: [subscriptions-design.md](subscriptions-design.md) · Plan: [subscriptions-implementation-plan.md](subscriptions-implementation-plan.md)
 
-## SUBSCRIPTION-D1 — Continuous `mimir watch stream`
-
-A streaming watch needs a long-running loop or background thread in the CLI. The workspace contract is sync-only (no async runtime); `std::thread` is allowed. Decide whether streaming uses a blocking poll loop, a thread, or waits for a Metta-native event interface. Blocks [SUBSCRIPTION5](subscriptions-implementation-plan.md).
-
 ## SUBSCRIPTION-D2 — What `retention` means
 
-SPECIFICATION-DESIGN§11.2 and §11.7 give a subscription `retention: Duration`: a dormant subscription whose consumer has not returned within it is garbage-collected (at boot and periodically). SUBSCRIPTIONS-DESIGN§1 and `crates/watch` use `retention: Retention` (`AtMostOnce` / `Bounded { max_events }` / `Unlimited`) for the pending-event queue instead, and nothing expires dormant subscriptions. Options: (a) keep both, adding an expiry duration and a last-active time to `SubscriptionRecord` (format change); (b) keep only the queue policy and drop expiry from the system design; (c) keep only expiry. Shapes [SUBSCRIPTION6](subscriptions-implementation-plan.md).
+SPECIFICATION-DESIGN§11.2 and §11.7 give a subscription `retention: Duration`: a dormant subscription whose consumer has not returned within it is garbage-collected (at boot and periodically). SUBSCRIPTIONS-DESIGN§1 and `crates/watch` use `retention: Retention` (`AtMostOnce` / `Bounded { max_events }` / `Unlimited`) for the pending-event queue instead, and nothing expires dormant subscriptions. Options: (a) keep both, adding an expiry duration and a last-active time to `SubscriptionRecord` (format change); (b) keep only the queue policy and drop expiry from the system design; (c) keep only expiry. With delivery from the journal (SUBSCRIPTIONS-DESIGN "Delivery"), a queue policy bounds only the in-memory event buffer, and a dormant subscription costs the journal nothing beyond the per-pool retention cap (JOURNAL-DESIGN§1.6) — past the cap it falls back to the diff — so expiry is about record clutter, not log growth; decide it together with that cap. Shapes [SUBSCRIPTION6](subscriptions-implementation-plan.md).
 
 ## SUBSCRIPTION-D3 — Batch parameters in the record
 
@@ -17,10 +13,6 @@ SPECIFICATION-DESIGN§11.6 configures batching by debounce, maximum delay since 
 ## SUBSCRIPTION-D4 — `mimir watch` command surface
 
 `bin/mimir` has `register <name> <query>`, `list`, `drain`, `unsubscribe`, `stream <name>`. SPECIFICATION-DESIGN Appendix A uses `mimir watch "<query>" --name <n>`, `list`, `catch-up <name>`, `stream "<query>" --format json`. Candidate additions: `--interest content-changed,created,…` and `--retention 30d` on creation; cursor lag (entries and age) in `list`; `catch-up` reporting the strategy used and event counts; `since <name>` summarising changes by kind; `remove`. Decide names and flags. Shapes [SUBSCRIPTION5](subscriptions-implementation-plan.md) and [SUBSCRIPTION6](subscriptions-implementation-plan.md).
-
-## SUBSCRIPTION-D5 — Subscription ids after removal
-
-`next_id` is derived at boot as the largest loaded `SubscriptionId` (SUBSCRIPTIONS-DESIGN§1). Removing the subscription with the largest id and reopening hands that id out again, so a consumer holding the old id (or an embedder's stored reference) would silently attach to a different subscription. Options: (a) keep a removed subscription's record as a tombstone while it holds the largest id (the term table's high-water pattern, INDEX-DESIGN§1.2); (b) store a high-water id in the subscription tree's header or in the pool state; (c) accept reuse and document that ids are only stable while the subscription exists. Shapes [SUBSCRIPTION7](subscriptions-implementation-plan.md).
 
 ## Future work
 

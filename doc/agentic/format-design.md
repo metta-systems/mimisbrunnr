@@ -139,7 +139,7 @@ enum BtreeKind {
     Backpointer           = 12,  // METADATA-DESIGN§2.2 reverse-mapping B+ tree (snapshot-agnostic)
     // Catalogs (snapshot-aware)
     Ontology              = 13,  // ONTOLOGY-DESIGN§1 ontology records: tags, rules, modules (snapshot-aware)
-    Subscriptions         = 14,  // SUBSCRIPTIONS-DESIGN§1 subscription B+ tree (snapshot-aware)
+    Subscriptions         = 14,  // SUBSCRIPTIONS-DESIGN§1 subscription records (snapshot-agnostic)
     // Snapshot tree itself
     Snapshots             = 15,  // SNAPSHOTS-DESIGN§1.1 snapshot tree (SnapshotId → SnapshotNode)
     // Per-disk physical allocation
@@ -159,6 +159,8 @@ enum BtreeKind {
     ObjectRoots           = 28,  // METADATA-DESIGN§1.4 NodeId → object radix root (snapshot-agnostic)
     // Pool
     PoolState             = 29,  // POOL-DESIGN§1.2 single-entry pool state record
+    // Subscriptions
+    SubscriptionMembers   = 30,  // SUBSCRIPTIONS-DESIGN§1 (id, window) → membership container (snapshot-agnostic)
 }
 ```
 
@@ -404,9 +406,9 @@ forward index roughly in half (~660 MiB at this scale).
 | Postings               | 200–400 MiB | INDEX-DESIGN§3 — roaring containers, one tree entry per (term, 65 536-id window); 5 000 tags |
 | Term dictionary + term table | 0.1–1 GiB | INDEX-DESIGN§4.1 — ~100 B per distinct attribute value; the upper end is one unique value per object |
 | Ontology               | <10 MiB   | One positional CBOR record per tag, rule, constraint and module, snapshot-tagged (ONTOLOGY-DESIGN§1) |
-| Subscriptions          | ~700 KiB  | Per 1 000 subs with packed `sub_id`                |
+| Subscriptions          | ~700 KiB + membership | Per 1 000 subs with packed `sub_id`; membership as posting containers, ~2 B per member (SUBSCRIPTIONS-DESIGN§1) |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
-| Snapshot key overhead  | ~80 MiB   | Per-snapshot divergent keys across the 7 snapshot-aware btrees (see breakdown below) |
+| Snapshot key overhead  | ~80 MiB   | Per-snapshot divergent keys across the 6 snapshot-aware btrees (see breakdown below) |
 | **Total metadata**     | **~2.9–3.9 GiB** | Replicated to every node; dominated by object records (1.19 GiB), the forward index and, with many distinct attribute values, the term dictionary |
 
 **Snapshot key overhead breakdown.** "Snapshot key overhead" is the sum of *divergent* keys —
@@ -422,7 +424,7 @@ snapshot, typical for sync-driven snapshotting):
 | `Forward` divergent leaf entries     | ~5 000 × ~20 B packed = ~100 KiB | ~10 MiB |
 | `Postings` divergent containers      | ~1 000 × ~0.5 KiB = ~500 KiB (one container per changed term window) | ~50 MiB |
 | `TermDictionary` divergent entries   | ~1 000 × ~90 B = ~90 KiB (statistics of changed terms) | ~9 MiB |
-| `Ontology`, `Subscriptions`         | usually 0 (catalogs change rarely)         | <1 MiB combined |
+| `Ontology`                          | usually 0 (the catalog changes rarely)     | <1 MiB          |
 | **Sum** (≈ 1.35 MiB / snap × 100)    |                   | **~135 MiB raw** |
 
 The raw arithmetic gives ~135 MiB; the table's ~80 MiB figure accounts for BTREE-DESIGN§1.6 packing
