@@ -14,7 +14,7 @@ Every query operator evaluates through bitmap algebra over an index built for it
 - Query evaluation is bitmap algebra over the indices in [index-design.md](index-design.md).
 - **SQL is read-only.** `SELECT` maps onto the query algebra; mutations go through the engine API.
 - `ORDER BY` over ordered collections reads the collection's sequence (INDEX-DESIGN§3.3).
-- Query operators map onto the term index: `HasTag` and `IsA` read postings; `HasAttr` with `Eq` is one dictionary lookup, with `Lt`/`Le`/`Gt`/`Ge`/`Prefix` one dictionary scan; `Related` reads the postings of the relation term.
+- Query operators map onto the term index: `HasTag` and `IsA` read postings; `HasAttr` with `Eq` is one dictionary lookup, with `Lt`/`Le`/`Gt`/`Ge`/`Prefix` one dictionary scan; `Contains` intersects n-gram postings on keys that declare them and scans the key's dictionary entries otherwise; a subtree query on a hierarchical key unions roll-up and node postings; `Related` reads the postings of the relation term (INDEX-DESIGN§4.2).
 - Queries accept an optional `snapshot_id` once [snapshots-design.md](snapshots-design.md) lands.
 
 ## SQL layer

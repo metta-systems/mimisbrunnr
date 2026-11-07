@@ -111,7 +111,7 @@ enum Value {
 
 Multi-valued attributes are natural — an object can have multiple assertions with the same key. A music track in two playlists simply has two `playlist` attributes.
 
-An object's **direct** assertions are the ones a user or application set; its **materialized** tags are the ones the ontology's implications add. The forward index stores direct assertions only; materialized tags are the closure of the direct tags under the ontology, recomputed when needed, and appear in tag postings so queries never expand implications (§3.3, INDEX-DESIGN§2.4).
+An object's **direct** assertions are the ones a user or application set; its **derived** terms are the ones the ontology's rules add. The forward index stores direct assertions only; derived terms are the closure of the direct ones under the rules, recomputed when needed, and appear in postings so queries never expand rules (§3.3, INDEX-DESIGN§2.4).
 
 ### 2.3 Query Algebra
 
@@ -148,60 +148,59 @@ And(vec![
 
 The ontology defines relationships between tags themselves. It is the schema of the filesystem and drives all storage behavior — placement, compression, encryption, chunking.
 
-### 3.1 Tag Definitions
+### 3.1 Tags and attribute keys
 
-Tags carry semantics defined by the ontology:
+Every tag has two identities: a 128-bit `TagUid`, derived from its module id and name (random for ad-hoc tags), which names it in modules, exports and sync; and a dense local `TagId` (`u32`), which is its `TermId` in the index. A tag has a canonical name, aliases, and a qualified name `module:name` for when two modules use the same name (ONTOLOGY-DESIGN "Tags and attribute keys").
 
 ```rust
-struct TagDefinition {
-    id: TagId,
-    name: String,
-    semantics: TagSemantics,
-    implies: Vec<TagId>,
-    storage: Option<StoragePolicy>,   // §3.5 — chunking, compression, encryption
-}
-
+enum TagKind { Label, AttributeKey { value_type: ValueType } }
 enum ValueType { Text, Int, Float, Timestamp, Blob }
+enum Collection { Plain, Grouping, Ordered, Ranked }   // attribute keys
 
-enum TagSemantics {
-    Label,                    // simple label: "electronic", "favorite"
-    Attribute { value_type: ValueType },  // key-value: "artist=Aphex Twin"
-    Grouping,                 // unordered group: "genre:ambient"
-    OrderedCollection {       // ordered: "playlist:workout", "album:SAW-II"
-        element_constraint: Option<TagId>,
-    },
-    Hierarchical,             // "location:europe/france/paris"
+struct TagRecord {
+    uid: TagUid,
+    name: String,
+    aliases: Vec<String>,
+    kind: TagKind,
+    collection: Collection,              // grouping: values name groups and may scope other
+                                         //   values; ordered / ranked: each group keeps a sequence
+    hierarchy_separator: Option<char>,   // values are paths: "europe/france/paris"
+    ngram: Option<u8>,                   // substring search over the key's values
+    storage: Option<StoragePolicy>,      // §3.5
+    provenance: Vec<ModuleUid>,          // modules declaring the tag
 }
 ```
 
-`OrderedCollection` is a property of the tag, not of the objects. The storage layer sees it and maintains both a bitmap (for fast membership queries) and a sequence vector (for ordering). Adding a new collection type — recipe books, photo albums, project folders — is purely an ontology change, no code needed.
+A label is asserted or not (`favorite`, `electronic`); an attribute key carries a value (`artist = "Aphex Twin"`). Groups are attribute values: `playlist = "workout"` puts an object in the workout playlist, and an `Ordered` key gives every playlist its own order. Adding a collection type — recipe books, photo albums, project folders — is an ontology change, no code.
 
 `storage` is the per-tag storage policy: chunking parameters, compression algorithm, encryption mode. A tag that does not declare a `storage` policy contributes nothing to the per-axis resolution (§3.5) for objects bearing it. Most user-facing tags don't need a policy — only tags meant to drive storage behaviour (`vm-disk`, `archive`, `sensitive`) declare one.
 
-### 3.2 Tag Relations
+### 3.2 Rules and constraints
 
 ```rust
-enum TagRelation {
-    ImpliedBy,          // "car" implies "vehicle"
-    MutuallyExclusive,  // "active" vs "discontinued"
-    Requires,           // "usb-c" requires "electronics"
-    Alias,              // "laptop" = "notebook"
+enum Rule {
+    Implies { from: TagId, to: TagId },                     // "flac" → "audio"
+    ValueImplies { key: TagId, value: Value, to: TagId },   // mime = audio/flac → "flac"
+    Bucket { key: TagId, out_key: TagId, granularity: Granularity },
+                                                            // created → created-month = 2026-11
+    Exclusive { tags: Vec<TagId> },          // asserting one removes the others: current / stale
+    Requires { tag: TagId, needs: TagId },   // asserting "lossless" without "audio" fails
 }
 ```
 
-### 3.3 Implication DAG and Materialization
+Aliases are names, not relations. Format facts come from rules over attributes; categories (`music`, `work`) are asserted, not derived (ONTOLOGY-DESIGN "Rules and constraints").
 
-Tag implications form a directed acyclic graph. When an object is tagged "car", the materializer automatically inserts "vehicle" and "physical_object" into its tag set. Querying for "vehicle" is then a single bitmap lookup — no query expansion needed.
+### 3.3 Derived terms
 
-Materialized implications trade write-time cost (bitmap OR operation — microseconds even for millions of objects) for read-time speed. Since reads vastly outnumber writes and the ontology changes rarely, this is the clear winner.
+Rules form a DAG. An object's derived terms — tags implied, values bucketed — are the closure of its direct terms under the rules. They are stored in postings, so querying `audio` is one posting-list read with no query expansion, and never in the object's forward entry, which holds only direct terms (INDEX-DESIGN§2.4). A rule change reworks the postings it affects in one commit; creating or renaming a tag touches no postings.
 
 ### 3.4 Ontology-Driven Storage
 
 The ontology informs all storage decisions:
 
 ```
-Ontology says "playlist:*" is-a ordered-collection
-  → Storage maintains bitmap + Vec<ObjectId> for sequence
+Ontology says "playlist" is an ordered attribute key
+  → each playlist keeps a sequence beside its postings
 
 Ontology says "video" is-a media
   → Skip compression (already compressed)
@@ -247,7 +246,7 @@ deepest tag → wins. No ambiguity, no install error.
 **2. Sibling tags.** `archive` declares `chunking: avg=1 MiB`, `log` declares
 `chunking: avg=64 KiB`, neither implies the other. **Install fails.** The fix is one of:
 declare an implication between them; move the policy to a common ancestor and remove from
-the conflicting tag; mark them `MutuallyExclusive` (§3.2) so they cannot coexist on an
+the conflicting tag; put them in one `Exclusive` set (§3.2) so they cannot coexist on an
 object.
 
 **3. Diamond.** `large-file` (1 MiB chunks) and `mutable-file` (16 KiB chunks) are siblings.
@@ -291,36 +290,27 @@ Cost: O(tags-on-object × axes), with no runtime ambiguity.
 
 ## 4. Ontology Modules
 
-Ontologies are not monolithic. They are composed from **modules** — self-contained, versioned packages that declare tags, relations, implications, and constraints.
+Ontologies are not monolithic. They are composed from **modules** — self-contained, versioned packages that declare tags, attribute keys, rules and constraints.
 
 ### 4.1 Module Structure
 
 ```rust
-struct OntologyModule {
-    id: Option<String>,                  // "systems.metta.music"
-    version: Option<String>,             // "2.1.0"
-    name: Option<String>,                // "Music Ontology"
-    tags: Vec<TagDefinition>,            // tags to register (IDs allocated during install)
-    implications: Vec<(String, String)>, // (from_name, to_name) pairs
-}
-
-/// Result of module installation
-struct InstallResult {
-    tags_registered: u32,
-    tags_skipped: u32,       // duplicates
-    implications_added: u32,
-    module_id: Option<String>,
-    module_name: Option<String>,
+struct ModuleRecord {
+    uid: ModuleUid,              // derived from the id
+    id: String,                  // "systems.metta.music"
+    version: String,             // "2.1.0"
+    name: String,                // "Music Ontology"
+    installers: Vec<String>,     // applications that installed it; it stays while any remain
+    core: bool,                  // a core module cannot be removed
+    digest: [u8; 32],            // BLAKE3 of the compiled form
 }
 ```
 
-Installation is two-phase: (1) register all tags, skipping duplicates, allocating IDs; (2) add implications by name lookup. Tag IDs start as placeholders (0) in the TOML and are assigned sequentially during install.
-
-Future extensions (not yet implemented): `mutex_groups`, `constraints`, `requires` (dependency tracking), `installed_by` (refcount), `core` flag.
+A module declares tags, rules and constraints; each declaration records the modules declaring it in its provenance (§3.1), so two modules may share a tag and removing one leaves it in place. Module source is compiled on the host into the ontology's record form with every name resolved to a uid; the engine installs compiled modules and never parses source, so a device installs what the host prepared (ONTOLOGY-DESIGN "Modules"). Ad-hoc tags belong to the built-in `local` module.
 
 ### 4.2 Distribution Format
 
-Modules ship as declarative TOML files — no code, just declarations:
+Module source is declarative TOML — no code, just declarations (full syntax in ONTOLOGY-DESIGN "Modules"):
 
 ```toml
 [module]
@@ -330,31 +320,32 @@ name = "Music Ontology"
 
 [[tags]]
 name = "artist"
-semantics = "attribute"       # or "attr"
-value_type = "text"           # default; also "int", "float", "timestamp", "blob"
+kind = "attribute"
+value_type = "text"           # also "int", "float", "timestamp", "blob"
+ngram = 3
 
 [[tags]]
 name = "playlist"
-semantics = "ordered-collection"   # or "ordered"
+kind = "attribute"
+collection = "ordered"        # "plain" (default), "grouping", "ordered", "ranked"
 
 [[tags]]
 name = "genre"
-semantics = "grouping"
+kind = "attribute"
+collection = "grouping"
 
-[[implications]]
-from = "rock"
-to = "genre"
-
-[[implications]]
+[[rules]]
+kind = "implies"
 from = "flac"
-to = "audio"
+to = "systems.metta.core:audio"
+
+[[constraints]]
+kind = "requires"
+tag = "lossless"
+needs = "systems.metta.core:audio"
 ```
 
-Supported `semantics` values: `"label"`, `"attribute"`/`"attr"`, `"grouping"`, `"ordered-collection"`/`"ordered"`, `"hierarchical"`. The `value_type` field is only used with attribute semantics (defaults to `"text"`).
-
-Distribution channels: built-in (core ontology), app-bundled, community repository, or user-created.
-
-Future extensions (not yet implemented): `[requires]` for module dependencies, `[[constraints]]` for tag prerequisites, `extensible` flag on tags.
+Distribution channels: built-in (core ontology), app-bundled, or user-created.
 
 ### 4.3 Module Hierarchy
 
@@ -378,39 +369,38 @@ Future extensions (not yet implemented): `[requires]` for module dependencies, `
 
 ### 4.4 Installation / Merge
 
-Module installation is transactional. The merge algorithm:
+Module installation is one commit:
 
-1. **Check dependencies** — all required modules present at compatible versions
-2. **Check conflicts** — tag name collisions with incompatible semantics
-3. **Check cycles** — new implications must not create DAG cycles
-4. **Check mutex consistency** — warn if existing objects violate new mutex groups
-5. **Apply** — register tags, add implications, rematerialize affected bitmaps
-6. **Sync** — emit `OntologyDelta::InstallModule` to cluster
+1. **References** — every qualified name the module uses resolves to an installed tag
+2. **Cycles** — new rules must not close a cycle
+3. **Storage-policy chain invariant** — §3.5
+4. **Apply** — put tag, rule and constraint records with the module added to their provenance, allocating `TagId`s for new tags; post every new rule's derived terms
+5. **Report** — objects already violating a new constraint are listed, not changed
 
-Rematerialization after adding an implication like "flac → audio" is a single bitmap OR: `bitmap_audio |= bitmap_flac` — microseconds even for 100K affected objects.
+Each record change is an `OntologyPut` or `OntologyDelete` journal entry naming the record by uid, which is also what cluster sync ships (§12). Posting the derived terms of a new `flac → audio` is a union of `flac`'s postings into `audio`'s, container by container.
 
 ### 4.5 Module Upgrade
 
-Upgrades compute a diff. Safe changes (adding tags, adding implications) apply directly. Dangerous changes (removing tags with data, changing semantics) require explicit migration or `--force`.
+Upgrades diff the compiled forms by uid; a tag keeps its uid across versions. Safe changes (adding tags, rules, constraints; removing unused tags) apply directly. Dangerous changes (removing tags with data, changing a tag's kind, value type or collection) require explicit migration or `--force`. A rename is a new tag with the old name kept as an alias.
 
-De-materialization when removing an implication computes which objects should lose the implied tag by checking if any _other_ implication still provides it — `to_remove = from_bitmap - other_sources_bitmap`.
+Removing a rule withdraws a derived term only from objects with no other source of it, found by re-deriving the closures of the objects that might lose it (INDEX-DESIGN§2.4).
 
 ### 4.6 Scrubbing (App Removal)
 
-Module removal is reference-counted. Multiple apps can depend on the same module. When the last app referencing a module is removed, three scrub policies are available:
+A module stays while any of its installers remain. When the last one is removed, the module leaves the provenance of everything it declared; rules left with no provenance are removed, and tags left with none follow the scrub policy:
 
 |Policy|Behavior|Use case|
 |---|---|---|
-|**Preserve** (default)|Tags become "orphaned" — still queryable, no module backing|Safe, data outlives apps|
-|**RemoveUnique**|Remove tags unique to this module, keep shared ones|Moderate cleanup|
-|**Purge**|Remove all tags + data this module introduced|"I want this gone"|
+|**Preserve** (default)|Tags become "orphaned" — still queryable, empty provenance|Safe, data outlives apps|
+|**RemoveUnique**|Remove tags no other module declares, from objects and ontology|Moderate cleanup|
+|**Purge**|Remove every tag this module declares, from objects and ontology|"I want this gone"|
 
 Orphaned tags remain fully functional and can be adopted by another module or user-created module:
 
 ```
 $ mimir ontology orphans
-  bpm          (was: com.djapp.mixing, removed 2024-03-15)
-  cue-point    (was: com.djapp.mixing, removed 2024-03-15)
+  bpm          (was: com.djapp.mixing 1.0.0)
+  cue-point    (was: com.djapp.mixing 1.0.0)
   These tags still have data on 12,450 objects.
 
 $ mimir ontology adopt bpm --into systems.metta.music
@@ -443,11 +433,13 @@ Containers are keyed by the high 48 bits of the object id, so ids keep their ful
 
 ### 5.3 Term dictionary
 
-The dictionary is sorted by `(kind, key, context, normalised value)`, where the normalised value is an order-preserving 16-byte encoding. An equality query is one lookup; a range or prefix query (`year > 2020`, `size BETWEEN 1MB AND 10MB`, `name LIKE 'cargo%'`) is one scan that unions the postings it passes. Each entry carries the term's cardinality and change counters for query planning and sync (INDEX-DESIGN§4).
+The dictionary is sorted by `(kind, key, context, parent, normalised value)`, where the normalised value is an order-preserving 16-byte encoding. An equality query is one lookup; a range or prefix query (`year > 2020`, `size BETWEEN 1MB AND 10MB`, `name LIKE 'cargo%'`) is one scan that unions the postings it passes. Each entry carries the term's cardinality and change counters for query planning and sync (INDEX-DESIGN§4).
+
+Values of a hierarchical key are a trie of path components (`parent` is the parent component's term), so shared prefixes are stored once, a directory listing is one scan and a subtree query unions a bounded number of postings with the help of roll-up terms on large subtrees. Keys declared with `ngram` answer substring queries (`name CONTAINS 'carg'`) from n-gram postings over their distinct values (INDEX-DESIGN§4.2).
 
 ### 5.4 Ordered and ranked collections
 
-Tags whose semantics are `OrderedCollection` keep membership in postings like any term and their order in a separate sequence tree keyed by `(term, position)` or `(term, score)` (INDEX-DESIGN§3.3). A playlist with 500 tracks costs its postings plus 500 sequence entries.
+Values of ordered and ranked attribute keys (`playlist = "workout"`) keep membership in postings like any term and their order in a separate sequence tree keyed by `(term, position)` or `(term, score)` (INDEX-DESIGN§3.3). A playlist with 500 tracks costs its postings plus 500 sequence entries.
 
 ### 5.5 Forward index
 
@@ -599,6 +591,7 @@ enum WalOpKind {
     Checkpoint,
     WriteInline, ExtendObject,                 // tiny objects and streams (JOURNAL-DESIGN§1.8)
     ReclaimTerms,                              // unused attribute terms (INDEX-DESIGN§1.2)
+    OntologyPut, OntologyDelete,               // ontology records (ONTOLOGY-DESIGN§1)
 }
 ```
 
@@ -740,7 +733,7 @@ enum ChunkingAlgo {
 operator wants to force a chunking decision that's not captured in the installed
 ontology (e.g. "all objects matching `tag=database AND size>1GiB` use FastCDC at 64 KiB
 average regardless of what the ontology says"). For ontology-driven defaults, declare the
-policy on the relevant `TagDefinition.storage` instead (§3.5).
+policy on the relevant `TagRecord.storage` instead (§3.5).
 
 `ChunkingAlgo::None` is the explicit "do not chunk" form — used both as the
 format-time default (`Superblock.default_storage_policy`) and as an admin override
@@ -896,7 +889,7 @@ Only ~1% of objects are typically chunked, keeping the chunk index small (~5 MB 
 (`algo`, `min_size`, `avg_size`, `max_size`) are resolved at write time per §3.5:
 
 1. Ontology-effective policy on the object's tag set (the deepest tag whose
-   `TagDefinition.storage.chunking` is set wins; static install-time invariant
+   `TagRecord.storage.chunking` is set wins; static install-time invariant
    guarantees no ambiguity).
 2. Matching `PlacementRule::Chunk` rules (§8.3) — admin-time overrides.
 3. `Superblock.default_storage_policy.chunking` — pool-wide default
@@ -1157,24 +1150,24 @@ Unix paths are not how files live in Mímisbrunnr — they are metadata about ho
 ```
 Object: vesper-kernel-binary
 
-  path-context:project-tree
+  unix-path-context = "project-tree"
     unix-path="target/aarch64-unknown-none/release/vesper"
 
-  path-context:rpi4-sdcard
+  unix-path-context = "rpi4-sdcard"
     unix-path="/boot/kernel8.img"
     unix-mode=0o755
     unix-uid=0
     unix-gid=0
 
-  path-context:debian-package
+  unix-path-context = "debian-package"
     unix-path="usr/lib/vesper/kernel"
 ```
 
 ### 12.2 Path Contexts
 
-A **path context** is just a tag with `Grouping` semantics, defined in the
-`unix-interop` ontology module. Members of the context carry the `unix-path-context:<name>`
-tag; their per-context paths and metadata are ordinary scoped attribute assertions.
+A **path context** is a value of the grouping attribute key `unix-path-context`, defined in
+the `unix-interop` ontology module. Members of the context carry `unix-path-context = "<name>"`;
+their per-context paths and metadata are ordinary attribute assertions scoped to that term.
 
 There is **no symlink kind**. Unix needs symlinks because each inode has only one path;
 Mímisbrunnr objects can hold many `unix-path` assertions, so an object that should appear
@@ -1189,13 +1182,15 @@ objects exist in Mímisbrunnr.
 
 Path projections reuse the existing tag/attribute machinery:
 
-- **Membership** in a context: the object carries the `unix-path-context:<name>` tag.
-- **Path** in a context: an `Attr(unix-path, Value::Scoped { context: tag, inner: Text(...) })`
-  assertion. Unscoped values (plain `Text(...)`) are visible in every context as the default.
+- **Membership** in a context: the object carries `unix-path-context = "<name>"`.
+- **Path** in a context: an `Attr(unix-path, Value::Scoped { context: term, inner: Text(...) })`
+  assertion, where `term` is the context's `TermId`. Unscoped values (plain `Text(...)`) are
+  visible in every context as the default. `unix-path` is a hierarchical key (§3.1), so paths
+  are stored as a trie of components and a directory listing is one dictionary scan.
 - **Per-context overrides** (mode, uid, gid): same `Scoped` form, applied to the matching
   attribute.
-- **Ordered manifest** (for tarball export): the context tag's sequence in the sequences
-  tree (INDEX-DESIGN§3.3).
+- **Ordered manifest** (for tarball export): the context term's sequence in the sequences
+  tree (INDEX-DESIGN§3.3), when `unix-path-context` is declared ordered.
 
 See UNIX-DESIGN§1 for the full encoding contract and INDEX-DESIGN§1.3 for `Value::Scoped`.
 
@@ -1446,9 +1441,9 @@ Index state is currently persisted as CBOR (length-prefixed) in the index zone �
 │  ONTOLOGY     │ │ INDEX LAYER │ │ METADATA      │
 │               │ │ (paged+WAL) │ │ LAYER         │
 │ Module system │ │             │ │               │
-│ Implication   │ │ Term dict   │ │ Object Table  │
-│ DAG           │ │ Postings    │ │ Location Table│
-│ Materializer  │ │ Sequences   │ │               │
+│ Rules and     │ │ Term dict   │ │ Object Table  │
+│ constraints   │ │ Postings    │ │ Location Table│
+│ Closures      │ │ Sequences   │ │               │
 │               │ │ Forward Idx │ │               │
 └───────┬───────┘ └─────┬───────┘ └────┬──────────┘
         │               │              │
@@ -1485,7 +1480,7 @@ Index state is currently persisted as CBOR (length-prefixed) in the index zone �
 
 ### 16.1 Component diagram
 
-The component view below shows the main data and control paths. Aliases and mutex groups are planned module extensions (§4.1).
+The component view below shows the main data and control paths.
 
 ```mermaid
 graph TB
@@ -1519,15 +1514,15 @@ graph TB
     end
 
     subgraph Ontology["Ontology Layer"]
-        ImplGraph["Implication DAG<br/><i>car → vehicle → physical<br/>transitive closure</i>"]
-        Aliases["Aliases<br/><i>laptop = notebook</i>"]
-        MutexGroups["Mutex Groups<br/><i>active ⊕ discontinued</i>"]
-        Materializer["Materializer<br/><i>on tag add: insert<br/>all implied tags</i>"]
+        ImplGraph["Rules<br/><i>flac → audio, mime → flac,<br/>created → created-month</i>"]
+        Aliases["Names and aliases<br/><i>laptop = notebook,<br/>module:name</i>"]
+        MutexGroups["Constraints<br/><i>current ⊕ stale,<br/>lossless requires audio</i>"]
+        Materializer["Closures<br/><i>derived terms of<br/>direct terms</i>"]
     end
 
     ImplGraph --> Materializer
     Aliases --> Planner
-    MutexGroups --> Materializer
+    MutexGroups --> Executor
 
     subgraph IndexLayer["Index Layer (paged B+ trees, WAL-persisted)"]
         TagIndex["Postings<br/><i>(TermId, id window) → roaring container<br/>tags, attribute values, relations</i>"]
@@ -1540,7 +1535,6 @@ graph TB
     Executor --> KVIndex
     Executor --> RangeIndex
     Materializer --> TagIndex
-    Materializer --> ForwardIndex
 
     subgraph MetadataLayer["Metadata Layer"]
         ObjTable["Object Table<br/><i>ObjectId → ObjectRecord<br/>128B fixed slots<br/>array indexed by ID</i>"]
@@ -1688,8 +1682,8 @@ graph TB
 |No POSIX paths|Tags + ontology queries|Associative access is fundamentally more expressive|
 |Roaring bitmaps|Primary index structure|Sub-ms intersection, excellent delta encoding for sync|
 |Ontology is the schema|Tag semantics drive storage|New collection types require zero code changes|
-|Ontology modules|Versioned, ref-counted packages|Apps bring schemas; data outlives apps|
-|Materialized implications|Insert implied tags at write time|Read path stays a single bitmap lookup|
+|Ontology modules|Versioned packages, provenance per declaration|Apps bring schemas; data outlives apps|
+|Derived terms in postings|Rules' results posted at write time, never in forward entries|Read path stays a single posting lookup|
 |Array-indexed metadata|O(1) by object ID|Faster than any tree for sequential IDs|
 |ID non-recycling|48-bit space, never reuse|Eliminates stale-reference bugs across cluster|
 |Separate zones|Index / metadata / blob|Each optimized for its access pattern|
@@ -1807,13 +1801,13 @@ Tag bitmaps (large, read-heavy, rarely mutated), object metadata (small records,
 - **Blob zone: extents over log structure.** A log-structured zone (LFS, F2FS) gives sequential writes but needs garbage collection; extents (XFS, ext4) favour large sequential reads. Extents with a free-space tree suit a general-purpose store.
 - **Metadata path separate from data path.** Queries touch only the fast disk; blob reads go to the capacity tier.
 
-### C.3 Implications: materialized, not expanded at query time
+### C.3 Derived terms: posted, not expanded at query time
 
-Materializing implied tags at write time makes every read a single bitmap lookup; ontology changes become batch bitmap ORs. Query-time expansion (`vehicle` → `OR(vehicle, car, truck, …)`) has cheaper writes but slower reads and needs the ontology graph in the planner. Reads dominate and ontologies change rarely, so the design materializes (§3.3).
+Posting derived terms at write time makes every read a single posting lookup; rule changes become batch posting unions. Query-time expansion (`vehicle` → `OR(vehicle, car, truck, …)`) has cheaper writes but slower reads and needs the rule graph in the planner. Reads dominate and ontologies change rarely, so the design posts derived terms, while forward entries keep only direct ones so a rule change never rewrites objects (§3.3).
 
-### C.4 Collections as tag semantics
+### C.4 Collections as attribute flavours
 
-Playlists and albums are not a separate object kind. A tag whose ontology semantics say `OrderedCollection` gets a sequence beside its membership bitmap; the storage layer knows only "this tag is ordered" (§5.2). Adding recipe books or photo albums is an ontology rule, not a code change: the ontology is the schema.
+Playlists and albums are not a separate object kind. An attribute key whose ontology declaration says `ordered` gives each of its values a sequence beside its postings; the storage layer knows only "this key is ordered" (§5.4). Adding recipe books or photo albums is an ontology declaration, not a code change: the ontology is the schema.
 
 ### C.5 Semantic placement versus block-level pools
 

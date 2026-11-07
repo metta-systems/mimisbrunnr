@@ -16,7 +16,7 @@ Every assertion an object makes is a **term**; the index is an inverted index ov
 
   | Tree | Key → value | Section |
   |---|---|---|
-  | Term dictionary | `(kind, key, context, NormalisedValue, term_id, snapshot)` → statistics + inline postings | INDEX-DESIGN§4.1 |
+  | Term dictionary | `(kind, key, context, parent, NormalisedValue, term_id, snapshot)` → statistics + inline postings | INDEX-DESIGN§4.1 |
   | Term table | `term_id` → kind, key and full value | INDEX-DESIGN§4.1 |
   | Postings | `(term_id, id >> 16, snapshot)` → one roaring container | INDEX-DESIGN§3.1–3.2 |
   | Forward | `(oid, snapshot)` → the object's term ids | INDEX-DESIGN§2 |
@@ -25,13 +25,14 @@ Every assertion an object makes is a **term**; the index is an inverted index ov
 
 - **Equality, range and prefix** queries are all dictionary lookups or scans: one ordered structure replaces a hash index and a separate range tree.
 - **Posting lists** are roaring containers keyed by the high 48 bits of the object id, so ids carry full node and local identity, a small update rewrites one container, and snapshot diffs and sync deltas work per container. Lists of up to four objects live inline in their dictionary entry.
+- **Derived terms** — tags implied by rules, values bucketed by rules, hierarchy roll-ups — live in postings only, computed from direct terms by the ontology's rules (INDEX-DESIGN§2.4). Hierarchical keys store their values as tries of path components (INDEX-DESIGN§4.2); n-grammed keys index the n-grams of their distinct values, not of objects (INDEX-DESIGN§4.2).
 - **Bounded memory.** Readers walk trees through a page cache; no index is mirrored whole in memory.
 - **TermIds are local to their pool.** Sync carries values, never term ids ([cluster-design.md](cluster-design.md)).
 
 ## Invariants
 
 - Every posting of a term is in exactly one place: its dictionary entry's inline list or the postings tree, never both.
-- Postings and forward lists agree: at each snapshot, an object is in a term's postings iff the term is in the object's forward list or is a tag implied by its direct tags under that snapshot's ontology (INDEX-DESIGN§2.4).
+- Postings and forward lists agree: at each snapshot, an object is in a term's postings iff the term is in the object's forward list or in the derived closure of its direct terms under that snapshot's ontology (INDEX-DESIGN§2.4).
 - A term's `TermId` is never reused, and two dictionary entries never denote the same term.
 - Posting ids are full `ObjectId`s (16-bit node, 48-bit local).
 
@@ -53,7 +54,7 @@ Value ::= [0, text]                      // Text(string)      payload: CBOR majo
         | [2, float]                     // Float(f64)        payload: CBOR major type 7, 64-bit
         | [3, int]                       // Timestamp(i64)    payload: CBOR major type 0/1
         | [4, bytes]                     // Blob(bytes)       payload: CBOR major type 2
-        | [5, context, inner]            // Scoped { context: TagId (u32), inner: Value }  INDEX-DESIGN§1.3
+        | [5, context, inner]            // Scoped { context: TermId (u64), inner: Value }  INDEX-DESIGN§1.3
 ```
 
 Integers use the shortest CBOR form; a float is always written as a 64-bit CBOR float, so one
@@ -67,9 +68,14 @@ A **term** is one thing an object can assert:
 | Kind | Term | `TermId` |
 |---|---|---|
 | `0` Tag | tag `t` | `t` (the `TagId`, `< 2³²`) |
-| `1` Attr | `(key: TagId, value: Value)` | allocated, `≥ 2³²` |
+| `1` Attr | `(key: TagId, value: Value)`; for a hierarchical key, one path node `(key, parent, component)` (INDEX-DESIGN§4.2) | allocated, `≥ 2³²` |
 | `2` Relation | `(predicate: TagId, target: ObjectId)` | allocated, `≥ 2³²` |
-| `3`–`255` | reserved (derived terms such as substring n-grams) | allocated |
+| `3` NGram | `(key: TagId, gram)` — derived; its postings are a set of attribute `TermId`s, not objects (INDEX-DESIGN§4.2) | allocated |
+| `4` RollUp | `(key: TagId, node: TermId)` — derived; its postings are every object in the node's subtree (INDEX-DESIGN§4.2) | allocated |
+| `5`–`255` | reserved | allocated |
+
+Derived terms (kinds 3 and 4, and the tags and bucketed values the ontology's rules derive) are
+never in forward entries (INDEX-DESIGN§2.4).
 
 **Allocation.** Attribute and relation terms take `TermId`s from a per-pool counter starting at
 2³², assigned in write order and never reused; the counter is not persisted but derived at boot
@@ -103,8 +109,9 @@ marker exists at a time.
 
 `Value::Scoped { context, inner }` lets the same attribute key carry different values under
 different scopes without inflating the tag namespace — e.g. an object's `unix-path` value
-scoped by a `unix-path-context:rpi4-sdcard` tag. The pattern generalises: any attribute can be
-scoped by any tag.
+scoped by the group `unix-path-context = rpi4-sdcard`. The scope is the `TermId` of any term with
+the grouping, ordered or ranked collection flavour (ONTOLOGY-DESIGN "Tags and attribute keys") —
+a grouping label or a grouping attribute value.
 
 - A scoped value is its own term: `(key, Scoped { C, v })` and `(key, v)` are different terms,
   so they have different postings without branching at the lookup site.
@@ -120,8 +127,8 @@ context-scoped (e.g. `created_ns`) never use this variant.
 **Type validation.** `Scoped` is **transparent to ontology type-checking**: an attribute
 declared with `value_type = "text"` accepts both `Text(...)` and `Scoped { context, inner: Text(...) }`.
 The validator strips the `Scoped` wrapper and checks `inner`. It additionally checks that
-`context` is a `TagId` whose definition has `Grouping` semantics; non-grouping tags cannot be
-used as scopes.
+`context` is a term with a collection flavour other than plain; other terms cannot be used as
+scopes.
 
 ---
 
@@ -193,37 +200,55 @@ is a format error.
   (INDEX-DESIGN§4.1) for each non-tag term.
 - **Diffing** for sync streams sorted runs newer than the peer's watermark (SNAPSHOTS-DESIGN§1.2).
 
-### 2.4 Implied tags
+### 2.4 Derived terms
 
-Implications connect tags only (SPECIFICATION-DESIGN§3.3), so attribute and relation terms are
-always direct; only tags have implied members.
+An object's **derived terms** are what the ontology's rules (ONTOLOGY-DESIGN "Rules and
+constraints") produce from its direct terms: tags from `Implies` and `ValueImplies`, attribute
+values from `Bucket`, and the roll-up terms of hierarchical keys (INDEX-DESIGN§4.2). N-gram terms
+are not per object; their postings list value terms and change only when a value term is
+interned or reclaimed (INDEX-DESIGN§4.2).
 
-**Invariant.** Under the ontology image of snapshot *S* (ONTOLOGY-DESIGN§1), an object is in
-`postings(t)` at *S* exactly when `t` is one of its direct tags or `t ∈ closure(direct tags)`.
-Postings hold direct and implied members alike, so `HasTag` and `IsA` remain single posting
-reads.
+**Invariant.** Under the ontology of snapshot *S* (ONTOLOGY-DESIGN§1), an object is in
+`postings(t)` at *S* exactly when `t` is one of its direct terms or `t ∈ closure(direct terms)`.
+Postings hold direct and derived members alike, so `HasTag`, `IsA` and queries on bucketed or
+rolled-up terms remain single posting reads.
 
-**Closure tables.** At mount, and whenever an ontology image is installed, the engine builds from
-the implication DAG, for every tag `t`:
+**Closure tables.** At mount, and whenever `rules_epoch` advances, the engine builds from the rules,
+for every tag `t`:
 
 - `ancestors[t]` — every tag `t` implies, transitively, as an ascending `u32` array;
-- `descendants[t]` — every tag that implies `t`, likewise.
+- `descendants[t]` — every tag that implies `t`, likewise;
+- `value_rules[key]` — the `ValueImplies` and `Bucket` rules on attribute key `key`.
 
 They are derived state, never persisted (about 2 MB each at 100 000 tags with an average depth of
-5). `closure(D) = D ∪ ⋃_{d ∈ D} ancestors[d]` merges a handful of short sorted arrays. An
-implementation may cache closures by the hash of the direct tag set, since many objects share one.
+5). For an object with direct terms `D`:
+
+```text
+closure(D) = tags(D) ∪ ⋃ ancestors[d] for d ∈ tags(D)
+           ∪ for each Attr(k, v) ∈ D: the tags its ValueImplies rules name, with their ancestors,
+                                       and Attr(out_key, bucket(v)) for each Bucket rule on k
+           ∪ for each hierarchical value node in D: the roll-up terms of its ancestors (INDEX-DESIGN§4.2)
+```
+
+An implementation may cache tag closures by the hash of the direct tag set, since many objects
+share one.
 
 **Maintenance:**
 
 | Change | Postings work |
 |---|---|
-| Add direct tag `a` | add the object to `postings(t)` for each `t ∈ {a} ∪ ancestors[a]` it is not yet in |
-| Remove direct tag `a` | `before = closure(D)`, `after = closure(D − {a})`; remove the object from `postings(t)` for each `t ∈ before − after` |
+| Add direct term `a` | add the object to `postings(t)` for each `t ∈ closure(D ∪ {a}) − closure(D)` |
+| Remove direct term `a` | `before = closure(D)`, `after = closure(D − {a})`; remove the object from `postings(t)` for each `t ∈ before − after` |
 | Delete the object | remove it from `postings(t)` for each `t ∈ closure(D)` |
-| New implication `a → b` | for each `t ∈ {b} ∪ ancestors[b]`: `postings(t) |= postings(a)` |
-| Removed implication `a → b` | see below |
+| New `Implies` `a → b` | for each `t ∈ {b} ∪ ancestors[b]`: `postings(t) |= postings(a)` |
+| New `ValueImplies` or `Bucket` on key `k` | for every term of key `k` the rule matches: OR that term's postings into the derived term's postings; for `Bucket`, one dictionary scan of `k` groups its value terms by bucket |
+| Removed rule | see below |
 
-**Removing `a → b`**, with the new ontology's tables:
+Adding a `Bucket` rule to a populated key reworks every object with that key; the engine runs it
+as a resumable job (RECONCILE-DESIGN§1) and keeps the previous `rules_epoch` for reads until the
+job commits.
+
+**Removing a rule.** For an `Implies` rule `a → b`, with the new ontology's tables:
 
 ```text
 keep     = ⋃ postings(d)  for every d ∈ descendants_new[b]     // still reach b another way
@@ -237,10 +262,13 @@ for each object o in suspects:
 `keep` is sound because any object holding some `d` with `d → … → b` reaches `b` from its direct
 tags. Forward entries are read only for `suspects` — the objects that may lose tags, whose
 postings change anyway — so the work is proportional to the change, not to `postings(a)`.
+`ValueImplies` and `Bucket` removals follow the same pattern with the rule's matching value terms
+in place of `a`.
 
-Ontology changes rework postings in the same commit that installs the new image (ONTOLOGY-DESIGN
-"Install", "Upgrade"), so the invariant holds at every committed root. Reads of an older snapshot
-use that snapshot's image and tables.
+Rule changes rework postings in the same commit that changes the rule records (ONTOLOGY-DESIGN
+"Install", "Upgrade", ONTOLOGY-DESIGN§1), or through a resumable job for bulk rules as above, so the
+invariant holds at every committed root. Reads of an older snapshot use that snapshot's records and
+tables.
 
 ---
 
@@ -301,9 +329,10 @@ postings tree's values to start 8-byte aligned within their node.
 
 ### 3.3 Ordered and ranked collections
 
-Tags with `OrderedCollection` semantics (SPECIFICATION-DESIGN§3.1) keep their membership in
-postings like any term, and their order in the sequences tree, a BTREE-DESIGN§1 tree of
-`BtreeKind::Sequences`:
+Terms whose declaration has the ordered or ranked collection flavour (ONTOLOGY-DESIGN "Tags and
+attribute keys") — a label, or each value of an attribute key such as `playlist = workout` — keep
+their membership in postings like any term, and their order in the sequences tree, a
+BTREE-DESIGN§1 tree of `BtreeKind::Sequences`:
 
 - **Ordered:** key `(term_id: u64, position: u64, snapshot: u32)` → `oid: u64`. Positions are
   sparse: appending takes the last position plus 2²⁰; inserting between two members takes the
@@ -322,16 +351,23 @@ postings like any term, and their order in the sequences tree, a BTREE-DESIGN§1
 **Term dictionary.** A BTREE-DESIGN§1 tree of `BtreeKind::TermDictionary`, keyed by
 
 ```
-(kind: u8, key: u32, context: u32, value: NormalisedValue, term_id: u64, snapshot: u32)
+(kind: u8, key: u32, context: u64, parent: u64, value: NormalisedValue, term_id: u64, snapshot: u32)
 ```
 
-through the packed-key codec.
+through the packed-key codec; zero fields pack to almost nothing.
 
-- Tag terms: `kind = 0`, `key` = the tag, `context = 0`, `value` all zero, `term_id` = the tag.
-- Attribute terms: `kind = 1`, `key` = the attribute's key tag, `context` = the scope tag of a
-  `Scoped` value or `0`, `value` = `NormalisedValue` of the (inner) value (INDEX-DESIGN§4.2).
-- Relation terms: `kind = 2`, `key` = the predicate, `context = 0`, `value` = the target's
-  `ObjectId` big-endian in bytes `[0..8]`, zero elsewhere.
+- Tag terms: `kind = 0`, `key` = the tag, `context = parent = 0`, `value` all zero, `term_id` =
+  the tag.
+- Attribute terms: `kind = 1`, `key` = the attribute's key tag, `context` = the scope `TermId` of
+  a `Scoped` value or `0`, `parent = 0`, `value` = `NormalisedValue` of the (inner) value
+  (INDEX-DESIGN§4.2). For a hierarchical key each term is one path node: `parent` = the parent
+  node's `TermId` (`0` at the root) and `value` = the normalised component (INDEX-DESIGN§4.2).
+- Relation terms: `kind = 2`, `key` = the predicate, `value` = the target's `ObjectId`
+  big-endian in bytes `[0..8]`, zero elsewhere.
+- N-gram terms: `kind = 3`, `key` = the n-grammed attribute key, `value` = the gram's bytes
+  (n ≤ 14, exact).
+- Roll-up terms: `kind = 4`, `key` = the hierarchical key, `parent` = the node whose subtree it
+  covers, `value` zero.
 - `term_id` ends the key so that distinct values sharing a normalised prefix stay distinct
   entries, adjacent in key order.
 
@@ -351,6 +387,8 @@ struct DictEntry {                           // 56 bytes
 
 const DICT_FLAG_EXACT:  u8 = 1 << 0;         // NormalisedValue holds the whole value
 const DICT_FLAG_INLINE: u8 = 1 << 1;         // postings are `inline`, not in the postings tree
+const DICT_FLAG_TERM_SET: u8 = 1 << 2;       // postings are TermIds, not ObjectIds (n-gram terms)
+const DICT_FLAG_HAS_ROLLUP: u8 = 1 << 3;     // hierarchy node with a roll-up term (INDEX-DESIGN§4.2)
 const DICT_FLAG_WHITEOUT: u8 = 1 << 7;       // snapshot whiteout (SNAPSHOTS-DESIGN§1.3)
 ```
 
@@ -372,13 +410,15 @@ struct TermRecord {                          // 8-byte head
 //   Attr, inline:       the value's INDEX-DESIGN§1.1 encoding (≤ 96 bytes), padded to 8
 //   Attr, out of line:  BlobRef (16 B) to a blob-zone extent holding the encoding
 //   Relation:           target: u64
+//   Attr, hierarchy node: parent: u64, then the component's encoding as for inline Attr
+//   NGram, RollUp:      nothing (the dictionary key holds everything)
 //   TERM_KIND_HIGH_WATER = 0xFF: nothing — a reclaimed term's marker (INDEX-DESIGN§1.2);
 //                        key = 0; no dictionary entry refers to it; lookups never return it
 ```
 
 Tag terms have no term-table entry; the ontology defines tags.
 
-**Equality lookup** of `(key, v)`: normalise `v`; seek to `(1, key, context, norm, 0)`; for every
+**Equality lookup** of `(key, v)`: normalise `v`; seek to `(1, key, context, 0, norm, 0)`; for every
 entry with that prefix, an `EXACT` entry matches outright, otherwise the term table's full value
 is compared. The matching entry's postings are its inline list or its postings-tree range. Most
 values (integers, floats, timestamps, text up to 14 bytes) are exact and take one descent.
@@ -398,11 +438,47 @@ orders the values they encode.
 | Text | first 14 bytes of UTF-8, then `min(length, 255)`, then `1` if longer than 14 bytes else `0` | length ≤ 14 |
 | Blob | first 14 bytes, then `min(length, 255)`, then a continuation byte as for Text | length ≤ 14 |
 
-A **range** query `lo ≤ key < hi` scans the dictionary from `(1, key, context, norm(lo))` to
-`(1, key, context, norm(hi))` and unions the postings of the entries it passes; entries whose
+A **range** query `lo ≤ key < hi` scans the dictionary from `(1, key, context, 0, norm(lo))` to
+`(1, key, context, 0, norm(hi))` and unions the postings of the entries it passes; entries whose
 normalised value equals a bound's and are not `EXACT` are compared against the term table's full
 value. A **prefix** query on text is the range from the prefix to its successor. Blob values are
 equality-only: a range over Blob values is rejected by the query layer.
+
+**Hierarchical keys** (ONTOLOGY-DESIGN "Tags and attribute keys", `hierarchy = sep`) store each value
+as a trie of path components: interning `europe/france/paris` interns `europe` under the root,
+`france` under `europe` and `paris` under `france`, each a term keyed by `(parent, component)`, and
+the object's forward entry holds only the leaf's `TermId`. Shared prefixes are stored once, and
+every component fits the 16-byte `NormalisedValue` far more often than a whole path would. The
+children of a node are contiguous in the dictionary, so listing one level — a directory — is one
+range scan. Moving or renaming a subtree re-keys only its root node's dictionary entry; the node
+keeps its `TermId`, and descendants are untouched.
+
+- **Roll-ups.** A node whose subtree holds more than `ROLLUP_THRESHOLD` distinct node terms
+  (64 by default, set per pool) has a roll-up term (kind 4) whose postings are every object in the
+  subtree, maintained through the derived closure (INDEX-DESIGN§2.4); the node's dictionary entry
+  sets `DICT_FLAG_HAS_ROLLUP`. A roll-up is created when its subtree first crosses the threshold
+  and dropped when it falls below half of it, each a rework of that node's postings only.
+- **Subtree query** (`key under p`): walk down from `p` to the nearest nodes with roll-ups, read
+  their roll-up postings, and union the postings of the remaining nodes of the subtree — at most
+  about `ROLLUP_THRESHOLD` of them below each roll-up.
+- **Ordering.** Siblings are ordered by normalised component; a range over full paths walks the
+  trie in that order.
+
+**N-grammed keys** (`ngram = n`) post the n-grams of their **distinct values**: when an attribute
+term of the key is interned, each n-gram of its text (for a hierarchical key, of its component)
+gets the term's `TermId` added to the postings of the n-gram term `(3, key, gram)`, flagged
+`DICT_FLAG_TERM_SET`; reclaiming the term removes it again. Object writes never touch n-gram
+postings.
+
+- **`Contains(s)`** on such a key: intersect the postings of `s`'s n-grams, giving candidate value
+  terms; confirm each against its full value in the term table; the result is the union of the
+  confirmed terms' object postings. For a hierarchical key, a confirmed node contributes its whole
+  subtree (through its roll-ups), since every path through it contains `s`; a pattern spanning
+  separators is split on them — interior parts must equal whole components, the first part must
+  end a component and the last start one — and matched by walking parent links from the last
+  part's candidates. A basename-only search restricts matches to leaf nodes.
+- Patterns shorter than `n`, and keys without n-grams, fall back to a scan of the key's dictionary
+  entries.
 
 ### 4.3 Chunk Index and Chunk List (for FastCDC objects)
 

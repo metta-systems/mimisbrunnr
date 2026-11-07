@@ -2,14 +2,9 @@
 
 Design: [query-design.md](query-design.md) · Plan: [query-implementation-plan.md](query-implementation-plan.md)
 
-## QUERY-D1 — `Contains` and `Ne` over the term index
+## QUERY-D1 — `Ne` over the term index
 
-Prefix and range scans are dictionary scans and `Related` reads relation-term postings (INDEX-DESIGN§4.1–4.2); two operators remain undefined:
-
-- **`Contains`** (substring). Options: (a) derived n-gram terms — term kind `3`, `(key, trigram)` — interned and posted like any term on every text write, queried by intersecting the substring's trigrams and confirming candidates against the term table; (b) a scan of the attribute's dictionary entries comparing full values, with no extra storage.
-- **`Ne`** (has the attribute, with a different value). Options: (a) a per-key presence term `(key, *)` posted on every attribute write, so `Ne v` = presence minus `Eq v`; (b) union the postings of every dictionary entry of the key, minus `Eq v`.
-
-Each (a) adds postings on every write; each (b) costs a scan per query. Blocks [QUERY1](query-implementation-plan.md), [QUERY3](query-implementation-plan.md).
+Prefix and range scans are dictionary scans, `Contains` uses n-gram postings over distinct values where the key declares them (INDEX-DESIGN§4.2), and `Related` reads relation-term postings. **`Ne`** (has the attribute, with a different value) remains undefined. Options: (a) a per-key presence term `(key, *)` posted on every attribute write, so `Ne v` = presence minus `Eq v`; (b) union the postings of every dictionary entry of the key, minus `Eq v` — for a hierarchical key, the root nodes' subtrees through their roll-ups. (a) adds a posting on every write; (b) costs a scan per query. Blocks [QUERY3](query-implementation-plan.md).
 
 ## QUERY-D2 — SQL spelling of Mímisbrunnr-specific operations
 
@@ -17,7 +12,7 @@ The SQL dialect is user-visible surface. Proposed capabilities, each to be spell
 
 - relation traversal from a selected set (`JOIN RELATION 'derived-from' ON subject` was one proposal), forward and reverse;
 - transitive closure over predicates (`CLOSURE OF <start> OVER 'derived-from', 'links', 'bundles'`, or `WITH RECURSIVE` mapped onto closure);
-- collection membership in sequence order (`IN COLLECTION 'playlist:workout' ORDER BY POSITION`);
+- collection membership in sequence order (`IN COLLECTION playlist = 'workout' ORDER BY POSITION`);
 - path-context projection (`IN CONTEXT 'rpi4-sdcard'` exposing `unix_path`, `mode` as columns);
 - faceting (`SELECT tag, COUNT(*) FROM TAGS OF (<select>) ORDER BY 2 DESC LIMIT 20`);
 - a streaming subscription (`SUBSCRIBE TO <select> ON CHANGE content, created, deleted WITH DEBOUNCE 200ms`), which would register a subscription ([subscriptions-design.md](subscriptions-design.md));

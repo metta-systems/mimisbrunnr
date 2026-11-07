@@ -8,7 +8,7 @@ ObjectIds embed a 16-bit `NodeId` (SPECIFICATION-DESIGN§2.1). Decide how a node
 
 ## CLUSTER-D2 — Conflict resolution rules
 
-SPECIFICATION-DESIGN§10.7 names conflict resolution without specifying it. Define per-assertion-kind rules (tags, attributes, relations, deletions, ontology changes) under concurrent writes from different nodes. Blocks [CLUSTER2](cluster-implementation-plan.md).
+SPECIFICATION-DESIGN§10.7 names conflict resolution without specifying it. Define per-assertion-kind rules (tags, attributes, relations, deletions) under concurrent writes from different nodes; ontology declarations merge as ONTOLOGY-DESIGN "Cluster propagation" records. Constraint effects that cross nodes are part of this decision: an `Exclusive` removal on one node racing an assertion of the other tag on another. Blocks [CLUSTER2](cluster-implementation-plan.md).
 
 ## CLUSTER-D3 — Hydration states
 

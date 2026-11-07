@@ -22,7 +22,7 @@ Unix tools see Mímisbrunnr through projections: TMSU-style tag navigation under
 
 **Several paths, one object.** `/bin/bash` and `/usr/bin/bash` are one object with two unscoped `unix-path` values. Both are first-class; neither is a link to the other.
 
-**Per-context paths.** A context is a `Grouping` tag `unix-path-context:<name>`. A value scoped to a context applies only in that context; an unscoped value is the default in every context. When projecting a context, an object's paths are its values scoped to that context, or its unscoped values if it has none; `unix-mode`, `unix-uid` and `unix-gid` resolve the same way.
+**Per-context paths.** A context is a value of the grouping attribute key `unix-path-context`; an object belongs to it by carrying `unix-path-context = "<name>"`. A value scoped to a context applies only in that context; an unscoped value is the default in every context. When projecting a context, an object's paths are its values scoped to that context, or its unscoped values if it has none; `unix-mode`, `unix-uid` and `unix-gid` resolve the same way.
 
 ```text
 vesper (kernel binary)    project=vesper component=kernel executable stripped current
@@ -37,9 +37,9 @@ vesper (kernel binary)    project=vesper component=kernel executable stripped cu
 
 A debug build is a different object with its own content hash and its own projections (`Scoped(jtag-debug, "/tftp/vesper.elf")`), never a second path on the release object. Every projection of an object serves the same blob; generating a projection copies nothing inside the pool.
 
-**Attribute tags.** The `systems.metta.unix-interop` module declares `unix-path` (attribute, text), `unix-mode`, `unix-uid`, `unix-gid` (attributes, int). A `Scoped` value satisfies an attribute's `value_type` when its inner value does, and its scope must be a `Grouping` tag ([UNIX8](unix-implementation-plan.md)).
+**Attribute keys.** The `systems.metta.unix-interop` module declares `unix-path-context` (attribute, text, `grouping`, ordered when a context needs a manifest order), `unix-path` (attribute, text, `hierarchy = "/"`, `ngram = 3`), `unix-mode`, `unix-uid`, `unix-gid` (attributes, int). A `Scoped` value satisfies an attribute's `value_type` when its inner value does, and its scope must be a term of a grouping-flavoured key ([UNIX8](unix-implementation-plan.md)). Being hierarchical, `unix-path` values are a trie of components: listing a directory is one dictionary scan, a subtree query uses roll-ups, and `find -name`-style searches use the component n-grams (INDEX-DESIGN§4.2).
 
-**Directories are virtual.** Intermediate directories (`/usr/bin/`) are synthesised from the path set when projecting; no directory objects exist.
+**Directories are virtual.** Intermediate directories (`/usr/bin/`) are interior nodes of the `unix-path` trie; no directory objects exist.
 
 ## Export
 
@@ -51,7 +51,7 @@ Import walks a host tree. Each file's content is hashed (BLAKE3); a file whose c
 
 ## FUSE bridge
 
-For tools that need real paths, `brunnr mount-unix --context <name>` mounts one projection. The adapter builds its `path → ObjectId` map from the context tag's members and their resolved `unix-path` values; reads go to the object's blob, and the path is only an index into the projection.
+For tools that need real paths, `brunnr mount-unix --context <name>` mounts one projection. The adapter builds its `path → ObjectId` map from the context term's members and their resolved `unix-path` values; reads go to the object's blob, and the path is only an index into the projection.
 
 ## CLI
 
@@ -61,7 +61,7 @@ Commands: `mimir project create-context <name> | list-contexts | set-path <oid> 
 
 - **Symlink targets as metadata** (a `symlink-target` attribute or symlink kind). An object at several paths carries several `unix-path` values (UNIX-DESIGN§1). How imported host symlinks map onto this is [UNIX-D3](unix-decisions.md).
 - **A `mimir context …` command family.** Projection commands live under `mimir project`.
-- **A `path-context` tag name.** Context tags are `unix-path-context:<name>`.
+- **One tag per context** (`unix-path-context:<name>`). A context is a value of the `unix-path-context` key, which already is a term with postings, statistics and a sequence (ONTOLOGY-DESIGN "Rejected alternatives").
 
 ## Format specification
 
@@ -74,19 +74,21 @@ Unix-style paths are an **export format**, not the truth. They are encoded as or
 
 - An object's path is an `Attr(unix-path, Value::Text("..."))` assertion (an attribute term, INDEX-DESIGN§1.2; multi-valued —
   the same object can hold any number of `unix-path` values, mirroring a hardlinked file).
-- A **context** (e.g. `rpi4-sdcard`, `debian-package`, `project-vesper`) is just a tag with
-  `Grouping` semantics, registered via the ontology (ONTOLOGY-DESIGN§1). An object belongs to a context
-  by carrying that tag.
-- A path that differs *per context* uses `Value::Scoped { context, inner }` (INDEX-DESIGN§1.3) — e.g.
-  `Attr(unix-path, Scoped(rpi4, Text("/boot/vesper")))`. Per-context overrides for `unix-mode`,
-  `unix-uid`, `unix-gid` follow the same pattern.
-- The **ordered manifest** (for tarball / package export) is the context tag's sequence
-  (INDEX-DESIGN§3.3): a context tag with `OrderedCollection` semantics gives sequential
+- `unix-path` is a hierarchical key (separator `/`, ONTOLOGY-DESIGN§1): each value is stored as
+  a chain of component terms (INDEX-DESIGN§4.2), and the object's forward entry holds the leaf.
+- A **context** (e.g. `rpi4-sdcard`, `debian-package`, `project-vesper`) is a value of the
+  grouping attribute key `unix-path-context` (ONTOLOGY-DESIGN§1). An object belongs to a context
+  by carrying `Attr(unix-path-context, Text("<name>"))`.
+- A path that differs *per context* uses `Value::Scoped { context, inner }` (INDEX-DESIGN§1.3),
+  `context` being the context's `TermId` — e.g. `Attr(unix-path, Scoped(rpi4, Text("/boot/vesper")))`.
+  Per-context overrides for `unix-mode`, `unix-uid`, `unix-gid` follow the same pattern.
+- The **ordered manifest** (for tarball / package export) is the context term's sequence
+  (INDEX-DESIGN§3.3): declaring `unix-path-context` with the `ordered` flavour gives sequential
   traversal in user-defined order.
-- **Per-context stats** come from the context tag's dictionary entry (INDEX-DESIGN§4.1):
+- **Per-context stats** come from the context term's dictionary entry (INDEX-DESIGN§4.1):
   `cardinality` is the member count and `last_modify_lsn` the last change. No header needed.
-- **Read-only / ephemeral context** policy lives on the *tag definition* in the ontology
-  alongside any other tag policy.
+- **Read-only / ephemeral context** policy lives on the `unix-path-context` key's declaration in the
+  ontology alongside any other tag policy.
 - **There is no symlink kind.** An object that should appear at multiple paths simply carries
   multiple `unix-path` assertions; this is the hardlink semantics, applied uniformly. Symlinks
   exist in Unix only because a single inode can hold one path; Mímisbrunnr objects can hold
@@ -94,6 +96,6 @@ Unix-style paths are an **export format**, not the truth. They are encoded as or
 
 Path projection is a convention layered on existing primitives. Listing all paths of an
 object is one forward-index hit (`Attr(unix-path, *)` assertions on the object). Listing
-all objects in a context is one tag-bitmap fetch. Building a tarball iterates the context's
-`Ordered` store.
+all objects in a context is one posting-list read of the context term. Building a tarball
+iterates the context term's sequence.
 

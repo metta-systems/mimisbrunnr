@@ -16,8 +16,9 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, and co
 - Snapshot diffs are the unit of sync; sync waits for [snapshots-design.md](snapshots-design.md).
 - Ordering across nodes uses `HybridTimestamp` (SPECIFICATION-DESIGN§10.4).
 - ObjectIds carry the writing node's `NodeId` in their top 16 bits.
-- **Only direct assertions are synced.** Implied tags are derived on each node from the synced ontology (INDEX-DESIGN§2.4), so peers never exchange them and cannot disagree about them.
-- **`TermId`s stay on their node.** Each pool numbers its attribute and relation terms itself (INDEX-DESIGN§1.2). Sync payloads name terms by value — a tag id, or an attribute key and `Value` — never by `TermId`; a receiver interns them into its own dictionary.
+- **Only direct assertions are synced.** Derived terms are computed on each node from the synced ontology (INDEX-DESIGN§2.4), so peers never exchange them and cannot disagree about them.
+- **Local ids stay on their node.** Each pool numbers its tags (`TagId`) and its attribute and relation terms (`TermId`) itself (ONTOLOGY-DESIGN§1, INDEX-DESIGN§1.2). Sync payloads name tags by `TagUid` and terms by value — a tag uid, or an attribute key's uid and a `Value` — never by a local id; a receiver resolves uids to its own `TagId`s and interns values into its own dictionary.
+- **The ontology syncs as ops.** A bundle's ontology changes are its `OntologyPut` / `OntologyDelete` entries with local ids replaced by uids, in HLC order ahead of the bundle's other ops (ONTOLOGY-DESIGN "Cluster propagation"). Declarations edited on two nodes merge by union of provenance, other fields last-writer-wins by HLC.
 
 ## Format specification
 
@@ -53,9 +54,10 @@ SyncBundle (CBOR):
    to_snapshot: u32
    from_node: NodeId
    ops: [SyncOp]                       // canonical, HLC-ordered
-   ontology_delta: Option<OntologyDelta>
+   ontology_ops: [OntologyOp]          // OntologyPut / OntologyDelete by uid, HLC-ordered,
+                                       //   applied before ops
    posting_deltas: [{ term, high, snapshot, container }]  // per-container divergences (INDEX-DESIGN§3.1);
-                                                          //   term = tag id or (key, Value), never a TermId
+                                                          //   term = tag uid or (key uid, Value)
 ```
 
 The bundle is signed and shipped to peers (per the SPECIFICATION-DESIGN§9.4 key hierarchy).

@@ -23,7 +23,7 @@ Goals:
    snapshot-aware btrees. Creation is O(1); diffs are set differences over the snapshot tree's
    ancestor relation, driving cluster sync.
 5. **No JSON on disk.** Fixed binary layouts everywhere they fit. CBOR (RFC 8949) only where the
-   shape is genuinely heterogeneous (attribute `Value`s, query ASTs, the ontology image), and
+   shape is genuinely heterogeneous (attribute `Value`s, query ASTs, ontology records), and
    then positional and versioned (FORMAT-DESIGN§1.6).
 
 ---
@@ -140,7 +140,7 @@ enum BtreeKind {
     // Physical reverse mapping
     Backpointer           = 12,  // METADATA-DESIGN§2.2 reverse-mapping B+ tree (snapshot-agnostic)
     // Catalogs (snapshot-aware)
-    Ontology              = 13,  // ONTOLOGY-DESIGN§1 ontology image tree (snapshot → CBOR(OntologyImage), snapshot-aware)
+    Ontology              = 13,  // ONTOLOGY-DESIGN§1 ontology records: tags, rules, modules (snapshot-aware)
     Subscriptions         = 14,  // SUBSCRIPTIONS-DESIGN§1 subscription B+ tree (snapshot-aware)
     // Snapshot tree itself
     Snapshots             = 15,  // SNAPSHOTS-DESIGN§1.1 snapshot tree (SnapshotId → SnapshotNode)
@@ -183,7 +183,7 @@ head, zero-padded to a multiple of 8. WAL payloads (JOURNAL-DESIGN§1.3) are the
 
 **CBOR.** CBOR is reserved for genuinely heterogeneous data: attribute `Value`s
 (INDEX-DESIGN§1), query ASTs (subscription records, placement-rule parameters) and the ontology
-image (ONTOLOGY-DESIGN§1). It is **positional**:
+records (ONTOLOGY-DESIGN§1). It is **positional**:
 
 - A struct is a CBOR array of its fields in the order its format section pins; no field names
   reach the disk.
@@ -193,7 +193,7 @@ image (ONTOLOGY-DESIGN§1). It is **positional**:
 - Integers use the shortest CBOR form (RFC 8949 §4.2.1 preferred serialisation), so equal
   values always encode to equal bytes.
 
-**Versioning.** Every top-level CBOR record persisted outside the WAL — an ontology image, a
+**Versioning.** Every top-level CBOR record persisted outside the WAL — an ontology record, a
 subscription record, a placement rule — is an array whose element 0 is a `u16` schema version.
 Fields are only ever appended. A reader decodes every version up to its own, supplying each
 field an older version lacks from the default its format section documents; a version newer
@@ -403,7 +403,7 @@ forward index roughly in half (~660 MiB at this scale).
 | Forward index          | ~0.5 GiB  | INDEX-DESIGN§2 — ~50 B per object at 8 direct assertions/object (24 B head + frame-of-reference term arrays); implied tags are not stored. Includes any `unix-path` and other path-projection attributes (UNIX-DESIGN§1) — those are ordinary `Attr` terms. |
 | Postings               | 200–400 MiB | INDEX-DESIGN§3 — roaring containers, one tree entry per (term, 65 536-id window); 5 000 tags |
 | Term dictionary + term table | 0.1–1 GiB | INDEX-DESIGN§4.1 — ~100 B per distinct attribute value; the upper end is one unique value per object |
-| Ontology               | <10 MiB   | One CBOR(OntologyImage) per snapshot — modules + tag definitions + relations + implications (ONTOLOGY-DESIGN§1) |
+| Ontology               | <10 MiB   | One positional CBOR record per tag, rule, constraint and module, snapshot-tagged (ONTOLOGY-DESIGN§1) |
 | Subscriptions          | ~700 KiB  | Per 1 000 subs with packed `sub_id`                |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
 | Snapshot key overhead  | ~80 MiB   | Per-snapshot divergent keys across the 8 snapshot-aware btrees (see breakdown below) |

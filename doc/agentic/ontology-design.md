@@ -1,88 +1,181 @@
 # Ontology — design
 
-Scope: `crates/ontology` (`OntologyState`, `ImplicationDag`, `Materializer`, module loader), tag registration in `crates/engine`, `mimir ontology` commands.
+Scope: `crates/ontology` (ontology state, closure tables, rule engine, module compiler and loader), tag registration in `crates/engine`, `mimir ontology` commands.
 Governing spec: SPECIFICATION-DESIGN§3 (ontology layer, storage policy resolution), SPECIFICATION-DESIGN§4 (modules), ONTOLOGY-DESIGN§1.
 
 Plan: [ontology-implementation-plan.md](ontology-implementation-plan.md) · Open decisions: [ontology-decisions.md](ontology-decisions.md) · Completed: [ontology-completed.md](ontology-completed.md) · Order: [operations-plan.md](operations-plan.md)
 
 ## Goal
 
-The ontology is the single authority over tag identity, semantics, implications and storage policy, installed through modules and persisted as one image per snapshot.
+The ontology is the single authority over tag identity, attribute keys, derivation rules, constraints and storage policy. It changes record by record — one tag is cheap to create — agrees across nodes by stable ids, and is the only source of every derived posting (INDEX-DESIGN§2.4).
 
 ## Selected design
 
-- **Single image per snapshot.** The ontology is rarely updated, fully loaded at mount and rewritten at checkpoint, so it persists as one CBOR `OntologyImage` sorted-run entry per snapshot in a `BtreeKind::Ontology` region, referenced directly by `RootPointer.ontology_root` (ONTOLOGY-DESIGN§1).
-- **One tag-id allocator.** The ontology's `IdAllocator` is the only source of `TagId`s; every tag, including ones created ad hoc from the CLI, enters through `OntologyState::install`.
-- `next_tag_id` is derived at boot from the loaded ontology.
+- **Two identities per tag.** `TagUid` (128 bits) is stable everywhere — sync, modules and exports name tags by it. `TagId` (`u32`) is the dense local id, used as the tag's `TermId` (INDEX-DESIGN§1.2) and never reused.
+- **Two kinds of concept.** *Labels* (plain tags) and *attribute keys* with a value type. Any label or attribute value can be a *collection* — grouping, ordered or ranked — by its declaration's collection flavour. Prefix-named tag families (`playlist:workout`) are attribute values (`playlist = workout`).
+- **Derivation rules produce every derived term:** `Implies` (tag → tag), `ValueImplies` (attribute value → tag), `Bucket` (attribute value → coarse value). Attribute keys may also be declared *hierarchical* (values are trie paths with adaptive roll-up postings, INDEX-DESIGN§4.2) and *n-grammed* (substring search over distinct values, INDEX-DESIGN§4.2). Derived terms are never stored per object.
+- **Constraints with defined write semantics.** `Exclusive { tags }` keeps at most one of its tags on an object — asserting one removes the others in the same mutation. `Requires(a, b)` rejects asserting `a` on an object lacking `b`. Aliases map extra names to one tag.
+- **Provenance per declaration.** Every tag, rule and constraint records the set of modules that declare it. Install adds a module to those sets, removal takes it out, and a declaration with an empty set is removed under the scrub policy. Ad-hoc tags are declared by the pool's `local` module.
+- **Per-record persistence.** Tags, rules and modules are records in one snapshot-aware `BtreeKind::Ontology` tree (ONTOLOGY-DESIGN§1). Creating a tag writes one record; all records are loaded at mount, with name maps and closure tables built in memory. Closure tables are rebuilt only when rules change.
+- **Changes are journaled record operations** (`OntologyPut`, `OntologyDelete`), applied with their posting rework in one commit and shipped to peers by uid.
+- **Module sources stay on the host.** Module files (TOML) are compiled on the host into the ontology's record form; a device installs compiled modules and never parses module source.
 - Storage errors surface as storage errors, never as CBOR errors.
+
+## Tags and attribute keys
+
+**Identity.** A tag's `TagUid` is fixed when it is declared:
+
+- a module's tag: the first 128 bits of `BLAKE3("mimir-tag" ‖ module_id ‖ 0x00 ‖ name)`, so every node and every reinstall of the module derives the same uid;
+- an ad-hoc tag (the `local` module): 128 random bits.
+
+Its `TagId` is allocated locally from 1 upward and never reused: the counter is derived at boot as one past the largest `TagId` key in the ontology tree, which keeps a high-water tag record when the tag with the largest id is removed (ONTOLOGY-DESIGN§1).
+
+**Names.** Every tag has a canonical name and any number of aliases. A name resolves to a tag when it is unique among installed tags; when two modules declare the same name (`album` from music and from photos), each is reachable by its qualified name (`systems.metta.music:album`) and the bare name is ambiguous — an error that names both. Modules reference other modules' tags by qualified name, and the core ontology's names resolve unqualified when no other module claims them.
+
+**Kinds.**
+
+| Kind | Declares | Example |
+|---|---|---|
+| Label | a plain tag | `favorite`, `source`, `flac` |
+| Attribute key | a tag used as the key of `Attr(key, value)`, with a value type (`text`, `int`, `float`, `timestamp`, `blob`) | `artist`, `year`, `unix-path` |
+
+**Collection flavour** — on a label or an attribute key:
+
+| Flavour | Meaning |
+|---|---|
+| plain | membership only |
+| grouping | the label, or each value of the key, is a named group usable as a scope (`Value::Scoped`, INDEX-DESIGN§1.3) |
+| ordered | each group keeps a user-defined order (INDEX-DESIGN§3.3) |
+| ranked | each group keeps members ordered by a score (INDEX-DESIGN§3.3) |
+
+`playlist` is an attribute key with the ordered flavour: `playlist = workout` is the workout playlist, a term with postings and a sequence. `unix-path-context` is an attribute key with the grouping flavour (ordered when a manifest order matters).
+
+**Attribute key options:**
+
+- `hierarchy = "/"` — values are paths, stored as a trie of components with adaptive roll-up postings (INDEX-DESIGN§1.2, INDEX-DESIGN§4.2). `location`, `unix-path`.
+- `ngram = 3` — `Contains` over the key's values uses n-gram postings over distinct values (INDEX-DESIGN§4.2). Opt-in per key, meant for name-like keys.
+
+**Storage policy** attaches to a tag and resolves per object over its derived closure (SPECIFICATION-DESIGN§3.5).
+
+## Rules and constraints
+
+| Rule | Derives | Example |
+|---|---|---|
+| `Implies { from, to }` | tag `to` for every object carrying tag `from` | `flac → audio → media` |
+| `ValueImplies { key, value, to }` | tag `to` for every object with `Attr(key, value)` | `mime = audio/flac → flac`; `extension = rs → lang-rust` |
+| `Bucket { key, out_key, granularity }` | `Attr(out_key, bucket(value))` | `created_ns → created-year = 2026`, `created-month = 2026-11`; `size → size-class = 1-10MiB` |
+
+- Rules form a DAG over tags (an install that would close a cycle through `Implies` and `ValueImplies` fails).
+- An object's **derived terms** are the closure of its direct terms under the rules (INDEX-DESIGN§2.4); they appear in postings and never in forward entries.
+- **Modelling rule for formats and categories.** Format facts come from rules over attributes (`mime`, `extension` → `flac` → `audio`); categories (`music`, `work`, `favorite`) are asserted directly by users and applications, or implied from other categories. `mp3` files are all `audio`; whether one is `music` is an assertion, not a derivation.
+- Import's path and extension conventions (UNIX-DESIGN "Import") are `ValueImplies` rules in the core ontology, not code.
+
+| Constraint | On a write that would violate it |
+|---|---|
+| `Exclusive { tags }` | asserting one tag of the set removes the others from the object in the same mutation; the result reports what was removed |
+| `Requires { tag, needs }` | asserting `tag` on an object that does not carry `needs` (directly or derived) fails with a defined error |
+
+Constraints are checked against the object's derived closure after the mutation.
 
 ## Modules
 
-Module management is package management applied to schemas: one app needs some tags to exist with given semantics, another app needs some of the same tags plus its own, and removing an app cleans up what it brought without destroying what others share.
+Module management is package management applied to schemas: one app needs some tags, keys and rules to exist, another needs some of the same plus its own, and removing an app cleans up what it brought without destroying what others share.
 
-- **Tags are global; definitions are owned.** A tag name exists once in the ontology. The module that first registered it owns its definition; any module may contribute implications and relations that mention it.
-- **Install bookkeeping.** Each installed module keeps a `ModuleRecord` (`crates/ontology/src/state.rs`): id, version, name, and the tags, implications and relations it added. Removal and upgrade work from these records; tags another installed module also registered survive the removal of one of them.
-- **Module ids** are reverse-domain names (`systems.metta.music`, `com.djapp.mixing`). The layering of core and application modules is SPECIFICATION-DESIGN§4.3.
-- **Distribution channels.** Built in (the core ontology), bundled with an app, user-created (`mimir ontology install ./my-tags.toml`). A community repository with install-by-id is future work.
-- **Module syntax.** The loader (`OntologyModule::from_toml`) reads `[module]` (`id`, `version`, `name`), `[[tags]]` (`name`, `semantics`, `value_type`, `element_constraint`, `storage`), `[[implications]]` (`from`, `to`) and `[[relations]]` (`from`, `kind` = `mutex` | `requires` | `alias`, `to`). Unknown keys such as a tag `description` are accepted and not stored. Relation predicates (`derived-from`, `links`) are ordinary tags used as `Assertion::Relation { predicate, target }` (SPECIFICATION-DESIGN§2.2); they declare `label` semantics.
+- **Module identity.** A reverse-domain id (`systems.metta.music`) and a `module_uid` derived from it as for tags; a version; a name. The layering of core and application modules is SPECIFICATION-DESIGN§4.3.
+- **Compilation.** A module source file is compiled on the host into the ontology's record form (ONTOLOGY-DESIGN§1): tag, rule and constraint records with uids resolved, plus a module record carrying the compiled form's BLAKE3 digest. Installing a compiled module needs no source parser, so devices install modules prepared by the host.
+- **Module record.** `installers` (the applications that installed it; it stays while any remain) and `core` (a core module cannot be removed).
+- **Distribution channels.** Built in (the core ontology), bundled with an app, user-created (`mimir ontology install ./my-tags.toml`).
+
+**Source syntax** (TOML; ONTOLOGY-D2 may replace the surface syntax):
+
+```toml
+[module]
+id = "systems.metta.music"
+version = "2.1.0"
+name = "Music Ontology"
+
+[[tags]]
+name = "artist"
+kind = "attribute"
+value_type = "text"
+ngram = 3
+
+[[tags]]
+name = "playlist"
+kind = "attribute"
+value_type = "text"
+collection = "ordered"
+
+[[tags]]
+name = "flac"                                # kind defaults to "label"
+aliases = ["free-lossless-audio"]
+
+[[rules]]
+kind = "implies"
+from = "flac"
+to = "systems.metta.core:audio"
+
+[[rules]]
+kind = "value-implies"
+key = "systems.metta.core:mime"
+value = "audio/flac"
+to = "flac"
+
+[[constraints]]
+kind = "requires"
+tag = "bpm"
+needs = "systems.metta.core:audio"
+```
 
 ### Install
 
-Install is all-or-nothing: `OntologyState::install` snapshots the state and restores it on any error. In order:
+Install is all-or-nothing and runs as one commit:
 
-1. **Duplicate module** — reinstalling an installed id fails (`ModuleAlreadyInstalled`); upgrade is a separate operation.
-2. **Tag conflicts** — a tag name that already exists with compatible semantics is shared (counted in `tags_skipped`); one with incompatible semantics fails the install, naming both modules and both semantics. ([ONTOLOGY5](ontology-implementation-plan.md))
-3. **Implications** — added by name; an edge that would close a cycle fails the install (`ImplicationDag::add_implication`).
-4. **Relations** — `mutex`, `requires` and `alias` edges by name; unknown names fail the install.
-5. **Storage-policy chain invariant** — SPECIFICATION-DESIGN§3.5.
-6. **Rematerialisation** — every new implication `A → B` adds `B` and `B`'s ancestors to each object tagged `A` ([ONTOLOGY6](ontology-implementation-plan.md)).
-
-**Rematerialisation** is a postings operation per new edge: `postings(B) |= postings(A)`, repeated for each ancestor of `B` (INDEX-DESIGN§2.4). Forward entries are untouched, since they hold direct tags only. Adding `flac → audio` with 100 000 `flac` objects is one container-wise OR per target tag.
+1. **Duplicate module** — installing an installed `module_uid` adds the installer to its record and changes nothing else; a different version is an upgrade.
+2. **References** — every qualified name the module uses must resolve to an installed tag; an unresolved reference fails the install.
+3. **Cycles** — rules that would close an `Implies` / `ValueImplies` cycle fail the install.
+4. **Storage-policy chain invariant** — SPECIFICATION-DESIGN§3.5.
+5. **Records** — tag, rule and constraint records are put with the module added to their provenance; new tags get `TagId`s.
+6. **Derived postings** — every new rule's derived terms are posted (INDEX-DESIGN§2.4) in the same commit.
+7. **Constraints on existing data** — objects already violating a new `Exclusive` or `Requires` are reported, not changed.
 
 ### Upgrade
 
-An upgrade diffs the installed module against the new version (SPECIFICATION-DESIGN§4.5):
+An upgrade diffs the installed module's compiled form against the new one (SPECIFICATION-DESIGN§4.5); tags keep their uids across versions because a uid depends only on module id and name:
 
 | Change | Handling |
 |---|---|
-| Add tag, add implication, add relation | Applied; new implications rematerialise. |
-| Remove implication | Applied; de-materialises the implied tag where no other source remains. |
-| Remove tag with no objects | Applied. |
-| Remove tag that objects carry | Blocked; the report lists the tag and its object count. Proceeds only with `--force`. |
-| Change tag semantics or attribute value type | Blocked; the report carries a migration plan (tag, old semantics, new semantics). Proceeds only with `--force`. |
-
-Blocked-change reporting and `--force` are [ONTOLOGY8](ontology-implementation-plan.md).
-
-**De-materialisation.** When `A → B` disappears, an object loses `B` (and whatever of `B`'s ancestors it no longer reaches) only if nothing else still provides it. The algorithm is INDEX-DESIGN§2.4's "Removing `a → b`": the objects of `postings(A)` not covered by any other descendant of `B` are the only suspects, and each suspect's forward entry says whether `B` is direct. An object tagged both `flac` and `mp3` keeps `audio` after `flac → audio` is removed, because `mp3 → audio` still holds. The same step runs for each implication a removed module contributed ([ONTOLOGY7](ontology-implementation-plan.md)).
+| Add tag, rule or constraint | Applied; new rules post their derived terms. |
+| Remove a rule | Applied; terms it alone derived are withdrawn (INDEX-DESIGN§2.4, "Removing a rule"). |
+| Remove a tag no object carries | Applied. |
+| Remove a tag that objects carry | Blocked; the report lists the tag and its object count. Proceeds only with `--force`. |
+| Change a tag's kind, value type or collection flavour | Blocked; the report carries a migration plan. Proceeds only with `--force`. |
+| Rename a tag | A rename is a new tag; the module declares the old name as an alias to keep it resolvable. |
 
 ### Removal and scrub policies
 
-Removing a module drops its definitions, implications and relations; what happens to the tags on objects is the scrub policy (SPECIFICATION-DESIGN§4.6):
+Removing a module removes it from the provenance of everything it declared; declarations whose provenance becomes empty are removed, and what happens to their tags on objects is the scrub policy (SPECIFICATION-DESIGN§4.6):
 
-- **Preserve** (default) — the module's tags stay on objects and stay queryable as *orphaned tags*: tags with no module owning their definition. They can be adopted into another module ([ONTOLOGY3](ontology-implementation-plan.md)).
-- **RemoveUnique** — tags no other installed module registered are removed from every object and from the ontology; shared tags stay.
-- **Purge** — every tag the module registered is removed from every object and from the ontology.
+- **Preserve** (default) — tags stay on objects and stay queryable as *orphaned tags*: tags with empty provenance. They can be adopted into another module, which adds that module to their provenance ([ONTOLOGY3](ontology-implementation-plan.md)).
+- **RemoveUnique** — tags whose provenance becomes empty are removed from every object and from the ontology; tags another module also declares stay.
+- **Purge** — every tag the module declares is removed from every object and from the ontology.
 
-Every policy de-materialises the module's implications ([ONTOLOGY9](ontology-implementation-plan.md)).
-
-Orphans as the CLI presents them:
+Rules whose provenance becomes empty are removed under every policy, withdrawing the terms they alone derived.
 
 ```text
 $ mimir ontology orphans
   bpm          (was: com.djapp.mixing 1.0.0)
   cue-point    (was: com.djapp.mixing 1.0.0)
-  energy-level (was: com.djapp.mixing 1.0.0)
   These tags still have data on 12,450 objects.
 
 $ mimir ontology adopt bpm --into systems.metta.music
-Adopted tag 'bpm' into module 'systems.metta.music'.
 ```
 
 Core principle: **data outlives apps.** Removing an app removes the schema, not the data, unless the user asks for it.
 
 ### Cluster propagation
 
-Ontology changes travel inside a `SyncBundle` as its `ontology_delta`, next to the ops of the same snapshot range ([cluster-design.md](cluster-design.md)). A receiving node applies the delta before the bundle's tag ops, so an op never names a tag the receiver lacks. The delta's shape is [ONTOLOGY-D7](ontology-decisions.md); concurrent ontology edits on different nodes are part of [CLUSTER-D2](cluster-decisions.md).
+Ontology changes are journal entries (`OntologyPut`, `OntologyDelete`; JOURNAL-DESIGN§1.3) naming tags, rules and modules by uid. Sync ships them in HLC order inside a `SyncBundle`, ahead of the bundle's other ops ([cluster-design.md](cluster-design.md)); a receiver resolves uids to its local `TagId`s, allocating ids for tags new to it, and reworks its postings in the same commit. Concurrent edits to the same declaration on different nodes merge by union of provenance, with scalar fields ordered last-writer-wins by HLC. A constraint arriving by sync is checked like a newly installed one: existing violators are reported, not changed (Install step 7).
 
 ### CLI
 
@@ -90,13 +183,16 @@ Commands: `mimir ontology list | install <file> | remove <module> | orphans | sh
 
 ### Rejected alternatives
 
-- **Storing module TOML inside the pool** (`/system/ontology/modules/<id>.toml`) as the installed form. The ontology image (ONTOLOGY-DESIGN§1) is the only installed form; TOML is parsed at install time and never read again.
-- **A composed-ontology view with per-tag `defined_in` / `implications_from` / `used_by_modules` sets.** Install bookkeeping is per module (`ModuleRecord`); per-tag views derive from it.
-- **`[[mutex_groups]]` and `[[constraints]]` tables.** Mutual exclusion and prerequisites are `TagRelation` edges declared in `[[relations]]` (`kind = "mutex"`, `kind = "requires"`); a mutex group of n tags is its pairwise edges.
-- **A `relation` tag semantics.** Relation predicates are label tags; relations are assertions, not a kind of tag.
-- **Implications from attribute values** (`lang:rust → source`). Implications connect tags, not attribute values.
-- **A per-op `OntologyUpdate` sync op, with tag ops for unknown tags buffered until it arrives.** The ontology delta travels in the same bundle as the ops that depend on it.
-- **An `auto-evict` placement rule** (delete or evict after n unused days). Placement has no eviction rule; ageing between tiers is `PlacementRule::AutoTier`.
+- **One ontology image per snapshot**, rewritten whole on every change. Ad-hoc tags make changes frequent; records make each change one entry.
+- **Node-local `TagId`s as the sync identity.** Two nodes allocate ids independently; uids name tags across nodes.
+- **Prefix-named tag families** (`playlist:workout`, `unix-path-context:rpi4`) as a tag kind beside attributes. An attribute value is already a term with postings; the collection flavour gives it group semantics.
+- **A `Hierarchical` tag kind materialising every path prefix.** Hierarchy is a key option with trie storage and adaptive roll-ups (INDEX-DESIGN§4.2).
+- **Per-object n-gram postings.** N-grams index distinct values (INDEX-DESIGN§4.2).
+- **Install bookkeeping lists per module** (tags, implications, relations it added). Provenance sets per declaration replace them.
+- **Pairwise `mutex` relations without write semantics.** `Exclusive` groups define what a write does.
+- **Storing module source inside the pool** as the installed form. Sources compile on the host; the pool holds records.
+- **A per-op ontology update with tag ops buffered until it arrives.** Ontology ops travel in the same bundle, ahead of the ops that use them.
+- **An `auto-evict` placement rule.** Placement has no eviction rule; ageing between tiers is `PlacementRule::AutoTier`.
 
 ## Example module: software development
 
@@ -104,13 +200,13 @@ Source trees are a good test of the ontology: files have roles, dependencies, bu
 
 **Project identity**
 
-| Tag | Semantics | Meaning |
+| Tag | Kind | Meaning |
 |---|---|---|
-| `project` | attribute (text) | Project the file belongs to: `project=vesper` |
-| `component` | attribute (text) | Crate or package within the project: `component=kernel` |
-| `workspace` | grouping | Multi-project workspace: `workspace=metta-systems` |
+| `project` | attribute (text, grouping) | Project the file belongs to: `project = vesper` |
+| `component` | attribute (text, grouping) | Crate or package within the project: `component = kernel` |
+| `workspace` | attribute (text, grouping) | Multi-project workspace: `workspace = metta-systems` |
 
-**File role** (all `label`)
+**File role** (labels)
 
 | Tag | Implies | Meaning |
 |---|---|---|
@@ -125,43 +221,31 @@ Source trees are a good test of the ontology: files have roles, dependencies, bu
 | `object`, `library`, `executable`, `bundle` | `generated` | `.o`/`.rlib`; linked library; final binary; tarball/`.img`/`.deb` |
 | `codegen`, `doc-output`, `test-result`, `intermediate` | `generated` | Generated sources; rendered docs; test logs and coverage; dep-info, incremental caches, stamps |
 
-**Language and toolchain:** `lang` (attribute, text: `rust`, `c`, `asm`, `toml`), `toolchain` (attribute, text: `nightly-2024-01-15`, `gcc-13.2`).
+**Language and toolchain:** `lang` (attribute, text, set by import from the file extension), `toolchain` (attribute, text). A `ValueImplies { lang = rust → source }` rule makes every Rust file `source` without a per-file tag.
 
 **Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `debug-info`, `lto`, `stripped` (labels).
 
-**Lifecycle** (labels): `dirty` (source changed since the build), `stale` (superseded build), `current`, `released` (published), `pinned` (kept by clean-up).
+**Lifecycle** (labels): `dirty`, `stale`, `current` (an `Exclusive` set — marking an artifact `stale` removes `current`), `released`, `pinned`.
 
 **Derivation** (relation predicates, label tags): `derived-from` (artifact → its inputs), `links` (artifact → library), `depends-on` (source → source), `bundles` (package → contents).
 
-Mutual exclusion and prerequisites, in module syntax:
+Constraints, in module syntax:
 
 ```toml
-[[relations]]
-from = "dirty"
-kind = "mutex"
-to = "current"
+[[constraints]]
+kind = "exclusive"
+tags = ["dirty", "current", "stale"]
 
-[[relations]]
-from = "dirty"
-kind = "mutex"
-to = "stale"
-
-[[relations]]
-from = "current"
-kind = "mutex"
-to = "stale"
-
-[[relations]]
-from = "debug-info"
-kind = "mutex"
-to = "stripped"
+[[constraints]]
+kind = "exclusive"
+tags = ["debug-info", "stripped"]
 
 # profile, target, opt-level, lto, derived-from, links, dirty, stale and current
 # each require "generated":
-[[relations]]
-from = "profile"
+[[constraints]]
 kind = "requires"
-to = "generated"
+tag = "profile"
+needs = "generated"
 ```
 
 **A tagged build** (Vesper kernel for Raspberry Pi 4):
@@ -197,9 +281,9 @@ vesper-0.1.0-rpi4.img   project=vesper                                bundle cur
 | Users of a library | `links` relation reversed from `libhal.rlib` |
 | All Rust libraries anywhere | `lang=rust AND library` |
 | Stale-artifact footprint | `generated AND stale`, summing stored size |
-| Recent work | `source AND modified > 7 days ago`, distinct `project` |
+| Recent work | `source AND modified-week = <this week>` (a `Bucket` rule over `modified_ns`), distinct `project` |
 
-**Build integration.** After compiling, a build hook tags the output (`object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and moves the previous `current` object of the same component to `stale`. Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
+**Build integration.** After compiling, a build hook tags the output (`object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and marks the previous `current` object of the same component `stale` (the `Exclusive` set removes its `current`). Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
 
 **Placement.** The same tags drive `PlacementRule`s (SPECIFICATION-DESIGN§8.3): `Pin { source AND NOT vendored, Hot }` and `Replicate { source AND NOT vendored, 2 }`; `Pin { intermediate OR object, Hot }`; `Replicate { bundle AND released, 3 }` with `Prefer { bundle AND released, Warm }`; `Prefer { vendored, Cold }`.
 
@@ -209,66 +293,57 @@ The numbered sections below are the normative on-disk and algorithmic specificat
 
 ## 1. Ontology persistence
 
-The ontology — modules, tag definitions (with semantics, value type, `implies`, storage policy),
-and tag-to-tag relations (`MutuallyExclusive`, `Requires`, `Alias`) — is **fully loaded into
-memory at mount** and rewritten as a single coherent image whenever it changes. Updates are
-rare (module install, schema bump, relation edit) and inherently batch-shaped: one update
-typically touches multiple tags and implications at once. The on-disk form is therefore
-optimised for **batch rewrite** (minimise blocks COW'd per update) and **compact serialised
-size**, not for per-element disk-resident lookup.
-
-`RootPointer.ontology_root` (ENGINE-DESIGN§1.2) points directly at a single BTREE-DESIGN§1 region — no 4 KiB envelope
-block. The region is the `BtreeKind::Ontology` tree (FORMAT-DESIGN§1.3); each sorted-run entry is one
-**ontology image** keyed by `snapshot: u32`:
+The ontology is a set of **records** in one BTREE-DESIGN§1 tree of `BtreeKind::Ontology`, rooted at
+`RootPointer.ontology_root` (ENGINE-DESIGN§1.2), keyed through the packed-key codec by
 
 ```
-ontology_root → BTREE-DESIGN§1 region, BtreeKind::Ontology
-  key   = snapshot: u32
-  value = CBOR(OntologyImage)        // optionally zstd-compressed; SORTED_RUN_FLAG_PACKED_KEYS
-                                     // packs the snapshot field to ~0 bits when one snapshot
-                                     // dominates a sorted run.
+(record_kind: u8, a: u64, b: u64, snapshot: u32)
 ```
 
-Snapshot semantics piggyback on BTREE-DESIGN§1's per-snapshot sorted-run mechanics (SNAPSHOTS-DESIGN§1.2): installing a
-new ontology version under a new snapshot id appends one new entry; older snapshots continue
-to see the prior image. Compaction folds away images for snapshots that are no longer
-referenced.
+| `record_kind` | `a`, `b` | Value |
+|---|---|---|
+| `0` tag | `a` = `TagId`, `b` = 0 | `TagRecord` |
+| `1` rule or constraint | `a` = rule id, `b` = 0 | `RuleRecord` |
+| `2` module | `a`, `b` = high and low 64 bits of `module_uid` | `ModuleRecord` |
 
-`OntologyImage` is positional CBOR (FORMAT-DESIGN§1.6): an array of the fields below in this
-order, element 0 being its schema version; nested structs and enums are positional too.
+Values are positional, versioned CBOR (FORMAT-DESIGN§1.6), schema version 1:
 
 ```text
-OntologyImage {
-  format_version: u16,                          // schema version (FORMAT-DESIGN§1.6)
-  modules:        Vec<ModuleRecord>,            // install bookkeeping (id, version, name,
-                                                //   installed_tags, installed_implications, …)
-  tags:           Vec<TagDefinition>,           // id, name, semantics (incl. value_type and
-                                                //   OrderedCollection.element_constraint),
-                                                //   implies: Vec<TagId>,
-                                                //   storage: Option<StoragePolicy>
-  relations:      Vec<TagRelationEdge>,         // (src: TagId, kind: TagRelation, dst: TagId)
-                                                //   covers MutuallyExclusive / Requires / Alias.
-                                                //   ImpliedBy lives inline in TagDefinition.implies.
-}
+TagRecord    = [version, uid: bytes(16), name: text, aliases: [text],
+                kind: uint,              // 0 label, 1 attribute key, 0xFF high-water marker
+                value_type: uint,        // attribute keys: 0 text, 1 int, 2 float, 3 timestamp, 4 blob
+                collection: uint,        // 0 plain, 1 grouping, 2 ordered, 3 ranked
+                hierarchy_sep: uint,     // attribute keys: separator code point, 0 = not hierarchical
+                ngram: uint,             // attribute keys: n-gram length, 0 = none
+                storage: StoragePolicy / null,
+                provenance: [bytes(16)]] // module uids declaring the tag
+
+RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)]]
+    kind 0 Implies       params = [from: TagId, to: TagId]
+    kind 1 ValueImplies  params = [key: TagId, value: Value, to: TagId]
+    kind 2 Bucket        params = [key: TagId, out_key: TagId, granularity: uint]
+    kind 3 Exclusive     params = [tags: [TagId]]
+    kind 4 Requires      params = [tag: TagId, needs: TagId]
+
+ModuleRecord = [version, uid: bytes(16), id: text, module_version: text, name: text,
+                installers: [text], core: bool, digest: bytes(32)]
 ```
 
-The image is the single source of truth on disk. The mount path decodes it once and rebuilds
-all in-memory accelerators (`HashMap<TagId, TagDefinition>`, `HashMap<String, TagId>`, the
-implication adjacency list, the materialised closure) — none of those are persisted, since
-they are deterministic functions of the image. There is no separate `tag_names` tree, no
-fixed-byte `TagDefRecord`, no separate DAG region: all are absorbed into the CBOR image.
+`TagId`s and rule ids inside records are local; a record's uids are what leaves the node.
 
-Modules ship as TOML, but their **on-disk** form is CBOR — the parser converts TOML → struct →
-CBOR at install time. TOML is never seen by the read path.
-
-**Update path.** A change rewrites the whole image (typically single-digit MiB CBOR; compresses
-well). Cost is one sorted-run append plus one root-pointer commit — 2 blocks COW'd per update,
-independent of how many tags/implications/relations the update touched. The size budget is
-absorbed by BTREE-DESIGN§1 compaction, not by per-key COW.
-
-**Why no envelope block.** An envelope block between the root pointer and the region would
-hold only module, tag and implication counts and sub-tree pointers. With one tree and a
-memory-loaded image, the counts are derivable in O(1) from the loaded image and the single
-`ontology_root` slot in `RootPointer` reaches the tree directly. Going without an envelope
-saves one `BlockKind`, one COW step per update, and one freshness/CRC surface.
-
+- **Tag ids.** `TagId`s are allocated from 1 and never reused. The counter is derived at boot as
+  one past the largest tag key. When the tag holding the largest `TagId` is removed, its record is
+  replaced by a high-water marker (`kind = 0xFF`, no name, no provenance) so the counter cannot fall
+  back; a marker is removed once a larger key exists. Rule ids follow the same rule.
+- **Granularity codes** for `Bucket`: 0 year, 1 month, 2 week, 3 day, 4 hour for timestamps;
+  for integers, `16 + k` means power-of-two classes of width 2ᵏ.
+- **Mount.** Every record is loaded; the engine builds the name maps (canonical names, aliases,
+  qualified names), the uid ↔ `TagId` maps and the closure tables (INDEX-DESIGN§2.4). The tree is
+  a few MiB even at 100 000 tags.
+- **Updates.** Each change is an `OntologyPut` or `OntologyDelete` journal entry
+  (JOURNAL-DESIGN§1.3) carrying the record key and value; a module install is a batch of them in
+  one commit. A `rules_epoch` counter in memory advances when a rule or constraint record
+  changes; only then are closure tables rebuilt and postings reworked, in the same commit
+  (INDEX-DESIGN§2.4). Creating or renaming a tag touches one record and no postings.
+- **Snapshots.** Keys carry the snapshot id (SNAPSHOTS-DESIGN§1.2), so a snapshot sees the
+  ontology as it was; reads of a snapshot build closure tables from that snapshot's records.

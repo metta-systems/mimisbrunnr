@@ -10,7 +10,7 @@ Mímisbrunnr is the associative filesystem of the Mettā operating system. Once 
 
 1. **Retrieval is associative.** A caller obtains an `ObjectId` set by submitting a `Query` over assertions (`Tag`, `Attr`, `Relation`, `IsA`). No path is supplied and none exists.
 2. **Metadata is answerable locally.** The metadata plane (tag bitmaps, forward index, ontology, object table) is replicated to every participating node. Once converged, a query needs no network round-trip and its latency does not grow with cluster size. Bytes cross the wire only for convergence traffic and when an application opens a blob the node does not hold.
-3. **Storage policy follows ontology.** Direct assertions combine with ontology rules into materialized assertions; placement, tier, compression and encryption follow from rules over the resulting set. One tagging operation re-classifies an object; no separate relocation call exists.
+3. **Storage policy follows ontology.** Direct assertions combine with ontology rules into derived terms; placement, tier, compression and encryption follow from rules over the resulting set. One tagging operation re-classifies an object; no separate relocation call exists.
 
 ### Role
 
@@ -29,7 +29,7 @@ Mímisbrunnr is the associative filesystem of the Mettā operating system. Once 
 
 **In scope:**
 
-- Object lifecycle: create, tag, untag, set attributes and relations, materialized implications, tombstone deletion.
+- Object lifecycle: create, tag, untag, set attributes and relations, derived terms from ontology rules, ontology constraints, tombstone deletion.
 - Query evaluation: bitmap algebra over `HasTag`, `HasAttr`, `Related`, `And` / `Or` / `Not`, `IsA`; faceted exploration; optional `snapshot_id`.
 - Pool management: multiple block devices, attach and detach, zone layout, ontology-driven placement and tiering.
 - Metadata replication with eventual convergence, each node authoritative for its own writes.
@@ -82,10 +82,10 @@ Workspace-level evidence (`just test`, `just clippy`) backs every claim: a regre
 | Term | Meaning |
 |---|---|
 | Object | An entity in a pool, identified by an `ObjectId` (16-bit node id, 48-bit local sequence). It has no intrinsic name or path and carries a bag of assertions. |
-| Assertion | A statement about an object: `Tag` (the object is X), `Attr` (key K has value V) or `Relation` (predicate P targets object T); either direct (set by a caller) or materialized (added by ontology implication). |
-| Tag | Membership in a category, keyed by `TagId`. The `u32` `TagId` space is shared by tags, attribute keys and relation predicates. |
+| Assertion | A statement about an object: `Tag` (the object is X), `Attr` (key K has value V) or `Relation` (predicate P targets object T); either direct (set by a caller) or derived (added by an ontology rule; held in postings only). |
+| Tag | A label, attribute key or relation predicate, named across nodes by its 128-bit `TagUid` and locally by its `u32` `TagId`. |
 | Query | A predicate over assertions evaluated by bitmap algebra (`HasTag`, `HasAttr` with comparisons, `Related`, `And` / `Or` / `Not`, `IsA`), resolving to an ObjectId set. |
-| Ontology | The tag definitions and implication rules of a pool; it determines materialized assertions and the placement, tier, compression and encryption of matching objects. |
+| Ontology | The tags, rules and constraints of a pool, installed as modules; it determines derived terms and the placement, tier, compression and encryption of matching objects. |
 | Pool | One or more block devices formed by `brunnr create`, holding superblock, WAL, metadata zones and blob zones. A Mímir instance operates on exactly one pool. |
 
 ## Workspace

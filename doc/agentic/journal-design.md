@@ -298,6 +298,15 @@ ReclaimTerms     : { high_water: u64, term_ids: [u64; N] }               // WalO
                    //   high_water ≠ 0 writes a high-water marker at that TermId; it is
                    //   0 when the largest term stays live. Any existing marker below the
                    //   new largest key is removed in the same entry.
+
+// Ontology (ONTOLOGY-DESIGN§1)
+OntologyPut      : { record_kind: u8, a: u64, b: u64, record: bytes }     // WalOpKind 35
+                   // Inserts or replaces one ontology record (TagRecord, RuleRecord or
+                   //   ModuleRecord, positional CBOR). A rule or constraint record advances
+                   //   rules_epoch; the postings it changes follow in the same commit.
+OntologyDelete   : { record_kind: u8, a: u64, b: u64 }                    // WalOpKind 36
+                   // Removes one ontology record; removing the tag with the largest TagId
+                   //   puts a high-water marker in the same commit.
 ```
 
 Replay applies entries strictly in LSN order. Each in-memory mutation is idempotent under
