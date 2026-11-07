@@ -254,10 +254,12 @@ struct RemoteLocator {                       // content_kind = Remote
 - **Inline** — objects of at most 40 bytes: the locator holds the bytes themselves,
   `length = stored_length ≤ 40`, `compression = None`, `replica_count = 0`. Such an object
   uses no blob space, packed slot or backpointer, is read with its record and replicates with
-  the record leaf. Its bytes are protected as the record is (SPECIFICATION-DESIGN§9.3).
+  the record leaf. Its bytes are protected as the record is (SPECIFICATION-DESIGN§9.3), so an
+  object whose resolved storage policy sets an encryption mode of its own (SPECIFICATION-DESIGN§3.5)
+  is never stored inline; it takes a packed slot or an extent, encrypted as its policy says.
 - **Remote** — no local replica; reads go to `origin_node` or a peer holding it.
 
-A write of at most 40 bytes stores `Inline`; a rewrite that grows past 40 bytes moves the
+A write of at most 40 bytes stores `Inline` unless its policy sets an encryption mode; a rewrite that grows past 40 bytes moves the
 object to `Packed` or `Extent`, and one that shrinks to 40 bytes or less moves it back,
 freeing what the old locator named. A stream (`state = Writing`) starts as `None`, becomes `Extent` with its first extent and
 `ExtentList` with its second; `length` is the durable prefix (JOURNAL-DESIGN§1.8).
