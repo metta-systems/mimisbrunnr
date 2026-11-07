@@ -34,7 +34,6 @@ Steps 1–7 replace the prototype's shortcuts with the specified binary formats 
 Each fixes a layout that later steps write; decide them first.
 
 - [OPERATIONS-D4](operations-decisions.md) — checksum algorithm.
-- [INDEX-D4](index-decisions.md) — materialized terms in forward entries.
 - [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md), [BTREE-D3](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes, aligned values in sorted runs.
 - [ALLOCATION-D1](allocation-decisions.md) — sub-bucket regions.
 - [ENGINE-D1](engine-decisions.md) — oplog persistence.
@@ -59,7 +58,7 @@ Independent of each other unless an order is given.
 The term dictionary, postings and forward index replace every index structure, so they land before the tree machinery that writes them (INDEX-DESIGN).
 
 1. [INDEX12](index-implementation-plan.md) — term dictionary, term table and interning (after INDEX9).
-2. [INDEX13](index-implementation-plan.md) — postings containers (after BTREE-D3); [INDEX14](index-implementation-plan.md) — forward index by `TermId` (after INDEX-D4).
+2. [INDEX13](index-implementation-plan.md) — postings containers (after BTREE-D3); then [INDEX14](index-implementation-plan.md) — forward index by `TermId`, direct terms only.
 3. [INDEX15](index-implementation-plan.md) — sequences; [INDEX16](index-implementation-plan.md) — queries, faceting, FUSE and watch over containers.
 
 ### 4. Live tree machinery

@@ -37,7 +37,7 @@ Install is all-or-nothing: `OntologyState::install` snapshots the state and rest
 5. **Storage-policy chain invariant** — SPECIFICATION-DESIGN§3.5.
 6. **Rematerialisation** — every new implication `A → B` adds `B` and `B`'s ancestors to each object tagged `A` ([ONTOLOGY6](ontology-implementation-plan.md)).
 
-**Rematerialisation** is a bitmap operation per new edge: `bitmap(B) |= bitmap(A)`, repeated for each ancestor of `B`, plus a `TagOrigin::Materialized` forward-index assertion on each affected object. Adding `flac → audio` with 100 000 `flac` objects is one bitmap OR per target tag.
+**Rematerialisation** is a postings operation per new edge: `postings(B) |= postings(A)`, repeated for each ancestor of `B` (INDEX-DESIGN§2.4). Forward entries are untouched, since they hold direct tags only. Adding `flac → audio` with 100 000 `flac` objects is one container-wise OR per target tag.
 
 ### Upgrade
 
@@ -53,16 +53,7 @@ An upgrade diffs the installed module against the new version (SPECIFICATION-DES
 
 Blocked-change reporting and `--force` are [ONTOLOGY8](ontology-implementation-plan.md).
 
-**De-materialisation.** When `A → B` disappears, an object loses `B` only if nothing else still provides it:
-
-```text
-other_sources = ⋃ bitmap(X) for every X ≠ A that implies B
-              ∪ objects carrying B with TagOrigin::Direct
-to_remove     = bitmap(A) − other_sources
-bitmap(B)    −= to_remove        // and drop the Materialized assertion from each forward entry
-```
-
-An object tagged both `flac` and `mp3` keeps `audio` after `flac → audio` is removed, because `mp3 → audio` still holds. This is why the forward index records `TagOrigin` per assertion (SPECIFICATION-DESIGN§2.2). The same step runs for each implication a removed module contributed ([ONTOLOGY7](ontology-implementation-plan.md)).
+**De-materialisation.** When `A → B` disappears, an object loses `B` (and whatever of `B`'s ancestors it no longer reaches) only if nothing else still provides it. The algorithm is INDEX-DESIGN§2.4's "Removing `a → b`": the objects of `postings(A)` not covered by any other descendant of `B` are the only suspects, and each suspect's forward entry says whether `B` is direct. An object tagged both `flac` and `mp3` keeps `audio` after `flac → audio` is removed, because `mp3 → audio` still holds. The same step runs for each implication a removed module contributed ([ONTOLOGY7](ontology-implementation-plan.md)).
 
 ### Removal and scrub policies
 

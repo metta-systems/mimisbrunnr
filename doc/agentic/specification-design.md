@@ -111,14 +111,7 @@ enum Value {
 
 Multi-valued attributes are natural — an object can have multiple assertions with the same key. A music track in two playlists simply has two `playlist` attributes.
 
-The forward index distinguishes **direct** assertions (user/app explicitly set) from **materialized** assertions (added automatically by the ontology's implication engine):
-
-```rust
-enum TagOrigin {
-    Direct,        // user/app explicitly tagged this object
-    Materialized,  // added by implication engine
-}
-```
+An object's **direct** assertions are the ones a user or application set; its **materialized** tags are the ones the ontology's implications add. The forward index stores direct assertions only; materialized tags are the closure of the direct tags under the ontology, recomputed when needed, and appear in tag postings so queries never expand implications (§3.3, INDEX-DESIGN§2.4).
 
 ### 2.3 Query Algebra
 
@@ -458,7 +451,7 @@ Tags whose semantics are `OrderedCollection` keep membership in postings like an
 
 ### 5.5 Forward index
 
-Object → the `TermId`s it asserts, each marked Direct or Materialized. Used for listing an object's tags and attributes, deletion cleanup, sync, and distinguishing direct from materialized tags. Term ids are stored as frame-of-reference arrays: about 64 bytes for an object with a dozen tags (INDEX-DESIGN§2).
+Object → the `TermId`s it asserts directly. Used for listing an object's tags and attributes, deletion cleanup and sync; implied tags are derived from the direct ones through closure tables built from the ontology at mount. Term ids are stored as frame-of-reference arrays: about 56 bytes for an object with a dozen tags, however many tags those imply (INDEX-DESIGN§2).
 
 ### 5.6 Faceted Exploration
 
@@ -1539,7 +1532,7 @@ graph TB
         TagIndex["Postings<br/><i>(TermId, id window) → roaring container<br/>tags, attribute values, relations</i>"]
         KVIndex["Term Dictionary<br/><i>(kind, key, context, normalised value) → TermId, stats<br/>equality, range and prefix scans</i>"]
         RangeIndex["Sequences<br/><i>(TermId, position | score) → ObjectId<br/>ordered and ranked collections</i>"]
-        ForwardIndex["Forward Index<br/><i>ObjectId → TermIds + origin<br/>for getattr / tag listing</i>"]
+        ForwardIndex["Forward Index<br/><i>ObjectId → direct TermIds<br/>for getattr / tag listing</i>"]
     end
 
     Executor --> TagIndex

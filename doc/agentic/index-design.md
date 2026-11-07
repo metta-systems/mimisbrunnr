@@ -31,7 +31,7 @@ Every assertion an object makes is a **term**; the index is an inverted index ov
 ## Invariants
 
 - Every posting of a term is in exactly one place: its dictionary entry's inline list or the postings tree, never both.
-- Postings and forward lists agree: an object is in a term's postings iff the term is in the object's forward list (for the same snapshot).
+- Postings and forward lists agree: at each snapshot, an object is in a term's postings iff the term is in the object's forward list or is a tag implied by its direct tags under that snapshot's ontology (INDEX-DESIGN§2.4).
 - A term's `TermId` is never reused, and two dictionary entries never denote the same term.
 - Posting ids are full `ObjectId`s (16-bit node, 48-bit local).
 
@@ -115,15 +115,16 @@ used as scopes.
 
 ## 2. Forward index
 
-The forward index maps each object to the `TermId`s it asserts. It answers "everything about
-object X" (projection, inspection) and drives cleanup on deletion (METADATA-DESIGN "Object
-deletion"), which must undo exactly the postings the object is in.
+The forward index maps each object to the `TermId`s it asserts **directly**. It answers
+"everything about object X" (projection, inspection) and drives cleanup on deletion
+(METADATA-DESIGN "Object deletion"). Implied tags are never stored per object: they are the
+closure of the direct tags under the ontology (INDEX-DESIGN§2.4).
 
 ### 2.1 Entry layout
 
 A BTREE-DESIGN§1 tree of `BtreeKind::Forward`, keyed by `(oid: u64, snapshot: u32)` through the
 packed-key codec (BTREE-DESIGN§1.6), with `VARINT` value sizes. Each value is a `ForwardEntry`:
-the object's terms in ascending `TermId` order, split into tag terms (`< 2³²`) and other terms,
+the object's direct terms in ascending `TermId` order, split into tag terms (`< 2³²`) and other terms,
 each run stored as a frame of reference — a base plus fixed-width offsets — so the arrays are
 aligned, binary-searchable in place and compact.
 
@@ -143,8 +144,6 @@ struct ForwardHead {                         // 24 bytes
 // followed by, each zero-padded to a multiple of 8 bytes:
 //   tag_offsets:   [u{8·tag_width};   tag_count]     TermId = tag_base + offset
 //   other_offsets: [u{8·other_width}; other_count]   TermId = other_base + offset
-//   origin:        [u8; ⌈(tag_count + other_count) / 8⌉]
-//                  bit i set = term i (tags first, then others) is Materialized
 
 const FORWARD_FLAG_OVERFLOW:  u8 = 1 << 0;   // arrays live in a ForwardOverflow chain
 const FORWARD_FLAG_WHITEOUT:  u8 = 1 << 7;   // snapshot whiteout (SNAPSHOTS-DESIGN§1.3)
@@ -152,11 +151,7 @@ const FORWARD_FLAG_WHITEOUT:  u8 = 1 << 7;   // snapshot whiteout (SNAPSHOTS-DES
 
 Each width is the smallest of the allowed widths that holds `max − base` for its run. A typical
 object with 12 tags (ids within a few thousand of each other) and 3 attributes costs
-24 + 24 (12 × u16, padded) + 8 (3 × u16, padded) + 8 (origin) = **64 bytes**.
-
-`Materialized` terms are the ontology's implications (ONTOLOGY-DESIGN, SPECIFICATION-DESIGN§3.3);
-`Direct` terms were asserted by a caller. The origin bit lets de-materialisation and deletion
-cleanup tell them apart.
+24 + 24 (12 × u16) + 8 (3 × u16, padded) = **56 bytes**, however many tags those 12 imply.
 
 ### 2.2 Overflow
 
@@ -185,6 +180,55 @@ is a format error.
 - **Lookup** is one tree descent; listing an object's values goes through the term table
   (INDEX-DESIGN§4.1) for each non-tag term.
 - **Diffing** for sync streams sorted runs newer than the peer's watermark (SNAPSHOTS-DESIGN§1.2).
+
+### 2.4 Implied tags
+
+Implications connect tags only (SPECIFICATION-DESIGN§3.3), so attribute and relation terms are
+always direct; only tags have implied members.
+
+**Invariant.** Under the ontology image of snapshot *S* (ONTOLOGY-DESIGN§1), an object is in
+`postings(t)` at *S* exactly when `t` is one of its direct tags or `t ∈ closure(direct tags)`.
+Postings hold direct and implied members alike, so `HasTag` and `IsA` remain single posting
+reads.
+
+**Closure tables.** At mount, and whenever an ontology image is installed, the engine builds from
+the implication DAG, for every tag `t`:
+
+- `ancestors[t]` — every tag `t` implies, transitively, as an ascending `u32` array;
+- `descendants[t]` — every tag that implies `t`, likewise.
+
+They are derived state, never persisted (about 2 MB each at 100 000 tags with an average depth of
+5). `closure(D) = D ∪ ⋃_{d ∈ D} ancestors[d]` merges a handful of short sorted arrays. An
+implementation may cache closures by the hash of the direct tag set, since many objects share one.
+
+**Maintenance:**
+
+| Change | Postings work |
+|---|---|
+| Add direct tag `a` | add the object to `postings(t)` for each `t ∈ {a} ∪ ancestors[a]` it is not yet in |
+| Remove direct tag `a` | `before = closure(D)`, `after = closure(D − {a})`; remove the object from `postings(t)` for each `t ∈ before − after` |
+| Delete the object | remove it from `postings(t)` for each `t ∈ closure(D)` |
+| New implication `a → b` | for each `t ∈ {b} ∪ ancestors[b]`: `postings(t) |= postings(a)` |
+| Removed implication `a → b` | see below |
+
+**Removing `a → b`**, with the new ontology's tables:
+
+```text
+keep     = ⋃ postings(d)  for every d ∈ descendants_new[b]     // still reach b another way
+suspects = postings(a) − keep
+for each object o in suspects:
+    if b ∉ direct(o):                                            // one forward-entry read
+        for each t ∈ closure_old(direct(o)) − closure_new(direct(o)):
+            remove o from postings(t)
+```
+
+`keep` is sound because any object holding some `d` with `d → … → b` reaches `b` from its direct
+tags. Forward entries are read only for `suspects` — the objects that may lose tags, whose
+postings change anyway — so the work is proportional to the change, not to `postings(a)`.
+
+Ontology changes rework postings in the same commit that installs the new image (ONTOLOGY-DESIGN
+"Install", "Upgrade"), so the invariant holds at every committed root. Reads of an older snapshot
+use that snapshot's image and tables.
 
 ---
 
@@ -477,7 +521,7 @@ per object:
 | Structure | Estimate |
 |---|---|
 | Postings | 150–400 MB for direct tags (2 B per id in arrays, ~1.25 B in dense bitmaps, far less in runs); × (1 + k) when each tag implies k ancestors |
-| Forward | ~55–90 B per object → ~0.6–0.9 GB |
+| Forward | direct terms only: ~40–70 B per object → ~0.4–0.7 GB, independent of implications |
 | Dictionary + term table | ~10 M attribute terms × ~100 B (key, entry with inline posting, term record) → ~1 GB; tags negligible |
 
 Roughly 100–250 B per object in all. These are estimates from the layouts above and assumed tag

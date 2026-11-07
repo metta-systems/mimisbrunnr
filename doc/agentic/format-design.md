@@ -402,7 +402,7 @@ forward index roughly in half (~660 MiB at this scale).
 | Object table (radix)   | < 1 MiB   | Single inner node (depth 1 total)                  |
 | Location table         | ~460 MiB  | Positional — no key packing; 1 839 leaves × 256 KiB |
 | Backpointers           | ~267 MiB  | METADATA-DESIGN§2.2 — 10 M extents × ~28 B packed                 |
-| Forward index          | ~0.6 GiB  | INDEX-DESIGN§2 — ~64 B per object at 8 assertions/object (24 B head + frame-of-reference term arrays + origin bits). Includes any `unix-path` and other path-projection attributes (UNIX-DESIGN§1) — those are ordinary `Attr` terms. |
+| Forward index          | ~0.5 GiB  | INDEX-DESIGN§2 — ~50 B per object at 8 direct assertions/object (24 B head + frame-of-reference term arrays); implied tags are not stored. Includes any `unix-path` and other path-projection attributes (UNIX-DESIGN§1) — those are ordinary `Attr` terms. |
 | Postings               | 200–400 MiB | INDEX-DESIGN§3 — roaring containers, one tree entry per (term, 65 536-id window); 5 000 tags |
 | Term dictionary + term table | 0.1–1 GiB | INDEX-DESIGN§4.1 — ~100 B per distinct attribute value; the upper end is one unique value per object |
 | Ontology               | <10 MiB   | One CBOR(OntologyImage) per snapshot — modules + tag definitions + relations + implications (ONTOLOGY-DESIGN§1) |

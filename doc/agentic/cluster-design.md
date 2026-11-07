@@ -16,6 +16,7 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, and co
 - Snapshot diffs are the unit of sync; sync waits for [snapshots-design.md](snapshots-design.md).
 - Ordering across nodes uses `HybridTimestamp` (SPECIFICATION-DESIGN§10.4).
 - ObjectIds carry the writing node's `NodeId` in their top 16 bits.
+- **Only direct assertions are synced.** Implied tags are derived on each node from the synced ontology (INDEX-DESIGN§2.4), so peers never exchange them and cannot disagree about them.
 - **`TermId`s stay on their node.** Each pool numbers its attribute and relation terms itself (INDEX-DESIGN§1.2). Sync payloads name terms by value — a tag id, or an attribute key and `Value` — never by `TermId`; a receiver interns them into its own dictionary.
 
 ## Format specification
