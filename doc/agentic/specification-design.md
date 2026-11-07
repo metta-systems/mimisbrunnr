@@ -183,7 +183,7 @@ enum Rule {
     ValueImplies { key: TagId, value: Value, to: TagId },   // mime = audio/flac → "flac"
     Bucket { key: TagId, out_key: TagId, granularity: Granularity },
                                                             // created → created-month = 2026-11
-    Exclusive { tags: Vec<TagId> },          // asserting one removes the others: current / stale
+    Exclusive { tags: Vec<TagId> },          // at most one per object: current / stale
     Requires { tag: TagId, needs: TagId },   // asserting "lossless" without "audio" fails
 }
 ```

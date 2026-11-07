@@ -14,7 +14,7 @@ The ontology is the single authority over tag identity, attribute keys, derivati
 - **Two identities per tag.** `TagUid` (128 bits) is stable everywhere — sync, modules and exports name tags by it. `TagId` (`u32`) is the dense local id, used as the tag's `TermId` (INDEX-DESIGN§1.2) and never reused.
 - **Two kinds of concept.** *Labels* (plain tags) and *attribute keys* with a value type. Any label or attribute value can be a *collection* — grouping, ordered or ranked — by its declaration's collection flavour. Prefix-named tag families (`playlist:workout`) are attribute values (`playlist = workout`).
 - **Derivation rules produce every derived term:** `Implies` (tag → tag), `ValueImplies` (attribute value → tag), `Bucket` (attribute value → coarse value). Attribute keys may also be declared *hierarchical* (values are trie paths with adaptive roll-up postings, INDEX-DESIGN§4.2) and *n-grammed* (substring search over distinct values, INDEX-DESIGN§4.2). Derived terms are never stored per object.
-- **Constraints with defined write semantics.** `Exclusive { tags }` keeps at most one of its tags on an object — asserting one removes the others in the same mutation. `Requires(a, b)` rejects asserting `a` on an object lacking `b`. Aliases map extra names to one tag.
+- **Constraints with defined write semantics.** `Exclusive { tags }` allows at most one of its tags on an object; what a write asserting a second one does is [ONTOLOGY-D9](ontology-decisions.md). `Requires(a, b)` rejects asserting `a` on an object lacking `b`. Aliases map extra names to one tag.
 - **Provenance per declaration.** Every tag, rule and constraint records the set of modules that declare it. Install adds a module to those sets, removal takes it out, and a declaration with an empty set is removed under the scrub policy. Ad-hoc tags are declared by the pool's `local` module.
 - **Per-record persistence.** Tags, rules and modules are records in one snapshot-aware `BtreeKind::Ontology` tree (ONTOLOGY-DESIGN§1). Creating a tag writes one record; all records are loaded at mount, with name maps and closure tables built in memory. Closure tables are rebuilt only when rules change.
 - **Changes are journaled record operations** (`OntologyPut`, `OntologyDelete`), applied with their posting rework in one commit and shipped to peers by uid.
@@ -72,7 +72,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 
 | Constraint | On a write that would violate it |
 |---|---|
-| `Exclusive { tags }` | asserting one tag of the set removes the others from the object in the same mutation; the result reports what was removed |
+| `Exclusive { tags }` | [ONTOLOGY-D9](ontology-decisions.md) |
 | `Requires { tag, needs }` | asserting `tag` on an object that does not carry `needs` (directly or derived) fails with a defined error |
 
 Constraints are checked against the object's derived closure after the mutation.
@@ -189,7 +189,7 @@ Commands: `mimir ontology list | install <file> | remove <module> | orphans | sh
 - **A `Hierarchical` tag kind materialising every path prefix.** Hierarchy is a key option with trie storage and adaptive roll-ups (INDEX-DESIGN§4.2).
 - **Per-object n-gram postings.** N-grams index distinct values (INDEX-DESIGN§4.2).
 - **Install bookkeeping lists per module** (tags, implications, relations it added). Provenance sets per declaration replace them.
-- **Pairwise `mutex` relations without write semantics.** `Exclusive` groups define what a write does.
+- **Pairwise `mutex` relations without write semantics.** `Exclusive` groups have a defined write behaviour (ONTOLOGY-D9).
 - **Storing module source inside the pool** as the installed form. Sources compile on the host; the pool holds records.
 - **A per-op ontology update with tag ops buffered until it arrives.** Ontology ops travel in the same bundle, ahead of the ops that use them.
 - **An `auto-evict` placement rule.** Placement has no eviction rule; ageing between tiers is `PlacementRule::AutoTier`.
@@ -225,7 +225,7 @@ Source trees are a good test of the ontology: files have roles, dependencies, bu
 
 **Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `debug-info`, `lto`, `stripped` (labels).
 
-**Lifecycle** (labels): `dirty`, `stale`, `current` (an `Exclusive` set — marking an artifact `stale` removes `current`), `released`, `pinned`.
+**Lifecycle** (labels): `dirty`, `stale`, `current` (an `Exclusive` set), `released`, `pinned`.
 
 **Derivation** (relation predicates, label tags): `derived-from` (artifact → its inputs), `links` (artifact → library), `depends-on` (source → source), `bundles` (package → contents).
 
@@ -283,7 +283,7 @@ vesper-0.1.0-rpi4.img   project=vesper                                bundle cur
 | Stale-artifact footprint | `generated AND stale`, summing stored size |
 | Recent work | `source AND modified-week = <this week>` (a `Bucket` rule over `modified_ns`), distinct `project` |
 
-**Build integration.** After compiling, a build hook tags the output (`object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and marks the previous `current` object of the same component `stale` (the `Exclusive` set removes its `current`). Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
+**Build integration.** After compiling, a build hook tags the output (`object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and marks the previous `current` object of the same component `stale` in place of `current`. Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
 
 **Placement.** The same tags drive `PlacementRule`s (SPECIFICATION-DESIGN§8.3): `Pin { source AND NOT vendored, Hot }` and `Replicate { source AND NOT vendored, 2 }`; `Pin { intermediate OR object, Hot }`; `Replicate { bundle AND released, 3 }` with `Prefer { bundle AND released, Warm }`; `Prefer { vendored, Cold }`.
 
