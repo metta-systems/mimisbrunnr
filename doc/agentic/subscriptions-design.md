@@ -118,6 +118,14 @@ and it stops being evaluated. The next `poll` returns the result-set diff (below
 it. A subscriber that never acknowledges costs only its own bounded events; the journal trims
 at its own pace (JOURNAL-DESIGN§1.6).
 
+**Why membership is stored as of the acknowledged cursor.** The stored membership has one
+use: when a subscription overflows and its pending events are dropped, the engine compares the
+current result with what the subscriber last saw and reports the difference. That comparison
+needs the membership as of the last `ack`, so `ack` is the only thing that updates it. Nothing
+else reads it — matching a mutation is decided against the object's own terms, and the current
+result is the query over postings — so keeping it current would only add a container rewrite
+per membership-changing event.
+
 ## Offline catch-up
 
 A returning consumer polls like any other ([SUBSCRIPTION6](subscriptions-implementation-plan.md)):
@@ -162,6 +170,7 @@ Commands: `mimir watch register <name> <query> | list | drain <name> | unsubscri
 - **Persisting subscriptions at fixed offsets with the match bitmap in a separate area.** Subscriptions are per-record B+ tree entries (SUBSCRIPTIONS-DESIGN§1).
 - **Replaying the journal for each subscriber** (membership at the cursor, events re-derived from journal history on restart). A subscriber that does not acknowledge would hold the shared journal back for every subscriber, on the fastest tier, and order would depend on the pool's journal cap rather than the subscriber's own bound.
 - **Membership at the head with a diff on every restart.** Every restart or buffer overflow would lose order.
+- **Stored membership kept current with every mutation**, rewound by the pending events when a subscription overflows. It costs a container rewrite per membership-changing event and gives nothing the acknowledged-cursor membership lacks: matching is decided against each object's own terms, and the current result is the query over postings.
 
 ## Format specification
 

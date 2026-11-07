@@ -558,6 +558,18 @@ engine depends on retained history: subscriptions keep their own pending events
 (SUBSCRIPTIONS-DESIGN "Delivery") and never hold the trim point, and cluster sync reads snapshot
 diffs, never the journal (CLUSTER-DESIGN).
 
+**Why none by default.** With nothing in the engine reading history, retained buckets would only
+occupy journal space on the fastest tier; with none retained, a journal bucket is reused as soon
+as checkpoints and pins allow, which keeps the journal small and, on an SD card, avoids keeping
+and rewriting data no one reads. The two places that mention retained history work without it:
+
+- term reclamation (INDEX-DESIGN§1.2) frees only terms older than the oldest retained entry;
+  with no retention that point is the trim point;
+- mutation history for tools (debugging, audit) exists only when a pool sets a cap.
+
+A non-zero default (a few MiB, or a day) would let such tools read recent mutations at the cost
+of holding journal buckets longer.
+
 ### 1.7 Mirroring
 
 When several hot-tier disks carry journal buckets, each commit writes the same jset — same
