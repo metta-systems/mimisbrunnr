@@ -38,6 +38,7 @@ compose naturally because each extent is evaluated independently.
 | Replica count below `Replicate { min_replicas }` rule | Re-replicate to additional disks         |
 | Object on wrong tier vs. `Pin` / `Prefer` rule    | Migrate via the move path                    |
 | Compression / encryption inconsistent with ontology | Rewrite with correct transform pipeline    |
+| `Inline` object whose resolved policy now sets an encryption mode (METADATA-DESIGN§1.2) | Move the content out of the record, encrypted as the policy says |
 | ChunkList head's `ChunkParamsRecord` ≠ resolved policy (INDEX-DESIGN§4.3, SPECIFICATION-DESIGN§3.5) | Re-chunk with new params via `WorkKind::OptionUpdate` |
 | `AutoTier` access-time threshold crossed          | Migrate Hot → Warm → Cold → Glacier          |
 | Bucket fragmentation > copygc threshold           | Run copy GC (ALLOCATION-DESIGN§1.6)                          |

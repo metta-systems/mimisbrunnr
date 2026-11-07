@@ -257,6 +257,12 @@ struct RemoteLocator {                       // content_kind = Remote
   the record leaf. Its bytes are protected as the record is (SPECIFICATION-DESIGN§9.3), so an
   object whose resolved storage policy sets an encryption mode of its own (SPECIFICATION-DESIGN§3.5)
   is never stored inline; it takes a packed slot or an extent, encrypted as its policy says.
+  When an inline object's resolved policy gains an encryption mode, the content moves out:
+  - an assertion change on the object (a tag whose policy sets encryption, directly or derived)
+    moves it in the same commit as the assertion;
+  - an ontology or placement-rule change that gives existing objects an encryption mode moves
+    them through reconcile (RECONCILE-DESIGN§1.1), in the commit that installs the change for
+    objects found then, and by scan for the rest.
 - **Remote** — no local replica; reads go to `origin_node` or a peer holding it.
 
 A write of at most 40 bytes stores `Inline` unless its policy sets an encryption mode; a rewrite that grows past 40 bytes moves the
