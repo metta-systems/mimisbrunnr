@@ -11,7 +11,7 @@ One fixed-size record per object says what the object is and where its content l
 
 ## Selected design
 
-- **One record per object, content location included.** `ObjectRecord` (128 B) holds state, lengths, content hash, timestamps, the transform applied and a 40-byte **content locator** whose shape depends on how the content is stored: one extent with its replicas, an extent list, a chunk list, a packed small-object slot, or a remote origin (METADATA-DESIGN§1.2). There is no separate location table: a read is one record lookup, a flush rewrites one tree, and a snapshot has one sidecar.
+- **One record per object, content location included.** `ObjectRecord` (128 B) holds state, lengths, content hash, timestamps, the transform applied and a 40-byte **content locator** whose shape depends on how the content is stored: one extent with its replicas, an extent list, a chunk list, a packed small-object slot, the content itself when it is at most 40 bytes, or a remote origin (METADATA-DESIGN§1.2). There is no separate location table: a read is one record lookup, a flush rewrites one tree, and a snapshot has one sidecar.
 - **No assertions in the record.** An object's tags, attributes and relations live only in its forward entry (INDEX-DESIGN§2); the record carries no tag ids, counts or overflow chains.
 - **One radix per origin node.** `ObjectId`s carry the creating node in their top 16 bits and every node holds every object's metadata, so records are kept in one radix tree per origin node, indexed by the id's local part. The `ObjectRoots` tree maps a `NodeId` to that radix's root, depth and id high-water (METADATA-DESIGN§1.4). Each node's ids are sequential, so each radix stays dense.
 - **Radix shape.** Leaf: `BtreeNodeHeader` + 256 B occupancy bitmap + 32 B trailer + 2 044 × 128 B records. Inner node: `BtreeNodeHeader` + 16 380 × `BlockRef`; an empty child has generation 0. `slot = local % 2044`, `child[level] = (local / 2044) % 16 380`.
@@ -36,7 +36,7 @@ An `ObjectId` is referenced from every posting list the object is in, the forwar
 
 Deletion walks `ObjectRecord.state` (`ObjectState`, discriminants pinned: `Active = 0`, `Tombstoned = 1`, `BlobReclaim = 2`, `Cleared = 3`, and `Writing = 4` for a stream not yet closed (JOURNAL-DESIGN§1.8), which deletion treats like `Active`) through the four phases of SPECIFICATION-DESIGN§7.1:
 
-1. **Tombstone.** `state = Tombstoned`, `modified_ns` = deletion time; the `DeleteObject` WAL entry and oplog op are written and subscribers get `Deleted`. The object is invisible to queries from here on. O(1).
+1. **Tombstone.** `state = Tombstoned`, `state_ns` = deletion time; the `DeleteObject` WAL entry and oplog op are written and subscribers get `Deleted`. The object is invisible to queries from here on. O(1).
 2. **Index cleanup.** The forward entry and the ontology's closure tables give exactly what to undo, so cost is O(terms on the object), not O(terms in the pool): the object leaves the postings of every term in its forward entry and of every term those derive (one container each, INDEX-DESIGN§2.4, INDEX-DESIGN§3.1) and, for ordered or ranked collections, their sequences (INDEX-DESIGN§3.3); each term's dictionary statistics are updated; then the forward entry goes. Twenty terms are about 2 µs, so the work is not parallelised.
 3. **Blob reclaim**, once every peer has seen the deletion (step 4's watermark condition): `state = BlobReclaim`; the extents, extent-list regions or packed slot the locator names are freed through the allocator (ALLOCATION-DESIGN§1), a chunked blob's chunk references are decremented and chunks reaching zero are freed (INDEX-DESIGN§4.3), and the locator is cleared. Waiting protects a peer still hydrating the blob, and freeing in the same commit that clears the locator keeps a crash from leaving a committed locator that points at freed space.
 4. **Tombstone expiry**, when every peer's sync watermark is past the deletion and the minimum grace period has elapsed (SPECIFICATION-DESIGN§7.2): `state = Cleared` and the rest of the record is zeroed. The id is not reused; a leaf left holding only cleared records is dropped (METADATA-DESIGN§1).
@@ -72,7 +72,7 @@ Deleting a tag is cheaper than deleting objects: its posting list is the member 
 - **A separate location table** beside the object table, indexed by the same id. It doubled descents, flushes and snapshot sidecars for no independent access pattern, and its one-extent, sector-granular record could not describe multi-extent, packed or remote content.
 - **One radix indexed by the local id alone.** Objects from different origin nodes with the same local id collide.
 - **A `generation` field for id reuse.** Ids are never reused.
-- **A `Deleted { deleted_at, tombstone_expires }` state variant.** The state is the pinned `u8` discriminant; the deletion time is `modified_ns`, and expiry is computed, not stored.
+- **A `Deleted { deleted_at, tombstone_expires }` state variant.** The state is the pinned `u8` discriminant; the deletion time is `state_ns`, and expiry is computed, not stored.
 - **Offline object-table compaction that remaps ids**, with every posting, forward entry, sequence, relation and chunk reference rewritten and a cluster-wide epoch bump. Ids are never remapped; cleared leaves are dropped instead.
 - **Generation-tagged references (`ObjectRef { id, generation }`) in sync ops and collection sequences.** Without id reuse a bare `ObjectId` is unambiguous.
 
@@ -189,11 +189,18 @@ struct ObjectRecord {                        // 128 bytes
     stored_length: u64,                      //  [16..24]   bytes on disk after transforms, one replica
     content_hash: [u8; 32],                  //  [24..56]   BLAKE3 of plaintext; zero while Writing
     created_ns: i64,                         //  [56..64]
-    modified_ns: i64,                        //  [64..72]   last content or state change (METADATA-D5)
-    _reserved: [u8; 16],                     //  [72..88]   zero
+    modified_ns: i64,                        //  [64..72]   last payload change (content written,
+                                             //             extended or replaced)
+    state_ns: i64,                           //  [72..80]   last ObjectState change (tombstone time)
+    _reserved: [u8; 8],                      //  [80..88]   zero
     locator: [u8; 40],                       //  [88..128]  ContentLocator, by content_kind
 }
 ```
+
+**Timestamps.** `modified_ns` is the payload's change time, like a Unix mtime: only content
+writes move it. Changes to the object's description — tags, attributes, relations — are timed
+with the terms themselves, in its forward entry's `modified_ns` (INDEX-DESIGN§2.1), so tagging
+never dirties the record. A Unix ctime is the later of the two (and of `state_ns`).
 
 `record_version` is `1`. A reader decodes every record version since the format was declared
 stable and upgrades a record when it next rewrites its leaf; `BtreeNodeHeader.format_version`
@@ -213,8 +220,8 @@ enum ContentKind {
     ExtentList = 2,   // several extents, listed in an extent-list region (METADATA-DESIGN§1.3)
     ChunkList  = 3,   // FastCDC chunks (INDEX-DESIGN§4.3)
     Packed     = 4,   // a slot in a small-object bucket (BLOB-D4)
+    Inline     = 5,   // the content itself, at most 40 bytes, in the locator
     Remote     = 6,   // content held by other nodes only (CLUSTER-D3)
-    // 5 reserved (METADATA-D4)
 }
 
 #[repr(C)]
@@ -244,9 +251,15 @@ struct RemoteLocator {                       // content_kind = Remote
   chunks are content-addressed and replicated by chunk-level placement, not by `replica_count`.
 - **Packed** — the object's bytes are one slot of a small-object block; the locator's layout is
   set by BLOB-D4 and names up to 40 bytes of slot address across its replicas.
+- **Inline** — objects of at most 40 bytes: the locator holds the bytes themselves,
+  `length = stored_length ≤ 40`, `compression = None`, `replica_count = 0`. Such an object
+  uses no blob space, packed slot or backpointer, is read with its record and replicates with
+  the record leaf. Its bytes are protected as the record is (SPECIFICATION-DESIGN§9.3).
 - **Remote** — no local replica; reads go to `origin_node` or a peer holding it.
 
-A stream (`state = Writing`) starts as `None`, becomes `Extent` with its first extent and
+A write of at most 40 bytes stores `Inline`; a rewrite that grows past 40 bytes moves the
+object to `Packed` or `Extent`, and one that shrinks to 40 bytes or less moves it back,
+freeing what the old locator named. A stream (`state = Writing`) starts as `None`, becomes `Extent` with its first extent and
 `ExtentList` with its second; `length` is the durable prefix (JOURNAL-DESIGN§1.8).
 
 ### 1.3 Extent lists

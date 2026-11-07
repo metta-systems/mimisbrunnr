@@ -149,7 +149,7 @@ aligned, binary-searchable in place and compact.
 
 ```rust
 #[repr(C)]
-struct ForwardHead {                         // 24 bytes
+struct ForwardHead {                         // 32 bytes
     tag_count:   u16,                        //  [0..2]   tag terms
     other_count: u16,                        //  [2..4]   attribute and relation terms
     tag_width:   u8,                         //  [4..5]   bytes per tag offset: 1, 2 or 4
@@ -159,6 +159,7 @@ struct ForwardHead {                         // 24 bytes
     tag_base:    u32,                        //  [8..12]  smallest tag TermId
     _pad1:       u32,                        // [12..16]
     other_base:  u64,                        // [16..24]  smallest other TermId
+    modified_ns: i64,                        // [24..32]  last change to the object's direct terms
 }
 // followed by, each zero-padded to a multiple of 8 bytes:
 //   tag_offsets:   [u{8·tag_width};   tag_count]     TermId = tag_base + offset
@@ -170,7 +171,12 @@ const FORWARD_FLAG_WHITEOUT:  u8 = 1 << 7;   // snapshot whiteout (SNAPSHOTS-DES
 
 Each width is the smallest of the allowed widths that holds `max − base` for its run. A typical
 object with 12 tags (ids within a few thousand of each other) and 3 attributes costs
-24 + 24 (12 × u16) + 8 (3 × u16, padded) = **56 bytes**, however many tags those 12 imply.
+32 + 24 (12 × u16) + 8 (3 × u16, padded) = **64 bytes**, however many tags those 12 imply.
+
+`modified_ns` is the time of the last mutation that changed the entry — a tag, attribute or
+relation added or removed — and is written with it. It times the object's description, while
+`ObjectRecord.modified_ns` times its payload (METADATA-DESIGN§1.1). Derived terms changing
+through a rule change do not move it: they are not part of the entry.
 
 ### 2.2 Overflow
 

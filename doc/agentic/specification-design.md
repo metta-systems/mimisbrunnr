@@ -443,7 +443,7 @@ Values of ordered and ranked attribute keys (`playlist = "workout"`) keep member
 
 ### 5.5 Forward index
 
-Object → the `TermId`s it asserts directly. Used for listing an object's tags and attributes, deletion cleanup and sync; implied tags are derived from the direct ones through closure tables built from the ontology at mount. Term ids are stored as frame-of-reference arrays: about 56 bytes for an object with a dozen tags, however many tags those imply (INDEX-DESIGN§2).
+Object → the `TermId`s it asserts directly. Used for listing an object's tags and attributes, deletion cleanup and sync; implied tags are derived from the direct ones through closure tables built from the ontology at mount. Term ids are stored as frame-of-reference arrays: about 64 bytes for an object with a dozen tags, however many tags those imply (INDEX-DESIGN§2).
 
 ### 5.6 Faceted Exploration
 
@@ -520,13 +520,14 @@ struct ObjectRecord {                   // 128 bytes
     stored_length: u64,                 //  [16..24]  bytes on disk, one replica
     content_hash: [u8; 32],             //  [24..56]  BLAKE3 of plaintext
     created_ns: i64,                    //  [56..64]
-    modified_ns: i64,                   //  [64..72]  last content or state change
-    _reserved: [u8; 16],                //  [72..88]
+    modified_ns: i64,                   //  [64..72]  last payload change (mtime)
+    state_ns: i64,                      //  [72..80]  last state change (tombstone time)
+    _reserved: [u8; 8],                 //  [80..88]
     locator: [u8; 40],                  //  [88..128] content locator (§6.3)
 }
 ```
 
-`record_version` lets a production pool upgrade records one leaf at a time as they are rewritten (FORMAT-DESIGN§15).
+`record_version` lets a production pool upgrade records one leaf at a time as they are rewritten (FORMAT-DESIGN§15). `modified_ns` times the payload only; changes to the object's tags, attributes and relations are timed in its forward entry (§5.5).
 
 ### 6.3 Content Location
 
@@ -538,6 +539,7 @@ The record's 40-byte **content locator** says where the content is; `content_kin
 | `ExtentList` | replicas of an extent-list region (METADATA-DESIGN§1.3) | large non-chunked objects, streams |
 | `ChunkList` | replicas of the head `ChunkList` region (§9.6) | chunked objects; chunks replicate independently |
 | `Packed` | a slot in a small-object block | tiny objects (JOURNAL-DESIGN§1.8) |
+| `Inline` | the content itself | objects of at most 40 bytes |
 | `Remote` | the origin node | content held by other nodes only (§10.3) |
 
 ```rust

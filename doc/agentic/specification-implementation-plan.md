@@ -14,7 +14,6 @@ Section numbers in item titles from SPEC3 on are sections of the system design (
 
 ## System design clarity
 
-- [ ] **SPEC3 — §6.2 content locator.** Keep SPECIFICATION-DESIGN§6.2's record summary in step with METADATA-DESIGN§1.1–1.2 once METADATA-D4 and METADATA-D5 resolve.
 - [ ] **SPEC4 — Storage-policy precedence.** Make §8.3 and §9.6 state one precedence order and link each other. Prerequisite: [ONTOLOGY-D5](ontology-decisions.md).
 - [ ] **SPEC5 — Rename §9.** Prerequisite: SPEC-D1.
 - [ ] **SPEC6 — §9.1 `TransformResult`.** State whether it is an in-memory result or an on-disk record, and link its definition.
