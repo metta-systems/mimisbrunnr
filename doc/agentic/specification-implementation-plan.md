@@ -14,7 +14,7 @@ Section numbers in item titles from SPEC3 on are sections of the system design (
 
 ## System design clarity
 
-- [ ] **SPEC3 — §6.2 overflow record layout.** Bring the overflow record layout into SPECIFICATION-DESIGN§6.2 or link METADATA-DESIGN§1.2, which defines it.
+- [ ] **SPEC3 — §6.2 content locator.** Keep SPECIFICATION-DESIGN§6.2's record summary in step with METADATA-DESIGN§1.1–1.2 once METADATA-D4 and METADATA-D5 resolve.
 - [ ] **SPEC4 — Storage-policy precedence.** Make §8.3 and §9.6 state one precedence order and link each other. Prerequisite: [ONTOLOGY-D5](ontology-decisions.md).
 - [ ] **SPEC5 — Rename §9.** Prerequisite: SPEC-D1.
 - [ ] **SPEC6 — §9.1 `TransformResult`.** State whether it is an in-memory result or an on-disk record, and link its definition.
@@ -31,4 +31,4 @@ Section numbers in item titles from SPEC3 on are sections of the system design (
 - [ ] **SPEC17 — §12.3 scoped values.** Expand on `Value::Scoped` and scoped tags.
 - [ ] **SPEC18 — §13.1 derivations.** Clarify derived tags and the `stale` / `dirty` lifecycle tags.
 - [ ] **SPEC19 — §2.1 NodeId uniqueness.** Prerequisite: [CLUSTER-D1](cluster-decisions.md).
-- [ ] **SPEC20 — Bulk deletion and tag counts in §7.5.** Prerequisite: [METADATA-D2](metadata-decisions.md).
+- [ ] **SPEC20 — Bulk deletion in §7.5.** State that deleting a tag changes forward entries, postings and the dictionary only, never object records (METADATA-DESIGN "Deleting a tag").

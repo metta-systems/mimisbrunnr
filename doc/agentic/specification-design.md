@@ -467,8 +467,8 @@ The filesystem operates directly on raw block devices. Each disk is divided into
                       │  3% of usable space (first extent)│
                       ├───────────────────────────────────┤
                       │  Zone 2: METADATA ZONE            │
-                      │  Object records, location table,  │
-                      │  forward index, backpointers      │
+                      │  Object records, forward index,   │
+                      │  backpointers                     │
                       │  2% of usable space (first extent)│
                       ├───────────────────────────────────┤
                       │  Zone 3: BLOB ZONE                │
@@ -489,7 +489,7 @@ The filesystem operates directly on raw block devices. Each disk is divided into
 
 ### 6.2 Object Records
 
-Fixed-size 128-byte records, addressed by `ObjectId.local`. Physically held in a **COW radix tree of 256 KiB large nodes** (BTREE-DESIGN§1, METADATA-DESIGN§1): leaves pack 2044 records each; depth grows with the populated id space (depth 1 covers 33 M objects, depth 3 reaches the full 48-bit local-id space). Lookup is a radix descent ending at `oid_local % 2044` within the resolved leaf — one large-node load per inner level.
+One fixed-size 128-byte record per object says what it is and where its content lives. Records are held in one **COW radix tree of 256 KiB large nodes per origin node** (BTREE-DESIGN§1, METADATA-DESIGN§1), indexed by `ObjectId.local`; a small `ObjectRoots` tree maps each `NodeId` to its radix root and id high-water. Leaves pack 2044 records; depth grows with the node's id space (depth 1 covers 33 M objects, depth 3 the full 48-bit space). Lookup is the node's root entry, then a radix descent ending at `local % 2044`. Leaves whose records are all cleared are dropped. The record holds no tags or attributes — those live only in the forward index (§5.5).
 
 ```rust
 #[repr(u8)]
@@ -507,57 +507,49 @@ enum CompressionState { None = 0, Zstd = 1, Lz4 = 2 }
 #[repr(u8)]
 enum EncryptionState { None = 0, Hctr2Aes128 = 1, XtsAes256 = 2 }
 
-#[repr(C)]
+#[repr(C, align(8))]
 struct ObjectRecord {                   // 128 bytes
-    id: u64,                            // [0..8]
-    generation: u32,                    // [8..12]   for future ID reuse safety
-    state: ObjectState,                 // [12..13]
-    flags: u8,                          // [13..14]  OBJECT_FLAG_HAS_OVERFLOW | OBJECT_FLAG_CHUNKED
-    record_version: u16,                // [14..16]  per-record structural version
-    content_hash: [u8; 32],             // [16..48]  BLAKE3 of plaintext
-    blob_offset: u64,                   // [48..56]
-    blob_length: u64,                   // [56..64]
-    created_ns: i64,                    // [64..72]
-    modified_ns: i64,                   // [72..80]
-    tag_count: u16,                     // [80..82]  object-wide totals
-    attr_count: u16,                    // [82..84]
-    compression: CompressionState,      // [84..85]
-    encryption: EncryptionState,        // [85..86]
-    relation_count: u16,                // [86..88]
-    inline_tags: [u32; 4],              // [88..104] valid iff !(flags & HAS_OVERFLOW)
-    overflow_offset: u64,               // [104..112]
-    stored_size: u64,                   // [112..120]
-    last_modify_lsn: u64,               // [120..128] for snapshot diffing
+    state: ObjectState,                 //   [0..1]
+    flags: u8,                          //   [1..2]
+    content_kind: ContentKind,          //   [2..3]   how `locator` is read (§6.3)
+    replica_count: u8,                  //   [3..4]
+    compression: CompressionState,      //   [4..5]
+    encryption: EncryptionState,        //   [5..6]
+    record_version: u16,                //   [6..8]   layout version of this record
+    length: u64,                        //   [8..16]  plaintext length
+    stored_length: u64,                 //  [16..24]  bytes on disk, one replica
+    content_hash: [u8; 32],             //  [24..56]  BLAKE3 of plaintext
+    created_ns: i64,                    //  [56..64]
+    modified_ns: i64,                   //  [64..72]  last content or state change
+    _reserved: [u8; 16],                //  [72..88]
+    locator: [u8; 40],                  //  [88..128] content locator (§6.3)
 }
 ```
 
-Object-wide totals (`tag_count`, `attr_count`, `relation_count`) live in the record. When `OBJECT_FLAG_HAS_OVERFLOW` is set, `inline_tags` is ignored and **all** tags + attrs + relations live in the overflow chain (a 4 KiB `OverflowRecord` block in the metadata zone, addressed by `overflow_offset`, chained for objects exceeding ~200 assertions). When the flag is clear, `attr_count` and `relation_count` are guaranteed `0` — only the four `inline_tags` slots store anything inline. See METADATA-DESIGN§1.1, METADATA-DESIGN§1.2 for the overflow record layout.
+`record_version` lets a production pool upgrade records one leaf at a time as they are rewritten (FORMAT-DESIGN§15).
 
-### 6.3 Location Table
+### 6.3 Content Location
 
-Maps objects to physical extents. Same COW-radix-tree machinery as the object table (METADATA-DESIGN§2.1), parameterised for 48-byte `ObjectLocation` records — leaves pack 5 440 records each:
+The record's 40-byte **content locator** says where the content is; `content_kind` selects its shape (METADATA-DESIGN§1.2):
+
+| `content_kind` | Locator | Used for |
+|---|---|---|
+| `Extent` | up to 4 `ReplicaRef`s of one extent | objects that fit one bucket |
+| `ExtentList` | replicas of an extent-list region (METADATA-DESIGN§1.3) | large non-chunked objects, streams |
+| `ChunkList` | replicas of the head `ChunkList` region (§9.6) | chunked objects; chunks replicate independently |
+| `Packed` | a slot in a small-object block | tiny objects (JOURNAL-DESIGN§1.8) |
+| `Remote` | the origin node | content held by other nodes only (§10.3) |
 
 ```rust
-#[repr(C, align(8))]
-struct ObjectLocation {         // 48 bytes
-    flags: u8,                  // [0..1]   LOCATION_FLAG_CHUNKED | LOCATION_FLAG_REMOTE_ONLY
-    replica_count: u8,          // [1..2]   1..=4; total physical copies
-    _pad: [u8; 6],              // [2..8]
-    extent_length: u64,         // [8..16]  bytes (chunked: plaintext logical length)
-    replicas: [ReplicaRef; 4],  // [16..48] slots [replica_count..4] are zeroed
-}
-
 #[repr(C)]
-struct ReplicaRef {             // 8 bytes — bucket-relative, mirrors §6.2's BackpointerKey
+struct ReplicaRef {             // 8 bytes — bucket-relative, mirrors BackpointerKey
     disk_id: u16,               // [0..2]
     sector_offset: u16,         // [2..4]   4 KiB sector within bucket
     bucket_no: u32,             // [4..8]   bucket within disk
 }
 ```
 
-**Symmetric replicas.** Every physical copy of an extent lives inline in `replicas[0..replica_count]`; there is no distinguished "primary". `replicas[0]` is the read-preferred copy by convention. The cap of 4 inline replicas bounds the maximum replication factor — workloads needing more durability use erasure coding (a separate code path; see RECONCILE-DESIGN§1).
-
-For chunked objects (`LOCATION_FLAG_CHUNKED`), `replicas[]` describe replicas of the head **`ChunkList` region** (§9.6), not the user data; the chunks themselves are content-addressed and replicated independently via the chunk index. `extent_length` is the plaintext logical length (sum of chunk plaintext lengths).
+**Symmetric replicas.** Every physical copy is one `ReplicaRef`; there is no distinguished "primary". `replicas[0]` is the read-preferred copy by convention. The cap of 4 bounds the replication factor — more durability uses erasure coding (a separate code path; see RECONCILE-DESIGN§1).
 
 A complementary **backpointer table** (`(disk_id, bucket_no, sector_offset) → owning key`) is maintained for copygc, scrub, evacuation, and resilver — turning O(pool size) operations into O(data on affected bucket). See METADATA-DESIGN§2.2.
 
@@ -621,7 +613,7 @@ Delete request
        ▼
 ┌────────────────┐
 │ 3. BLOB        │  Free disk extents (or decrement chunk refs).
-│    RECLAIM     │  Clear location table entry.
+│    RECLAIM     │  Clear the record's content locator.
 └──────┬─────────┘
        │ after tombstone expiry
        ▼
@@ -744,7 +736,7 @@ ontology effective policy → matching `PlacementRule::Chunk` → superblock def
 
 **Disk addition:** Semantic rebalance — archives move to HDD, active projects move to SSD. Unlike ZFS where only new writes go to the new disk.
 
-**Disk removal:** Location table scan (10M objects in ~50ms). Each object migrated to a destination chosen by evaluating placement rules against its tags. Disk enters `Draining` state during removal — reads still served, no new writes.
+**Disk removal:** Backpointer range scan over the disk's buckets, which yields exactly the objects with data on it. Each object migrated to a destination chosen by evaluating placement rules against its tags. Disk enters `Draining` state during removal — reads still served, no new writes.
 
 **Resilver:** Proportional to data on the failed disk, not pool size. Prioritized by surviving replica count. ~20× faster than ZFS resilver for typical configurations.
 
@@ -1323,7 +1315,7 @@ ObjectRecord lookup (disk):              ~50 μs
 ### 14.2 File Open
 
 ```
-Location table → extent:                 ~1 μs (cached)
+Object record → locator → extent:        ~1 μs (cached)
 HCTR2 decrypt (AES-NI):                  ~50 μs/MB
 Zstd decompress:                         ~80 μs/MB
 NVMe sequential read:                    ~200 μs/MB
@@ -1441,10 +1433,10 @@ Index state is currently persisted as CBOR (length-prefixed) in the index zone �
 │  ONTOLOGY     │ │ INDEX LAYER │ │ METADATA      │
 │               │ │ (paged+WAL) │ │ LAYER         │
 │ Module system │ │             │ │               │
-│ Rules and     │ │ Term dict   │ │ Object Table  │
-│ constraints   │ │ Postings    │ │ Location Table│
-│ Closures      │ │ Sequences   │ │               │
-│               │ │ Forward Idx │ │               │
+│ Rules and     │ │ Term dict   │ │ Object roots  │
+│ constraints   │ │ Postings    │ │ Object table  │
+│ Closures      │ │ Sequences   │ │ Extent lists  │
+│               │ │ Forward Idx │ │ Backpointers  │
 └───────┬───────┘ └─────┬───────┘ └────┬──────────┘
         │               │              │
 ┌───────▼───────────────▼──────────────▼───────────────────────────┐
@@ -1460,8 +1452,8 @@ Index state is currently persisted as CBOR (length-prefixed) in the index zone �
 │   Tag queries → ideal tier → migration planner → allocator       │
 ├──────────────────────────────────────────────────────────────────┤
 │                   TRANSACTION LAYER                              │
-│   WAL (64MB circular, mirrored) → Checkpoint → Recovery          │
-│   Extended oplog retention for dormant subscriptions             │
+│   Journal sets (mirrored) → Checkpoint → Recovery                │
+│   Retained journal buckets are the oplog for subscriptions       │
 ├──────────────────────────────────────────────────────────────────┤
 │                     POOL MANAGER                                 │
 │   Topology │ Rebalancer │ Resilverer │ Health Monitor            │
@@ -1478,7 +1470,103 @@ Index state is currently persisted as CBOR (length-prefixed) in the index zone �
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 16.1 Component diagram
+### 16.1 Storage structures
+
+How the persistent structures relate. Every mutation is a journal entry first; trees are rewritten behind it and committed by a `Checkpoint` entry carrying the new root pointer. Assertions are interned as terms; an object's direct terms go to its forward entry, and direct plus derived terms to postings. The object record says what the object is and where its content lives. Backpointers map physical space back to owners, so moves, scrub and evacuation touch only affected buckets.
+
+```mermaid
+flowchart TB
+    API["Engine API<br/><i>create · tag · set · write · delete<br/>query · read</i>"]
+
+    subgraph Journal["Journal (JOURNAL-DESIGN)"]
+        JSets["Journal sets<br/><i>write-once, group commit,<br/>mirrored on hot devices</i>"]
+        History["Retained history<br/><i>the oplog</i>"]
+        JSets --> History
+    end
+
+    subgraph Roots["Superblock + root pointer (ENGINE-DESIGN§1)"]
+        RootPtr["RootPointer<br/><i>committed by Checkpoint entry;<br/>superblock copy is a mount hint</i>"]
+    end
+
+    subgraph OntologyB["Ontology (ONTOLOGY-DESIGN)"]
+        OntTree["Ontology tree<br/><i>tag, rule, module records<br/>TagUid ↔ TagId</i>"]
+        Closures["Closure tables<br/><i>built at mount, in memory</i>"]
+        OntTree --> Closures
+    end
+
+    subgraph TermIndex["Term index (INDEX-DESIGN)"]
+        Dict["Term dictionary<br/><i>(kind, key, context, parent, value) → TermId,<br/>stats, inline postings</i>"]
+        TermTable["Term table<br/><i>TermId → full value</i>"]
+        Postings["Postings<br/><i>(TermId, window) → roaring container<br/>direct + derived terms</i>"]
+        Sequences["Sequences<br/><i>ordered / ranked collections</i>"]
+        Dict --- TermTable
+        Dict --> Postings
+    end
+
+    Forward["Forward index<br/><i>oid → direct TermIds</i>"]
+
+    subgraph Meta["Object metadata (METADATA-DESIGN)"]
+        ObjRoots["ObjectRoots<br/><i>NodeId → radix root,<br/>id high-water</i>"]
+        ObjTable["Object table<br/><i>per-node radix of 128 B records:<br/>state, length, hash, content locator</i>"]
+        ExtentList["Extent lists"]
+        ObjRoots --> ObjTable
+    end
+
+    subgraph Content["Content (BLOB-DESIGN, INDEX-DESIGN§4.3)"]
+        Blobs["Blob buckets<br/><i>extents, via transform pipeline</i>"]
+        ChunkList["Chunk lists"]
+        ChunkIndex["Chunk index<br/><i>hash → extent, refcount</i>"]
+        Packed["Small-object blocks"]
+        ChunkList --> ChunkIndex --> Blobs
+    end
+
+    subgraph Physical["Physical space (ALLOCATION-DESIGN, METADATA-DESIGN§2.2)"]
+        Alloc["Bucket alloc + freespace LRU<br/><i>per disk</i>"]
+        Backptr["Backpointers<br/><i>(disk, bucket, sector) → owner</i>"]
+    end
+
+    Snapshots["Snapshot tree + ObjectHistory sidecar<br/><i>snapshot id in snapshot-aware keys</i>"]
+    Subs["Subscriptions"]
+    Reconcile["Reconcile<br/><i>copygc, tiering, repair, rule rework</i>"]
+    Peers["Cluster peers<br/><i>ops by uid and value</i>"]
+
+    API -->|"every mutation"| JSets
+    JSets -->|"Checkpoint"| RootPtr
+    RootPtr -.->|"roots of every tree"| TermIndex
+    RootPtr -.-> Meta
+    RootPtr -.-> OntologyB
+
+    API -->|"intern assertion"| Dict
+    API -->|"direct terms"| Forward
+    Closures -->|"derive"| Postings
+    Forward -->|"cleanup on delete,<br/>rework on rule change"| Postings
+    API -->|"query: lookups and scans"| Dict
+    Postings -->|"oid sets"| API
+    Sequences -.-> API
+
+    API -->|"state, metadata"| ObjTable
+    ObjTable -->|"Extent"| Blobs
+    ObjTable -->|"ExtentList"| ExtentList --> Blobs
+    ObjTable -->|"ChunkList"| ChunkList
+    ObjTable -->|"Packed"| Packed
+    ObjTable -.->|"Remote"| Peers
+
+    Alloc --> Blobs
+    Blobs -.-> Backptr
+    Packed -.-> Backptr
+    Backptr -->|"owner of moved data"| Reconcile
+    Reconcile -->|"update locator"| ObjTable
+    Reconcile --> Alloc
+
+    Snapshots -.-> Postings
+    Snapshots -.-> Forward
+    Snapshots -.-> ObjTable
+    History --> Subs
+    History --> Peers
+    OntTree -.->|"uids"| Peers
+```
+
+### 16.2 Component diagram
 
 The component view below shows the main data and control paths.
 
@@ -1537,8 +1625,8 @@ graph TB
     Materializer --> TagIndex
 
     subgraph MetadataLayer["Metadata Layer"]
-        ObjTable["Object Table<br/><i>ObjectId → ObjectRecord<br/>128B fixed slots<br/>array indexed by ID</i>"]
-        LocTable["Location Table<br/><i>ObjectId → ObjectLocation<br/>disk_id, extent_offset,<br/>replica refs</i>"]
+        ObjTable["Object Table<br/><i>per-node radix of<br/>128B ObjectRecords</i>"]
+        LocTable["Content Locator<br/><i>in each record:<br/>extent, extent list, chunk list,<br/>packed slot, remote</i>"]
     end
 
     Executor --> ObjTable
@@ -1558,22 +1646,21 @@ graph TB
     LocTable <-->|"read current /<br/>update after move"| Migrator
 
     subgraph TxnLayer["Transaction Layer"]
-        WAL["Write-Ahead Log<br/><i>circular 64MB buffer<br/>on fastest disk<br/>+ mirror</i>"]
-        Checkpoint["Checkpoint Engine<br/><i>flush dirty bitmaps<br/>+ metadata to zones</i>"]
-        Recovery["Crash Recovery<br/><i>replay WAL from<br/>last checkpoint</i>"]
+        WAL["Journal<br/><i>write-once journal sets<br/>on fastest disk<br/>+ mirror</i>"]
+        Checkpoint["Checkpoint Engine<br/><i>flush dirty tree pages,<br/>commit root in journal</i>"]
+        Recovery["Crash Recovery<br/><i>replay journal from<br/>last checkpoint</i>"]
     end
 
     TagIndex -->|"mutations"| WAL
     ForwardIndex -->|"mutations"| WAL
     ObjTable -->|"mutations"| WAL
-    LocTable -->|"mutations"| WAL
     WAL --> Checkpoint
     Recovery --> WAL
 
     subgraph PoolManager["Pool Manager"]
         Topology["Topology Map<br/><i>DiskDescriptor[]<br/>media type, tier,<br/>capacity, health</i>"]
         Rebalancer["Rebalancer<br/><i>on disk add/remove:<br/>semantic migration</i>"]
-        Resilverer["Resilverer<br/><i>on disk fail/replace:<br/>location table scan<br/>priority by replica count</i>"]
+        Resilverer["Resilverer<br/><i>on disk fail/replace:<br/>backpointer scan<br/>priority by replica count</i>"]
         HealthMon["Health Monitor<br/><i>SMART, I/O errors,<br/>latency tracking</i>"]
     end
 
@@ -1589,7 +1676,7 @@ graph TB
             D0Super["Superblock"]
             D0WAL["WAL (primary)"]
             D0Index["Index Zone<br/><i>tag bitmaps,<br/>B+ trees</i>"]
-            D0Meta["Metadata Zone<br/><i>object table,<br/>location table</i>"]
+            D0Meta["Metadata Zone<br/><i>object table,<br/>forward index</i>"]
             D0Blobs["Hot Blobs<br/><i>tag:active,<br/>tag:scratch</i>"]
         end
         subgraph Disk1["Disk 1 — SATA SSD (Warm Tier)"]
@@ -1617,7 +1704,7 @@ graph TB
     Allocator --> DNBlobs
 
     subgraph BlobIO["Blob I/O Path"]
-        BlobRead["Read Path<br/><i>LocTable → disk_id +<br/>offset → direct I/O</i>"]
+        BlobRead["Read Path<br/><i>locator → disk_id +<br/>bucket, sector → direct I/O</i>"]
         BlobWrite["Write Path<br/><i>allocate extent →<br/>write → update loc<br/>→ WAL commit</i>"]
         ContentAddr["Content Addressing<br/><i>BLAKE3 hash<br/>dedup optional</i>"]
     end
@@ -1814,11 +1901,11 @@ Playlists and albums are not a separate object kind. An attribute key whose onto
 ZFS sees opaque blocks: adding a vdev only steers new writes, removal scans all metadata, resilver time grows with pool size. Knowing what each object is (tags), what belongs together and what matters lets the pool:
 
 - rebalance semantically when a disk is added (archives to the new HDD, active projects to SSD);
-- drain a disk by scanning the location table (10 M entries in about 50 ms) and placing each object by its tier rules;
+- drain a disk by scanning its backpointers, which name exactly the objects with data there, and placing each object by its tier rules;
 - resilver in time proportional to the affected data, most-endangered objects first;
 - tier automatically from tags plus access age.
 
-The object-granularity location table (§6.3) is the indirection that makes moves cheap: copy, verify, update one record, free the old extent in the same WAL transaction.
+The object-granularity content locator (§6.3) is the indirection that makes moves cheap: copy, verify, update one record, free the old extent in the same journal commit.
 
 ### C.6 Cluster sync
 

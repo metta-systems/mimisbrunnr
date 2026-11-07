@@ -64,9 +64,10 @@ When a slice changes or implements something a format section or the system desi
 - **Verify facts when touching a section.** Check struct sizes, field offsets (`// [a..b]`), magic values, discriminants, region sizes and zone offsets against the code and the `validation/` layout-check crate, and fix any error found anywhere in that section.
 - Implementation gaps against the spec live in the plan and `TODO(<ITEM>)` markers, not in the spec text.
 
-## No backwards compatibility
+## No backwards compatibility during design
 
-- Pools are disposable until the maintainer declares a format stable. An approved format change is a one-way break: recreate the pool. Add no migration readers, compatibility shims, legacy decode paths, deprecated aliases or format-version bumps.
+- This rule covers the **design phase**: until the maintainer declares a format stable, pools are disposable. An approved format change is a one-way break: recreate the pool. Add no migration readers, compatibility shims, legacy decode paths, deprecated aliases or format-version bumps for formats that were never declared stable.
+- It does **not** remove versioning from the format. Production pools migrate transparently (FORMAT-DESIGN§15): records keep their version fields (`record_version`, `BlockHeader.format_version`, the leading schema version of positional CBOR, FORMAT-DESIGN§1.6), the superblock keeps its writing and minimum-on-disk versions, and readers decode every version since the format was declared stable. Design those fields in; never drop one as "compatibility scaffolding".
 - Update every consumer in the same slice: storage, owning crate, engine wiring, bins (`mimir`, `brunnr`, `populate`, `analyze`), tests, `validation/` and the spec. Do not leave the old representation alongside the new one.
 - This does not authorise divergence from the spec: change the spec (with approval) first, then remove the old behaviour outright.
 

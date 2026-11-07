@@ -61,6 +61,7 @@ The term dictionary, postings and forward index replace every index structure, s
 2. [INDEX13](index-implementation-plan.md) — postings containers (after BTREE-D3); then [INDEX14](index-implementation-plan.md) — forward index by `TermId`, direct terms only.
 3. [INDEX15](index-implementation-plan.md) — sequences; [INDEX16](index-implementation-plan.md) — queries, faceting, FUSE and watch over containers.
 4. [ONTOLOGY16](ontology-implementation-plan.md) — attribute flavours and key options (after INDEX15); then [INDEX18](index-implementation-plan.md) — hierarchy tries with roll-ups — and [INDEX19](index-implementation-plan.md) — n-gram postings over distinct values.
+5. [METADATA7](metadata-implementation-plan.md) — `ObjectRecord` with content locator, one object table (after INDEX14).
 
 ### 4. Live tree machinery
 
@@ -78,17 +79,17 @@ The term dictionary, postings and forward index replace every index structure, s
 2. [ENGINE3](engine-implementation-plan.md) — COW commit; then [JOURNAL12](journal-implementation-plan.md) — root in the journal.
 3. [ALLOCATION3](allocation-implementation-plan.md) — generation check on read.
 4. [BTREE7](btree-implementation-plan.md), then [ENGINE2](engine-implementation-plan.md) — compaction.
-5. [METADATA1](metadata-implementation-plan.md), then [METADATA2](metadata-implementation-plan.md) — multi-level radix tables.
+5. [METADATA1](metadata-implementation-plan.md) — multi-level radix per origin node.
 6. [ENGINE4](engine-implementation-plan.md) — retire fixed index-zone areas.
 7. [SUBSCRIPTION1](subscriptions-implementation-plan.md) — externalized subscription bitmaps.
 8. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md), [ALLOCATION6](allocation-implementation-plan.md) — per-disk allocation trees.
-9. [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup; [METADATA5](metadata-implementation-plan.md) — overflow records (after SPEC3).
+9. [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup.
 10. [INDEX6](index-implementation-plan.md) — footprint benchmark.
 
 ### 6. Blob zone and legacy blob retirement
 
 1. [BLOB1](blob-implementation-plan.md), [BLOB2](blob-implementation-plan.md), [BLOB5](blob-implementation-plan.md); then [JOURNAL11](journal-implementation-plan.md) — one barrier per commit with extent verification.
-2. [ENGINE5](engine-implementation-plan.md) — backpointers in the engine; then [METADATA6](metadata-implementation-plan.md) — blob reclaim and tombstone expiry (after METADATA-D3).
+2. [ENGINE5](engine-implementation-plan.md) — backpointers in the engine; [METADATA8](metadata-implementation-plan.md) — extent lists; then [METADATA6](metadata-implementation-plan.md) — blob reclaim and tombstone expiry (after METADATA-D3).
 3. [BLOB3](blob-implementation-plan.md), [BLOB4](blob-implementation-plan.md) — chunked objects, selective chunking; then [BLOB8](blob-implementation-plan.md) — tiny objects (after BLOB-D4) and [BLOB9](blob-implementation-plan.md) — streaming objects.
 4. [JOURNAL13](journal-implementation-plan.md) — retention as the oplog; then [BLOB6](blob-implementation-plan.md), [UNIX1](unix-implementation-plan.md), [ENGINE6](engine-implementation-plan.md), [ENGINE7](engine-implementation-plan.md), then [ENGINE8](engine-implementation-plan.md) — no legacy blob.
 

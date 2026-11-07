@@ -13,7 +13,7 @@ A snapshot captures the assertion graph (tags, attributes, relations, ontology) 
 
 - Snapshots are per node; there is no cluster-wide snapshot coordination.
 - Every snapshot-aware tree (forward, term dictionary, postings, sequences, ontology, subscriptions) keys by `(…, snapshot)`; the `snapshot` field is 0 until this scope lands.
-- Object and location history live in sidecar trees (`ObjectHistory`, `LocationHistory`); the main tables hold the current view.
+- Object record history (content locator included) lives in the `ObjectHistory` sidecar tree; the object table holds the current view.
 - Queries take an optional `snapshot_id` and resolve visibility through the snapshot tree's ancestor bitmap.
 
 ## Format specification
@@ -108,11 +108,11 @@ entry that selects it carries the snapshot id.
 | `Ontology`         | yes             | snapshot freezes the ontology version          |
 | `Subscriptions`    | yes             | per-snapshot watch state                       |
 | `ObjectHistory`    | yes             | sidecar for `ObjectTable` (METADATA-DESIGN§1) — current view in the radix, per-snapshot overrides here |
-| `LocationHistory`  | yes             | sidecar for `LocationTable` (METADATA-DESIGN§2.1) — same pattern |
+| `ObjectRoots`, `ExtentList` | no     | roots and high-water are physical; extent lists are reached from a record version |
 
-For the **positional radix tables** (`ObjectTable` METADATA-DESIGN§1, `LocationTable` METADATA-DESIGN§2.1), snapshot-versioning
-uses a sidecar btree per radix (`BtreeKind::ObjectHistory` for METADATA-DESIGN§1; `BtreeKind::LocationHistory`
-for METADATA-DESIGN§2.1): each is keyed by `(oid, snapshot)` with values that shadow the radix entry. The radix
+For the **positional object table** (METADATA-DESIGN§1), snapshot-versioning uses the
+`BtreeKind::ObjectHistory` sidecar, keyed by `(oid, snapshot)` with values that shadow the radix
+entry. The radix
 always holds the **current** view; reads in a non-current snapshot consult the sidecar first,
 falling through to the radix only if no shadowing record applies. This keeps the hot path
 (current-snapshot reads) at single-radix-lookup cost while preserving the snapshot model for
@@ -136,7 +136,7 @@ so the whiteout encoding is **per leaf shape**:
 | `TermDictionary` (INDEX-DESIGN§4.1) | a `DictEntry` with bit 7 of `flags` set (`DICT_FLAG_WHITEOUT`) and every other field zero. |
 | `Sequences` (INDEX-DESIGN§3.3) | ordered: the value `oid = u64::MAX`, never a valid id; ranked: the 1-byte value `0xFF` in place of `0x00`. |
 | `Ontology`, `Subscriptions` (ONTOLOGY-DESIGN§1, SUBSCRIPTIONS-DESIGN§1) | a CBOR null (`0xF6`) at the value position, in place of the usual record. |
-| `ObjectHistory`, `LocationHistory` (SNAPSHOTS-DESIGN§1.2) | a 1-byte discriminator precedes the shadowed record; `0xFF` (`KEY_TYPE_whiteout`) means whiteout, otherwise the record follows. |
+| `ObjectHistory` (SNAPSHOTS-DESIGN§1.2) | a 1-byte discriminator precedes the shadowed record; `0xFF` (`KEY_TYPE_whiteout`) means whiteout, otherwise the record follows. |
 
 Whiteouts carry no payload beyond the sentinel — the entry's length stops there.
 
@@ -213,9 +213,9 @@ and its existing backpointer is valid for both snapshots. Backpointers are physi
 Deleting a snapshot is **two operations**: a small synchronous step that takes the snapshot
 out of visibility, and a long-running background scan that physically reclaims the keys.
 The synchronous step's WAL cost is `1 + N` entries (one `SnapshotDelete` plus one
-`ReconcileEnqueue` per snapshot-aware btree — N = 8 in the current format, every
+`ReconcileEnqueue` per snapshot-aware btree — N = 7 in the current format, every
 yes-row of SNAPSHOTS-DESIGN§1.2's table: `Forward`, `TermDictionary`, `Postings`, `Sequences`,
-`Ontology`, `Subscriptions`, plus the two radix sidecars `ObjectHistory` and `LocationHistory`).
+`Ontology`, `Subscriptions`, plus the radix sidecar `ObjectHistory`).
 The scan's WAL cost is a handful of cursor checkpoints, regardless of how many keys
 are involved.
 

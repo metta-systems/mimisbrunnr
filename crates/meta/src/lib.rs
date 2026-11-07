@@ -15,11 +15,11 @@
 //!
 //! - The live COW radix tree for the object & location tables (METADATA-DESIGN§1 + METADATA-DESIGN§2.1):
 //!   COW write path, journal-reclaim integration, leaf occupancy bitmap,
-//!   merging of pending mutations past `last_persisted_lsn` — TODO(METADATA1), METADATA2.
+//!   merging of pending mutations past `last_persisted_lsn` — TODO(METADATA1).
 //! - The global B+ tree backing `BtreeKind::Backpointer` with BTREE-DESIGN§1.6 key
 //!   packing — TODO(METADATA3).
-//! - `OverflowRecord` payload encoder/decoder, `OverflowAttr` variants,
-//!   chain navigation — TODO(METADATA5).
+//! - Content locator in `ObjectRecord` replacing `ObjectLocation`, the location
+//!   table and `OverflowRecord` — TODO(METADATA7).
 //! - WAL integration: positional updates (METADATA1), `BackpointerInsert/Remove`
 //!   (ENGINE5), `ReconcileMove` projection (RECONCILE2).
 

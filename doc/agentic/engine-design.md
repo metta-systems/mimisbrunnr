@@ -13,7 +13,7 @@ The engine orchestrates mutations WAL-first, keeps one long-lived `LoadedNode` p
 
 - **Root pointer.** Every tree the engine owns is reached through its `RootPointer.*_root` `BlockRef`; a `BlockRef::ZERO` slot loads as an empty tree. Slots for snapshots, reconcile and value spill stay zero until those scopes land.
 - **Commit.** Flush dirty trees (append a run, or compact into a fresh region), write the new `RootPointer`, flip it with `commit_root`, then free the previous copies. A crash before the flip leaves the previous root's regions intact.
-- **No legacy blob.** The `MIXI` CBOR blob is retired: counters are derived at boot (`next_oid_local` from the object table, `next_tag_id` from the ontology, `last_applied_lsn` from the latest checkpoint), path contexts are rebuilt from the forward index, and blob bytes live in the blob zone.
+- **No legacy blob.** The `MIXI` CBOR blob is retired: counters are derived at boot (`next_oid_local` from the pool's own `ObjectRoots` entry, `next_tag_id` from the ontology, `last_applied_lsn` from the latest checkpoint), path contexts are rebuilt from the forward index, and blob bytes live in the blob zone.
 - **Pools are disposable** until the maintainer declares the format stable: a format change means recreating the pool.
 - **One engine on host and device.** The engine and every crate it depends on build as `no_std` + `alloc` (operations-design "Deployment targets"); file-backed devices, `pool.toml` and other host parts sit behind the `std` feature. A pool opens from a `BlockDevice` alone, and opening replays the journal on every target, the device included.
 - **Durability per call.** Every mutating call takes `Sync` (returns once durable) or `Buffered { max_delay }` (durable within the bound), and an explicit `commit` waits for everything before it (JOURNAL-DESIGN§1.5). The `BlockDevice` trait offers a write-through (FUA) write, a cache flush and a discard, each reporting whether the device supports it.
@@ -155,10 +155,10 @@ struct RootPointer {                         // 408 bytes
     lsn: u64,                                //   [8..16]   journal LSN this root corresponds to
 
     // Logical / data btrees (snapshot-aware unless noted; see SNAPSHOTS-DESIGN§1.2 table).
-    object_table_root:        BlockRef,      //  [16..32]   METADATA-DESIGN§1     radix table — current view
+    object_table_root:        BlockRef,      //  [16..32]   METADATA-DESIGN§1.4   ObjectRoots: NodeId → radix root
     object_history_root:      BlockRef,      //  [32..48]   SNAPSHOTS-DESIGN§1.2  sidecar: (oid, snapshot) overrides
-    location_table_root:      BlockRef,      //  [48..64]   METADATA-DESIGN§2.1   radix table — current view
-    location_history_root:    BlockRef,      //  [64..80]   SNAPSHOTS-DESIGN§1.2  sidecar
+    _unassigned_48:           BlockRef,      //  [48..64]   zero
+    _unassigned_64:           BlockRef,      //  [64..80]   zero
     forward_index_root:       BlockRef,      //  [80..96]   INDEX-DESIGN§2
     term_dictionary_root:     BlockRef,      //  [96..112]  INDEX-DESIGN§4.1   term dictionary
     term_table_root:          BlockRef,      // [112..128]  INDEX-DESIGN§4.1   term table (snapshot-agnostic)
@@ -195,8 +195,7 @@ struct RootPointer {                         // 408 bytes
 self-validating against the destination block's header.
 
 `BlobRef` is `{ disk_id: u16, _pad: u16, block_no: u32, length: u64 }` — also 16 bytes, used to
-address a contiguous payload extent within the blob zone (INDEX-DESIGN§4.1's out-of-line term values, METADATA-DESIGN§1.2's `OverflowAttr` spill,
-INDEX-DESIGN§4.3's chunk index leaf). Unlike `BlockRef`, it carries an explicit `length` (in bytes) rather
+address a contiguous payload extent within the blob zone (INDEX-DESIGN§4.1's out-of-line term values, INDEX-DESIGN§4.3's chunk index leaf). Unlike `BlockRef`, it carries an explicit `length` (in bytes) rather
 than a generation; freshness is derived from the owning record's bucket-generation check at
 deref time.
 
@@ -226,12 +225,11 @@ Within a single device, blocks are addressed by `block_no` (4 KiB unit). Across 
 `(disk_id, block_no)` uniquely identifies a block. Devices may grow; `block_no` is never
 re-mapped.
 
-**Positional access** for the `ObjectRecord` and `ObjectLocation` arrays is preserved at the
-*per-leaf* level: the radix descent in METADATA-DESIGN§1 / METADATA-DESIGN§2.1 resolves `oid_local` to a leaf `BlockRef`,
-and the record lives at slot `oid_local % LEAF_RECORDS` (2044 for the object table, 5440 for
-the location table) within that leaf. The leaves themselves are COW pages whose physical
-addresses are indirected through `object_table_root` / `location_table_root`; there is no
-zone-wide flat array.
+**Positional access** for `ObjectRecord`s is preserved at the *per-leaf* level: the object's
+origin node selects a radix root in `ObjectRoots`, the radix descent (METADATA-DESIGN§1) resolves
+`oid_local` to a leaf `BlockRef`, and the record lives at slot `oid_local % 2044` within that
+leaf. The leaves themselves are COW pages whose physical addresses are indirected through
+`object_table_root`; there is no zone-wide flat array.
 
 ---
 
@@ -242,9 +240,9 @@ queries:
 
 | In-memory type                               | Mirrors on-disk                           | Lifetime                  |
 | -------------------------------------------- | ----------------------------------------- | ------------------------- |
-| `ObjectTable` (positional accessor over `BTreeNodeCache`) | METADATA-DESIGN§1 radix tree of `BtreeKind::ObjectTable` leaves; per-record access = (radix descent → leaf `BlockRef`) → cache lookup → 128 B slot at `oid_local % 2044` | leaves cached per `BTreeNodeCache` policy below; no separate resident array (~1.19 GiB at 10 M objects, ≥ TiBs at the 48-bit cap) |
-| `LocationTable` (positional accessor over `BTreeNodeCache`) | METADATA-DESIGN§2.1 radix tree of `BtreeKind::LocationTable` leaves; per-record access = same descent → 48 B slot at `oid_local % 5440` | shares `BTreeNodeCache`; same eviction policy as `ObjectTable` |
-| `ObjectHistory`, `LocationHistory` (snapshot-override sidecars) | SNAPSHOTS-DESIGN§1.2 — `BtreeKind::ObjectHistory` / `BtreeKind::LocationHistory` keyed by `(oid, snapshot)`; consulted only for non-current-snapshot reads | shares `BTreeNodeCache`; typically cold (current-snapshot reads bypass) |
+| `ObjectTable` (positional accessor over `BTreeNodeCache`) | METADATA-DESIGN§1 per-node radix trees of `BtreeKind::ObjectTable` leaves; per-record access = (`ObjectRoots` entry → radix descent → leaf `BlockRef`) → cache lookup → 128 B slot at `oid_local % 2044` | leaves cached per `BTreeNodeCache` policy below; no separate resident array (~1.19 GiB at 10 M objects, ≥ TiBs at the 48-bit cap) |
+| `ObjectRoots` | METADATA-DESIGN§1.4 — one entry per origin node | fully resident (a few entries) |
+| `ObjectHistory` (snapshot-override sidecar) | SNAPSHOTS-DESIGN§1.2 — `BtreeKind::ObjectHistory` keyed by `(oid, snapshot)`; consulted only for non-current-snapshot reads | shares `BTreeNodeCache`; typically cold (current-snapshot reads bypass) |
 | Term dictionary, term table, postings, sequences, forward index (accessors over `BTreeNodeCache`) | INDEX-DESIGN§2–§4 trees | no resident mirror; nodes cached per `BTreeNodeCache` policy, posting containers read in place |
 | `TermId` counter                             | derived at boot from the term table       | resident scalar           |
 | `OntologyState`                              | OntologyRoot                              | fully resident         |

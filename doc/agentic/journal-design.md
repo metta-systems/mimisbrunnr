@@ -182,7 +182,7 @@ record rules:
   written; recovery uses it to verify data written in the same commit (JOURNAL-DESIGN§1.5).
 
 ```rust
-CreateObject     : { oid: u64, generation: u32, created_ns: i64 }
+CreateObject     : { oid: u64, created_ns: i64 }               // raises the origin node's next_local
 DeleteObject     : { oid: u64, lsn: u64 }
 AddTag           : { oid: u64, tag: u32 }                     // a direct tag (INDEX-DESIGN§2.4)
 RemoveTag        : { oid: u64, tag: u32 }
@@ -191,7 +191,10 @@ RemoveAttr       : { oid: u64, term_id: u64 }                   // the attribute
 AddRelation      : { oid: u64, predicate: u32, target: u64 }
 RemoveRelation   : { oid: u64, predicate: u32, target: u64 }
 WriteBlob        : { oid: u64, content_hash: [u8;32], extent: BlockRef, size: u64, extent_sum: u64 }
-                   // Non-chunked objects only. Chunked objects (INDEX-DESIGN§4.3) use the
+                   // One-extent objects only: sets the record's Extent locator
+                   //   (METADATA-DESIGN§1.2). Larger non-chunked objects are written
+                   //   through ExtendObject into an extent list (METADATA-DESIGN§1.3).
+                   //   Chunked objects (INDEX-DESIGN§4.3) use the
                    // ChunkInsertBatch / ChunkListAppend / ChunkObjectFinalize flow
                    // described in JOURNAL-DESIGN§1.3.1.
 
@@ -217,10 +220,9 @@ ChunkListShrink     : { oid: u64, new_length: u64 }
                    //   emptied regions are freed via bucket-gen bump.
 ChunkObjectFinalize : { oid: u64, content_hash: [u8;32], total_length: u64,
                         list_head: BlockRef }
-                   // Publishes a chunked object: sets ObjectLocation.flags |=
-                   //   LOCATION_FLAG_CHUNKED, replicas[0] = list_head;
-                   //   ObjectRecord.content_hash = whole-plaintext hash;
-                   //   ObjectRecord.blob_length = total_length. Readers see a fully
+                   // Publishes a chunked object: sets content_kind = ChunkList,
+                   //   locator.head[0] = list_head (METADATA-DESIGN§1.2);
+                   //   content_hash = whole-plaintext hash; length = total_length. Readers see a fully
                    //   assembled chunked object only after this op replays.
 
 // Bucket lifecycle (ALLOCATION-DESIGN§1)
@@ -290,7 +292,9 @@ WriteInline      : { oid: u64, content_hash: [u8;32], data: bytes }      // WalO
 ExtendObject     : { oid: u64, new_length: u64, extents: [(extent: BlockRef, length: u32,
                      extent_sum: u64); N] }                               // WalOpKind 33
                    // Appends extents to an object in the Writing state and makes its first
-                   //   new_length bytes durable.
+                   //   new_length bytes durable. The first extent sets an Extent locator;
+                   //   later ones go to the object's extent list (METADATA-DESIGN§1.3),
+                   //   whose tail region replay rewrites.
 
 // Term maintenance (INDEX-DESIGN§1.2)
 ReclaimTerms     : { high_water: u64, term_ids: [u64; N] }               // WalOpKind 34
@@ -362,7 +366,7 @@ shrink-replay; chunks reaching `ref_count = 0` are freed.
 not yet referenced from any `ChunkInsertBatch` get reclaimed by bucket-gen GC. ChunkList
 regions written but not yet referenced from a `ChunkListAppend` get reclaimed similarly. A
 chunked object that crashed before `ChunkObjectFinalize` is invisible to readers — its oid's
-`ObjectLocation.replicas[0]` was never set — so no partial state is observable.
+record's locator was never set — so no partial state is observable.
 
 **Throughput model — 32 GiB bulk write, no dedup, across the FastCDC parameter space.**
 

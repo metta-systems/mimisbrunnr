@@ -530,7 +530,7 @@ chunk once, refcounted, so two objects sharing common chunks share their storage
 
 #### `ChunkList` — per-object FastCDC recipe
 
-A chunked object's `ObjectLocation` (METADATA-DESIGN§2.1, with `LOCATION_FLAG_CHUNKED`) points at the **head**
+A chunked object's record (content kind `ChunkList`, METADATA-DESIGN§1.2) points at the **head**
 of a `BtreeKind::ChunkList` chain. The head region carries `BTREE_NODE_FLAG_HEAD_OF_CHAIN`
 in `BtreeNodeHeader.flags` (BTREE-DESIGN§1.1) and a fixed 16 B `ChunkParamsRecord` immediately after
 the header — recording the chunking parameters used to produce the chain. Chained
@@ -592,7 +592,7 @@ object changes — typically because the operator updated a `PlacementRule::Chun
 an ontology install bumped a tag's `storage.chunking` — reconcile (RECONCILE-DESIGN§1.1) detects the
 mismatch by comparing the head region's `ChunkParamsRecord` to the resolved policy and
 enqueues a `WorkKind::OptionUpdate` item. The re-chunk pass produces a fresh ChunkList
-chain (with new params in its head) and atomically swaps `ObjectLocation.replicas[0]` to
+chain (with new params in its head) and atomically swaps the record's `locator.head[0]` to
 the new head via `ReconcileMove`; the old chain becomes unreferenced and is reclaimed via
 bucket-gen GC.
 

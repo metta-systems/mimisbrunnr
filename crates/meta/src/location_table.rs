@@ -13,9 +13,8 @@
 //! `snapshot` is always 0 for now — see the analogous note on
 //! [`crate::object_table::ObjectTableKey`].
 //!
-//! TODO(METADATA2): swap to true positional-radix encoding per
-//! METADATA-DESIGN§2.1 (leaf fanout 5440 for 48-byte records). Same migration shape
-//! as the object table.
+//! TODO(METADATA7): the location table is removed; content locations move into
+//! `ObjectRecord`'s content locator (METADATA-DESIGN§1.2).
 
 use std::collections::{BTreeMap, btree_map};
 

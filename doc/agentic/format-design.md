@@ -108,8 +108,7 @@ enum BlockKind {
     PoolStateRoot     = 2,   // pool-wide disk geometry + tunables (POOL-DESIGN§1)
     // 3..=4 unassigned (journal sets carry their own header, JOURNAL-DESIGN§1.2)
     // 5..=9 unassigned (index data lives in BtreeKind trees, INDEX-DESIGN)
-    // Per-object metadata overflow
-    OverflowRecord    = 10,  // per-object tag/attr overflow (4 KiB; METADATA-DESIGN§1.2)
+    // 10 unassigned (object assertions live in the forward index, INDEX-DESIGN§2)
 }
 ```
 
@@ -122,10 +121,9 @@ of type `BtreeKind` instead of `BlockHeader.kind`:
 #[repr(u16)]
 enum BtreeKind {
     // Logical radix (current view + per-snapshot history sidecars)
-    ObjectTable           = 0,   // METADATA-DESIGN§1 radix leaves & inners (current view)
+    ObjectTable           = 0,   // METADATA-DESIGN§1 per-node radix leaves & inners (current view)
     ObjectHistory         = 1,   // SNAPSHOTS-DESIGN§1.2 sidecar: (oid, snapshot) → ObjectRecord overrides
-    LocationTable         = 2,   // METADATA-DESIGN§2.1 radix leaves & inners (current view)
-    LocationHistory       = 3,   // SNAPSHOTS-DESIGN§1.2 sidecar: (oid, snapshot) → ObjectLocation overrides
+    // 2, 3 unassigned (content locations live in ObjectRecord, METADATA-DESIGN§1.2)
     // Forward index (oid → TermIds)
     Forward               = 4,   // INDEX-DESIGN§2 forward index B+ tree (snapshot-aware key)
     ForwardOverflow       = 5,   // INDEX-DESIGN§2.2 forward arrays of very large entries (positional, no sorted runs)
@@ -158,6 +156,9 @@ enum BtreeKind {
     ReconcileHighPrioPhys = 24,  // RECONCILE-DESIGN§1.2 physical-LBA-ordered high-prio index (HDD pools)
     ReconcilePending      = 25,  // RECONCILE-DESIGN§1.2 failed items awaiting device-config retry
     ReconcileScan         = 26,  // RECONCILE-DESIGN§1.3 in-progress scan cursors
+    // Object metadata
+    ExtentList            = 27,  // METADATA-DESIGN§1.3 per-object extent-list region (positional, no sorted runs)
+    ObjectRoots           = 28,  // METADATA-DESIGN§1.4 NodeId → object radix root (snapshot-agnostic)
 }
 ```
 
@@ -396,9 +397,8 @@ forward index roughly in half (~660 MiB at this scale).
 | Journal                | ~64 MiB   | Journal buckets (JOURNAL-DESIGN§1) plus retained history; mirrored across hot devices |
 | Bucket alloc table     | ~288 MiB  | 16 M buckets × ~18 B/entry (16 B value + ~2 B packed `bucket_no`) + sorted-run overhead (BTREE-DESIGN§1.1 headers, format descriptors, tail padding) |
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
-| Object table (records) | ~1.19 GiB | Positional — no key packing applies; 4 893 leaves × 256 KiB |
-| Object table (radix)   | < 1 MiB   | Single inner node (depth 1 total)                  |
-| Location table         | ~460 MiB  | Positional — no key packing; 1 839 leaves × 256 KiB |
+| Object table (records) | ~1.19 GiB | Positional — no key packing applies; 4 893 leaves × 256 KiB; content locators included |
+| Object table (radix, roots) | < 1 MiB | One inner node per origin node (depth 1 total); `ObjectRoots` one leaf |
 | Backpointers           | ~267 MiB  | METADATA-DESIGN§2.2 — 10 M extents × ~28 B packed                 |
 | Forward index          | ~0.5 GiB  | INDEX-DESIGN§2 — ~50 B per object at 8 direct assertions/object (24 B head + frame-of-reference term arrays); implied tags are not stored. Includes any `unix-path` and other path-projection attributes (UNIX-DESIGN§1) — those are ordinary `Attr` terms. |
 | Postings               | 200–400 MiB | INDEX-DESIGN§3 — roaring containers, one tree entry per (term, 65 536-id window); 5 000 tags |
@@ -406,8 +406,8 @@ forward index roughly in half (~660 MiB at this scale).
 | Ontology               | <10 MiB   | One positional CBOR record per tag, rule, constraint and module, snapshot-tagged (ONTOLOGY-DESIGN§1) |
 | Subscriptions          | ~700 KiB  | Per 1 000 subs with packed `sub_id`                |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
-| Snapshot key overhead  | ~80 MiB   | Per-snapshot divergent keys across the 8 snapshot-aware btrees (see breakdown below) |
-| **Total metadata**     | **~3.3–4.4 GiB** | Replicated to every node; dominated by object records (1.19 GiB), the forward index and, with many distinct attribute values, the term dictionary |
+| Snapshot key overhead  | ~80 MiB   | Per-snapshot divergent keys across the 7 snapshot-aware btrees (see breakdown below) |
+| **Total metadata**     | **~2.9–3.9 GiB** | Replicated to every node; dominated by object records (1.19 GiB), the forward index and, with many distinct attribute values, the term dictionary |
 
 **Snapshot key overhead breakdown.** "Snapshot key overhead" is the sum of *divergent* keys —
 keys whose value at one snapshot differs from its value at an ancestor. Shared keys cost nothing
@@ -419,14 +419,13 @@ snapshot, typical for sync-driven snapshotting):
 | Source of divergence                 | Per snapshot      | × 100 snapshots |
 | ------------------------------------ | ----------------- | --------------- |
 | `ObjectHistory` sidecar (oid, snap → ObjectRecord override) | ~5 000 × 128 B = ~640 KiB | ~64 MiB |
-| `LocationHistory` sidecar (oid, snap → ObjectLocation override) | ~5 000 × 48 B = ~240 KiB | ~24 MiB |
 | `Forward` divergent leaf entries     | ~5 000 × ~20 B packed = ~100 KiB | ~10 MiB |
 | `Postings` divergent containers      | ~1 000 × ~0.5 KiB = ~500 KiB (one container per changed term window) | ~50 MiB |
 | `TermDictionary` divergent entries   | ~1 000 × ~90 B = ~90 KiB (statistics of changed terms) | ~9 MiB |
 | `Ontology`, `Subscriptions`         | usually 0 (catalogs change rarely)         | <1 MiB combined |
-| **Sum** (≈ 1.6 MiB / snap × 100)     |                   | **~160 MiB raw** |
+| **Sum** (≈ 1.35 MiB / snap × 100)    |                   | **~135 MiB raw** |
 
-The raw arithmetic gives ~160 MiB; the table's ~80 MiB figure accounts for BTREE-DESIGN§1.6 packing
+The raw arithmetic gives ~135 MiB; the table's ~80 MiB figure accounts for BTREE-DESIGN§1.6 packing
 benefits (the trailing `snapshot` field packs to ~0 bits when one snapshot dominates a sorted
 run) and the fact that not every divergent oid touches every snapshot-aware tree. Workloads
 with **lower mutation rates** (cold archive snapshots taken daily) drop into the single-digit

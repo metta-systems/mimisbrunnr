@@ -48,8 +48,8 @@ Two large-node variants share the same outer envelope but differ in their intern
   placement rules, cluster peers, reconcile queues): a sequence of **sorted runs** of keyed
   records. New updates append a new sorted run; periodic full compaction merges all of a node's
   sorted runs back into one.
-- **Positional region** (object table, location table — radix leaves; *and* `ForwardOverflow`
-  INDEX-DESIGN§2.2, `ChunkList` INDEX-DESIGN§4.3): a positional array of fixed-size
+- **Positional region** (object table radix leaves; *and* `ForwardOverflow`
+  INDEX-DESIGN§2.2, `ChunkList` INDEX-DESIGN§4.3, `ExtentList` METADATA-DESIGN§1.3): a positional array of fixed-size
   records or `BlockRef` slots. No internal sorted runs — for radix leaves the WAL journal (JOURNAL-DESIGN§1.4)
   serves as the per-leaf update log and the leaf is rewritten from the merged in-memory state on
   flush; for the per-object overflow/list regions, growth is a single rewrite and chains via a
@@ -202,7 +202,6 @@ For a 10 M-object pool with 5 000 tags and ~100 snapshots, every tree is shallow
 | Tree                | Depth  | Levels | Notes                                      |
 | ------------------- | ------ | ------ | ------------------------------------------ |
 | Object table (METADATA-DESIGN§1)   | 1      | 2      | 4 893 leaves under 1 inner                 |
-| Location table (METADATA-DESIGN§2.1)| 1     | 2      | 1 839 leaves under 1 inner                 |
 | Forward index (INDEX-DESIGN§2)  | 1      | 2      | ~2 500 leaves (~64 B per object) under 1 inner |
 | Term dictionary (INDEX-DESIGN§4.1) | 0–1 | 1–2    | 5 000 tag entries fit one leaf; depth 1 once attribute values number in the millions |
 | Postings (INDEX-DESIGN§3.1)     | 1      | 2      | one entry per (term, 65 536-id window)     |

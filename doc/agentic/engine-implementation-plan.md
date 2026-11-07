@@ -16,7 +16,7 @@ Design: [engine-design.md](engine-design.md) · Decisions: [engine-decisions.md]
 ## Retire the legacy blob
 
 - [ ] **ENGINE6 — Oplog out of the legacy blob.** The in-memory `OpLog` and its CBOR copy in the legacy blob go; history comes from the retained journal (JOURNAL-DESIGN§1.6). Prerequisite: [JOURNAL13](journal-implementation-plan.md).
-- [ ] **ENGINE7 — Derive counters at boot.** `next_oid_local` from the object table, `last_applied_lsn` from the latest checkpoint; `next_tag_id` via [ONTOLOGY1](ontology-implementation-plan.md).
+- [ ] **ENGINE7 — Derive counters at boot.** `next_oid_local` from the pool's own `ObjectRoots` entry (METADATA-DESIGN§1.4; until [METADATA1](metadata-implementation-plan.md), from the single object-table leaf), `last_applied_lsn` from the latest checkpoint; `next_tag_id` via [ONTOLOGY1](ontology-implementation-plan.md).
 - [ ] **ENGINE8 — Delete the legacy blob.** Remove `IndexBlob`, `INDEX_BLOB_MAGIC`, `LEGACY_CBOR_BLOB_OFFSET`, `read_index_blob`, `apply_index_blob`, `build_index_blob`. Prerequisites: ENGINE6, ENGINE7, [UNIX1](unix-implementation-plan.md), [BLOB6](blob-implementation-plan.md). Acceptance: format, insert tags, objects and a path context, commit, reopen: all state survives with no `MIXI` blob on disk.
 
 ## Superblock

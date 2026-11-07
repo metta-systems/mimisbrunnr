@@ -49,9 +49,8 @@ pub const OVERFLOW_ATTR_FLAG_SPILL: u8 = 1 << 0;
 /// `let v = { hdr.field };` to copy aligned locals before use (see
 /// `doc/agentic/operations-design.md`, on-disk struct discipline rule 7).
 //
-// TODO(METADATA5): expose payload encoder / decoder, `OverflowAttr`
-// struct, and chain-walking helpers. They are deferred along with the live
-// 4 KiB block-management path that owns `BLOCK_FLAG_CONTINUATION`.
+// TODO(METADATA7): overflow records are removed — an object's assertions
+// live only in its forward entry (METADATA-DESIGN "Rejected alternatives").
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct OverflowHeader {

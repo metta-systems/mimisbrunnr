@@ -134,8 +134,8 @@ Work is processed strictly in this order:
 5. `ReconcilePending` — retries (only when prerequisite device-config event has fired).
 
 Tiers 1 and 2 share the `ReconcileHighPrio` btree; the worker discriminates by inspecting
-`WorkItem.target_kind` (an `OwnerKind` from METADATA-DESIGN§2.2). `OwnerKind ∈ { BtreeNode, OverflowRecord }`
-is metadata (tier 1); `OwnerKind ∈ { BlobExtent, Chunk }` is data
+`WorkItem.target_kind` (an `OwnerKind` from METADATA-DESIGN§2.2). `OwnerKind::BtreeNode`
+is metadata (tier 1); `OwnerKind ∈ { BlobExtent, Chunk, PackedBlock }` is data
 (tier 2). Workers consume the btree in `target_kind`-priority order rather than via two
 separate scans, so the on-disk shape stays a single tree.
 
@@ -163,10 +163,12 @@ ReconcileMove { from_loc, to_loc, owner_key }
   ⇒ BackpointerRemove(from_loc → key)
    ∘ BackpointerInsert(to_loc → key, value)
    ∘ owner-update on owner_key:
-        OwnerKind::BlobExtent      → ObjectLocation.replicas[i] (METADATA-DESIGN§2.1)
+        OwnerKind::BlobExtent      → the record's Extent locator replicas[i], or the
+                                     extent_index-th ExtentEntry's (METADATA-DESIGN§1.2–1.3)
         OwnerKind::Chunk           → ChunkIndex entry's BlobRef (INDEX-DESIGN§4.3)
-        OwnerKind::BtreeNode       → parent inner node's BlockRef (BTREE-DESIGN§1)
-        OwnerKind::OverflowRecord  → ObjectRecord.overflow_offset (METADATA-DESIGN§1.2)
+        OwnerKind::BtreeNode       → parent inner node's BlockRef (BTREE-DESIGN§1), or for a
+                                     ChunkList / ExtentList head the record's locator head[i]
+        OwnerKind::PackedBlock     → the Packed locator of every object the block names
 ```
 
 All three projected mutations apply under the move's LSN, so a crash either replays all of
@@ -178,12 +180,11 @@ lazy btree-node free) — moves are the only flow that needs the bundled `Reconc
 (`{disk_id, block_no, generation}`); the on-disk owner fields use narrower or differently-shaped
 types for compactness. Replay demotes `to_loc: BlockRef` into the target's shape:
 
-- `ReplicaRef` (METADATA-DESIGN§2.1, `BlobExtent`): split `block_no` into `(bucket_no, sector_offset)` per
+- `ReplicaRef` (METADATA-DESIGN§2.1, `BlobExtent` and list heads): split `block_no` into `(bucket_no, sector_offset)` per
   the METADATA-DESIGN§2.1 conversion; drop `generation` (recoverable on demand from `BucketAllocEntry`).
 - `BlobRef` (INDEX-DESIGN§4.3, `Chunk`): drop `generation`; copy `length` from the *previous* owner
   record's `BlobRef.length` — moves preserve extent length, so the field is unchanged.
 - `BlockRef` (`BtreeNode`): copy verbatim.
-- raw `u64` (`OverflowRecord`): take `block_no`.
 
 Writers do the inverse promotion when emitting `ReconcileMove`: they read the destination
 bucket's current `BucketAllocEntry.generation` to populate `BlockRef.generation`, and any
