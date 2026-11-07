@@ -514,7 +514,8 @@ struct ObjectRecord {                   // 128 bytes
     created_ns: i64,                    //  [56..64]
     modified_ns: i64,                   //  [64..72]  last payload change (mtime)
     state_ns: i64,                      //  [72..80]  last state change (tombstone time)
-    _reserved: [u8; 8],                 //  [80..88]
+    snapshot: u32,                      //  [80..84]  snapshot this version was written in
+    _reserved: [u8; 4],                 //  [84..88]
     locator: [u8; 40],                  //  [88..128] content locator (§6.3)
 }
 ```

@@ -194,7 +194,8 @@ struct ObjectRecord {                        // 128 bytes
     modified_ns: i64,                        //  [64..72]   last payload change (content written,
                                              //             extended or replaced)
     state_ns: i64,                           //  [72..80]   last ObjectState change (tombstone time)
-    _reserved: [u8; 8],                      //  [80..88]   zero
+    snapshot: u32,                           //  [80..84]   snapshot this version was written in (SNAPSHOTS-DESIGN§1.2)
+    _reserved: [u8; 4],                      //  [84..88]   zero
     locator: [u8; 40],                       //  [88..128]  ContentLocator, by content_kind
 }
 ```

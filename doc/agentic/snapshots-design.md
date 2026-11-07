@@ -37,7 +37,7 @@ A `SnapshotId` is a `u32` (4 G snapshots before recycling concerns). Snapshot re
 stored in the **snapshots btree** (`BtreeKind::Snapshots`, a BTREE-DESIGN§1 B+ tree keyed by `SnapshotId`):
 
 ```rust
-#[repr(C, packed)]
+#[repr(C)]
 struct SnapshotNode {                        // 64 bytes — fits one cache line
     id: u32,                                 //  [0..4]   self-id (also the btree key)
     parent: u32,                             //  [4..8]   0 = root snapshot
@@ -52,12 +52,14 @@ struct SnapshotNode {                        // 64 bytes — fits one cache line
     flags: u8,                               // [46..47]  SNAPSHOT_FLAG_*
     _pad: u8,                                // [47..48]
     created_ns: i64,                         // [48..56]
-    label_offset: u32,                       // [56..60]  into a string heap; 0 = unlabelled
-    _reserved: u32,                          // [60..64]
+    label_len: u16,                          // [56..58]  bytes of UTF-8 label after the node; 0 = unlabelled
+    _reserved: [u8; 6],                      // [58..64]
 }
+// The snapshots btree value is the 64-byte node followed by `label_len` bytes of label
+// (a variable-size value, BTREE-DESIGN§1.6).
 
 // SnapshotNode.flags bits
-const SNAPSHOT_FLAG_LEAF:    u8 = 1 << 0;  // subvolume-bearing (a writable head)
+const SNAPSHOT_FLAG_LEAF:    u8 = 1 << 0;  // a writable head: current writes are tagged with it
 const SNAPSHOT_FLAG_DELETED: u8 = 1 << 1;  // marked for SnapshotCleanup (SNAPSHOTS-DESIGN§1.5)
 ```
 
@@ -111,12 +113,20 @@ entry that selects it carries the snapshot id.
 | `ObjectRoots`, `ExtentList` | no     | roots and high-water are physical; extent lists are reached from a record version |
 
 For the **positional object table** (METADATA-DESIGN§1), snapshot-versioning uses the
-`BtreeKind::ObjectHistory` sidecar, keyed by `(oid, snapshot)` with values that shadow the radix
-entry. The radix
-always holds the **current** view; reads in a non-current snapshot consult the sidecar first,
-falling through to the radix only if no shadowing record applies. This keeps the hot path
-(current-snapshot reads) at single-radix-lookup cost while preserving the snapshot model for
-older views.
+`BtreeKind::ObjectHistory` sidecar, keyed by `(oid, snapshot)`, whose values are earlier
+versions of records. The radix holds each object's version for the **head** — the writable
+snapshot current writes are tagged with — and every record names the snapshot it was written in
+(`ObjectRecord.snapshot`):
+
+- **Push-down on write.** Before a write replaces a radix record whose `snapshot` is not the
+  head's id — so some frozen snapshot can still see it — the old record is put into
+  `ObjectHistory` at `(oid, old.snapshot)`. Records already written at the head are replaced in
+  place. The first write to an object after a snapshot therefore costs one sidecar entry; later
+  writes cost nothing extra.
+- **Read at snapshot S.** If the radix record's `snapshot` is S or an ancestor of S, it is the
+  answer. Otherwise the answer is the `ObjectHistory` entry for the oid with the highest
+  snapshot that is S or an ancestor of S (SNAPSHOTS-DESIGN§1.3), or a whiteout — absent.
+- **Head reads** check one field and never touch the sidecar.
 
 For **posting lists** (INDEX-DESIGN§3.1), each container is its own snapshot-tagged entry: a
 write that changes one 65 536-id window of a term writes one new container at the writing
@@ -211,56 +221,60 @@ and its existing backpointer is valid for both snapshots. Backpointers are physi
 ### 1.5 Snapshot deletion
 
 Deleting a snapshot is **two operations**: a small synchronous step that takes the snapshot
-out of visibility, and a long-running background scan that physically reclaims the keys.
-The synchronous step's WAL cost is `1 + N` entries (one `SnapshotDelete` plus one
-`ReconcileEnqueue` per snapshot-aware btree — N = 7 in the current format, every
-yes-row of SNAPSHOTS-DESIGN§1.2's table: `Forward`, `TermDictionary`, `Postings`, `Sequences`,
-`Ontology`, `Subscriptions`, plus the radix sidecar `ObjectHistory`).
-The scan's WAL cost is a handful of cursor checkpoints, regardless of how many keys
-are involved.
+out of visibility, and a background cleanup that physically reclaims its keys. Deletions are
+**batched**: every snapshot marked deleted joins one pending set, and one cleanup pass over the
+snapshot-aware btrees — `Forward`, `TermDictionary`, `Postings`, `Sequences`, `Ontology`,
+`Subscriptions`, `ObjectHistory`, the yes-rows of SNAPSHOTS-DESIGN§1.2's table — serves every
+snapshot in the set. A burst of sync-snapshot expiries costs one pass, not one per snapshot.
 
 **Synchronous step (`SnapshotDelete` WAL op).**
 1. In the snapshots btree, set `SNAPSHOT_FLAG_DELETED` in `SnapshotNode.flags`. The node remains in
    place — its `depth` and `skiplist` are still consulted during ancestry checks for siblings
-   and descendants — but no new reads are accepted *at* the deleted snapshot id.
-2. Enqueue a `WorkKind::SnapshotCleanup` work item per snapshot-aware btree (RECONCILE-DESIGN§1.2). Each
-   item carries `(deleted_id, surviving_descendant_id, btree_kind)`. The surviving descendant
-   is determined by the tree shape: a leaf snapshot has none (keys are dropped or whited
-   out); an interior snapshot collapses to whichever child remains live.
-3. Checkpoint. The deletion is durable after this; subsequent crashes resume the cleanup
-   from the work-item queue.
+   and descendants — but no new reads are accepted *at* the deleted snapshot id. The snapshot
+   joins the pending set (the snapshots marked deleted and not yet unlinked); its surviving
+   descendant is determined by the tree shape: a leaf snapshot has none (keys are dropped or
+   whited out); an interior snapshot collapses to whichever child remains live.
+2. If no cleanup pass is running, start one: one `ReconcileScan` cursor per snapshot-aware
+   btree (RECONCILE-DESIGN§1.3). A pass already running picks the new snapshot up for the
+   leaves it has not reached, and a next pass covers the leaves it already passed.
 
-**Background scan (reconcile-driven, no per-key WAL).** For each `SnapshotCleanup` item:
+**Cleanup pass (reconcile-driven, no per-key WAL).** For each tree:
 
 ```
 let mut cursor = scan_state.cursor;            // resumed from ReconcileScan record (RECONCILE-DESIGN§1.3)
 for leaf in btree.leaves_from(cursor) {
-    for entry in leaf.entries_with_snapshot(deleted_id) {
-        match classify(entry, child_set, sibling_set) {
-            Drop          => leaf.remove(entry),
-            Whiteout      => leaf.replace_value(entry, KEY_TYPE_whiteout),
-            Retag(target) => leaf.set_snapshot(entry, target),
+    for block in leaf.blocks() {
+        // RunBlockEntry.min_snapshot/max_snapshot (BTREE-DESIGN§1.2): skip blocks with no
+        // pending id without reading them.
+        if !pending.intersects(block.snapshot_range()) { continue; }
+        for entry in block.entries_with_snapshot_in(&pending) {
+            match classify(entry, snapshot_tree) {
+                Drop          => leaf.remove(entry),
+                Whiteout      => leaf.replace_value(entry, KEY_TYPE_whiteout),
+                Retag(target) => leaf.set_snapshot(entry, target),
+            }
         }
     }
     if leaf.is_dirty() { dirty_node_set.add(leaf); }
     cursor = leaf.next_key();
-    if elapsed_since_checkpoint() > scan_step_interval {
-        emit ReconcileScanStep { scan_id, btree, cursor_key: cursor };
-    }
 }
 ```
 
-The mutations above are ordinary in-memory btree changes that hit the JOURNAL-DESIGN§1.4 dirty-node path —
-flushed lazily, not journalled per key. `ReconcileScanStep` entries fire at most every
-~30 s of scan progress (configurable), bounding WAL cost to O(scan duration), not O(keys).
+The mutations above are ordinary in-memory btree changes that hit the JOURNAL-DESIGN§1.4
+dirty-node path — flushed lazily, not journalled per key. The cursor is journalled
+(`ReconcileScanStep`) **only at a checkpoint**, and only as far as the leaves that checkpoint
+flushed, so a durable cursor never runs ahead of durable cleanup; journal cost is one entry per
+checkpoint while the pass runs, not O(keys). Most blocks are skipped from their run index
+alone, so a pass reads the blocks that hold deleted snapshots' keys, not the whole pool.
 
-**Idempotency.** The scan classification is a function of the entry's snapshot id and the
-snapshot tree's current shape — both stable after `SnapshotDelete` is journalled. A leaf
-that has already been re-tagged no longer contains entries at `deleted_id`, so resuming the
-scan from a stale cursor after a crash is a no-op for already-processed leaves. This
-removes the need for any per-key undo or redo log.
+**Idempotency.** The classification is a function of the entry's snapshot id and the snapshot
+tree's current shape — both stable after `SnapshotDelete` is journalled. A leaf that has already
+been cleaned no longer contains entries at pending ids, so resuming from the durable cursor
+after a crash redoes at most the leaves cleaned since the last checkpoint. No per-key undo or
+redo log is needed.
 
-**Completion.** When the scan reaches the end of every snapshot-aware btree, a final
+**Completion.** When the pass reaches the end of every snapshot-aware btree, the snapshots it
+covered completely leave the pending set and a final
 **SnapshotTreeReorg pass** runs (deferred to the next checkpoint quiesce — see JOURNAL-DESIGN§1.5 — to
 avoid racing with live ancestry queries). The pass emits, in this order:
 
@@ -279,9 +293,9 @@ journal entry small regardless of how many descendants are affected.
   first. This is checked at `SnapshotDelete` time and the request is rejected if not
   satisfied. (Walking a node's children to count them is O(children_count), which is bounded
   by the per-node fan-out in practice — typically 2, occasionally 3-5 after rollbacks.)
-- Multiple deletions can run concurrently — each `SnapshotCleanup` work item has its own
-  cursor and operates independently (the per-leaf rewrites compose because each touches
-  disjoint snapshot-id sets).
+- Only head snapshots (`SNAPSHOT_FLAG_LEAF`) hold radix records (SNAPSHOTS-DESIGN§1.2), and a
+  head cannot be deleted while it is current; deleting other snapshots touches only
+  `ObjectHistory` and the key-level trees.
 
 ### 1.6 Bucket retention under key-level snapshots
 
@@ -296,6 +310,14 @@ prevent generation bumps once *all* snapshots have moved on), retention is enfor
   *and* its owner's snapshot is still reachable through the snapshot tree.
 - When the deleting snapshot pass (SNAPSHOTS-DESIGN§1.5) removes a key, the corresponding backpointer is
   removed too. Once a bucket has no live backpointers, its generation can be bumped.
+
+**Extents shared by record versions.** An object's head record and its `ObjectHistory` versions
+may name the same extent or list region — a state change pushes down a version whose locator is
+unchanged. A backpointer names the owner (`oid`, extent index), not a version, so the move path
+(RECONCILE-DESIGN§1.5) updates **every** version of the oid whose locator names the moved
+location: the radix record and each matching `ObjectHistory` entry, under the move's single LSN.
+An object has at most as many versions as snapshots it changed in, so the update is bounded by
+that, and an extent stays live while any version names it.
 
 Snapshot retention scales with **logical changes**, not bucket counts.
 
@@ -327,9 +349,17 @@ brunnr rollback --to <snapshot_label>
 3. Atomically retag the pool's "current" pointer to `S'`. The view now reflects `S`'s state;
    subsequent writes are tagged with `S'` and diverge from `S` at this point. The previously
    current branch remains intact as another sibling of `S'` until explicitly deleted.
+4. Re-head the object table: every radix record written on the abandoned branch after `S` is
+   pushed down into `ObjectHistory` at its own snapshot id and replaced by the version `S` sees
+   (taken from `ObjectHistory`, or a whiteout for an object created after `S`). The records to
+   swap are the `ObjectHistory` and radix entries with snapshot ids on the abandoned branch,
+   found by a resumable reconcile scan; until it completes, reads at `S'` resolve through the
+   rule of SNAPSHOTS-DESIGN§1.2, which already returns the right versions.
 
-No data is copied. The rollback is O(1); subsequent reads pay the snapshot-iteration cost
-(SNAPSHOTS-DESIGN§1.3) until the abandoned branch is deleted via SNAPSHOTS-DESIGN§1.5.
+No data is copied. For the key-level trees the rollback is O(1); for the object table it costs
+O(records changed on the abandoned branch since `S`), done in the background. Reads pay the
+snapshot-iteration cost (SNAPSHOTS-DESIGN§1.3) until the abandoned branch is deleted via
+SNAPSHOTS-DESIGN§1.5.
 
 ---
 
