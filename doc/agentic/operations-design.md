@@ -101,7 +101,7 @@ Workspace-level evidence (`just test`, `just clippy`) backs every claim: a regre
 | `std` | Library crates are `#![no_std]` + `alloc`; host-only parts sit behind a default `std` feature. Dependencies are taken with `default-features = false` where they offer it. |
 | Structured on-disk data | Binary records where the shape is known from the kind (WAL payloads included); positional, versioned CBOR via `ciborium` only for heterogeneous data (FORMAT-DESIGN§1.6). |
 | JSON | Never on disk; allowed in CLI output, logs and test fixtures. |
-| TOML | Human-edited configuration only (`pool.toml`, ontology modules). |
+| TOML | Human-edited sources only (ontology module sources, compiled on the host). Never on disk. |
 | Content hash | BLAKE3. |
 | Block and sorted-run CRC | CRC32C (`crc32c`). |
 | Fixed-size on-disk structs | `bytemuck::{Pod, Zeroable}`, `#[repr(C)]`, naturally aligned. |

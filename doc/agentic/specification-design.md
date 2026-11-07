@@ -653,19 +653,20 @@ enum DiskState {
     Faulted,  // failed, needs resilver
 }
 
-struct DiskDescriptor {
+struct DiskDescriptor {       // persisted per disk (POOL-DESIGN§1.1)
     id: DiskId,
-    capacity: u64,
-    used: u64,
+    uuid: [u8; 16],           // matches the device's superblock
+    bucket_count: u32,        // capacity; usage comes from the alloc table
     media_type: MediaType,
     tier: StorageTier,
     state: DiskState,
-    seq_read_mbps: u32,
-    random_iops: u32,
-    latency_us: u32,
-    path: Option<String>,     // file path for file-backed devices
+    rotational: bool,
 }
 ```
+
+Performance figures (sequential throughput, random IOPS, latency) are measured at mount and kept
+in memory, not persisted. A pool is identified by the UUID in its devices' superblocks and opened
+from the devices themselves; host paths are never stored.
 
 ### 8.2 Multi-Disk Layout
 
@@ -673,9 +674,10 @@ struct DiskDescriptor {
    NVMe (Disk 0)            SSD (Disk 1)             HDD (Disk 2)
  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
  │ Superblock   │         │ Superblock   │         │ Superblock   │
- │ WAL (primary)│         │ WAL (mirror) │         │              │
- │ Index Zone   │         │              │         │              │
- │ Metadata Zone│         │              │         │              │
+ │ Journal      │         │ Journal      │         │              │
+ │  (mirrored)  │         │  (mirrored)  │         │              │
+ │ Tree nodes   │         │ Tree-node    │         │              │
+ │  copy 1      │         │  copy 2      │         │              │
  ├──────────────┤         ├──────────────┤         ├──────────────┤
  │ Hot blobs    │         │ Warm blobs   │         │ Cold blobs   │
  │ tag:active   │         │ default      │         │ tag:archive  │
@@ -1380,30 +1382,20 @@ enum OpKind {
 }
 ```
 
-`DiskEngine` wraps `Engine` with persistence via `FileBlockDevice`:
+`DiskEngine` wraps `Engine` with persistence over the pool's block devices:
 
 ```rust
 struct DiskEngine {
     engine: Engine,
-    blobs: HashMap<u64, Vec<u8>>,
-    primary_device: FileBlockDevice,
-    superblock: Superblock,
-    config: PoolConfig,
-    config_path: PathBuf,
+    devices: Vec<Box<dyn BlockDevice>>,   // the pool's members, opened by the embedder
+    superblocks: Vec<Superblock>,
 }
 ```
 
-**Pool configuration** (`pool.toml`) links `brunnr` and `mimir` to the same pool:
-
-```toml
-node_id = 1
-
-[[disks]]
-id = 0
-path = "/path/to/device"
-tier = "hot"
-capacity_bytes = 1073741824
-```
+A pool opens from the set of devices the embedder supplies — disks, partitions or byte ranges
+of image files; their superblocks and the disk descriptors say which pool they form
+(POOL-DESIGN§1.1). Host tools (`brunnr`, `mimir`) take those device paths on the command line;
+no configuration file names them.
 
 All engine state persists in the trees of the root list — B+ trees and positional regions of 256 KiB write-once nodes, fixed binary layouts, committed atomically by checkpoints — specified in the scope format sections indexed by [format-design.md](format-design.md).
 

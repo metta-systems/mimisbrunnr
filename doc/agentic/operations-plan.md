@@ -44,7 +44,7 @@ Independent of each other unless an order is given.
 - **Encodings** (FORMAT-DESIGN§1.6): [SPEC25](specification-implementation-plan.md) and [INDEX9](index-implementation-plan.md) first; then [JOURNAL8](journal-implementation-plan.md) (binary payloads, then [JOURNAL9](journal-implementation-plan.md): journal buckets and journal sets, after JOURNAL7), [QUERY11](query-implementation-plan.md) and [ONTOLOGY10](ontology-implementation-plan.md); after QUERY11, [SUBSCRIPTION7](subscriptions-implementation-plan.md) and [POOL5](pool-implementation-plan.md) (native placement-rules tree).
 - [SPEC24](specification-implementation-plan.md) — no packed on-disk structs.
 - [JOURNAL7](journal-implementation-plan.md) — one checksum algorithm (after OPERATIONS-D4).
-- [POOL3](pool-implementation-plan.md), then [POOL7](pool-implementation-plan.md) — pool state through the root pointer; pool assembled from its devices, no `pool.toml`.
+- [POOL1](pool-implementation-plan.md) — one disk-descriptor tree (after ALLOCATION9); [POOL3](pool-implementation-plan.md) — pool state record (after SPEC25 and ENGINE12); then [POOL7](pool-implementation-plan.md) — pool assembled from its devices, no `pool.toml`.
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
 - [ENGINE12](engine-implementation-plan.md) — superblock and root list (after ALLOCATION9 and JOURNAL12); [ENGINE11](engine-implementation-plan.md) — typed chunking defaults in pool state (after POOL3).
 - [BTREE9](btree-implementation-plan.md) — write-once regions with block-addressable runs; then [BTREE10](btree-implementation-plan.md) — positional page regions, and [BTREE8](btree-implementation-plan.md) — one run format for every tree.
@@ -117,7 +117,7 @@ These touch disjoint code and can run whenever their prerequisites hold:
 - **Query and SQL:** [QUERY1](query-implementation-plan.md)–[QUERY10](query-implementation-plan.md), [QUERY12](query-implementation-plan.md) (QUERY1–QUERY3 after INDEX12, QUERY1's n-gram path after INDEX19; QUERY12 after INDEX18 and QUERY1; QUERY4 after INDEX13; QUERY5 after INDEX15; QUERY6 and QUERY9 after QUERY7; QUERY10 after QUERY4 and QUERY-D2).
 - **Subscriptions:** [SUBSCRIPTION3](subscriptions-implementation-plan.md)–[SUBSCRIPTION6](subscriptions-implementation-plan.md).
 - **Ontology:** [ONTOLOGY6](ontology-implementation-plan.md) (after INDEX14), then [ONTOLOGY7](ontology-implementation-plan.md) and [ONTOLOGY12](ontology-implementation-plan.md); [ONTOLOGY14](ontology-implementation-plan.md) (after ONTOLOGY11 and ONTOLOGY15), then [ONTOLOGY5](ontology-implementation-plan.md), [ONTOLOGY8](ontology-implementation-plan.md), [ONTOLOGY9](ontology-implementation-plan.md), [ONTOLOGY3](ontology-implementation-plan.md); [ONTOLOGY4](ontology-implementation-plan.md) after ONTOLOGY-D2.
-- **Pool:** [POOL1](pool-implementation-plan.md), [POOL4](pool-implementation-plan.md).
+- **Pool:** [POOL4](pool-implementation-plan.md).
 - **Unix and FUSE:** [UNIX2](unix-implementation-plan.md)–[UNIX6](unix-implementation-plan.md), [UNIX8](unix-implementation-plan.md); [UNIX9](unix-implementation-plan.md) after UNIX-D3; [UNIX10](unix-implementation-plan.md) after BLOB1.
 - **Tooling:** [TOOLING3](tooling-implementation-plan.md)–[TOOLING8](tooling-implementation-plan.md); TOOLING3 early, since later end-to-end acceptance criteria use it.
 - **Specification:** [SPEC4](specification-implementation-plan.md)–[SPEC23](specification-implementation-plan.md) as their decisions resolve; SPEC21 (trim struct bodies) scope by scope as code lands.

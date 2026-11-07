@@ -105,7 +105,7 @@ enum BlockKind {
     // Filesystem identity, on-disk geometry, and pool composition
     Superblock        = 0,   // per-disk identity + format pointers (ENGINE-DESIGN§1.1)
     // 1 unassigned (devices have no zones, ENGINE-DESIGN§1)
-    PoolStateRoot     = 2,   // pool-wide disk geometry + tunables (POOL-DESIGN§1)
+    // 2 unassigned (pool state is a tree, POOL-DESIGN§1.2)
     // 3..=4 unassigned (journal sets carry their own header, JOURNAL-DESIGN§1.2)
     // 5..=9 unassigned (index data lives in BtreeKind trees, INDEX-DESIGN)
     // 10 unassigned (object assertions live in the forward index, INDEX-DESIGN§2)
@@ -146,7 +146,7 @@ enum BtreeKind {
     BucketAlloc           = 16,  // ALLOCATION-DESIGN§1.2 per-disk bucket alloc B+ tree (physical)
     FreespaceLru          = 17,  // ALLOCATION-DESIGN§1.4 per-disk freespace LRU B+ tree (physical)
     // Pool / cluster state
-    DiskDescriptors       = 18,  // POOL-DESIGN§1 disk descriptors overflow tree (>12 disks)
+    DiskDescriptors       = 18,  // POOL-DESIGN§1.1 disk descriptors (disk_id → DiskDescriptor)
     PlacementRules        = 19,  // POOL-DESIGN§1 placement rules (heterogeneous, CBOR values)
     ClusterPeers          = 20,  // POOL-DESIGN§1 cluster peers (NodeId → PeerRecord)
     // Reconcile queues (transient)
@@ -157,6 +157,8 @@ enum BtreeKind {
     // Object metadata
     ExtentList            = 27,  // METADATA-DESIGN§1.3 per-object extent-list region (positional, no sorted runs)
     ObjectRoots           = 28,  // METADATA-DESIGN§1.4 NodeId → object radix root (snapshot-agnostic)
+    // Pool
+    PoolState             = 29,  // POOL-DESIGN§1.2 single-entry pool state record
 }
 ```
 

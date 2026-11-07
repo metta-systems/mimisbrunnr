@@ -1,7 +1,7 @@
 # Pool management — design
 
-Scope: `crates/pool` (`PoolManager`, `PoolConfig`, placement rules, disk descriptors), `bin/brunnr`.
-Governing spec: SPECIFICATION-DESIGN§8, POOL-DESIGN§1 (pool state root).
+Scope: `crates/pool` (`PoolManager`, placement rules, disk descriptors, pool state), `bin/brunnr`.
+Governing spec: SPECIFICATION-DESIGN§8, POOL-DESIGN§1 (pool state and disk descriptors).
 
 Plan: [pool-implementation-plan.md](pool-implementation-plan.md) · Open decisions: [pool-decisions.md](pool-decisions.md) · Completed: [pool-completed.md](pool-completed.md) · Order: [operations-plan.md](operations-plan.md)
 
@@ -11,9 +11,12 @@ A pool spans any number of disks across tiers; placement and tiering follow plac
 
 ## Selected design
 
-- `pool.toml` links `brunnr` and `mimir` to the same pool; `PoolManager::add_disk` updates the configuration it owns.
-- Placement rules and disk descriptors persist in B+ tree regions referenced from the pool state root (`placement_rules_root`, `disks_overflow_root`); `cluster_peers_root` belongs to [cluster-design.md](cluster-design.md).
-- Placement changes are carried out by reconcile autotier ([RECONCILE5](reconcile-implementation-plan.md)).
+- **Identity from the devices.** A pool is the set of devices whose superblocks carry its `fs_uuid`; each device names itself by `disk_id` and `disk_uuid` (ENGINE-DESIGN§1.1), and the disk-descriptor tree lists every member. Opening a pool takes a set of block devices — whole disks, partitions or byte ranges of image files — and checks them against the descriptors. Nothing in the pool names a host path; host tools take device paths on their command line.
+- **One disk-descriptor tree** keyed by `disk_id`, whatever the disk count: a few descriptors fit one leaf, so there is no inline array and no overflow mode.
+- **Pool state is one versioned record** — tunables, throttles, default chunking, the error log — in its own single-entry tree.
+- **Tree nodes are replicated** `metadata_replicas` times across disks, fastest tier first (ENGINE-DESIGN§1.2); the replica count is [POOL-D1](pool-decisions.md).
+- Placement rules persist one entry per rule (`placement_rules_root`); `cluster_peers_root` belongs to [cluster-design.md](cluster-design.md).
+- Placement changes are carried out by reconcile ([RECONCILE5](reconcile-implementation-plan.md)).
 
 ## Format specification
 
@@ -21,75 +24,63 @@ The numbered sections below are the normative on-disk and algorithmic specificat
 
 ## 1. Pool state
 
-`PoolStateRoot` is a single 4 KiB block holding pool-wide scalars and an inline disk
-descriptor array sized for the typical small-pool case:
+### 1.1 Disk descriptors
+
+`RootPointer.disk_descriptors_root` (ENGINE-DESIGN§1.2) roots a BTREE-DESIGN§1 B+ tree of
+`BtreeKind::DiskDescriptors`, snapshot-agnostic, keyed by `disk_id: u16`, with fixed-size values:
 
 ```rust
-#[repr(C, packed)]
-struct PoolStateRoot {                        // 4096 bytes
-    header: BlockHeader,                      //    [0..32]   kind = PoolStateRoot
-    disk_count: u32,                          //   [32..36]
-    cluster_node_count: u32,                  //   [36..40]
-    inline_disks: [DiskDescriptorOnDisk; 12], //   [40..3112]  12 × 256 B
-    _reserved: [u8; 980],                     // [3112..4092] room for pool-wide tunables
-    // trailing CRC32C at [4092..4096] inside BlockHeader's frame
+#[repr(C)]
+struct DiskDescriptor {                      // 32 + 32 × R bytes (R = metadata_replicas)
+    disk_uuid: [u8; 16],                     //  [0..16]   matches the device's Superblock.disk_uuid
+    media_type: u8,                          // [16..17]   MediaType
+    tier: u8,                                // [17..18]   StorageTier
+    state: u8,                               // [18..19]   DiskState
+    flags: u8,                               // [19..20]   DISK_FLAG_*
+    bucket_count: u32,                       // [20..24]   buckets on the device
+    first_usable_bucket: u32,                // [24..28]   = the device's Superblock.first_usable_bucket
+    _reserved: u32,                          // [28..32]
+    buckets_root: NodePtr,                   // [32..)     ALLOCATION-DESIGN§1.2 bucket alloc table
+    freespace_root: NodePtr,                 //            ALLOCATION-DESIGN§1.4 freespace LRU
 }
+
+const DISK_FLAG_ROTATIONAL: u8 = 1 << 0;     // seek-bound: reconcile sweeps in physical order
 ```
 
-**Hybrid disk storage.** Per the typical use case (1–5 disks per pool), the inline array
-covers normal operation without indirection; the cap of 12 leaves comfortable headroom for
-modest multi-disk hosts (4–10 disks) before any spillover. Larger pools spill to a B+ tree:
+`MediaType`, `StorageTier` and `DiskState` are SPECIFICATION-DESIGN§8.1's enums with their
+declaration order as discriminants. Capacity is `bucket_count` buckets; usage is the alloc
+table's. The per-disk allocation trees are COW under the standard checkpoint machinery, so every
+checkpoint captures a self-consistent state of every disk's allocation.
 
-- `disk_count ≤ 12`: all disks live in `inline_disks[0..disk_count]`. The
-  `RootPointer.disks_overflow_root` (ENGINE-DESIGN§1.2) is zero; no overflow tree exists.
-- `disk_count > 12`: all disks live in the **disks-overflow B+ tree**
-  (`BtreeKind::DiskDescriptors`, keyed by `disk_id: u16`, rooted at
-  `RootPointer.disks_overflow_root`). The `inline_disks[]` array is unused (zeroed).
+**Opening a pool.** Read every supplied device's superblock; group by `fs_uuid`; load the root
+list from the newest checkpoint among their journals (JOURNAL-DESIGN§1.5); then require that
+every descriptor in state `Online` or `Draining` has a supplied device with its `disk_uuid`, and
+that no supplied device of the pool lacks a descriptor. A missing or foreign device is a defined
+error naming it.
 
-Crossing the threshold (the 13th disk added) migrates the inline contents into the overflow
-tree as a single batched btree insert. The reverse transition (disk_count dropping to 12 or
-below) is **lazy** — the overflow tree may be retained until the next checkpoint or until
-explicitly compacted; readers always check `disk_count` to know which side to consult.
+### 1.2 Pool state record
 
-A 256 KiB overflow leaf packs ~1 000 entries per sorted run (256 B per descriptor), so even
-multi-thousand-disk clusters stay at depth 0–1.
+`RootPointer.pool_state_root` roots a B+ tree of `BtreeKind::PoolState` holding one entry, key
+`0`, whose value is positional, versioned CBOR (FORMAT-DESIGN§1.6), schema version 1:
 
-**Disk descriptor (256 bytes):**
+```text
+PoolStateRecord = [version,
+                   cluster_node_count: uint,
+                   default_chunking_threshold: uint,      // objects ≤ this size are never chunked
+                   default_chunking: bytes(16),           // ChunkParamsRecord (INDEX-DESIGN§4.3)
+                   move_bytes_in_flight: uint,            // RECONCILE-DESIGN§1.5, default 64 MiB
+                   move_ios_in_flight: uint,              // default 64
+                   reconcile_flags: uint,                 // bit 0 copygc, 1 tiering, 2 repair,
+                                                          //   3 ac-only (RECONCILE-DESIGN§1.9)
+                   errors: [ErrorEntry]]                  // newest 64 (RECONCILE-DESIGN§1.7)
 
-```rust
-#[repr(C, packed)]
-struct DiskDescriptorOnDisk {                // 256 bytes
-    disk_id: u16,                            //  [0..2]
-    media_type: u8,                          //  [2..3]
-    tier: u8,                                //  [3..4]
-    state: u8,                               //  [4..5]    DiskState
-    _pad0: u8,                               //  [5..6]
-    path_len: u8,                            //  [6..7]    valid byte count of path[]
-    _pad1: u8,                               //  [7..8]
-    capacity_bytes: u64,                     //  [8..16]
-    used_bytes: u64,                         // [16..24]
-    bucket_count: u32,                       // [24..28]   capacity_bytes >> bucket_size_log2
-    first_usable_bucket: u32,                // [28..32]   = Superblock.first_usable_bucket
-    buckets_root: BlockRef,                  // [32..48]   ALLOCATION-DESIGN§1.2 bucket alloc table root
-    freespace_root: BlockRef,                // [48..64]   ALLOCATION-DESIGN§1.4 freespace LRU root
-    path: [u8; 192],                         // [64..256]  UTF-8, NUL-padded; path_len bytes valid
-}
+ErrorEntry = [lsn: uint, time_ns: int, kind: uint, detail: bytes]
 ```
 
-The 192-byte inline `path` covers the full range of plausible disk identifiers: Linux device
-names (`/dev/sda`, `/dev/nvme0n1p1`), full by-id / by-uuid symlinks
-(`/dev/disk/by-id/nvme-Samsung_SSD_990_PRO_2TB_S6Z2NJ0X123456A`), NVMe-oF and iSCSI
-discovery URLs, S3/HTTP endpoints with full bucket+key paths, etc. A `path_len` exceeding
-192 is a format error; this would represent a genuinely pathological identifier and is
-better surfaced explicitly than silently truncated.
+The default chunking policy applies when neither the ontology nor a placement rule resolves the
+chunking axis (SPECIFICATION-DESIGN§3.5); the format-time default is no chunking.
 
-The per-disk `buckets_root` and `freespace_root` are COW under the standard checkpoint
-machinery — every RootPointer commit captures a self-consistent snapshot of every disk's
-allocation state.
-
-**Other pool-state btrees** (`placement_rules_root`, `cluster_peers_root`) live directly in
-`RootPointer` (ENGINE-DESIGN§1.2). All btree roots are uniformly anchored at the top of the COW commit
-machinery, so a checkpoint flips a single `RootPointer` and every tree advances atomically.
+**Other pool-state trees** (`placement_rules_root`, `cluster_peers_root`) are root-list entries
+like every other tree (ENGINE-DESIGN§1.2), so one checkpoint advances them all atomically.
 
 ---
-
