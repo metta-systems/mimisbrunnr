@@ -263,6 +263,21 @@ struct RemoteLocator {                       // content_kind = Remote
   - an ontology or placement-rule change that gives existing objects an encryption mode moves
     them through reconcile (RECONCILE-DESIGN§1.1), in the commit that installs the change for
     objects found then, and by scan for the rest.
+
+**Residual copies after a move out of the record.** Moving inline content out changes where the
+current version lives; it does **not** erase earlier copies of the bytes. Until each is
+reclaimed, the bytes stay readable, under the protection of the structure that holds them and
+not under the object's own encryption policy, in:
+
+| Copy | Held until | Protection |
+|---|---|---|
+| Record leaf versions written before the move (copy-on-write leaves) | their bucket is reused and overwritten; freeing does not overwrite | metadata zone: XTS-AES-256 under the disk key when the pool is encrypted (ENCRYPTION-DESIGN§1), plaintext otherwise |
+| Journal sets whose entries carried the bytes (`WriteInline`, the record's put) | the journal trims past them, which retention (JOURNAL-DESIGN§1.6) can delay indefinitely, and their buckets are reused | journal: AES-256-GCM under the journal key when encrypted, plaintext otherwise |
+| `ObjectHistory` records of snapshots taken before the move (SNAPSHOTS-DESIGN§1.2) | every such snapshot is deleted and its cleanup scan has run | metadata zone, as above |
+| Peers' copies of the record (cluster sync) | each peer moves its copy out and reclaims as above | each peer's own pool protection |
+
+No step overwrites or scrubs these copies, so an object that must never have existed outside
+its own encryption has to carry that policy from its first write.
 - **Remote** — no local replica; reads go to `origin_node` or a peer holding it.
 
 A write of at most 40 bytes stores `Inline` unless its policy sets an encryption mode; a rewrite that grows past 40 bytes moves the

@@ -539,7 +539,7 @@ The record's 40-byte **content locator** says where the content is; `content_kin
 | `ExtentList` | replicas of an extent-list region (METADATA-DESIGN§1.3) | large non-chunked objects, streams |
 | `ChunkList` | replicas of the head `ChunkList` region (§9.6) | chunked objects; chunks replicate independently |
 | `Packed` | a slot in a small-object block | tiny objects (JOURNAL-DESIGN§1.8) |
-| `Inline` | the content itself | objects of at most 40 bytes whose storage policy sets no encryption mode of its own |
+| `Inline` | the content itself | objects of at most 40 bytes whose storage policy sets no encryption mode of its own; one that gains such a policy moves out, but earlier copies of its bytes persist until reclaimed (METADATA-DESIGN§1.2 "Residual copies") |
 | `Remote` | the origin node | content held by other nodes only (§10.3) |
 
 ```rust
