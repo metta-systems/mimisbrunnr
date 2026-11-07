@@ -38,6 +38,9 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 |---|---|---|
 | Label | a plain tag | `favorite`, `source`, `flac` |
 | Attribute key | a tag used as the key of `Attr(key, value)`, with a value type (`text`, `int`, `float`, `timestamp`, `blob`) | `artist`, `year`, `unix-path` |
+| Record field | a name for a field of the object record (METADATA-DESIGN§1.1), declared by the core ontology; never asserted, readable as a SQL column and usable as a `Bucket` input | `size`, `created`, `modified`, `changed` |
+
+**System labels.** The core ontology declares labels the engine asserts and retracts from the object record, and that users and applications cannot assert or remove (an attempt is a defined error): `_object` (the object is live; the universe of `Not`, SPECIFICATION-DESIGN§2.3), `_presence:remote` (its content is held by other nodes only, METADATA-DESIGN§1.2), `_writing` (a stream not yet closed). Their records carry the system flag.
 
 **Collection flavour** — on a label or an attribute key:
 
@@ -63,7 +66,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 |---|---|---|
 | `Implies { from, to }` | tag `to` for every object carrying tag `from` | `flac → audio → media` |
 | `ValueImplies { key, value, to }` | tag `to` for every object with `Attr(key, value)` | `mime = audio/flac → flac`; `extension = rs → lang-rust` |
-| `Bucket { key, out_key, granularity }` | `Attr(out_key, bucket(value))` | `created_ns → created-year = 2026`, `created-month = 2026-11`; `size → size-class = 1-10MiB` |
+| `Bucket { key, out_key, granularity }` | `Attr(out_key, bucket(value))`, where `key` is an attribute key or a record field | `created → created-year = 2026`, `created-month = 2026-11`; `size → size-class = 1-10MiB` |
 
 - Rules form a DAG over tags (an install that would close a cycle through `Implies` and `ValueImplies` fails).
 - An object's **derived terms** are the closure of its direct terms under the rules (INDEX-DESIGN§2.4); they appear in postings and never in forward entries.
@@ -281,7 +284,7 @@ vesper-0.1.0-rpi4.img   project=vesper                                bundle cur
 | Users of a library | `links` relation reversed from `libhal.rlib` |
 | All Rust libraries anywhere | `lang=rust AND library` |
 | Stale-artifact footprint | `generated AND stale`, summing stored size |
-| Recent work | `source AND modified-week = <this week>` (a `Bucket` rule over `modified_ns`), distinct `project` |
+| Recent work | `source AND modified-week = <this week>` (a `Bucket` rule over the `modified` record field), distinct `project` |
 
 **Build integration.** After compiling, a build hook tags the output (`object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and marks the previous `current` object of the same component `stale` in place of `current`. Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
 
@@ -310,18 +313,25 @@ Values are positional, versioned CBOR (FORMAT-DESIGN§1.6), schema version 1:
 
 ```text
 TagRecord    = [version, uid: bytes(16), name: text, aliases: [text],
-                kind: uint,              // 0 label, 1 attribute key, 0xFF high-water marker
-                value_type: uint,        // attribute keys: 0 text, 1 int, 2 float, 3 timestamp, 4 blob
+                kind: uint,              // 0 label, 1 attribute key, 2 record field,
+                                         //   0xFF high-water marker
+                value_type: uint,        // attribute keys and record fields: 0 text, 1 int,
+                                         //   2 float, 3 timestamp, 4 blob
                 collection: uint,        // 0 plain, 1 grouping, 2 ordered, 3 ranked
                 hierarchy_sep: uint,     // attribute keys: separator code point, 0 = not hierarchical
                 ngram: uint,             // attribute keys: n-gram length, 0 = none
                 storage: StoragePolicy / null,
-                provenance: [bytes(16)]] // module uids declaring the tag
+                provenance: [bytes(16)], // module uids declaring the tag
+                record_field: uint,      // kind 2: 1 length, 2 created_ns, 3 modified_ns,
+                                         //   4 changed (latest of modified_ns, the forward
+                                         //   entry's modified_ns and state_ns); 0 otherwise
+                flags: uint]             // bit 0: system label, asserted only by the engine
 
 RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)]]
     kind 0 Implies       params = [from: TagId, to: TagId]
     kind 1 ValueImplies  params = [key: TagId, value: Value, to: TagId]
     kind 2 Bucket        params = [key: TagId, out_key: TagId, granularity: uint]
+                                  // key: an attribute key or a record field (TagRecord kind 2)
     kind 3 Exclusive     params = [tags: [TagId]]
     kind 4 Requires      params = [tag: TagId, needs: TagId]
 

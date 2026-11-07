@@ -11,11 +11,28 @@ Every query operator evaluates through bitmap algebra over an index built for it
 
 ## Selected design
 
-- Query evaluation is bitmap algebra over the indices in [index-design.md](index-design.md).
+- Query evaluation is bitmap algebra over the indices in [index-design.md](index-design.md); the algebra is SPECIFICATION-DESIGN§2.3.
 - **SQL is read-only.** `SELECT` maps onto the query algebra; mutations go through the engine API.
 - `ORDER BY` over ordered collections reads the collection's sequence (INDEX-DESIGN§3.3).
-- Query operators map onto the term index: `HasTag` and `IsA` read postings; `HasAttr` with `Eq` is one dictionary lookup, with `Lt`/`Le`/`Gt`/`Ge`/`Prefix` one dictionary scan; `Contains` intersects n-gram postings on keys that declare them and scans the key's dictionary entries otherwise; a subtree query on a hierarchical key unions roll-up and node postings; `Related` reads the postings of the relation term (INDEX-DESIGN§4.2).
+- Query operators map onto the term index: `HasTag` reads postings, which hold derived members too (with `direct`, the result is filtered against forward entries); `HasKey` and `HasAttr` with `Eq` are dictionary lookups, with `Lt`/`Le`/`Gt`/`Ge`/`Prefix` one dictionary scan; `Contains` intersects n-gram postings on keys that declare them and scans the key's dictionary entries otherwise; `Under` unions roll-up and node postings of a hierarchical key; `Related` reads the postings of the relation term; `Not` subtracts from the `_object` system label's postings (INDEX-DESIGN§4.2, SPECIFICATION-DESIGN§2.3).
+- **Record fields are columns, not terms.** `size`, `created`, `modified` and `changed` filter the result after the indexed part of the query; to index them, the ontology declares a `Bucket` rule over the field (ONTOLOGY-DESIGN "Rules and constraints").
 - Queries accept an optional `snapshot_id` once [snapshots-design.md](snapshots-design.md) lands.
+
+## Evaluation
+
+**Compile, then run.** A query names tags (by `TagUid` in its stored form, by name in text)
+and values. Compilation resolves them once: tags to `TermId`s, attribute equalities to
+dictionary lookups, ranges and prefixes to dictionary key ranges, `Contains` to n-gram term
+sets. The compiled query is cached with the `rules_epoch` and the dictionary entries it read,
+and recompiled when either changes. Subscriptions and placement rules keep compiled forms
+resident.
+
+**Stream window by window.** The executor produces the result one 65 536-id window at a time
+over posting containers (INDEX-DESIGN§3.2): for each window, intersections run smallest first
+by dictionary cardinality, a window empty after any operand is skipped without reading the
+rest, and `Not` reads the `_object` container of the window. `LIMIT` stops the stream; SQL
+post-operations consume windows, not a materialised result. Memory is bounded by a few
+containers per operand, whatever the result size — the property the device needs.
 
 ## SQL layer
 
@@ -54,13 +71,16 @@ SELECT * FROM objects WHERE artist = 'Aphex Twin' AND year >= 2024 AND year < 20
 SELECT * FROM objects WHERE name LIKE 'cargo%';            -- Prefix
 SELECT * FROM objects WHERE name LIKE '%lock';             -- Contains
 SELECT * FROM objects WHERE tag = 'electronics' AND NOT tag = 'discontinued';
-SELECT * FROM objects WHERE isa('vehicle');                -- follows implications
+SELECT * FROM objects WHERE tag = 'vehicle';               -- cars and trucks too (derived)
+SELECT * FROM objects WHERE direct_tag('vehicle');         -- only objects tagged vehicle themselves
+SELECT * FROM objects WHERE unix_path LIKE '/usr/lib/%';   -- Under on a hierarchical key
+SELECT * FROM objects WHERE size > 1048576 AND tag = 'video';  -- size: record-field column, post-filter
 SELECT * FROM objects WHERE related('member_of', 900);
 SELECT * FROM objects WHERE tag = 'song' LIMIT 100 OFFSET 50;
 SELECT COUNT(*) FROM objects WHERE tag = 'electronics';
 ```
 
-`objects` is the only table: a schemaless table whose columns are attribute keys, read from the forward index. Mímisbrunnr-specific predicates are functions (`isa`, `related`) so the stock dialect parses them. Statements outside the surface and its planned post-operations return `SqlError::Unsupported`.
+`objects` is the only table: a schemaless table whose columns are the attribute keys, read from the forward index, plus the record-field columns `id`, `size`, `created`, `modified` and `changed`, read from the object record. Mímisbrunnr-specific predicates are functions (`direct_tag`, `related`) so the stock dialect parses them. Statements outside the surface and its planned post-operations return `SqlError::Unsupported`.
 
 ### Post-operations
 
@@ -90,4 +110,6 @@ How relation traversal, closure, collection order, path contexts and faceting ar
 
 - **A custom keyword grammar** (`HAS TAG 'x'`, `HAS ALL TAGS (…)`, `IS A 'x'`, `exe HAS TAG …`) in a forked dialect. Tag predicates are `tag = 'x'` / `tag IN (…)` and extensions are functions, so `GenericDialect` parses everything.
 - **Mutation statements in SQL** (`TAG <obj> WITH …`, `UNTAG`, `SET <obj> attr = value`). SQL is read-only; mutations go through `mimir tag` / `mimir set` and the engine API.
+- **An `IsA` operator** (and SQL `isa()`) distinct from `HasTag`. Derived terms are posted, so `HasTag` already matches implied tags; `direct` covers the narrower question.
+- **Record fields as attribute terms** (`size = 4096` interned per object). Millions of distinct sizes and times would become terms; fields are columns, and `Bucket` rules index coarse classes of them.
 - **A separate physical-plan tree** (`PhysicalOp` with `TagBitmap`, `Intersect`, `Difference`, …) between planner and executor. The `Query` algebra is the pushed-down plan; only post-operations sit outside it.

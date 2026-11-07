@@ -208,8 +208,11 @@ interned or reclaimed (INDEX-DESIGN§4.2).
 
 **Invariant.** Under the ontology of snapshot *S* (ONTOLOGY-DESIGN§1), an object is in
 `postings(t)` at *S* exactly when `t` is one of its direct terms or `t ∈ closure(direct terms)`.
-Postings hold direct and derived members alike, so `HasTag`, `IsA` and queries on bucketed or
-rolled-up terms remain single posting reads.
+Postings hold direct and derived members alike, so `HasTag` (whether the tag is direct or
+implied) and queries on bucketed or rolled-up terms remain single posting reads. System labels
+(`_object`, `_presence:remote`, `_writing`, ONTOLOGY-DESIGN "Tags and attribute keys") are
+direct terms the engine asserts from the object record and are held in the forward entry like
+any other.
 
 **Closure tables.** At mount, and whenever `rules_epoch` advances, the engine builds from the rules,
 for every tag `t`:
@@ -225,6 +228,8 @@ They are derived state, never persisted (about 2 MB each at 100 000 tags with an
 closure(D) = tags(D) ∪ ⋃ ancestors[d] for d ∈ tags(D)
            ∪ for each Attr(k, v) ∈ D: the tags its ValueImplies rules name, with their ancestors,
                                        and Attr(out_key, bucket(v)) for each Bucket rule on k
+           ∪ for each record field f with a Bucket rule (size, created, modified, changed):
+                                       Attr(out_key, bucket(record.f))
            ∪ for each hierarchical value node in D: the roll-up terms of its ancestors (INDEX-DESIGN§4.2)
 ```
 
@@ -238,6 +243,7 @@ share one.
 | Add direct term `a` | add the object to `postings(t)` for each `t ∈ closure(D ∪ {a}) − closure(D)` |
 | Remove direct term `a` | `before = closure(D)`, `after = closure(D − {a})`; remove the object from `postings(t)` for each `t ∈ before − after` |
 | Delete the object | remove it from `postings(t)` for each `t ∈ closure(D)` |
+| A record field changes (content write) | for each `Bucket` rule on the field, move the object from the old bucket term to the new one |
 | New `Implies` `a → b` | for each `t ∈ {b} ∪ ancestors[b]`: `postings(t) |= postings(a)` |
 | New `ValueImplies` or `Bucket` on key `k` | for every term of key `k` the rule matches: OR that term's postings into the derived term's postings; for `Bucket`, one dictionary scan of `k` groups its value terms by bucket |
 | Removed rule | see below |

@@ -8,7 +8,7 @@ Order: [operations-plan.md](operations-plan.md) · Open decisions: [operations-d
 
 Mímisbrunnr is the associative filesystem of the Mettā operating system. Once a pool exists on a node and Mímir answers queries against it, three things differ from a hierarchical filesystem:
 
-1. **Retrieval is associative.** A caller obtains an `ObjectId` set by submitting a `Query` over assertions (`Tag`, `Attr`, `Relation`, `IsA`). No path is supplied and none exists.
+1. **Retrieval is associative.** A caller obtains an `ObjectId` set by submitting a `Query` over assertions (`Tag`, `Attr`, `Relation`), direct or derived through the ontology. No path is supplied and none exists.
 2. **Metadata is answerable locally.** The metadata plane (tag bitmaps, forward index, ontology, object table) is replicated to every participating node. Once converged, a query needs no network round-trip and its latency does not grow with cluster size. Bytes cross the wire only for convergence traffic and when an application opens a blob the node does not hold.
 3. **Storage policy follows ontology.** Direct assertions combine with ontology rules into derived terms; placement, tier, compression and encryption follow from rules over the resulting set. One tagging operation re-classifies an object; no separate relocation call exists.
 
@@ -30,7 +30,7 @@ Mímisbrunnr is the associative filesystem of the Mettā operating system. Once 
 **In scope:**
 
 - Object lifecycle: create, tag, untag, set attributes and relations, derived terms from ontology rules, ontology constraints, tombstone deletion.
-- Query evaluation: bitmap algebra over `HasTag`, `HasAttr`, `Related`, `And` / `Or` / `Not`, `IsA`; faceted exploration; optional `snapshot_id`.
+- Query evaluation: bitmap algebra over `HasTag`, `HasKey`, `HasAttr`, `Under`, `Related`, `And` / `Or` / `Not`; faceted exploration; optional `snapshot_id`.
 - Pool management: multiple block devices, attach and detach, zone layout, ontology-driven placement and tiering.
 - Metadata replication with eventual convergence, each node authoritative for its own writes.
 - Subscriptions over `ChangeInterest`.
@@ -84,7 +84,7 @@ Workspace-level evidence (`just test`, `just clippy`) backs every claim: a regre
 | Object | An entity in a pool, identified by an `ObjectId` (16-bit node id, 48-bit local sequence). It has no intrinsic name or path and carries a bag of assertions. |
 | Assertion | A statement about an object: `Tag` (the object is X), `Attr` (key K has value V) or `Relation` (predicate P targets object T); either direct (set by a caller) or derived (added by an ontology rule; held in postings only). |
 | Tag | A label, attribute key or relation predicate, named across nodes by its 128-bit `TagUid` and locally by its `u32` `TagId`. |
-| Query | A predicate over assertions evaluated by bitmap algebra (`HasTag`, `HasAttr` with comparisons, `Related`, `And` / `Or` / `Not`, `IsA`), resolving to an ObjectId set. |
+| Query | A predicate over assertions evaluated by bitmap algebra (`HasTag`, `HasKey`, `HasAttr` with comparisons, `Under`, `Related`, `And` / `Or` / `Not`), resolving to an ObjectId set. |
 | Ontology | The tags, rules and constraints of a pool, installed as modules; it determines derived terms and the placement, tier, compression and encryption of matching objects. |
 | Pool | One or more block devices formed by `brunnr create`, each holding superblock copies and buckets for the journal, tree nodes and data. A Mímir instance operates on exactly one pool. |
 

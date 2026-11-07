@@ -119,17 +119,39 @@ Queries are set operations over object sets, evaluated bottom-up via bitmap alge
 
 ```rust
 enum Query {
-    HasTag(TagId),
-    HasAttr { key: TagId, op: CmpOp, value: Value },
+    HasTag { tag: TagId, direct: bool },  // direct = false: carries the tag directly or derived —
+                                          //   "vehicle" matches "car", "truck" (§3.3)
+    HasKey(TagId),                        // has any value of the attribute key
+    HasAttr { key: TagId, op: CmpOp, value: Value, scope: Option<Scope> },
+    Under { key: TagId, path: Value },    // hierarchical keys: the value or anything below it
     Related { predicate: TagId, target: ObjectId },
     And(Vec<Query>),
     Or(Vec<Query>),
-    Not(Box<Query>),
-    IsA(TagId),   // ontology-aware: "vehicle" matches "car", "truck"
+    Not(Box<Query>),                      // complement within the live objects
 }
 
+enum Scope { Unscoped, In(Value /* the grouping value naming the scope */), Any }
 enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge, Prefix, Contains }
 ```
+
+- **Derived terms make `IsA` unnecessary:** postings hold every object a rule derives a tag
+  for, so `HasTag` already answers the ontology-aware question; `direct: true` restricts the
+  match to objects that carry the tag themselves, checked against forward entries.
+- **The universe is the live objects.** The engine posts every object it creates to the
+  system label `_object` and removes it at tombstone (METADATA-DESIGN "Object deletion");
+  `Not(q)` is `_object − q`, so tombstoned objects never appear.
+- **System terms.** Engine-maintained labels expose record facts to queries: `_object`
+  (live), `_presence:remote` (content held by other nodes only), `_writing` (a stream not yet
+  closed). Users and applications cannot assert or remove them (ONTOLOGY-DESIGN "Tags and
+  attribute keys").
+- **Record fields** (`size`, `created`, `modified`, `changed`) are not attributes: SQL exposes
+  them as columns filtered after the indexed part of a query, and ontology `Bucket` rules take
+  them as inputs, so `created-month = 2026-11` or `size-class = 1-10MiB` are derived, indexed
+  terms (ONTOLOGY-DESIGN "Rules and constraints").
+- **Stored and compiled forms.** A query that is persisted — a subscription, a placement rule —
+  names tags by `TagUid` so it survives renames and travels between nodes. Before evaluation it
+  is compiled into `TermId`s and dictionary ranges, and recompiled only when the ontology's
+  `rules_epoch` advances or a term it references changes (QUERY-DESIGN "Evaluation").
 
 Example — "all portable electronics from 2024, not discontinued":
 
