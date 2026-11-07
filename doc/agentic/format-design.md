@@ -150,10 +150,8 @@ enum BtreeKind {
     PlacementRules        = 19,  // POOL-DESIGN§1 placement rules (heterogeneous, CBOR values)
     ClusterPeers          = 20,  // POOL-DESIGN§1 cluster peers (NodeId → PeerRecord)
     // Reconcile queues (transient)
-    ReconcileWork         = 21,  // RECONCILE-DESIGN§1.2 normal-priority reconcile queue (logical order)
-    ReconcileHighPrio     = 22,  // RECONCILE-DESIGN§1.2 high-priority reconcile queue
-    ReconcileWorkPhys     = 23,  // RECONCILE-DESIGN§1.2 physical-LBA-ordered work index (HDD pools)
-    ReconcileHighPrioPhys = 24,  // RECONCILE-DESIGN§1.2 physical-LBA-ordered high-prio index (HDD pools)
+    ReconcileWork         = 21,  // RECONCILE-DESIGN§1.2 queued work, by priority then physical position
+    // 22..=24 unassigned (priority and physical order live in the ReconcileWork key)
     ReconcilePending      = 25,  // RECONCILE-DESIGN§1.2 failed items awaiting device-config retry
     ReconcileScan         = 26,  // RECONCILE-DESIGN§1.3 in-progress scan cursors
     // Object metadata
@@ -437,9 +435,9 @@ disk space, surfaced via SNAPSHOTS-DESIGN§1.7's retention policy.
 
 | Structure              | Size       | Trigger                                           |
 | ---------------------- | ---------- | ------------------------------------------------- |
-| Reconcile work btrees  | < 1 MiB idle, ~458 MiB during disk evacuation / cluster resilver | RECONCILE-DESIGN§1.10 |
+| Reconcile trees        | < 1 MiB idle; a scan record per bulk event, plus the entries it could not act on at once | RECONCILE-DESIGN§1.10 |
 | `ReconcileScan` cursors| < 1 MiB    | Per active scan; ~hundreds of bytes each          |
-| `SnapshotCleanup` work | < 1 MiB    | Bounded by the count of snapshot-aware btrees, not key count (SNAPSHOTS-DESIGN§1.5) |
+| Snapshot cleanup scans | < 1 KiB    | One cursor per snapshot-aware btree while a pass runs, not per key or snapshot (SNAPSHOTS-DESIGN§1.5) |
 
 At moderate scale (10 M objects, the worked example here) metadata sits in the low single-digit
 GiB; for typical workloads where average object size is ≥ 1 MiB, that's well under 1% of pool

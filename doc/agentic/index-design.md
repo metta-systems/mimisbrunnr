@@ -577,7 +577,7 @@ its physical extent.
 object changes — typically because the operator updated a `PlacementRule::Chunk` or because
 an ontology install bumped a tag's `storage.chunking` — reconcile (RECONCILE-DESIGN§1.1) detects the
 mismatch by comparing the chain's `ChunkParamsRecord` to the resolved policy and
-enqueues a `WorkKind::OptionUpdate` item. The re-chunk pass produces a fresh ChunkList
+queues a `WorkKind::OptionUpdate` entry, or, for a policy change affecting many objects, the policy change's scan handles them (RECONCILE-DESIGN§1.3). The re-chunk pass produces a fresh ChunkList
 chain (with the new params in its regions) and atomically swaps the record's `locator.newest` to
 the new head via `ReconcileMove`; the old chain becomes unreferenced and is reclaimed via
 bucket-gen GC.

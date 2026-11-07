@@ -4,11 +4,12 @@ Design: [reconcile-design.md](reconcile-design.md) · Decisions: [reconcile-deci
 
 Prerequisites for the whole scope: [ENGINE3](engine-implementation-plan.md), [JOURNAL4](journal-implementation-plan.md), [BLOB2](blob-implementation-plan.md), [ENGINE5](engine-implementation-plan.md).
 
-- [ ] **RECONCILE1 — Work-item trees.** Persist and load the reconcile trees through `RootPointer`.
-- [ ] **RECONCILE2 — `reconcile_step` consumer.** Drain work items (currently returns `Ok(0)`) through the move path (RECONCILE-DESIGN§1.5).
-- [ ] **RECONCILE3 — Copy GC.** Fragmentation tracking, bucket-fill watermark producer, backpointer-driven evacuation (ALLOCATION-DESIGN§1.6). Prerequisite: [ALLOCATION5](allocation-implementation-plan.md).
-- [ ] **RECONCILE4 — Replica repair.** Replica drift producer and resilver.
-- [ ] **RECONCILE5 — Autotier.** Tier residence versus placement policy producer and moves.
+- [ ] **RECONCILE1 — Reconcile trees.** `ReconcileWork` and `ReconcilePending` keyed by `WorkKey` (priority, then physical position) with `WorkValue`, and `ReconcileScan` with `ScanRecord`s (RECONCILE-DESIGN§1.2–1.3), persisted through the root list; the physical-order and high-priority trees and stored desired state go. Acceptance: entries for two disks and three priorities come back in key order after reopen; layouts asserted.
+- [ ] **RECONCILE2 — `reconcile_step` consumer.** Inside the engine's `step` ([ENGINE13](engine-implementation-plan.md)): take queue entries and scan progress up to the step budget, re-evaluate desired state through the backpointer at each entry's location, and act through the move path (RECONCILE-DESIGN§1.5), updating every owner and version of a moved location. Acceptance: an entry whose mismatch was fixed by a later mutation is dropped without a move; moving a packed block updates every object in it.
+- [ ] **RECONCILE9 — Scans.** Scan records with cursors journalled only at checkpoints; evacuation and failure scans over backpointer ranges, policy scans over postings (RECONCILE-DESIGN§1.3). Prerequisite: RECONCILE2. Acceptance: evacuating a disk of 100 000 extents keeps one scan record and no per-extent entries while every extent is movable; a crash mid-scan resumes from the last checkpoint's cursor and ends in the same state.
+- [ ] **RECONCILE3 — Copy GC.** Fragmentation tracking, reserve watermark scan over the freespace LRU, backpointer-driven evacuation of fragmented buckets (ALLOCATION-DESIGN§1.6). Prerequisites: [ALLOCATION5](allocation-implementation-plan.md), RECONCILE9.
+- [ ] **RECONCILE4 — Replica repair.** Triggers for failed replica writes and node-copy verification failures; failure scans and resilver. Prerequisite: RECONCILE9.
+- [ ] **RECONCILE5 — Autotier.** Tier residence versus placement policy, as triggers on write and scans on rule change. Prerequisite: RECONCILE9.
 - [ ] **RECONCILE6 — Snapshot cleanup.** One batched cleanup pass per pending set, skipping blocks by their snapshot range, cursor journalled only at checkpoints (SNAPSHOTS-DESIGN§1.5). Prerequisites: [SNAPSHOT4](snapshots-implementation-plan.md), [BTREE9](btree-implementation-plan.md). Acceptance: deleting 100 snapshots runs one pass; a pass over a pool where one snapshot changed 10 objects reads only the blocks holding those keys (counted); a crash mid-pass resumes and ends with the same trees.
 - [ ] **RECONCILE7 — Self-healing.** RECONCILE-DESIGN§1.7.
 - [ ] **RECONCILE8 — Operator interface.** `mimir reconcile status / pause / resume` (RECONCILE-DESIGN§1.9).

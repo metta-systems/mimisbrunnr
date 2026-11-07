@@ -256,7 +256,7 @@ SnapshotUnlink     : { id: u32, parent: u32, prev_sibling: u32 }
                      // Remove `id` from the snapshots btree. If prev_sibling != 0,
                      //   set prev_sibling.next_sibling = id.next_sibling; otherwise set
                      //   parent.first_child = id.next_sibling. Emitted at the end of
-                     //   a SnapshotCleanup scan (SNAPSHOTS-DESIGN§1.5) once all keys at `id` have
+                     //   a snapshot cleanup pass (SNAPSHOTS-DESIGN§1.5) once all keys at `id` have
                      //   been re-tagged or dropped.
 SnapshotDepthUpdate: { id: u32, new_depth: u16, new_skiplist: [u32; 3], new_ancestor_bitmap: u128 }
                      // Recompute ancestry data for a snapshot node whose effective
@@ -268,13 +268,14 @@ SnapshotDepthUpdate: { id: u32, new_depth: u16, new_skiplist: [u32; 3], new_ance
 // local to the snapshots btree.
 
 // Reconcile (RECONCILE-DESIGN§1)
-ReconcileEnqueue : { work: WorkItem, high_prio: bool, phys_index: bool }
-ReconcileDequeue : { target_kind: u8, owner_key: bytes, work_kind: u8 }   // completion or cancel;
-                   //   owner_key capped at 16 bytes (METADATA-DESIGN§2.2)
+ReconcileEnqueue : { key: WorkKey, value: WorkValue, pending: bool }   // into ReconcileWork, or
+                   //   ReconcilePending when `pending` (RECONCILE-DESIGN§1.2)
+ReconcileDequeue : { key: WorkKey, pending: bool }                     // completion or cancel
 ReconcileMove    : { from_loc: BlockRef, to_loc: BlockRef, owner_key: bytes }
                    // atomic location-update for move-path completion;
                    //   owner_key capped at 16 bytes (METADATA-DESIGN§2.2)
-ReconcileScanStep: { scan_id: u64, btree: BtreeKind, cursor_key: bytes }  // resumable progress;
+ReconcileScanStep: { scan_id: u64, record: ScanRecord }  // a scan started, advanced or finished
+                   //   (empty record); emitted at checkpoints only (RECONCILE-DESIGN§1.3);
                    //   cursor_key capped at 256 bytes
 
 // WalOpKind 30 unassigned: each run carries its own key format (BTREE-DESIGN§1.6)

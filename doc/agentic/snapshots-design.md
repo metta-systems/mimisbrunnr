@@ -60,7 +60,7 @@ struct SnapshotNode {                        // 64 bytes — fits one cache line
 
 // SnapshotNode.flags bits
 const SNAPSHOT_FLAG_LEAF:    u8 = 1 << 0;  // a writable head: current writes are tagged with it
-const SNAPSHOT_FLAG_DELETED: u8 = 1 << 1;  // marked for SnapshotCleanup (SNAPSHOTS-DESIGN§1.5)
+const SNAPSHOT_FLAG_DELETED: u8 = 1 << 1;  // in the pending-deletion set (SNAPSHOTS-DESIGN§1.5)
 ```
 
 **Children topology.** The pair `(first_child, next_sibling)` encodes a **first-child /

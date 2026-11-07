@@ -102,7 +102,7 @@ The term dictionary, postings and forward index replace every index structure, s
 
 ### 9. Reconcile and allocation completeness
 
-[RECONCILE1](reconcile-implementation-plan.md) through [RECONCILE8](reconcile-implementation-plan.md), [INDEX17](index-implementation-plan.md) (term reclamation), with [ALLOCATION7](allocation-implementation-plan.md), [ALLOCATION8](allocation-implementation-plan.md) and [POOL6](pool-implementation-plan.md) (disk evacuation); then [POOL2](pool-implementation-plan.md).
+[RECONCILE1](reconcile-implementation-plan.md), [RECONCILE2](reconcile-implementation-plan.md), [RECONCILE9](reconcile-implementation-plan.md) (scans), then [RECONCILE3](reconcile-implementation-plan.md) through [RECONCILE8](reconcile-implementation-plan.md), [INDEX17](index-implementation-plan.md) (term reclamation), with [ALLOCATION7](allocation-implementation-plan.md), [ALLOCATION8](allocation-implementation-plan.md) and [POOL6](pool-implementation-plan.md) (disk evacuation); then [POOL2](pool-implementation-plan.md).
 
 ### 10. Cluster sync
 
