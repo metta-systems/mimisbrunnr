@@ -167,8 +167,10 @@ ReconcileMove { from_loc, to_loc, owner_key }
         OwnerKind::BlobExtent      → the record's Extent locator replicas[i], or the
                                      extent_index-th ExtentEntry's (METADATA-DESIGN§1.2–1.3)
         OwnerKind::Chunk           → ChunkIndex entry's BlobRef (INDEX-DESIGN§4.3)
-        OwnerKind::BtreeNode       → parent inner node's BlockRef (BTREE-DESIGN§1), or for a
-                                     ChunkList / ExtentList head the record's locator head[i]
+        OwnerKind::BtreeNode       → the moved copy's slot in the parent's NodePtr (BTREE-DESIGN§1);
+                                     for the newest ChunkList / ExtentList region the record's
+                                     locator newest[i], for an older one the next region's
+                                     predecessor pointer (a new copy of that region)
         OwnerKind::PackedBlock     → the Packed locator of every object the block names
 ```
 

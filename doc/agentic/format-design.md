@@ -397,7 +397,7 @@ forward index roughly in half (~660 MiB at this scale).
 | Journal                | ~64 MiB   | Journal buckets (JOURNAL-DESIGN§1) plus retained history; mirrored across hot devices |
 | Bucket alloc table     | ~160 MiB  | 16 M buckets × ~10 B/entry (8 B value + ~2 B packed `bucket_no`) + sorted-run overhead (BTREE-DESIGN§1.1 headers, format descriptors, tail padding) |
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
-| Object table (records) | ~1.19 GiB | Positional — no key packing applies; 4 893 leaves × 256 KiB; content locators included |
+| Object table (records) | ~1.6 GiB  | Positional — 1.19 GiB of records in 6 511 leaves × 256 KiB (¾ of each region holds pages, the rest absorbs page runs); content locators included |
 | Object table (radix, roots) | < 1 MiB | One inner node per origin node (depth 1 total); `ObjectRoots` one leaf |
 | Backpointers           | ~267 MiB  | METADATA-DESIGN§2.2 — 10 M extents × ~28 B packed                 |
 | Forward index          | ~0.6 GiB  | INDEX-DESIGN§2 — ~58 B per object at 8 direct assertions/object (32 B head + frame-of-reference term arrays); implied tags are not stored. Includes any `unix-path` and other path-projection attributes (UNIX-DESIGN§1) — those are ordinary `Attr` terms. |

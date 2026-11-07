@@ -489,7 +489,7 @@ The filesystem operates directly on raw block devices. Each disk is divided into
 
 ### 6.2 Object Records
 
-One fixed-size 128-byte record per object says what it is and where its content lives. Records are held in one **COW radix tree of 256 KiB large nodes per origin node** (BTREE-DESIGN§1, METADATA-DESIGN§1), indexed by `ObjectId.local`; a small `ObjectRoots` tree maps each `NodeId` to its radix root and id high-water. Leaves pack 2044 records; depth grows with the node's id space (depth 1 covers 33 M objects, depth 3 the full 48-bit space). Lookup is the node's root entry, then a radix descent ending at `local % 2044`. Leaves whose records are all cleared are dropped. The record holds no tags or attributes — those live only in the forward index (§5.5).
+One fixed-size 128-byte record per object says what it is and where its content lives. Records are held in one **COW radix tree of 256 KiB large nodes per origin node** (BTREE-DESIGN§1, METADATA-DESIGN§1), indexed by `ObjectId.local`; a small `ObjectRoots` tree maps each `NodeId` to its radix root and id high-water. Leaves pack 1 536 records in 4 KiB pages and a flush writes only changed pages; depth grows with the node's id space (depth 1 covers 18.9 M objects with one copy of each node, depth 3 the full 48-bit space). Lookup is the node's root entry, then a radix descent ending at `local % 1536`. Leaves whose records are all cleared are dropped. The record holds no tags or attributes — those live only in the forward index (§5.5).
 
 ```rust
 #[repr(u8)]
@@ -581,7 +581,6 @@ enum WalOpKind {
     SnapshotCreate, SnapshotDelete,
     SnapshotUnlink, SnapshotDepthUpdate,
     ReconcileEnqueue, ReconcileDequeue, ReconcileMove, ReconcileScanStep,
-    FormatPromote,
     Checkpoint,
     WriteInline, ExtendObject,                 // tiny objects and streams (JOURNAL-DESIGN§1.8)
     ReclaimTerms,                              // unused attribute terms (INDEX-DESIGN§1.2)

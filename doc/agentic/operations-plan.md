@@ -34,7 +34,6 @@ Steps 1–7 replace the prototype's shortcuts with the specified binary formats 
 Each fixes a layout that later steps write; decide them first.
 
 - [OPERATIONS-D4](operations-decisions.md) — checksum algorithm.
-- [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md), [BTREE-D3](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes, aligned values in sorted runs.
 - [POOL-D1](pool-decisions.md) — metadata replica count (sets node-pointer width).
 - [BLOB-D4](blob-decisions.md) — small-object bucket layout.
 
@@ -48,7 +47,7 @@ Independent of each other unless an order is given.
 - [POOL3](pool-implementation-plan.md), then [POOL7](pool-implementation-plan.md) — pool state through the root pointer; pool assembled from its devices, no `pool.toml`.
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
 - [ENGINE11](engine-implementation-plan.md) — typed chunking defaults in the superblock.
-- [BTREE8](btree-implementation-plan.md) — codec-transparent region read.
+- [BTREE9](btree-implementation-plan.md) — write-once regions with block-addressable runs; then [BTREE10](btree-implementation-plan.md) — positional page regions, and [BTREE8](btree-implementation-plan.md) — one run format for every tree.
 - [ONTOLOGY2](ontology-implementation-plan.md) — storage errors.
 - [ONTOLOGY10](ontology-implementation-plan.md) (per-record ontology tree, in the encodings group above), then [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator with ad-hoc tags in `local` — and [ONTOLOGY15](ontology-implementation-plan.md) — tag uids and name resolution; [ONTOLOGY11](ontology-implementation-plan.md) — ontology journal ops, after JOURNAL8.
 - [ALLOCATION9](allocation-implementation-plan.md) — bucket-relative pointers and node pointers (after POOL-D1); [ALLOCATION10](allocation-implementation-plan.md) — 8-byte bucket entries, derived live sectors.
@@ -59,20 +58,19 @@ Independent of each other unless an order is given.
 The term dictionary, postings and forward index replace every index structure, so they land before the tree machinery that writes them (INDEX-DESIGN).
 
 1. [INDEX12](index-implementation-plan.md) — term dictionary, term table and interning (after INDEX9).
-2. [INDEX13](index-implementation-plan.md) — postings containers (after BTREE-D3); then [INDEX14](index-implementation-plan.md) — forward index by `TermId`, direct terms only.
+2. [INDEX13](index-implementation-plan.md) — postings containers (after BTREE9); then [INDEX14](index-implementation-plan.md) — forward index by `TermId`, direct terms only.
 3. [INDEX15](index-implementation-plan.md) — sequences; [INDEX16](index-implementation-plan.md) — queries, faceting, FUSE and watch over containers.
 4. [ONTOLOGY16](ontology-implementation-plan.md) — attribute flavours and key options (after INDEX15); then [INDEX18](index-implementation-plan.md) — hierarchy tries with roll-ups — and [INDEX19](index-implementation-plan.md) — n-gram postings over distinct values.
 5. [METADATA7](metadata-implementation-plan.md) — `ObjectRecord` with content locator, one object table (after INDEX14).
 
 ### 4. Live tree machinery
 
-1. [BTREE4](btree-implementation-plan.md) — covered key ranges (after BTREE-D2).
+1. [BTREE4](btree-implementation-plan.md) — separator keys for descent.
 2. [JOURNAL2](journal-implementation-plan.md) — trim respects pins; [JOURNAL10](journal-implementation-plan.md) — group commit and durability levels.
-3. [BTREE5](btree-implementation-plan.md) — append-on-flush with whiteouts (after BTREE-D1).
+3. [BTREE5](btree-implementation-plan.md) — append-on-flush with whiteouts.
 4. [ENGINE1](engine-implementation-plan.md) — long-lived nodes per tree.
-5. [BTREE6](btree-implementation-plan.md), then [JOURNAL3](journal-implementation-plan.md) — `FormatPromote` emit and replay.
-6. [JOURNAL4](journal-implementation-plan.md) — checkpoint cadence driver.
-7. [SUBSCRIPTION2](subscriptions-implementation-plan.md) — per-subscription COW check.
+5. [JOURNAL4](journal-implementation-plan.md) — checkpoint cadence driver.
+6. [SUBSCRIPTION2](subscriptions-implementation-plan.md) — per-subscription COW check.
 
 ### 5. Copy-on-write allocation
 

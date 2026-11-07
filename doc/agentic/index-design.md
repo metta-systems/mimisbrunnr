@@ -142,7 +142,7 @@ closure of the direct tags under the ontology (INDEX-DESIGN§2.4).
 ### 2.1 Entry layout
 
 A BTREE-DESIGN§1 tree of `BtreeKind::Forward`, keyed by `(oid: u64, snapshot: u32)` through the
-packed-key codec (BTREE-DESIGN§1.6), with `VARINT` value sizes. Each value is a `ForwardEntry`:
+packed-key codec (BTREE-DESIGN§1.6), with variable-size values. Each value is a `ForwardEntry`:
 the object's direct terms in ascending `TermId` order, split into tag terms (`< 2³²`) and other terms,
 each run stored as a frame of reference — a base plus fixed-width offsets — so the arrays are
 aligned, binary-searchable in place and compact.
@@ -181,22 +181,14 @@ through a rule change do not move it: they are not part of the entry.
 ### 2.2 Overflow
 
 An entry whose arrays exceed 4 KiB (around 2 000 terms) sets `FORWARD_FLAG_OVERFLOW`: the value
-holds only the `ForwardHead` followed by a `BlockRef`, and the arrays — laid out exactly as
-above — fill one or more `ForwardOverflow` regions:
+holds only the `ForwardHead` followed by a `NodePtr` (ENGINE-DESIGN§1.2), and the arrays — laid
+out exactly as above — fill a backward-linked chain of `ForwardOverflow` positional regions
+(BTREE-DESIGN§1.7), the `NodePtr` naming the newest. The record array of each region is bytes:
+its pages hold the arrays in order, and each region's kind header holds `bytes_used: u32`, the
+array bytes it holds, and — in every region but the first — the previous region's `NodePtr`.
 
-```rust
-#[repr(C)]
-struct ForwardOverflowRegion {               // 262 144 B = 256 KiB
-    header:    BtreeNodeHeader,              //      [0..64]       kind = ForwardOverflow;
-                                             //                    payload_used = bytes of arrays held
-    payload:   [u8; 262_064],                //     [64..262_128]  continuation of the arrays
-    next_page: BlockRef,                     // [262_128..262_144] ZERO = tail of chain
-}
-```
-
-The arrays are the concatenation of each region's `payload[..payload_used]` in chain order; the
-tail's `next_page` is zero, and a chain whose total length disagrees with the counts in the head
-is a format error.
+The arrays are the concatenation of each region's first `bytes_used` page bytes, oldest region
+first; a chain whose total length disagrees with the counts in the head is a format error.
 
 ### 2.3 Behaviour
 
@@ -525,10 +517,10 @@ ChunkIndexLeafEntry {                        // 56 bytes
 }
 ```
 
-A 256 KiB leaf packs **4 678 chunk entries per sorted run** —
-`(262 144 − 64 [BtreeNodeHeader] − 32 [SortedRunHeader] − 72 [4-field key format])
-÷ 56 = 4 678`. Random-looking BLAKE3 hashes bypass BTREE-DESIGN§1.6 packing (each 32 B hash uses
-four `bit_width = 64` field formats), so per-key cost is the unpacked 56 B.
+A 4 KiB data block (BTREE-DESIGN§1.2) holds 70 chunk entries — 8 B block head, then per entry a
+32 B key, 1 flag byte and 24 B of fixed-size value — so a 256 KiB leaf of 60 data blocks holds
+about **4 200**. Random-looking BLAKE3 hashes do not compress (each 32 B hash is four 8-byte
+`MSB_FIRST` fields with base 0, BTREE-DESIGN§1.6), so per-entry cost is the unpacked 57 B.
 
 Chunk hashes use BLAKE3 of plaintext (pre-compression) so dedup is content-defined. FastCDC
 (content-defined chunking) decides the chunk boundaries; the chunk index records each unique
@@ -536,12 +528,12 @@ chunk once, refcounted, so two objects sharing common chunks share their storage
 
 #### `ChunkList` — per-object FastCDC recipe
 
-A chunked object's record (content kind `ChunkList`, METADATA-DESIGN§1.2) points at the **head**
-of a `BtreeKind::ChunkList` chain. The head region carries `BTREE_NODE_FLAG_HEAD_OF_CHAIN`
-in `BtreeNodeHeader.flags` (BTREE-DESIGN§1.1) and a fixed 16 B `ChunkParamsRecord` immediately after
-the header — recording the chunking parameters used to produce the chain. Chained
-(non-head) regions carry only the `BtreeNodeHeader`; their chunking parameters are inherited
-from the head.
+A chunked object's record (content kind `ChunkList`, METADATA-DESIGN§1.2) points at the
+**newest** region of a backward-linked `BtreeKind::ChunkList` chain of positional regions
+(BTREE-DESIGN§1.7). The first region carries `BTREE_NODE_FLAG_HEAD_OF_CHAIN`. Every region's
+kind header (block 0, written once) holds the 16 B `ChunkParamsRecord` recording the chunking
+parameters used to produce the chain, then — in every region but the first — the previous
+region's `NodePtr` and the index of the region's first entry.
 
 ```rust
 #[repr(C)]
@@ -572,33 +564,21 @@ struct ChunkListEntry {                      // 40 bytes (8-aligned)
 Region capacity:
 
 ```
-Head region:
-  262 144 − 64 (BtreeNodeHeader) − 16 (ChunkParamsRecord) − 16 (trailing chain BlockRef)
-    = 262 048 B  ÷ 40 B/entry  = 6 551 entries
-
-Chained regions:
-  262 144 − 64 (BtreeNodeHeader) − 16 (trailing chain BlockRef)
-    = 262 064 B  ÷ 40 B/entry  = 6 551 entries
+102 entries per 4 KiB page (40 B each, 16 B of pad) × 48 logical pages = 4 896 entries per region
 ```
 
-Both shapes pack the same 6 551 entries — the head's `ChunkParamsRecord` occupies space that
-is trailing pad in a chained region, so it costs no slots. The head region's first
-entry sits at offset 80 (`64 + 16`); chained regions' first entry sits at offset 64.
-Readers determine which shape they're looking at by inspecting
-`BTREE_NODE_FLAG_HEAD_OF_CHAIN`.
-
 Each entry covers a single FastCDC chunk (typical 4 – 64 KiB plaintext); a single region
-therefore covers ≈ 26 MiB – 410 MiB of plaintext at the average chunk size. Larger objects
-chain through the trailing `BlockRef` slot (same convention as `ForwardOverflow`, INDEX-DESIGN§2.2).
-Reads stream chunks in order: walk the list, look up each chunk in `ChunkIndex` to find its
-physical extent, fetch.
+therefore covers ≈ 19 MiB – 306 MiB of plaintext at the average chunk size. Larger objects
+add regions to the chain. Reads stream chunks in order: walk back from the newest region once
+to the first, then forward through the entries, looking up each chunk in `ChunkIndex` to find
+its physical extent.
 
 **Re-chunking after policy change.** When the resolved storage policy (SPECIFICATION-DESIGN§3.5) for an
 object changes — typically because the operator updated a `PlacementRule::Chunk` or because
 an ontology install bumped a tag's `storage.chunking` — reconcile (RECONCILE-DESIGN§1.1) detects the
-mismatch by comparing the head region's `ChunkParamsRecord` to the resolved policy and
+mismatch by comparing the chain's `ChunkParamsRecord` to the resolved policy and
 enqueues a `WorkKind::OptionUpdate` item. The re-chunk pass produces a fresh ChunkList
-chain (with new params in its head) and atomically swaps the record's `locator.head[0]` to
+chain (with the new params in its regions) and atomically swaps the record's `locator.newest` to
 the new head via `ReconcileMove`; the old chain becomes unreferenced and is reclaimed via
 bucket-gen GC.
 

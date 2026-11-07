@@ -253,9 +253,9 @@ re-mapped.
 
 **Positional access** for `ObjectRecord`s is preserved at the *per-leaf* level: the object's
 origin node selects a radix root in `ObjectRoots`, the radix descent (METADATA-DESIGN§1) resolves
-`oid_local` to a leaf `BlockRef`, and the record lives at slot `oid_local % 2044` within that
-leaf. The leaves themselves are COW pages whose physical addresses are indirected through
-`object_table_root`; there is no zone-wide flat array.
+`oid_local` to a leaf, and the record lives at slot `oid_local % 1536` within that leaf. The
+leaves are positional page regions (BTREE-DESIGN§1.7) reached through `NodePtr`s; there is no
+device-wide flat array.
 
 ---
 
@@ -266,7 +266,7 @@ queries:
 
 | In-memory type                               | Mirrors on-disk                           | Lifetime                  |
 | -------------------------------------------- | ----------------------------------------- | ------------------------- |
-| `ObjectTable` (positional accessor over `BTreeNodeCache`) | METADATA-DESIGN§1 per-node radix trees of `BtreeKind::ObjectTable` leaves; per-record access = (`ObjectRoots` entry → radix descent → leaf `BlockRef`) → cache lookup → 128 B slot at `oid_local % 2044` | leaves cached per `BTreeNodeCache` policy below; no separate resident array (~1.19 GiB at 10 M objects, ≥ TiBs at the 48-bit cap) |
+| `ObjectTable` (positional accessor over `BTreeNodeCache`) | METADATA-DESIGN§1 per-node radix trees of `BtreeKind::ObjectTable` leaves; per-record access = (`ObjectRoots` entry → radix descent → leaf `BlockRef`) → cache lookup of the 4 KiB page → 128 B slot at `oid_local % 1536` | pages cached per the block cache policy below; no separate resident array (~1.19 GiB of records at 10 M objects) |
 | `ObjectRoots` | METADATA-DESIGN§1.4 — one entry per origin node | fully resident (a few entries) |
 | `ObjectHistory` (snapshot-override sidecar) | SNAPSHOTS-DESIGN§1.2 — `BtreeKind::ObjectHistory` keyed by `(oid, snapshot)`; consulted only for non-current-snapshot reads | shares `BTreeNodeCache`; typically cold (current-snapshot reads bypass) |
 | Term dictionary, term table, postings, sequences, forward index (accessors over `BTreeNodeCache`) | INDEX-DESIGN§2–§4 trees | no resident mirror; nodes cached per `BTreeNodeCache` policy, posting containers read in place |
@@ -277,7 +277,7 @@ queries:
 | `PoolManager`                                | PoolStateRoot                             | fully resident         |
 | Bucket generations (`Vec<u32>` per disk) | ALLOCATION-DESIGN§1.3, per-disk alloc table | fully resident (4 B per bucket) |
 | `WritePoints` (`HashMap<(DiskId, DataType, StreamTag), OpenBucket>`) | derived             | resident; ~hundreds of entries |
-| `BTreeNodeCache` (`HashMap<BlockRef, LoadedNode>` + LRU) | BTREE-DESIGN§1 large nodes (256 KiB each) | journal-pinned nodes never evicted; clean nodes LRU. Working-set ≈ 100–500 hot nodes ⇒ 25–125 MiB. |
+| `BTreeNodeCache` (`HashMap<BlockRef, LoadedNode>` + LRU of 4 KiB blocks) | BTREE-DESIGN§1 nodes: headers and run index blocks per loaded node, data blocks and pages on demand | journal-pinned nodes never evicted; clean blocks LRU. The cache budget is set by the embedder — a few MiB on a device, hundreds on a host. |
 | `BackpointerCache` (LRU of bucket-prefix scan results) | METADATA-DESIGN§2.2 backpointer btree leaves | populated on demand by copygc / scrub / resilver |
 | `SnapshotTree` (`BTreeMap<SnapshotId, SnapshotNode>` + ancestor cache) | SNAPSHOTS-DESIGN§1.1 snapshots btree | fully resident — typically thousands of entries; ancestor checks must be in-cache |
 | `ReconcileEngine` (priority queue heads, throttle counters, move-path semaphore) | RECONCILE-DESIGN§1 reconcile btrees | resident; queue heads cached, deeper queue paged from btree |

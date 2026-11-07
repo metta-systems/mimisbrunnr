@@ -2,13 +2,17 @@
 
 Design: [btree-design.md](btree-design.md) · Decisions: [btree-decisions.md](btree-decisions.md) · Order: [operations-plan.md](operations-plan.md)
 
+## Region format
+
+- [ ] **BTREE9 — Write-once regions with block-addressable runs.** `BtreeNodeHeader` with its checksum written once in block 0; runs of an index block (`RunHeader`, `KeyFormat`, `RunBlockEntry`s, fence keys) and self-contained data blocks with aligned values, large values in value blocks and the whiteout entry flag (BTREE-DESIGN§1.1–1.2, BTREE-DESIGN§1.6); byte-width frame-of-reference keys replace bit packing; region load walks runs and stops at the first invalid index block. `FormatPromote` and its handling go from `crates/wal` and `crates/storage`. Acceptance: fixed expected bytes for a header block, an index block and a data block; a lookup in a 3-run node reads at most one data block per run (counted); a value of 8 KiB is read in place 8-byte aligned; a run torn in its last data block is dropped at load and earlier runs read back.
+- [ ] **BTREE10 — Positional page regions.** Radix leaves and inner nodes, chunk lists, extent lists and forward overflow as `logical_pages` pages written in page runs; backward-linked chains (BTREE-DESIGN§1.7). Prerequisite: BTREE9. Acceptance: changing one record of a full radix leaf writes 8 KiB; a never-written page reads as zeros; a chain of three regions is appended without rewriting the first two.
+
 ## Live tree machinery
 
-- [ ] **BTREE4 — Populate `min_key` / `max_key`.** `flush_to_run`, `compact` and `append_sorted_run` keep the header range current (none of them sets it today); inner-node descent validates the child range after load and reports corruption on mismatch. Prerequisite: BTREE-D2 for keys wider than 16 B. Acceptance: test dumps header bytes and compares them with the smallest and largest key.
-- [ ] **BTREE5 — Append-on-flush with whiteouts.** `flush_to_run` keeps deletes (it currently keeps only inserts); `append_sorted_run` writes only the new run and the header sector. Prerequisite: BTREE-D1. Acceptance: 1 000-entry tree, modify one entry, flush: the region grows by one small run; a delete survives flush and reopen.
-- [ ] **BTREE6 — Emit `FormatPromote` on format widening.** When an appended run needs a wider `SortedRunKeyFormat` than the existing runs, journal `FormatPromote` before writing the run. Prerequisites: BTREE5. Replay: [JOURNAL3](journal-implementation-plan.md).
-- [ ] **BTREE7 — Compaction and its crash recovery.** `should_compact` (payload > 75 % or > 4 runs) and `compact` into a fresh region; on boot, a region whose header carries `BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS` is re-compacted. Engine hook: [ENGINE2](engine-implementation-plan.md). Acceptance: after compaction `sorted_run_count == 1`; interrupted-compaction test recovers.
+- [ ] **BTREE4 — Separator keys for descent.** Inner nodes route by full separator keys with `NodePtr` values; descent checks that a loaded child's first key is not below its separator and reports corruption otherwise. Prerequisite: BTREE9. Acceptance: a tree of term-dictionary keys (wider than 16 bytes) and one of chunk hashes descend correctly across three levels.
+- [ ] **BTREE5 — Append-on-flush with whiteouts.** A flush writes one new run with the pending inserts and whiteouts at the region's next free block and writes nothing else. Prerequisite: BTREE9. Acceptance: 1 000-entry tree, modify one entry, flush: the region grows by one index block and one data block; a delete survives flush and reopen.
+- [ ] **BTREE7 — Compaction.** Compaction (more than 4 runs, more than 75 % of blocks, or no room for the next run) merges into a fresh region, splitting when needed, and the parent's pointer follows at the next checkpoint (BTREE-DESIGN§1.4). Engine hook: [ENGINE2](engine-implementation-plan.md). Acceptance: after compaction the node has one run; a crash between compaction and checkpoint reopens on the old region with no data lost.
 
-## Read path polish
+## Read path
 
-- [ ] **BTREE8 — Codec-transparent region read.** A region read dispatches on the run flags (packed or CBOR) and returns `StorageError::MixedRunFormats { offset }` for mixed regions; drop the `UnsupportedFormatVersion(0)` misuse. Acceptance: a region written by the packed writer is readable through the generic read.
+- [ ] **BTREE8 — One run format for every tree.** CBOR-valued trees (ontology, subscriptions, placement rules) store CBOR as opaque values in ordinary runs; the separate CBOR run kind and `StorageError::MixedRunFormats` go. Prerequisite: BTREE9. Acceptance: an ontology tree and a postings tree are read through the same region reader.

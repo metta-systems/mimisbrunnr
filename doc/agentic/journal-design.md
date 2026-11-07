@@ -20,7 +20,6 @@ The journal is the durability point for every mutation on any medium — SD card
 - **Retention is the oplog.** Journal buckets are kept past the trim point while subscriptions need history, within a cap.
 - **Journal pins.** Each `LoadedNode` holds one `JournalPin { lsn_min, lsn_max, count }` over its pending journal; the trim point is the lowest live pin or the last checkpoint. `JournalPin` lives in `mimisbrunnr-storage`, beside `LoadedNode`.
 - **The engine starts no thread.** It exposes `commit`, `checkpoint` and a non-blocking query of what is due; the embedder drives them — a `std`-gated helper thread on the host, the filesystem server's own thread or event loop on Vesper.
-- **`FormatPromote`** (`WalOpKind::FormatPromote = 30`) journals a sorted-run format widening before the widened run is written; replay re-applies it before decoding later runs.
 
 ## Invariants
 
@@ -219,9 +218,9 @@ ChunkListShrink     : { oid: u64, new_length: u64 }
                    //   tail and decrements ref_count for each dropped chunk; fully-
                    //   emptied regions are freed via bucket-gen bump.
 ChunkObjectFinalize : { oid: u64, content_hash: [u8;32], total_length: u64,
-                        list_head: BlockRef }
+                        list_newest: NodePtr }
                    // Publishes a chunked object: sets content_kind = ChunkList,
-                   //   locator.head[0] = list_head (METADATA-DESIGN§1.2);
+                   //   locator.newest = list_newest (METADATA-DESIGN§1.2);
                    //   content_hash = whole-plaintext hash; length = total_length. Readers see a fully
                    //   assembled chunked object only after this op replays.
 
@@ -278,8 +277,7 @@ ReconcileMove    : { from_loc: BlockRef, to_loc: BlockRef, owner_key: bytes }
 ReconcileScanStep: { scan_id: u64, btree: BtreeKind, cursor_key: bytes }  // resumable progress;
                    //   cursor_key capped at 256 bytes
 
-// Sorted-run format mutations (BTREE-DESIGN§1.6)
-FormatPromote    : { node_ref: BlockRef, sorted_run_seq: u32, new_format: SortedRunKeyFormat }
+// WalOpKind 30 unassigned: each run carries its own key format (BTREE-DESIGN§1.6)
 
 Checkpoint       : { new_root: RootPointer, gc_reserve_buckets: u32 }
                    // Commits a root (JOURNAL-DESIGN§1.5): every tree flushed up to this
@@ -328,20 +326,21 @@ during long transfers matters.
 resolves the per-object chunking parameters per SPECIFICATION-DESIGN§3.5 (ontology effective policy →
 matching `PlacementRule::Chunk` → superblock default). Then:
 
-1. Allocates a fresh `ChunkList` head region; sets `BTREE_NODE_FLAG_HEAD_OF_CHAIN` and
-   writes the resolved `ChunkParamsRecord` immediately after the header (INDEX-DESIGN§4.3). The
-   region holds 6 551 entries.
+1. Allocates the first `ChunkList` region; sets `BTREE_NODE_FLAG_HEAD_OF_CHAIN` and writes the
+   resolved `ChunkParamsRecord` in its kind header (INDEX-DESIGN§4.3). The region holds 4 896
+   entries.
 2. Splits plaintext using the resolved algorithm/params (e.g. FastCDC at the resolved
    `avg_size`). For each chunk: writes the chunk extent to a fresh blob bucket; appends
    the `(hash, extent, length)` triple to a pending `ChunkInsertBatch` and the hash to
    the region's entry array.
 3. When the in-flight `ChunkInsertBatch` reaches the producer's chosen size cap (bounded
    by 1 000 chunks per entry), emits the batch as a journal entry.
-4. When the head region fills (or fsync arrives), commits it and allocates a chained
-   non-head region (no `ChunkParamsRecord`). Each region commit emits
+4. On fsync, writes the region's new pages as a page run (BTREE-DESIGN§1.7); when the region
+   fills, allocates the next region of the chain, whose kind header names the previous one and
+   repeats the `ChunkParamsRecord`. Each page run or new region emits
    `ChunkListAppend { oid, position_start, region, count }`.
-5. At end-of-write, emits `ChunkObjectFinalize { oid, content_hash, total_length, list_head }`.
-   `list_head` points at the head region whose `ChunkParamsRecord` is now the durable
+5. At end-of-write, emits `ChunkObjectFinalize { oid, content_hash, total_length, list_newest }`.
+   `list_newest` points at the newest region; the chain's `ChunkParamsRecord` is the durable
    record of the parameters this object was written with.
 
 **Small in-place edit** (e.g. 4 KiB write at offset 1 GiB into a VM disk → FastCDC re-chunks
@@ -431,7 +430,7 @@ whose update has not yet been merged into the on-disk node:
 ```rust
 struct DirtyNode {                           // in-memory only
     block_ref: BlockRef,                     // current on-disk location
-    last_persisted_lsn: u64,                 // BlockHeader.lsn of the on-disk version
+    last_persisted_lsn: u64,                 // journal_seq of the node's newest run
     pending_lsn_min: u64,                    // oldest WAL entry pinning this node
     pending_lsn_max: u64,                    // newest WAL entry pinning this node
     pending_count: u32,                      // entries waiting to be merged

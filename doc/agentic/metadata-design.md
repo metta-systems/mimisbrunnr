@@ -14,8 +14,8 @@ One fixed-size record per object says what the object is and where its content l
 - **One record per object, content location included.** `ObjectRecord` (128 B) holds state, lengths, content hash, timestamps, the transform applied and a 40-byte **content locator** whose shape depends on how the content is stored: one extent with its replicas, an extent list, a chunk list, a packed small-object slot, the content itself when it is at most 40 bytes, or a remote origin (METADATA-DESIGN§1.2). There is no separate location table: a read is one record lookup, a flush rewrites one tree, and a snapshot has one sidecar.
 - **No assertions in the record.** An object's tags, attributes and relations live only in its forward entry (INDEX-DESIGN§2); the record carries no tag ids, counts or overflow chains.
 - **One radix per origin node.** `ObjectId`s carry the creating node in their top 16 bits and every node holds every object's metadata, so records are kept in one radix tree per origin node, indexed by the id's local part. The `ObjectRoots` tree maps a `NodeId` to that radix's root, depth and id high-water (METADATA-DESIGN§1.4). Each node's ids are sequential, so each radix stays dense.
-- **Radix shape.** Leaf: `BtreeNodeHeader` + 256 B occupancy bitmap + 32 B trailer + 2 044 × 128 B records. Inner node: `BtreeNodeHeader` + 16 380 × `BlockRef`; an empty child has generation 0. `slot = local % 2044`, `child[level] = (local / 2044) % 16 380`.
-- **Growth and flush.** An id beyond the root's range adds a new root one level up with the old root as its first child; dirty leaves are written to fresh regions and every ancestor is rewritten (COW).
+- **Radix shape.** Nodes are positional page regions (BTREE-DESIGN§1.7). Leaf: 1 536 × 128 B records (32 per page); a zero record was never allocated. Inner node: 12 288 / R `NodePtr` slots; an empty child is zero. `slot = local % 1536`, `child[level] = (local / 1536) % (12 288 / R)`.
+- **Growth and flush.** An id beyond the root's range adds a new root one level up with the old root as its first child; a flush appends a dirty leaf's changed pages, and a leaf moved to a fresh region at compaction updates its parent's slot the same way.
 - **Cleared leaves are dropped.** Below a node's id high-water, an empty child means every record under it is `Cleared`; a leaf whose records are all `Cleared` is replaced by an empty child at its next flush, so ids are never reused and deleted history costs nothing.
 - **Wire form is the POD byte image** (`bytemuck`), never CBOR-wrapped; every record carries `record_version` so production pools migrate record by record (FORMAT-DESIGN§15).
 - **Backpointer table** keys use the packed-key codec (BTREE-DESIGN§1.6).
@@ -88,54 +88,57 @@ populated id space; `ObjectRoots` (METADATA-DESIGN§1.4) holds the roots.
 
 ### Node capacities
 
-Each node is a 256 KiB region (BTREE-DESIGN§1) with a 64-byte `BtreeNodeHeader` of
-`BtreeKind::ObjectTable`. There are no internal sorted runs — positional updates are journalled
-via JOURNAL-DESIGN§1.4 and merged on flush.
+Each node is a 256 KiB positional region (BTREE-DESIGN§1.7) of `BtreeKind::ObjectTable` with 48
+logical 4 KiB pages; positional updates are journalled via JOURNAL-DESIGN§1.4 and a flush
+appends only the changed pages. The kind header in block 0 holds the node's first local id
+(`u64`) and origin `NodeId` (`u16`), so a reader can check that a node belongs where the descent
+found it.
 
-- **Leaf node** (level 0): **2044** × `ObjectRecord` (128 B). Layout: 64 B header + 256 B
-  occupancy bitmap (one bit per slot, ≥ 2044 bits) + 32 B trailer (first local id of the leaf
-  `u64`, origin `NodeId` `u16`, reserved) + 2044 × 128 B = **261 984 B used**, leaving 160 B
-  trailing pad inside the 256 KiB region. The bitmap distinguishes "never allocated" from
-  allocated slots; the trailer lets a reader check that a leaf belongs where the descent found it.
-- **Inner node** (level ≥ 1): **16 380** × `BlockRef` (16 B) = 262 080 B = exactly 256 KiB −
-  64 B header. No bitmap and no trailer: empty child slots are denoted by the
-  `BlockRef.generation == 0` sentinel, which never matches a live bucket generation.
+- **Leaf node** (level 0): 32 `ObjectRecord`s (128 B) per page, **1 536** per leaf. A slot whose
+  record is all zero (`record_version == 0`) was never allocated; every written record has
+  `record_version ≥ 1`, cleared records included.
+- **Inner node** (level ≥ 1): `NodePtr` slots of 16 × R bytes (R = `metadata_replicas`,
+  ENGINE-DESIGN§1.2), 256 / R per page, **12 288 / R** per node. An empty child slot is all zero
+  (generation 0 never matches a live bucket generation).
 
 ### Tree depth and capacity
 
 > **Depth convention.** Throughout this document, *depth* counts the **inner levels** of a B+
 > tree or radix tree above the leaves — equivalently, the maximum value of `BtreeNodeHeader.level`
 > present in the tree. A **depth-0** tree is leaf-only (one node, `level = 0`); a **depth-*N***
-> tree has *N* inner levels plus the leaf level, *N + 1* levels in total. `MAX_LEVELS = 3`
-> bounds *inner* depth, so the deepest tree this format addresses is depth 3 (4 levels total),
-> covering ≥ 2⁴⁸ objects. A read at depth *N* touches at most `N + 1` nodes; a flush at depth
-> *N* rewrites at most `N + 1` nodes (`(N + 1) × node_size` bytes). The plural *levels* is the
+> tree has *N* inner levels plus the leaf level, *N + 1* levels in total. `MAX_LEVELS = 4`
+> bounds *inner* depth, so the deepest tree this format addresses is depth 4 (5 levels total),
+> covering ≥ 2⁴⁸ objects for every R. A read at depth *N* touches at most `N + 1` nodes; a flush
+> at depth *N* appends a page run to at most `N + 1` nodes. The plural *levels* is the
 > informal name for the total layer count when prose calls for it; the singular *level* refers
 > to a specific layer, matching the `BtreeNodeHeader.level` field value.
 
-| Depth (inner levels + leaf) | Max objects per origin node              |
-| --------------------------- | ---------------------------------------- |
-| 0 inner (leaf only)         | 2 044                                    |
-| 1 inner                     | 2 044 × 16 380 ≈ 33 M                    |
-| 2 inner                     | 2 044 × 16 380² ≈ 548 G                  |
-| 3 inner                     | 2 044 × 16 380³ ≈ 9 P                    |
+| Depth (inner levels + leaf) | Max objects per origin node, R = 1 | R = 2               |
+| --------------------------- | ---------------------------------- | ------------------- |
+| 0 inner (leaf only)         | 1 536                              | 1 536               |
+| 1 inner                     | 1 536 × 12 288 ≈ 18.9 M            | 1 536 × 6 144 ≈ 9.4 M |
+| 2 inner                     | ≈ 232 G                            | ≈ 58 G              |
+| 3 inner                     | ≈ 2.8 P                            | ≈ 356 T             |
 
-A node that has created 10 M objects has a **single-inner-level radix** (root inner + leaves;
-depth 1). The full 48-bit local-id space is reachable at depth 3.
+A node that has created 10 M objects has a **single-inner-level radix** at R = 1 (root inner +
+6 511 leaves; depth 1) and depth 2 at R = 2. The full 48-bit local-id space (≈ 281 T) is
+reachable at depth 3 for R ≤ 2 and at depth 4 for R ≤ 4.
 
 ### Address translation (oid → leaf slot)
 
 ```rust
 // MAX_LEVELS bounds the inner-node depth above the leaf.
-const MAX_LEVELS: usize = 3;
+const MAX_LEVELS: usize = 4;
+const LEAF_RECORDS: u64 = 1536;
+let inner_slots: u64 = 12_288 / metadata_replicas;   // Superblock.metadata_replicas
 
 let entry = object_roots.get(oid.node())?;        // METADATA-DESIGN§1.4
 let mut idx = oid.local();
-let leaf_slot  = (idx % 2044) as u16; idx /= 2044;
+let leaf_slot  = (idx % LEAF_RECORDS) as u16; idx /= LEAF_RECORDS;
 let mut child_path = [0u16; MAX_LEVELS];
 for level in 0..entry.root_level as usize {
-    child_path[level] = (idx % 16380) as u16;
-    idx /= 16380;
+    child_path[level] = (idx % inner_slots) as u16;
+    idx /= inner_slots;
 }
 // idx must be zero now; non-zero means the id exceeds the radix's addressable range
 // (the writer grows the radix first — "Tree growth").
@@ -162,16 +165,15 @@ again: ids are not reused, so nothing is ever written under it.
 
 ### COW write path
 
-Nodes are rewritten copy-on-write **only when the journal-reclaim thread flushes them** (JOURNAL-DESIGN§1.4),
-never per mutation. A flush at depth *D* costs roughly *(D + 1) × 256 KiB* of writes (one
-rewrite per level, leaf included), amortised across however many mutations accumulated against
-that leaf since its last flush. Assertion changes do not touch the record (they change the
-forward entry and postings), so record leaves are dirtied by creation, content writes, state
+Nodes are written **only when the journal-reclaim thread flushes them** (JOURNAL-DESIGN§1.4),
+never per mutation. A flush appends a page run holding the leaf's changed pages — 8 KiB for one
+dirty page — and, when the leaf moves to a fresh region at compaction, a page run to its parent
+for the changed slot (BTREE-DESIGN§1.7). Assertion changes do not touch the record (they change
+the forward entry and postings), so record leaves are dirtied by creation, content writes, state
 changes and replica moves only.
 
 Per-mutation cost is the journal entry. Reads consult the in-memory `LoadedNode`
-(BTREE-DESIGN§1.3), which holds the on-disk state plus pending journal entries past
-`BtreeNodeHeader.last_persisted_lsn`.
+(BTREE-DESIGN§1.3), which holds the on-disk pages plus pending journal entries.
 
 ### 1.1 ObjectRecord (128 bytes)
 
@@ -232,7 +234,7 @@ struct ExtentLocator {                       // content_kind = Extent
 
 #[repr(C)]
 struct ListLocator {                         // content_kind = ExtentList or ChunkList
-    head: [ReplicaRef; 4],                   //  [0..32]   copies of the list's head region
+    newest: [ReplicaRef; 4],                 //  [0..32]   copies of the list's newest region
     entry_count: u64,                        // [32..40]   extents or chunks in the whole list
 }
 
@@ -245,9 +247,10 @@ struct RemoteLocator {                       // content_kind = Remote
 
 - **Extent** — `stored_length` bytes from the first sector of each replica. An object whose
   stored form fits one extent (at most one bucket) uses this.
-- **ExtentList** — larger non-chunked objects and streams: the head region lists the extents in
-  order (METADATA-DESIGN§1.3); `head` names the region's replicas.
-- **ChunkList** — `head` names the replicas of the head `ChunkList` region (INDEX-DESIGN§4.3); the
+- **ExtentList** — larger non-chunked objects and streams: the list's regions hold the extents in
+  order (METADATA-DESIGN§1.3); `newest` names the replicas of its newest region, from which the
+  chain links back (BTREE-DESIGN§1.7).
+- **ChunkList** — `newest` names the replicas of the newest `ChunkList` region (INDEX-DESIGN§4.3); the
   chunks are content-addressed and replicated by chunk-level placement, not by `replica_count`.
 - **Packed** — the object's bytes are one slot of a small-object block; the locator's layout is
   set by BLOB-D4 and names up to 40 bytes of slot address across its replicas.
@@ -287,10 +290,10 @@ freeing what the old locator named. A stream (`state = Writing`) starts as `None
 
 ### 1.3 Extent lists
 
-An extent list is a chain of positional 256 KiB regions of `BtreeKind::ExtentList`, laid out
-like a `ChunkList` chain (INDEX-DESIGN§4.3): the head carries `BTREE_NODE_FLAG_HEAD_OF_CHAIN`,
-regions chain through a trailing `BlockRef`, and each region holds `ExtentEntry` records in
-object order:
+An extent list is a backward-linked chain of positional regions of `BtreeKind::ExtentList`
+(BTREE-DESIGN§1.7): the first region carries `BTREE_NODE_FLAG_HEAD_OF_CHAIN`, each later
+region's kind header names its predecessor and its first entry index, and each region holds
+`ExtentEntry` records in object order:
 
 ```rust
 #[repr(C)]
@@ -302,9 +305,9 @@ struct ExtentEntry {                         // 40 bytes
 }
 ```
 
-A region holds 6 550 entries — about 25 GiB of 4 MiB extents — before it chains. Appending
-(`ExtendObject`, JOURNAL-DESIGN§1.3) rewrites the tail region; a `ReconcileMove` of one extent
-rewrites the region holding its entry.
+A page holds 102 entries and a region 48 pages, 4 896 entries — about 19 GiB of 4 MiB extents —
+before a new region is added. Appending (`ExtendObject`, JOURNAL-DESIGN§1.3) appends the changed
+page of the newest region; a `ReconcileMove` of one extent appends the page holding its entry.
 
 ### 1.4 Object roots
 
