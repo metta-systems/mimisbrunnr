@@ -485,7 +485,7 @@ The filesystem operates directly on raw block devices. Each disk is divided into
 
 **Atomic root commit.** All persistent B+ tree / radix-tree roots are anchored in a single `RootPointer` (~408 B) inside the superblock. Two slots (`root_a`, `root_b`) alternate with `active_root` selecting the live one — a torn write never produces a corrupt root. Routine mutations land in the WAL; the superblock root is flipped only at checkpoint cadence (§6.4 / ENGINE-DESIGN§1.2, JOURNAL-DESIGN§1.5).
 
-**Allocation is bucket-based, not bitmap-based.** Per-disk free space is tracked via two B+ trees (`BucketAllocEntry` table + `FreespaceLruEntry` LRU), rooted in each disk's `DiskDescriptorOnDisk`. A bucket carries `(generation, data_type, dirty_sectors, last_modify_lsn)`; pointers (`BlockRef`) self-validate against the destination bucket's generation. See ALLOCATION-DESIGN§1 for the full allocation protocol.
+**Allocation is bucket-based, not bitmap-based.** Per-disk free space is tracked via two B+ trees (`BucketAllocEntry` table + `FreespaceLruEntry` LRU), rooted in each disk's `DiskDescriptorOnDisk`. A bucket carries `(generation, kind, live_sectors)` in 8 bytes; live sectors are derived from the journal on replay, and generations are held in memory. Pointers (`BlockRef`) are bucket-relative — a disk addresses 4 PiB at the default 1 MiB bucket — and are checked against the destination bucket's generation; a mismatch on a committed pointer is corruption. Tree-node pointers carry `metadata_replicas` copies on different disks. See ALLOCATION-DESIGN§1 and ENGINE-DESIGN§1.2.
 
 ### 6.2 Object Records
 
@@ -576,7 +576,7 @@ enum WalOpKind {
     WriteBlob,                                 // non-chunked objects
     ChunkInsertBatch, ChunkListAppend,         // chunked-object flow (§9.6)
     ChunkListReplace, ChunkListShrink, ChunkObjectFinalize,
-    BucketAlloc, BucketWrite, BucketGenBump, BucketDiscard,    // §6.1 allocation
+    BucketAlloc, BucketGenBump, BucketDiscard, // §6.1 allocation
     BackpointerInsert, BackpointerRemove,
     SnapshotCreate, SnapshotDelete,
     SnapshotUnlink, SnapshotDepthUpdate,

@@ -35,7 +35,7 @@ Each fixes a layout that later steps write; decide them first.
 
 - [OPERATIONS-D4](operations-decisions.md) — checksum algorithm.
 - [BTREE-D1](btree-decisions.md), [BTREE-D2](btree-decisions.md), [BTREE-D3](btree-decisions.md) — whiteouts, separator keys wider than 16 bytes, aligned values in sorted runs.
-- [ALLOCATION-D1](allocation-decisions.md) — sub-bucket regions.
+- [POOL-D1](pool-decisions.md) — metadata replica count (sets node-pointer width).
 - [BLOB-D4](blob-decisions.md) — small-object bucket layout.
 
 ### 2. Binary formats that need no new allocation
@@ -51,6 +51,7 @@ Independent of each other unless an order is given.
 - [BTREE8](btree-implementation-plan.md) — codec-transparent region read.
 - [ONTOLOGY2](ontology-implementation-plan.md) — storage errors.
 - [ONTOLOGY10](ontology-implementation-plan.md) (per-record ontology tree, in the encodings group above), then [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator with ad-hoc tags in `local` — and [ONTOLOGY15](ontology-implementation-plan.md) — tag uids and name resolution; [ONTOLOGY11](ontology-implementation-plan.md) — ontology journal ops, after JOURNAL8.
+- [ALLOCATION9](allocation-implementation-plan.md) — bucket-relative pointers and node pointers (after POOL-D1); [ALLOCATION10](allocation-implementation-plan.md) — 8-byte bucket entries, derived live sectors.
 - [ALLOCATION2](allocation-implementation-plan.md) — freelist seeding at format time.
 
 ### 3. Term index
@@ -75,9 +76,9 @@ The term dictionary, postings and forward index replace every index structure, s
 
 ### 5. Copy-on-write allocation
 
-1. [ALLOCATION1](allocation-implementation-plan.md) — sub-bucket regions (after ALLOCATION-D1).
+1. [ALLOCATION1](allocation-implementation-plan.md) — sub-bucket regions.
 2. [ENGINE3](engine-implementation-plan.md) — COW commit; then [JOURNAL12](journal-implementation-plan.md) — root in the journal.
-3. [ALLOCATION3](allocation-implementation-plan.md) — generation check on read.
+3. [ALLOCATION3](allocation-implementation-plan.md) — resident generations and the dereference check.
 4. [BTREE7](btree-implementation-plan.md), then [ENGINE2](engine-implementation-plan.md) — compaction.
 5. [METADATA1](metadata-implementation-plan.md) — multi-level radix per origin node.
 6. [ENGINE4](engine-implementation-plan.md) — retire fixed index-zone areas.

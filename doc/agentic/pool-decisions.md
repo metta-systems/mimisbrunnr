@@ -2,9 +2,9 @@
 
 Design: [pool-design.md](pool-design.md) · Plan: [pool-implementation-plan.md](pool-implementation-plan.md)
 
-## POOL-D1 — Index and metadata zone replicas on fast disks
+## POOL-D1 — Metadata replica count
 
-SPECIFICATION-DESIGN§8.2 places the index and metadata zones on one disk. Decide whether the SSD tier also carries replicas of these zones within a node, and how that relates to their replication across the cluster.
+Every tree node is written `metadata_replicas` (R) times on different disks, and node pointers carry R `BlockRef`s (ENGINE-DESIGN§1.2). Decide the default R for a multi-disk pool (for example 2 when at least two disks exist, else 1), whether R may change after format (a change rewrites every inner node and radix slot, since slot width is 16 × R bytes), and how R relates to replicating metadata across the cluster, where every node already holds all metadata (SPECIFICATION-DESIGN§8.2).
 
 ## POOL-D2 — Quotas
 

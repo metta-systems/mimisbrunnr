@@ -69,7 +69,7 @@ struct DiskDescriptorOnDisk {                // 256 bytes
     capacity_bytes: u64,                     //  [8..16]
     used_bytes: u64,                         // [16..24]
     bucket_count: u32,                       // [24..28]   capacity_bytes >> bucket_size_log2
-    first_usable_bucket: u32,                // [28..32]   = bootstrap_buckets
+    first_usable_bucket: u32,                // [28..32]   = Superblock.first_usable_bucket
     buckets_root: BlockRef,                  // [32..48]   ALLOCATION-DESIGN§1.2 bucket alloc table root
     freespace_root: BlockRef,                // [48..64]   ALLOCATION-DESIGN§1.4 freespace LRU root
     path: [u8; 192],                         // [64..256]  UTF-8, NUL-padded; path_len bytes valid

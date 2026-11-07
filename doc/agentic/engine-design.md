@@ -66,8 +66,9 @@ struct Superblock {                          // 4096 bytes total
     bucket_size_log2: u8,                    // [952..953]   e.g. 20 = 1 MiB bucket
     copygc_reserve_pct: u8,                  // [953..954]   default 8 (range 5..=21)
     btree_node_size_log2: u8,                // [954..955]   default 18 = 256 KiB (BTREE-DESIGN§1)
-    _pad3: [u8; 5],                          // [955..960]
-    bootstrap_buckets: u32,                  // [960..964]   reserved leading buckets (sb + WAL + …)
+    metadata_replicas: u8,                   // [955..956]   R: copies of every tree node (ENGINE-DESIGN§1.2)
+    _pad3: [u8; 4],                          // [956..960]
+    first_usable_bucket: u32,                // [960..964]   first bucket after the one holding the superblocks
     _pad4: [u8; 4],                          // [964..968]
     zone_map_offset: u64,                    // [968..976]   0 until any zone is grown
 
@@ -191,13 +192,38 @@ struct RootPointer {                         // 408 bytes
 }
 ```
 
-`BlockRef` is `{ disk_id: u16, _pad: u16, block_no: u32, generation: u64 }` — 16 bytes,
-self-validating against the destination block's header.
+```rust
+#[repr(C)]
+struct BlockRef {                            // 16 bytes
+    disk_id: u16,                            //  [0..2]
+    sector: u16,                             //  [2..4]   4 KiB sector within the bucket
+    bucket_no: u32,                          //  [4..8]
+    generation: u32,                         //  [8..12]  bucket generation at write time (ALLOCATION-DESIGN§1.3)
+    _reserved: u32,                          // [12..16]  zero
+}
 
-`BlobRef` is `{ disk_id: u16, _pad: u16, block_no: u32, length: u64 }` — also 16 bytes, used to
-address a contiguous payload extent within the blob zone (INDEX-DESIGN§4.1's out-of-line term values, INDEX-DESIGN§4.3's chunk index leaf). Unlike `BlockRef`, it carries an explicit `length` (in bytes) rather
-than a generation; freshness is derived from the owning record's bucket-generation check at
-deref time.
+#[repr(C)]
+struct BlobRef {                             // 16 bytes
+    disk_id: u16,                            //  [0..2]
+    sector: u16,                             //  [2..4]
+    bucket_no: u32,                          //  [4..8]
+    length: u64,                             //  [8..16]  bytes
+}
+```
+
+Both are **bucket-relative**: their first 8 bytes have the `ReplicaRef` shape
+(METADATA-DESIGN§2.1) and the backpointer key's fields, so a disk addresses `2³²` buckets —
+4 PiB at the default 1 MiB bucket, 16 PiB at 4 MiB. A `BlockRef` names a tree node or region and
+is checked against the bucket's generation on dereference. A `BlobRef` names a payload extent
+(INDEX-DESIGN§4.1's out-of-line term values, INDEX-DESIGN§4.3's chunk index leaf); it carries a
+length instead of a generation, and its freshness follows from the owning record's check.
+
+**Node pointers.** A pointer to a tree node — a child slot in an inner node, a root-list entry,
+a list head — is a `NodePtr`: `Superblock.metadata_replicas` (R, 1..=4, fixed at format time)
+`BlockRef`s naming the R copies of the node, each on a different disk, the fastest tier first.
+A node is written to all R places before any pointer to it is committed; a read takes the
+first copy that verifies and repairs the others through reconcile. On a single-disk pool R = 1.
+The default R and whether it may change after format are [POOL-D1](pool-decisions.md).
 
 **Commit protocol** (invoked per the cadence in JOURNAL-DESIGN§1.5, *not* per mutation):
 
@@ -249,7 +275,7 @@ queries:
 | `ImplicationDag` (`petgraph::Graph<TagId, ()>`) | dag pages                              | fully resident         |
 | `SubscriptionEngine`                         | SubscriptionsRoot                         | fully resident         |
 | `PoolManager`                                | PoolStateRoot                             | fully resident         |
-| `BucketCache` (`HashMap<(DiskId, u32), BucketAllocEntry>`) | per-disk buckets B+ tree    | hot buckets pinned, cold paged in |
+| Bucket generations (`Vec<u32>` per disk) | ALLOCATION-DESIGN§1.3, per-disk alloc table | fully resident (4 B per bucket) |
 | `WritePoints` (`HashMap<(DiskId, DataType, StreamTag), OpenBucket>`) | derived             | resident; ~hundreds of entries |
 | `BTreeNodeCache` (`HashMap<BlockRef, LoadedNode>` + LRU) | BTREE-DESIGN§1 large nodes (256 KiB each) | journal-pinned nodes never evicted; clean nodes LRU. Working-set ≈ 100–500 hot nodes ⇒ 25–125 MiB. |
 | `BackpointerCache` (LRU of bucket-prefix scan results) | METADATA-DESIGN§2.2 backpointer btree leaves | populated on demand by copygc / scrub / resilver |

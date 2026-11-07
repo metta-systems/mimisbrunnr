@@ -226,9 +226,10 @@ ChunkObjectFinalize : { oid: u64, content_hash: [u8;32], total_length: u64,
                    //   assembled chunked object only after this op replays.
 
 // Bucket lifecycle (ALLOCATION-DESIGN§1)
-BucketAlloc      : { disk_id: u16, bucket_no: u32, data_type: u8, generation: u32 }
-BucketWrite      : { disk_id: u16, bucket_no: u32, sectors_added: u16 }   // dirty_sectors delta
-BucketGenBump    : { disk_id: u16, bucket_no: u32, new_generation: u32 }  // bucket reused
+BucketAlloc      : { disk_id: u16, bucket_no: u32, kind: u8, generation: u32 }  // bucket opened
+BucketGenBump    : { disk_id: u16, bucket_no: u32, new_generation: u32 }  // bucket freed for reuse
+// live_sectors has no op: replay derives it from the entries that add and drop references
+//   (ALLOCATION-DESIGN§1.2).
 BucketDiscard    : { disk_id: u16, bucket_no: u32 }                       // TRIM issued
 
 // Backpointers (METADATA-DESIGN§2.2)

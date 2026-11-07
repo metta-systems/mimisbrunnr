@@ -395,7 +395,7 @@ forward index roughly in half (~660 MiB at this scale).
 | ---------------------- | --------- | -------------------------------------------------- |
 | Superblock × 3         | 12 KiB    | Fixed                                              |
 | Journal                | ~64 MiB   | Journal buckets (JOURNAL-DESIGN§1) plus retained history; mirrored across hot devices |
-| Bucket alloc table     | ~288 MiB  | 16 M buckets × ~18 B/entry (16 B value + ~2 B packed `bucket_no`) + sorted-run overhead (BTREE-DESIGN§1.1 headers, format descriptors, tail padding) |
+| Bucket alloc table     | ~160 MiB  | 16 M buckets × ~10 B/entry (8 B value + ~2 B packed `bucket_no`) + sorted-run overhead (BTREE-DESIGN§1.1 headers, format descriptors, tail padding) |
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
 | Object table (records) | ~1.19 GiB | Positional — no key packing applies; 4 893 leaves × 256 KiB; content locators included |
 | Object table (radix, roots) | < 1 MiB | One inner node per origin node (depth 1 total); `ObjectRoots` one leaf |

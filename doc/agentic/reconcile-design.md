@@ -178,17 +178,17 @@ because they are also emitted directly by non-move callers (object deletion, fre
 lazy btree-node free) — moves are the only flow that needs the bundled `ReconcileMove`.
 
 **Type adaptation.** `BlockRef` is the uniform 16-byte handle used in journal entries
-(`{disk_id, block_no, generation}`); the on-disk owner fields use narrower or differently-shaped
-types for compactness. Replay demotes `to_loc: BlockRef` into the target's shape:
+(`{disk_id, sector, bucket_no, generation}`, ENGINE-DESIGN§1.2); the on-disk owner fields use
+narrower shapes sharing its first 8 bytes. Replay demotes `to_loc: BlockRef` into the target's shape:
 
-- `ReplicaRef` (METADATA-DESIGN§2.1, `BlobExtent` and list heads): split `block_no` into `(bucket_no, sector_offset)` per
-  the METADATA-DESIGN§2.1 conversion; drop `generation` (recoverable on demand from `BucketAllocEntry`).
-- `BlobRef` (INDEX-DESIGN§4.3, `Chunk`): drop `generation`; copy `length` from the *previous* owner
-  record's `BlobRef.length` — moves preserve extent length, so the field is unchanged.
-- `BlockRef` (`BtreeNode`): copy verbatim.
+- `ReplicaRef` (METADATA-DESIGN§2.1, `BlobExtent` and list heads): take the first 8 bytes; drop
+  `generation` (the bucket's resident generation, ALLOCATION-DESIGN§1.3).
+- `BlobRef` (INDEX-DESIGN§4.3, `Chunk`): take the first 8 bytes; copy `length` from the *previous*
+  owner record's `BlobRef.length` — moves preserve extent length, so the field is unchanged.
+- `BlockRef` (`BtreeNode`): copy verbatim into the moved copy's slot of the parent's `NodePtr`.
 
 Writers do the inverse promotion when emitting `ReconcileMove`: they read the destination
-bucket's current `BucketAllocEntry.generation` to populate `BlockRef.generation`, and any
+bucket's resident generation to populate `BlockRef.generation`, and any
 `length` carried by the source field is dropped in the journal (the journal entry carries no
 `length` because none of its consumers — `BackpointerInsert`, the owner-update — needs one
 beyond what the existing owner record already holds). The move-preserves-length invariant is
