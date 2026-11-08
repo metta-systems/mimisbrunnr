@@ -1208,7 +1208,7 @@ mimir project export debian-package --format deb -o vesper_0.1.0_arm64.deb
 
 ### 12.5 Import
 
-Ingesting a Unix tree: walk directory, create objects (dedup by content hash), auto-tag based on path conventions and file extensions:
+Ingesting a Unix tree: walk directory, create objects (dedup by content hash, METADATA-D6), set context membership and scoped paths, and auto-tag with the unix-interop module's path conventions (`lang = rust`, `type = source`):
 
 ```
 mimir project import ./vesper-checkout \
@@ -1233,11 +1233,8 @@ The FUSE VFS provides two navigation modes:
 ```rust
 struct TagVfs {
     // Index access (paged through the engine's node cache; INDEX-DESIGN)
-    index: TermIndex,                 // term dictionary, postings, forward index
-    dag: ImplicationDag,
-    // Context VFS trees
-    context_trees: HashMap<String, VfsTree>,
-    blobs: HashMap<u64, Vec<u8>>,
+    index: TermIndex,                 // term dictionary, postings, forward index;
+                                      //   /ctx/ paths resolve through the unix-path trie
     // Lazy inode allocation
     entries: HashMap<u64, TagVfsEntry>,
     next_ino: u64,

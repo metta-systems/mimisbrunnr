@@ -11,8 +11,9 @@ Unix tools see Mímisbrunnr through projections: TMSU-style tag navigation under
 
 ## Selected design
 
-- **Path contexts are derived.** `PathContextManager` is a view over forward-index `Attr(unix-path, …)` assertions, rebuilt at boot; it has no `BtreeKind` and no persisted state of its own.
-- Tag paths are canonical sets (`BTreeSet<TagId>`), order-independent; faceted refinement lists only tags with a non-empty intersection.
+- **Projections are answered from the index.** `unix-path` is a hierarchical, n-grammed key (INDEX-DESIGN§4.2), and a context is a term: the objects at a path are the postings of the path's node term (found by walking its components in the dictionary) intersected with the context term's postings; a directory listing is one dictionary scan of a node's children; `find -name` is an n-gram lookup. Scoped paths form a trie per context, because the scope is part of the dictionary key. There is no path-context manager and nothing to rebuild at boot.
+- Tag paths are canonical sets (`BTreeSet<TagId>`), order-independent; faceted refinement lists only tags with a non-empty intersection. How a segment names an ambiguous tag or an attribute value is [UNIX-D5](unix-decisions.md).
+- **File attributes come from the pool.** `mtime` is the record's `modified_ns`, `ctime` the `changed` record field (METADATA-DESIGN§1.1), `size` the record's length; `mode`, `uid` and `gid` are the `unix-mode`, `unix-uid` and `unix-gid` values, scoped to the projected context or unscoped, with defaults where absent.
 - Inodes are allocated lazily behind an `RwLock` (FUSE requires `Sync`).
 - The mount root is selectable (`MountRoot::Full`, `TagsOnly`, …).
 
@@ -47,11 +48,11 @@ Export walks a context's members in the order of its sequence (INDEX-DESIGN§3.3
 
 ## Import
 
-Import walks a host tree. Each file's content is hashed (BLAKE3); a file whose content already exists in the pool reuses that object, otherwise a new object is created. The object is tagged with the context and gains `Attr(unix-path, Scoped(context, <relative path>))`, plus scoped mode, uid and gid. With auto-tagging, path and extension conventions add tags such as `lang=rust`, `source`, `test`, `documentation` (the conventions are independent of projection). The report counts created and deduplicated objects. `Importer` (`crates/unix/src/import.rs`) walks the tree; the engine creates the objects ([UNIX10](unix-implementation-plan.md)).
+Import walks a host tree. Each file's content is hashed (BLAKE3); whether a file whose content already exists in the pool reuses that object depends on a content-hash lookup ([METADATA-D6](metadata-decisions.md)), otherwise a new object is created. The object gains the context's membership term (`unix-path-context = <context>`) and `Attr(unix-path, Scoped(context, <relative path>))` together — a scoped path without membership is invisible to export, and validation reports one — plus scoped mode, uid and gid. With auto-tagging, the `systems.metta.unix-interop` module's path conventions assert categories directly — `lang = rust`, `type = source`, `type = test`, `type = documentation` — not file extensions, which are not a concept of the core ontology (ONTOLOGY-DESIGN "Rules and constraints"); the conventions are independent of projection. The report counts created and deduplicated objects. `Importer` (`crates/unix/src/import.rs`) walks the tree; the engine creates the objects ([UNIX10](unix-implementation-plan.md)).
 
 ## FUSE bridge
 
-For tools that need real paths, `brunnr mount-unix --context <name>` mounts one projection. The adapter builds its `path → ObjectId` map from the context term's members and their resolved `unix-path` values; reads go to the object's blob, and the path is only an index into the projection.
+For tools that need real paths, `brunnr mount-unix --context <name>` mounts one projection. The adapter resolves each path through the index as above, with no map of its own; reads go to the object's blob, and the path is only an index into the projection.
 
 ## CLI
 
@@ -61,6 +62,8 @@ Commands: `mimir project create-context <name> | list-contexts | set-path <oid> 
 
 - **Symlink targets as metadata** (a `symlink-target` attribute or symlink kind). An object at several paths carries several `unix-path` values (UNIX-DESIGN§1). How imported host symlinks map onto this is [UNIX-D3](unix-decisions.md).
 - **A `mimir context …` command family.** Projection commands live under `mimir project`.
+- **An in-memory path-context manager** rebuilt at boot from every object's `unix-path` assertions. The hierarchical `unix-path` key answers path, directory and name lookups from the index (INDEX-DESIGN§4.2); a resident copy would cost memory proportional to the pool and a scan at every mount.
+- **File extensions as the basis of classification.** Import asserts categories (`lang`, `type`) from path conventions; an ontology may still declare an `extension` key with rules over it, but the core does not.
 - **One tag per context** (`unix-path-context:<name>`). A context is a value of the `unix-path-context` key, which already is a term with postings, statistics and a sequence (ONTOLOGY-DESIGN "Rejected alternatives").
 
 ## Format specification
@@ -96,6 +99,8 @@ Unix-style paths are an **export format**, not the truth. They are encoded as or
 
 Path projection is a convention layered on existing primitives. Listing all paths of an
 object is one forward-index hit (`Attr(unix-path, *)` assertions on the object). Listing
-all objects in a context is one posting-list read of the context term. Building a tarball
-iterates the context term's sequence.
+all objects in a context is one posting-list read of the context term. Resolving a path walks
+its components through the dictionary within the context's trie and reads the leaf's postings;
+listing a directory scans one node's children. Building a tarball iterates the context term's
+sequence.
 

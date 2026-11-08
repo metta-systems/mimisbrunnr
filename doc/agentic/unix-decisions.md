@@ -8,7 +8,7 @@ The backlog plans FUSE `write`, `create`, `unlink`, `rename`, `mkdir`, `rmdir` a
 
 ## UNIX-D2 — File attributes source
 
-Real `mtime`, `mode`, `uid`, `gid` need `libc` or `nix` in the workspace, or a configurable defaults file. Decide the source and the dependency. Blocks [UNIX3](unix-implementation-plan.md).
+Times, size, mode, uid and gid come from the pool (UNIX-DESIGN "Selected design"). What remains open is the default for an object that has no `unix-mode` / `unix-uid` / `unix-gid` in the projected context: the mounting user (needs `libc` or `nix` in the workspace), fixed defaults (`0o644`, uid and gid 0), or a configurable defaults file. Decide the defaults and the dependency. Blocks [UNIX3](unix-implementation-plan.md).
 
 ## UNIX-D3 — Host symlinks on import and export
 
@@ -17,6 +17,10 @@ UNIX-DESIGN§1 and SPECIFICATION-DESIGN§12.2 have no symlink kind: several path
 ## UNIX-D4 — `mimir project` command surface and archive formats
 
 SPECIFICATION-DESIGN§12.4 and §12.5 show `export --format tar.gz | deb` and `import --project <p> --auto-tag`. Candidate additions: a context description (`create-context --description`), object counts and descriptions in `list-contexts`, sizes and tags in `tree`, `auto-path <ctx> --query <q> --template "src/{component}/{name}"` (set paths in bulk from attribute values). Archive export needs a new workspace dependency (for example `tar`, and `flate2` for gzip; `.deb` adds `ar`). Decide the commands, flags, formats and dependencies. Blocks [UNIX9](unix-implementation-plan.md), shapes [UNIX10](unix-implementation-plan.md).
+
+## UNIX-D5 — Tag-path segments for qualified names and attribute values
+
+`/tags/` paths are sets of tag names. A tag whose bare name is ambiguous is reachable only by qualified name (`systems.metta.music:album`, ONTOLOGY-DESIGN "Tags and attribute keys"), which contains `.` and `:`; attribute values (`artist = Aphex Twin`) have no segment form at all. Decide the spelling: qualified names as-is or with a short module alias, and whether attribute values appear as `key=value` segments (with escaping for `/` and `=`), as a nested `key/value` pair of directories, or not at all. Shapes [UNIX5](unix-implementation-plan.md) and the FUSE layout.
 
 ## Future work
 

@@ -65,8 +65,8 @@ impl PathProjection {
     }
 
     /// Linear scan: find the first object id whose path matches `path`.
-    // TODO(UNIX6): replace with a path → oid index when the
-    // path-projection B+ tree (UNIX-DESIGN§1) lands.
+    // TODO(UNIX1): replace with resolution through the hierarchical
+    // `unix-path` key and the context term (UNIX-DESIGN "Selected design").
     pub fn reverse_lookup(&self, path: &str) -> Option<ObjectId> {
         self.paths
             .iter()
