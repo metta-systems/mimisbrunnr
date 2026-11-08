@@ -46,7 +46,7 @@ Ordered collections keep sparse `u64` positions and renumber when a gap runs out
 - (b) **LSEQ / Logoot:** the same with bounded position growth.
 - (c) **RGA or Fugue:** no interleaving anomalies (Fugue is the strongest), but tombstones and a tree per sequence, heavier than sparse positions.
 
-Moves are a delete and an insert, or Kleppmann's move operation where an element must never be duplicated. The choice changes the `Sequences` key (INDEX-DESIGN§3.3) and removes renumbering on a single node too. Blocks the sequence part of [CLUSTER2](cluster-implementation-plan.md); shapes [INDEX15](index-implementation-plan.md).
+Moves are a delete and an insert, or Kleppmann's move operation where an element must never be duplicated. The choice changes the forward entry's order slots (INDEX-DESIGN§2.1) and the `Sequences` key (INDEX-DESIGN§3.3) and removes renumbering on a single node too. Blocks the sequence part of [CLUSTER2](cluster-implementation-plan.md); shapes [INDEX15](index-implementation-plan.md).
 
 ## Future work
 

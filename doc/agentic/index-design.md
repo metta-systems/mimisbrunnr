@@ -138,17 +138,25 @@ struct ForwardHead {                         // 32 bytes
     flags:       u8,                         //  [6..7]   FORWARD_FLAG_*
     _pad0:       u8,                         //  [7..8]
     tag_base:    u32,                        //  [8..12]  smallest tag TermId
-    _pad1:       u32,                        // [12..16]
+    order_count: u16,                        // [12..14]  collection terms with an order slot
+    _pad1:       u16,                        // [14..16]
     other_base:  u64,                        // [16..24]  smallest other TermId
     modified_ns: i64,                        // [24..32]  last change to the object's direct terms
 }
 // followed by, each zero-padded to a multiple of 8 bytes:
 //   tag_offsets:   [u{8·tag_width};   tag_count]     TermId = tag_base + offset
 //   other_offsets: [u{8·other_width}; other_count]   TermId = other_base + offset
+//   order_slots:   [(term_id: u64, order: u64); order_count]   ascending term_id
 
 const FORWARD_FLAG_OVERFLOW:  u8 = 1 << 0;   // arrays live in a ForwardOverflow chain
 const FORWARD_FLAG_WHITEOUT:  u8 = 1 << 7;   // snapshot whiteout (SNAPSHOTS-DESIGN§1.3)
 ```
+
+**Order slots.** For each direct term with the ordered or ranked collection flavour, the entry
+holds the object's place in that collection: its position for an ordered term, its encoded score
+(zero-extended) for a ranked one (INDEX-DESIGN§3.3). The place is stated by the user, so it is
+direct state and lives with the term; an object in no collection has `order_count = 0` and no
+array.
 
 Each width is the smallest of the allowed widths that holds `max − base` for its run. A typical
 object with 12 tags (ids within a few thousand of each other) and 3 attributes costs
@@ -338,6 +346,11 @@ BTREE-DESIGN§1 tree of `BtreeKind::Sequences`:
 - **Ranked:** key `(term_id: u64, score: u32, oid: u64, snapshot: u32)` → the byte `0x00`, where `score` is
   the order-preserving encoding of an `f32` (sign bit flipped for positives, all bits flipped for
   negatives), so a scan yields members by score.
+
+Each member's position or score is also its forward entry's order slot (INDEX-DESIGN§2.1), the
+direct state the sequences tree is maintained from, as postings are. Removing a member, moving it,
+re-scoring it or deleting the object reads the slot to find the sequence key, so none of them
+scans the sequence. A renumber rewrites the order slot of every member it moves.
 
 ---
 

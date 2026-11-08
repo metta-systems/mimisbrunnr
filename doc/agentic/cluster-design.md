@@ -15,14 +15,14 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, and co
 - The network transport is provided by Mettā; Mímisbrunnr rides on it.
 - Ordering across nodes uses `HybridTimestamp` (SPECIFICATION-DESIGN§10.4).
 - ObjectIds carry the writing node's `NodeId` in their top 16 bits.
-- **Sync ships state, not history.** A bundle carries what changed between two of the sender's snapshots, read from the snapshot diff (CLUSTER-DESIGN§1) of the trees that hold direct state only: object records (without the content locator, which is local), forward entries, the ontology tree and collection sequences. No operation log is kept for sync and nothing reads journal history.
+- **Sync ships state, not history.** A bundle carries what changed between two of the sender's snapshots, read from the snapshot diff (CLUSTER-DESIGN§1) of the trees that hold direct state only: object records (without the content locator, which is local), forward entries (which carry collection positions, INDEX-DESIGN§2.1) and the ontology tree. No operation log is kept for sync and nothing reads journal history.
 - **Only direct assertions are synced.** Derived terms, postings, the term dictionary and roll-ups are computed on each node from the synced state and ontology (INDEX-DESIGN§2.4), so peers never exchange them and cannot disagree about them. No posting containers travel.
 - **Local ids stay on their node.** Each pool numbers its tags (`TagId`) and its attribute and relation terms (`TermId`) itself (ONTOLOGY-DESIGN§1, INDEX-DESIGN§1.2). Bundles name tags by `TagUid` and terms by value — a tag uid, an attribute key's uid and a `Value`, a relation predicate's uid and a target `ObjectId` — never by a local id; a receiver resolves uids to its own `TagId`s and interns values into its own dictionary.
 - **Received changes are local operations.** A receiver applies a bundle by journalling its changes as ordinary local entries and replaying them through the same mutation path, so indexes, rules, constraints and subscriptions (SUBSCRIPTIONS-DESIGN "Selected design") treat them exactly as local mutations; each keeps its origin's hybrid timestamp.
 - **What a peer already has.** A sender ships only changes a peer has not seen, and a peer's acknowledgement is its watermark for tombstone expiry (METADATA-DESIGN "Object deletion"). How that knowledge is kept — a snapshot of the sender per peer, a version vector of per-origin hybrid timestamps, or what the merge model needs — is [CLUSTER-D7](cluster-decisions.md), decided together with the merge model.
 - **The ontology syncs as records.** A bundle carries the ontology records changed between its snapshots, by uid, ahead of its other changes (ONTOLOGY-DESIGN "Cluster propagation"). Declarations edited on two nodes merge by union of provenance, other fields last-writer-wins by hybrid timestamp.
 - **Merge rules** for object state are [CLUSTER-D2](cluster-decisions.md); **collection order** under concurrent inserts is [CLUSTER-D6](cluster-decisions.md).
-- **Open parts of CLUSTER-DESIGN§1.** How the base snapshot `A` is chosen for a peer, or whether changes are selected by per-origin timestamps instead, and what an acknowledgement names (CLUSTER-D7); whether a delta carries the terms at `A` (CLUSTER-D2); the shape of sequence deltas (CLUSTER-D6). §1 specifies the bundle for the snapshot-based selection.
+- **Open parts of CLUSTER-DESIGN§1.** How the base snapshot `A` is chosen for a peer, or whether changes are selected by per-origin timestamps instead, and what an acknowledgement names (CLUSTER-D7); whether a delta carries the terms at `A` (CLUSTER-D2); the encoding of collection positions and how concurrent inserts merge (CLUSTER-D6). §1 specifies the bundle for the snapshot-based selection.
 
 ## Format specification
 
@@ -37,7 +37,7 @@ state:
 ```
 let new_only = ancestors(B) - ancestors(A);     // snapshot ids unique to B's lineage
 
-for tree in [ObjectTable /* radix records and ObjectHistory */, Forward, Ontology, Sequences] {
+for tree in [ObjectTable /* radix records and ObjectHistory */, Forward, Ontology] {
     for entry in tree.entries_with_snapshot_in(&new_only) {   // blocks skipped by snapshot range,
         emit(entry);                                          //   BTREE-DESIGN§1.2
     }
@@ -54,12 +54,12 @@ SyncBundle = [version,                     // positional CBOR (FORMAT-DESIGN§1.
               from_snapshot: uint,         // A: what the peer had
               to_snapshot: uint,           // B
               ontology: [OntologyRecord],  // by uid, applied first
-              objects: [ObjectDelta],      // HLC-ordered
-              sequences: [SequenceDelta]]
+              objects: [ObjectDelta]]      // HLC-ordered
 
 ObjectDelta = [oid: uint, hlc: HybridTimestamp,
                record: [state, length, content_hash, created_ns, modified_ns] / null,
-               added: [Term], removed: [Term]]
+               added: [Term], removed: [Term],
+               ordered: [[Term, order: uint]]]  // order slots set or changed (INDEX-DESIGN§2.1)
 
 Term = [0, tag_uid: bytes(16)]
      / [1, key_uid: bytes(16), value: Value]
