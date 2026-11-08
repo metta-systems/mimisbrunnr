@@ -429,9 +429,10 @@ as a trie of path components: interning `europe/france/paris` interns `europe` u
 `france` under `europe` and `paris` under `france`, each a term keyed by `(parent, component)`, and
 the object's forward entry holds only the leaf's `TermId`. Shared prefixes are stored once, and
 every component fits the 16-byte `NormalisedValue` far more often than a whole path would. The
-children of a node are contiguous in the dictionary, so listing one level — a directory — is one
-range scan. Moving or renaming a subtree re-keys only its root node's dictionary entry; the node
-keeps its `TermId`, and descendants are untouched.
+children of a node are contiguous in the dictionary, so listing one level is one range scan.
+Node terms never change once interned: there is no operation that renames a prefix, and an
+object whose value changes simply drops the old leaf term and gains the new one, as for any
+attribute.
 
 - **Roll-ups.** A node whose subtree holds more than `ROLLUP_THRESHOLD` distinct node terms
   (64 by default, set per pool) has a roll-up term (kind 4) whose postings are every object in the
