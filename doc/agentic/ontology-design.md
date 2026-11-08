@@ -69,6 +69,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 | `Bucket { key, out_key, granularity }` | `Attr(out_key, bucket(value))`, where `key` is an attribute key or a record field | `created → created-year = 2026`, `created-month = 2026-11`; `size → size-class = 1-10MiB` |
 
 - Rules form a DAG over tags (an install that would close a cycle through `Implies` and `ValueImplies` fails).
+- **Derivation runs in one fixed order, in a single pass:** direct attributes and record fields → `Bucket` → `ValueImplies` → `Implies` (transitive). A `ValueImplies` may match a bucket's output (`size-class = huge → large-file`); a `Bucket` takes only a direct attribute key or a record field, so a bucket of a bucket is written from the source key (`created → created-quarter`, not `created-month → created-quarter`). The single pass keeps the cost of one write bounded and rule removal local.
 - An object's **derived terms** are the closure of its direct terms under the rules (INDEX-DESIGN§2.4); they appear in postings and never in forward entries.
 - **Modelling rule for formats and categories.** Format facts come from rules over attributes (`mime`, `extension` → `flac` → `audio`); categories (`music`, `work`, `favorite`) are asserted directly by users and applications, or implied from other categories. `mp3` files are all `audio`; whether one is `music` is an assertion, not a derivation.
 - Import's path conventions (UNIX-DESIGN "Import") belong to the `systems.metta.unix-interop` module, not the core ontology. An ontology may declare an `extension` key with rules over it (`extension = rs → lang-rust`); the core does not, and categories such as `lang = rust` and `type = source` are asserted directly.
@@ -136,7 +137,7 @@ Install is all-or-nothing and runs as one commit:
 
 1. **Duplicate module** — installing an installed `module_uid` adds the installer to its record and changes nothing else; a different version is an upgrade.
 2. **References** — every qualified name the module uses must resolve to an installed tag; an unresolved reference fails the install.
-3. **Cycles** — rules that would close an `Implies` / `ValueImplies` cycle fail the install.
+3. **Cycles and order** — rules that would close an `Implies` / `ValueImplies` cycle fail the install, and so does a `Bucket` whose `key` is another `Bucket`'s `out_key`.
 4. **Storage-policy chain invariant** — SPECIFICATION-DESIGN§3.5.
 5. **Records** — tag, rule and constraint records are put with the module added to their provenance; new tags get `TagId`s.
 6. **Derived postings** — every new rule's derived terms are posted (INDEX-DESIGN§2.4) in the same commit.

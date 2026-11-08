@@ -209,15 +209,19 @@ They are derived state, never persisted (about 2 MB each at 100 000 tags with an
 5). For an object with direct terms `D`:
 
 ```text
-closure(D) = tags(D) ∪ ⋃ ancestors[d] for d ∈ tags(D)
-           ∪ for each Attr(k, v) ∈ D: the tags its ValueImplies rules name, with their ancestors,
-                                       and Attr(out_key, bucket(v)) for each Bucket rule on k
-           ∪ for each record field f with a Bucket rule (size, created, modified, changed):
-                                       Attr(out_key, bucket(record.f))
+B(D)       = Attr(out_key, bucket(v))      for each Attr(k, v) ∈ D and each Bucket rule on k
+           ∪ Attr(out_key, bucket(record.f)) for each record field f with a Bucket rule
+                                             (size, created, modified, changed)
+V(D)       = the tags named by the ValueImplies rules matching any Attr in D ∪ B(D)
+T(D)       = tags(D) ∪ V(D)
+closure(D) = B(D) ∪ T(D) ∪ ⋃ ancestors[t] for t ∈ T(D)
            ∪ labels(record): _object when the record is live, _presence:remote when its content
                              locator is Remote, _writing while its stream is open
            ∪ for each hierarchical value node in D: the roll-up terms of its ancestors (INDEX-DESIGN§4.2)
 ```
+
+The order is fixed and single-pass (ONTOLOGY-DESIGN "Rules and constraints"): a `Bucket` reads
+only direct attributes and record fields, so `B` never feeds itself.
 
 An implementation may cache tag closures by the hash of the direct tag set, since many objects
 share one.
@@ -229,7 +233,7 @@ share one.
 | Add direct term `a` | add the object to `postings(t)` for each `t ∈ closure(D ∪ {a}) − closure(D)` |
 | Remove direct term `a` | `before = closure(D)`, `after = closure(D − {a})`; remove the object from `postings(t)` for each `t ∈ before − after` |
 | Delete the object | remove it from `postings(t)` for each `t ∈ closure(D)` |
-| A record field changes (content write) | for each `Bucket` rule on the field, move the object from the old bucket term to the new one |
+| A record field changes (content write) | `before` and `after` are `closure(D)` with the old and new record; only the field's bucket terms and the tags `ValueImplies` derives from them can differ; remove the object from `before − after`, add it to `after − before` |
 | The record's state, locator kind or stream state changes | add the object to the labels in `labels(after) − labels(before)`, remove it from those in `labels(before) − labels(after)`; a tombstone removes it from `_object` |
 | New `Implies` `a → b` | for each `t ∈ {b} ∪ ancestors[b]`: `postings(t) |= postings(a)` |
 | New `ValueImplies` or `Bucket` on key `k` | for every term of key `k` the rule matches: OR that term's postings into the derived term's postings; for `Bucket`, one dictionary scan of `k` groups its value terms by bucket |
