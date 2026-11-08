@@ -1,7 +1,7 @@
 # Cluster sync — design
 
-Scope: peer registry, sync op stream, bitmap delta sync, hydration, hybrid clock use.
-Governing spec: SPECIFICATION-DESIGN§10, CLUSTER-DESIGN§1 (cluster diff between snapshots), target-system role and boundary in [operations-design.md](operations-design.md#target-system).
+Scope: peer registry, sync bundles, merge, hydration, hybrid clock use.
+Governing spec: SPECIFICATION-DESIGN§10, CLUSTER-DESIGN§1 (sync bundles from snapshot diffs), target-system role and boundary in [operations-design.md](operations-design.md#target-system).
 
 Plan: [cluster-implementation-plan.md](cluster-implementation-plan.md) · Open decisions: [cluster-decisions.md](cluster-decisions.md) · Completed: [cluster-completed.md](cluster-completed.md) · Order: [operations-plan.md](operations-plan.md)
 
@@ -13,59 +13,68 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, and co
 
 - Convergence is eventual; there is no consensus, quorum or linearisable cross-node write.
 - The network transport is provided by Mettā; Mímisbrunnr rides on it.
-- Snapshot diffs are the unit of sync; sync waits for [snapshots-design.md](snapshots-design.md).
 - Ordering across nodes uses `HybridTimestamp` (SPECIFICATION-DESIGN§10.4).
 - ObjectIds carry the writing node's `NodeId` in their top 16 bits.
-- **Only direct assertions are synced.** Derived terms are computed on each node from the synced ontology (INDEX-DESIGN§2.4), so peers never exchange them and cannot disagree about them.
-- **Local ids stay on their node.** Each pool numbers its tags (`TagId`) and its attribute and relation terms (`TermId`) itself (ONTOLOGY-DESIGN§1, INDEX-DESIGN§1.2). Sync payloads name tags by `TagUid` and terms by value — a tag uid, or an attribute key's uid and a `Value` — never by a local id; a receiver resolves uids to its own `TagId`s and interns values into its own dictionary.
-- **Received ops are local operations.** A receiver applies a bundle's ops by journalling them as ordinary local entries and replaying them through the same mutation path, so indexes, rules, constraints and subscriptions (SUBSCRIPTIONS-DESIGN "Selected design") treat them exactly as local mutations; each keeps its origin's hybrid timestamp.
-- **The ontology syncs as ops.** A bundle's ontology changes are its `OntologyPut` / `OntologyDelete` entries with local ids replaced by uids, in HLC order ahead of the bundle's other ops (ONTOLOGY-DESIGN "Cluster propagation"). Declarations edited on two nodes merge by union of provenance, other fields last-writer-wins by HLC.
+- **Sync ships state, not history.** A bundle carries what changed between two of the sender's snapshots, read from the snapshot diff (CLUSTER-DESIGN§1) of the trees that hold direct state only: object records (without the content locator, which is local), forward entries, the ontology tree and collection sequences. No operation log is kept for sync and nothing reads journal history.
+- **Only direct assertions are synced.** Derived terms, postings, the term dictionary and roll-ups are computed on each node from the synced state and ontology (INDEX-DESIGN§2.4), so peers never exchange them and cannot disagree about them. No posting containers travel.
+- **Local ids stay on their node.** Each pool numbers its tags (`TagId`) and its attribute and relation terms (`TermId`) itself (ONTOLOGY-DESIGN§1, INDEX-DESIGN§1.2). Bundles name tags by `TagUid` and terms by value — a tag uid, an attribute key's uid and a `Value`, a relation predicate's uid and a target `ObjectId` — never by a local id; a receiver resolves uids to its own `TagId`s and interns values into its own dictionary.
+- **Received changes are local operations.** A receiver applies a bundle by journalling its changes as ordinary local entries and replaying them through the same mutation path, so indexes, rules, constraints and subscriptions (SUBSCRIPTIONS-DESIGN "Selected design") treat them exactly as local mutations; each keeps its origin's hybrid timestamp.
+- **Sync snapshots.** Each exchange with a peer ends with a local snapshot on both sides, the *sync snapshot* of that peer; the next exchange diffs from it, and it is the common base the merge compares against. A peer's acknowledged sync snapshot is its watermark for tombstone expiry (METADATA-DESIGN "Object deletion").
+- **The ontology syncs as records.** A bundle carries the ontology records changed between its snapshots, by uid, ahead of its other changes (ONTOLOGY-DESIGN "Cluster propagation"). Declarations edited on two nodes merge by union of provenance, other fields last-writer-wins by hybrid timestamp.
+- **Merge rules** for object state are [CLUSTER-D2](cluster-decisions.md); **collection order** under concurrent inserts is [CLUSTER-D6](cluster-decisions.md).
 
 ## Format specification
 
 The numbered sections below are the normative on-disk and algorithmic specification for this scope; [format-design.md](format-design.md) lists every scope's sections in format order.
 
-## 1. Cluster diff between snapshots
+## 1. Sync bundles from snapshot diffs
 
-With key-level snapshots, the cluster-sync diff between two snapshots `A` and `B` becomes a
-**snapshot-set difference**: stream every key whose `snapshot` is in `ancestors(B) \ ancestors(A)`.
+With key-level snapshots, the changes between two of the sender's snapshots `A` (the peer's last
+sync snapshot) and `B` (now) are the keys whose `snapshot` is in `ancestors(B) \ ancestors(A)`,
+read from the trees of direct state:
 
 ```
-let from_set = ancestors(A);            // 128-bit bitmap + skiplist walk; small
-let to_set   = ancestors(B);
-let new_only = to_set - from_set;       // snapshot IDs unique to B's lineage
+let new_only = ancestors(B) - ancestors(A);     // snapshot ids unique to B's lineage
 
-for tree in snapshot_aware_btrees {
-    for key in tree.iter() {
-        if new_only.contains(key.snapshot) {
-            emit(SyncOp::from(key));
-        }
+for tree in [ObjectTable /* radix records and ObjectHistory */, Forward, Ontology, Sequences] {
+    for entry in tree.entries_with_snapshot_in(&new_only) {   // blocks skipped by snapshot range,
+        emit(entry);                                          //   BTREE-DESIGN§1.2
     }
 }
 ```
 
-The diff is a single btree range scan filtered by the small `new_only` set. The same operation
-serves recent and old snapshots — no special case for either.
+The scan reads only blocks whose snapshot range meets `new_only`, so its cost follows the
+changes, not the pool. Each emitted entry becomes an object delta: the object's record fields and
+its direct terms at `B`, translated to uids and values, with the terms at `A` when the receiver
+needs the difference (CLUSTER-D2).
 
-The result is a `SyncBundle`:
+```text
+SyncBundle = [version,                     // positional CBOR (FORMAT-DESIGN§1.6)
+              from_node: uint,
+              from_snapshot: uint,         // the sender's sync snapshot for this peer
+              to_snapshot: uint,
+              ontology: [OntologyRecord],  // by uid, applied first
+              objects: [ObjectDelta],      // HLC-ordered
+              sequences: [SequenceDelta]]  // CLUSTER-D6
 
-```
-SyncBundle (CBOR):
-   from_snapshot: u32
-   to_snapshot: u32
-   from_node: NodeId
-   ops: [SyncOp]                       // canonical, HLC-ordered
-   ontology_ops: [OntologyOp]          // OntologyPut / OntologyDelete by uid, HLC-ordered,
-                                       //   applied before ops
-   posting_deltas: [{ term, high, snapshot, container }]  // per-container divergences (INDEX-DESIGN§3.1);
-                                                          //   term = tag uid or (key uid, Value)
+ObjectDelta = [oid: uint, hlc: HybridTimestamp,
+               record: [state, length, content_hash, created_ns, modified_ns] / null,
+               added: [Term], removed: [Term]]
+
+Term = [0, tag_uid: bytes(16)]
+     / [1, key_uid: bytes(16), value: Value]
+     / [2, predicate_uid: bytes(16), target: uint]
 ```
 
 The bundle is signed and shipped to peers (per the SPECIFICATION-DESIGN§9.4 key hierarchy).
+After applying it, the receiver takes its own sync snapshot for the sender and acknowledges
+`to_snapshot`; the sender then makes `B` its sync snapshot for that peer and may delete the
+previous one.
+
+A new node's first bundle diffs from the empty snapshot: the sender's whole direct state.
 
 **Resilver path.** When a peer comes back from a degraded state with one disk missing, recovery
-is driven by the reconcile subsystem (RECONCILE-DESIGN§1). The disk-state change triggers a scan that
-backpointer-walks (METADATA-DESIGN§2.2) the affected disk and enqueues `ReplicaRepair` work items at high
+is driven by the reconcile subsystem (RECONCILE-DESIGN§1). The disk-state change starts a scan
+that walks the affected disk's backpointers (METADATA-DESIGN§2.2) and repairs replicas at high
 priority. Backpointers are snapshot-agnostic, so the resilver re-fetches extents irrespective
 of which snapshot owns them.
-

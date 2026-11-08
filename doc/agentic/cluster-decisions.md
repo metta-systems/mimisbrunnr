@@ -8,7 +8,17 @@ ObjectIds embed a 16-bit `NodeId` (SPECIFICATION-DESIGN§2.1). Decide how a node
 
 ## CLUSTER-D2 — Conflict resolution rules
 
-SPECIFICATION-DESIGN§10.7 names conflict resolution without specifying it. Define per-assertion-kind rules (tags, attributes, relations, deletions) under concurrent writes from different nodes; ontology declarations merge as ONTOLOGY-DESIGN "Cluster propagation" records. Constraint effects that cross nodes are part of this decision: an `Exclusive` removal on one node racing an assertion of the other tag on another. Blocks [CLUSTER2](cluster-implementation-plan.md).
+SPECIFICATION-DESIGN§10.7 names conflict resolution without specifying it. Bundles carry object state between sync snapshots (CLUSTER-DESIGN§1); define how a receiver merges an object changed on both sides. Candidates, by kind of state:
+
+- **Term sets** (tags, attribute values, relations — attribute keys are multi-valued, so every value is a set element):
+  - (a) **three-way merge** against the sync snapshot: base + (local adds ∪ remote adds) − (removes neither side re-added). No per-term metadata; correct when every pair of nodes merges directly or through one hub, but changes reaching a node by two paths (a removal through a hub, a re-add directly) can diverge;
+  - (b) **observed-remove set** (add wins): each added term carries a dot (origin node, counter) and each node a version vector, so concurrent add and remove resolve the same way on every node whatever the path. Costs about 8–10 bytes per direct term in forward entries plus version vectors per peer;
+  - investigate whether Mettā's topology (peers and hubs) makes (a) safe, or needs (b).
+- **Single-valued fields** (content hash and length, `state`, a ranked collection's score): last-writer-wins by hybrid timestamp, or for content, keeping the losing version as a conflict copy.
+- **Delete against a concurrent edit:** delete wins when it is causally after the edit (METADATA-DESIGN "Deletion and cluster sync"); define "causally after" under the chosen set model.
+- **Constraints:** an `Exclusive` removal on one node racing an assertion of the other tag on another.
+
+Ontology declarations already merge as ONTOLOGY-DESIGN "Cluster propagation" records (union of provenance, other fields last-writer-wins). Blocks [CLUSTER2](cluster-implementation-plan.md).
 
 ## CLUSTER-D3 — Hydration states
 
@@ -17,6 +27,16 @@ SPECIFICATION-DESIGN§10.3 has both `Partial` and `Hydrating` (with progress). D
 ## CLUSTER-D4 — Sync transport
 
 DESIGN notes suggest iroh as the sync transport; the target-system boundary ([operations-design.md](operations-design.md#boundary)) places the transport outside Mímisbrunnr (Mettā provides peer reach). Decide whether Mímisbrunnr defines a transport binding at all, and if so which.
+
+## CLUSTER-D6 — Collection order under concurrent inserts
+
+Ordered collections keep sparse `u64` positions and renumber when a gap runs out (INDEX-DESIGN§3.3). Renumbering cannot be merged across nodes, and two nodes inserting at the same place pick colliding positions. Candidates:
+
+- (a) **Fractional indexing** with a node-id tie-break: positions become variable-length byte strings between their neighbours, never renumbered. Simple and fits the `(term, position)` sequences tree; concurrent inserts at one place may interleave.
+- (b) **LSEQ / Logoot:** the same with bounded position growth.
+- (c) **RGA or Fugue:** no interleaving anomalies (Fugue is the strongest), but tombstones and a tree per sequence, heavier than sparse positions.
+
+Moves are a delete and an insert, or Kleppmann's move operation where an element must never be duplicated. The choice changes the `Sequences` key (INDEX-DESIGN§3.3) and removes renumbering on a single node too. Blocks the sequence part of [CLUSTER2](cluster-implementation-plan.md); shapes [INDEX15](index-implementation-plan.md).
 
 ## Future work
 

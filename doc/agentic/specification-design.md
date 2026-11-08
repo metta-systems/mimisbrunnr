@@ -954,21 +954,18 @@ Content  │ ░░░░ 30%       │    │ ████████ 80%   �
 
 ### 10.3 Content Presence (Hydration Model)
 
-```rust
-enum ContentPresence {
-    Local { disk_id: u16, extent_offset: u64, extent_length: u64 },
-    Remote { origin_node: NodeId, mirrors: Vec<NodeId> },
-    Hydrating { source: NodeId, progress_bytes: u64, total_bytes: u64 },
-    Cached { disk_id: u16, extent_offset: u64, fetched_at: Timestamp },
-    Partial { stub_length: u64, full_length: u64, origin_node: NodeId }, // why? how is it diff from Hydrating
-}
-```
+Where an object's content is follows from its record's content locator (§6.3): any local kind
+(extent, extent list, chunk list, packed, inline) means present; `Remote` means held by other
+nodes only, naming the origin, and the object carries the `_presence:remote` system label
+(§2.3). Content being fetched, and whether a partially fetched object is a distinct state
+(`Hydrating` with progress, `Partial` stubs), is CLUSTER-D3; a fetched copy that may be evicted
+is a cached replica, dropped lazily by generation (ALLOCATION-DESIGN§1.3).
 
 Hydration policy is ontology-driven — `Pin`, `StubOnly`, `Prefetch`, `AutoEvict` rules using the same query language as placement rules.
 
-### 10.4 Sync Protocol — Operation Log
+### 10.4 Sync Protocol — State Deltas
 
-Mutations generate sync operations replicated across nodes via hybrid logical clocks (HLC) for total ordering without coordination:
+Nodes exchange **state, not history**. Each exchange with a peer ships what changed in the sender's direct state — object records, forward entries, ontology records, collection order — between the peer's last *sync snapshot* and now, read from a snapshot diff (CLUSTER-DESIGN§1). No operation log is kept for sync, no postings or derived terms travel (each node derives its own), and tags travel by uid, values as values. The receiver journals the changes as local mutations, so its indexes, rules and subscriptions treat them as its own. Every change carries the hybrid timestamp of its origin, which orders changes without coordination:
 
 ```rust
 /// Hybrid Logical Clock timestamp for total ordering without coordination
@@ -980,31 +977,28 @@ struct HybridTimestamp {            // 16 B
 }
 // Total order: physical_ns → logical → node_id
 
-struct SyncOp {
-    timestamp: HybridTimestamp,
-    origin_node: NodeId,
-    sequence: u64,
-    op: SyncOpKind,
+struct ObjectDelta {               // one changed object in a SyncBundle (CLUSTER-DESIGN§1)
+    oid: ObjectId,
+    hlc: HybridTimestamp,
+    record: Option<RecordFields>,  // state, length, content hash, timestamps; never the locator
+    added: Vec<Term>,              // direct terms, tags by uid
+    removed: Vec<Term>,
 }
 ```
 
-### 10.5 Bitmap Delta Sync
+### 10.5 Delta Size
 
-Roaring bitmaps support efficient delta encoding:
-
-```rust
-let added   = &new_bitmap - &old_bitmap;   // tiny bitmap
-let removed = &old_bitmap - &new_bitmap;
-// Send ~200 bytes instead of ~50KB full bitmap
-```
+A delta is proportional to what changed: retagging one object ships its uid-named term changes,
+tens of bytes, whatever the size of the postings it lands in. The diff that finds the changes
+reads only blocks whose snapshot range includes the changed snapshots (BTREE-DESIGN§1.2).
 
 ### 10.6 Sync Modes
 
-**Incremental** (normal): ops since last watermark. **Snapshot** (catch-up): compressed full state (~400 MB for 10M objects). Threshold: >1M ops behind triggers snapshot.
+**Incremental** (normal): the diff since the peer's sync snapshot. **Full** (a new node): the diff from the empty snapshot — the sender's whole direct state, ~400 MB for 10M objects. The receiver derives postings and the dictionary locally.
 
 ### 10.7 Conflict Resolution
 
-Most tag operations are commutative. For conflicts: `AddWins` (tag add beats remove, safer) or `LastWriterWins` (timestamp-based).
+Ontology declarations merge by union of provenance, other fields last-writer-wins (ONTOLOGY-DESIGN "Cluster propagation"). How object state changed on both sides merges — a three-way merge of term sets against the sync snapshot or an observed-remove set, last-writer-wins registers for single-valued fields, delete against edit — is CLUSTER-D2; collection order under concurrent inserts is CLUSTER-D6.
 
 ### 10.8 Bandwidth Budget
 
@@ -1469,7 +1463,7 @@ All engine state persists in the trees of the root list — B+ trees and positio
 │   NVMe (Hot) │ SSD (Warm) │ HDD (Cold) │ S3/SFTP (Glacier)       │
 ├──────────────────────────────────────────────────────────────────┤
 │                  CLUSTER SYNC LAYER                              │
-│   SyncOps (HLC) ←→ Bitmap deltas ←→ Blob hydration               │
+│   State deltas from snapshot diffs (HLC) ←→ Blob hydration       │
 │   Node A ◄──► Node B ◄──► Hub ◄──► Node C                        │
 ├──────────────────────────────────────────────────────────────────┤
 │                UNIX INTEROP LAYER                                │
@@ -1785,7 +1779,7 @@ graph TB
 |XTS for metadata|Narrow-block disk encryption|Fast random access; structure leak acceptable|
 |GCM/ChaCha for messages|AEAD for WAL + sync|Authentication + unique nonces in append-only contexts|
 |Full metadata replication|Every node holds all tags|Search is always local, instant|
-|Oplog sync with HLC|Operation-based replication|Commutative ops minimize conflicts; sub-MB daily bandwidth|
+|State-delta sync with HLC|Direct state between sync snapshots, derived state recomputed|No history to retain; sub-MB daily bandwidth; peers cannot disagree on derived terms|
 |Ontology-driven chunking|CDC only for mutable large files|Avoids 16× metadata overhead for immutable media|
 |Query subscriptions|Replace inotify entirely|Semantic filtering, offline catch-up, no lost events|
 |Path projections|Unix paths as export metadata|Same object serves multiple Unix tree layouts|
@@ -1917,7 +1911,7 @@ The object-granularity content locator (§6.3) is the indirection that makes mov
 ### C.6 Cluster sync
 
 - **Conflicts.** Tag adds from two nodes commute; add-versus-remove needs a policy. Options weighed: add-wins (no accidental loss), last-writer-wins (intuitive), mark-conflict (user resolves). Ordered collections need a sequence CRDT such as RGA, or last-writer-wins per collection ([CLUSTER-D2](cluster-decisions.md)).
-- **Hubs.** Nodes that are never online together relay through an always-on hub that stores only a bounded oplog (for example 7 days); a node offline longer re-joins by snapshot.
+- **Hubs.** Nodes that are never online together relay through an always-on hub that holds their direct state and keeps a sync snapshot per peer; a node offline for any time catches up by one state delta from its last sync snapshot.
 - **Node roles considered:** full, thin (metadata and stubs), blob-store only, hub.
 - **Bandwidth.** A moderately active user generates under 1 MB of metadata sync per day; a full join of 10 M objects is about 400 MB compressed. Blobs move only when opened.
 

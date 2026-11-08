@@ -178,7 +178,7 @@ Core principle: **data outlives apps.** Removing an app removes the schema, not 
 
 ### Cluster propagation
 
-Ontology changes are journal entries (`OntologyPut`, `OntologyDelete`; JOURNAL-DESIGN§1.3) naming tags, rules and modules by uid. Sync ships them in HLC order inside a `SyncBundle`, ahead of the bundle's other ops ([cluster-design.md](cluster-design.md)); a receiver resolves uids to its local `TagId`s, allocating ids for tags new to it, and reworks its postings in the same commit. Concurrent edits to the same declaration on different nodes merge by union of provenance, with scalar fields ordered last-writer-wins by HLC. A constraint arriving by sync is checked like a newly installed one: existing violators are reported, not changed (Install step 7).
+Ontology records are snapshot-aware, so the records changed between two of a node's snapshots are a snapshot diff of the ontology tree. Sync ships them by uid inside a `SyncBundle`, ahead of the bundle's other changes ([cluster-design.md](cluster-design.md)), and the receiver journals them as `OntologyPut` / `OntologyDelete` entries (JOURNAL-DESIGN§1.3); a receiver resolves uids to its local `TagId`s, allocating ids for tags new to it, and reworks its postings in the same commit. Concurrent edits to the same declaration on different nodes merge by union of provenance, with scalar fields ordered last-writer-wins by HLC. A constraint arriving by sync is checked like a newly installed one: existing violators are reported, not changed (Install step 7).
 
 ### CLI
 
