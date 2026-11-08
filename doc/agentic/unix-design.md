@@ -1,6 +1,6 @@
 # Unix interoperability and FUSE — design
 
-Scope: `crates/unix` (`PathProjection`, `PathContextManager`, `Importer`), `crates/fuse` (`VfsTree`, `TagVfs`, `MimisbrunnrFs`), `brunnr mount-unix`, `mimir import`.
+Scope: `crates/unix` (`PathProjection`, `Importer`), `crates/fuse` (`VfsTree`, `TagVfs`, `MimisbrunnrFs`), `brunnr mount-unix`, `mimir import`.
 Governing spec: SPECIFICATION-DESIGN§12, UNIX-DESIGN§1.
 
 Plan: [unix-implementation-plan.md](unix-implementation-plan.md) · Open decisions: [unix-decisions.md](unix-decisions.md) · Completed: [unix-completed.md](unix-completed.md) · Order: [operations-plan.md](operations-plan.md)
@@ -13,7 +13,7 @@ Unix tools see Mímisbrunnr through projections: TMSU-style tag navigation under
 
 - **Projections are answered from the index.** `unix-path` is a hierarchical, n-grammed key (INDEX-DESIGN§4.2), and a context is a term: the objects at a path are the postings of the path's node term (found by walking its components in the dictionary) intersected with the context term's postings; a directory listing is one dictionary scan of a node's children; `find -name` is an n-gram lookup. Scoped paths form a trie per context, because the scope is part of the dictionary key. There is no path-context manager and nothing to rebuild at boot.
 - Tag paths are canonical sets (`BTreeSet<TagId>`), order-independent; faceted refinement lists only tags with a non-empty intersection. How a segment names an ambiguous tag or an attribute value is [UNIX-D5](unix-decisions.md).
-- **File attributes come from the pool.** `mtime` is the record's `modified_ns`, `ctime` the `changed` record field (METADATA-DESIGN§1.1), `size` the record's length; `mode`, `uid` and `gid` are the `unix-mode`, `unix-uid` and `unix-gid` values, scoped to the projected context or unscoped, with defaults where absent.
+- **File attributes come from the pool.** `mtime` is the record's `modified_ns`, `ctime` the `changed` record field (ONTOLOGY-DESIGN§1, `record_field` 4), `size` the record's length; `mode`, `uid` and `gid` are the `unix-mode`, `unix-uid` and `unix-gid` values, scoped to the projected context or unscoped, with defaults where absent.
 - Inodes are allocated lazily behind an `RwLock` (FUSE requires `Sync`).
 - The mount root is selectable (`MountRoot::Full`, `TagsOnly`, …).
 
@@ -38,7 +38,7 @@ vesper (kernel binary)    project=vesper component=kernel executable stripped cu
 
 A debug build is a different object with its own content hash and its own projections (`Scoped(jtag-debug, "/tftp/vesper.elf")`), never a second path on the release object. Every projection of an object serves the same blob; generating a projection copies nothing inside the pool.
 
-**Attribute keys.** The `systems.metta.unix-interop` module declares `unix-path-context` (attribute, text, `grouping`, ordered when a context needs a manifest order), `unix-path` (attribute, text, `hierarchy = "/"`, `ngram = 3`), `unix-mode`, `unix-uid`, `unix-gid` (attributes, int). A `Scoped` value satisfies an attribute's `value_type` when its inner value does, and its scope must be a term of a grouping-flavoured key ([UNIX8](unix-implementation-plan.md)). Being hierarchical, `unix-path` values are a trie of components: listing a directory is one dictionary scan, a subtree query uses roll-ups, and `find -name`-style searches use the component n-grams (INDEX-DESIGN§4.2).
+**Attribute keys.** The `systems.metta.unix-interop` module declares `unix-path-context` (attribute, text, `grouping`, ordered when a context needs a manifest order), `unix-path` (attribute, text, `hierarchy = "/"`, `ngram = 3`), `unix-mode`, `unix-uid`, `unix-gid` (attributes, int). A `Scoped` value satisfies an attribute's `value_type` when its inner value does, and its scope must be a term of a grouping-, ordered- or ranked-flavoured key ([UNIX8](unix-implementation-plan.md)). Being hierarchical, `unix-path` values are a trie of components: listing a directory is one dictionary scan, a subtree query uses roll-ups, and `find -name`-style searches use the component n-grams (INDEX-DESIGN§4.2).
 
 **Directories are virtual.** Intermediate directories (`/usr/bin/`) are interior nodes of the `unix-path` trie; no directory objects exist.
 

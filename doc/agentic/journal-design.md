@@ -7,7 +7,7 @@ Plan: [journal-implementation-plan.md](journal-implementation-plan.md) · Open d
 
 ## Goal
 
-The journal is the durability point for every mutation on any medium — SD card, SSD, NVMe, HDD — and for every write shape from tiny files to long streams; B+ tree nodes and object data are written behind or beside it, and its retained history is the oplog.
+The journal is the durability point for every mutation on any medium — SD card, SSD, NVMe, HDD — and for every write shape from tiny files to long streams; B+ tree nodes and object data are written behind or beside it, and history past the trim point is kept only when a pool asks for it (JOURNAL-DESIGN§1.6).
 
 ## Selected design
 
@@ -119,8 +119,8 @@ const ENTRY_FLAG_HLC_EXPLICIT: u8 = 1 << 0;  // a full 16-byte HybridTimestamp p
 ```
 
 **LSN.** An entry's LSN is `seq << 16 | index`, where `index` is its position in the jset
-(< 2¹⁶). Every LSN in the format — `BlockHeader.lsn`, `RootPointer.lsn`, subscription cursors,
-`last_modify_lsn` — is this value; LSNs increase with seq and position.
+(< 2¹⁶). Every LSN in the format — run `journal_seq`, the root list's `lsn`, subscription cursors,
+dictionary entries' `last_modify_lsn` — is this value; LSNs increase with seq and position.
 
 **Timestamps.** An entry's HLC is `hlc_base` with `physical_ns + hlc_delta`, `node_id` from the
 base, and `logical` equal to `hlc_base.logical` plus the number of earlier entries in the set
@@ -146,7 +146,7 @@ device that dropped acknowledged writes surfaces as a shorter journal, never as 
 // ObjectRecord.created_ns/modified_ns, SnapshotNode.created_ns,
 // Superblock.creation_timestamp_ns, etc.). At ns granularity, two events colliding
 // inside one tick is rare, so a 16-bit `logical` counter is plenty.
-#[repr(C, packed)]
+#[repr(C)]
 struct HybridTimestamp {                     // 16 bytes
     physical_ns: i64,                        // [0..8]   monotonic wall-clock nanoseconds
     logical:     u16,                        // [8..10]  same-tick disambiguation
@@ -216,7 +216,8 @@ ChunkListReplace    : { oid: u64, position: u64, new_hashes: [[u8;32]; N] }
 ChunkListShrink     : { oid: u64, new_length: u64 }
                    // Truncate oid's ChunkList to new_length entries. Replay walks the
                    //   tail and decrements ref_count for each dropped chunk; fully-
-                   //   emptied regions are freed via bucket-gen bump.
+                   //   emptied regions are freed through live-sector accounting
+                   //   (ALLOCATION-DESIGN§1.2).
 ChunkObjectFinalize : { oid: u64, content_hash: [u8;32], total_length: u64,
                         list_newest: NodePtr }
                    // Publishes a chunked object: sets content_kind = ChunkList,
@@ -262,10 +263,9 @@ SnapshotDepthUpdate: { id: u32, new_depth: u16, new_skiplist: [u32; 3], new_ance
                      // Recompute ancestry data for a snapshot node whose effective
                      //   parent changed because an ancestor was unlinked. Emitted in
                      //   batches by the SnapshotTreeReorg pass — one per affected
-                     //   descendant. Replay updates the snapshots btree leaf in place.
+                     //   descendant. Replay updates the snapshot's entry in the snapshots btree.
 // The reorg decomposes into N × SnapshotDepthUpdate followed by one SnapshotUnlink per
-// removed snapshot. Each op fits comfortably in one sector (max ~50 B), and replay is
-// local to the snapshots btree.
+// removed snapshot. Each op is small (max ~50 B), and replay is local to the snapshots btree.
 
 // Reconcile (RECONCILE-DESIGN§1)
 ReconcileEnqueue : { key: WorkKey, value: WorkValue, pending: bool }   // into ReconcileWork, or
@@ -283,7 +283,7 @@ ReconcileScanStep: { scan_id: u64, record: ScanRecord }  // a scan started, adva
 Checkpoint       : { gc_reserve_buckets: u32, roots: RootList }   // RootListHead + RootEntry × N
                    //   (ENGINE-DESIGN§1.2)
                    // Commits a root (JOURNAL-DESIGN§1.5): every tree flushed up to this
-                   //   entry's LSN is reachable from new_root. Recovery starts from the newest
+                   //   entry's LSN is reachable from its root list. Recovery starts from the newest
                    //   valid Checkpoint and replays the entries after it.
 
 // Data paths (JOURNAL-DESIGN§1.8)
@@ -295,7 +295,7 @@ ExtendObject     : { oid: u64, new_length: u64, extents: [(extent: BlockRef, len
                    // Appends extents to an object in the Writing state and makes its first
                    //   new_length bytes durable. The first extent sets an Extent locator;
                    //   later ones go to the object's extent list (METADATA-DESIGN§1.3),
-                   //   whose tail region replay rewrites.
+                   //   to whose newest region replay appends a page run.
 
 // Term maintenance (INDEX-DESIGN§1.2)
 ReclaimTerms     : { high_water: u64, term_ids: [u64; N] }               // WalOpKind 34
@@ -376,12 +376,12 @@ FastCDC's avg-chunk-size knob spans ~3 orders of magnitude in real deployments (
 4 KiB for fine-grained edits at the small end, up to 8 MiB for resumability-only large
 transfers at the other. The five-regime table below shows how the design scales:
 
-| Avg chunk | Typical workload                   | Chunks      | `ChunkInsertBatch` entries (≤ 1 000 chunks each) | `ChunkListAppend` entries (one per 6 551-entry region) | Journal bytes (64 B per chunk) | Journal append rate at 530 MiB/s plaintext |
+| Avg chunk | Typical workload                   | Chunks      | `ChunkInsertBatch` entries (≤ 1 000 chunks each) | ChunkList regions (4 896 entries each, at least one `ChunkListAppend` per region) | Journal bytes (64 B per chunk) | Journal append rate at 530 MiB/s plaintext |
 | --------- | ---------------------------------- | ----------- | ------------------------------------------------ | ------------------------------------------------------ | ------------------------------ | ------------------------------------------ |
-| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 8 389                                            | 1 281                                                  | ~512 MiB (1.6 % of plaintext)  | ~8.3 MiB/s                                 |
-| 16 KiB    | VM disks, databases                | 2 097 152   | 2 098                                            | 321                                                    | ~128 MiB (0.39 %)              | ~2.1 MiB/s                                 |
-| 256 KiB   | generic FastCDC default            | 131 072     | 132                                              | 21                                                     | ~8 MiB (0.024 %)               | ~130 KiB/s                                 |
-| 1 MiB     | backup-tool default (restic-class) | 32 768      | 33                                               | 6                                                      | ~2 MiB (0.006 %)               | ~33 KiB/s                                  |
+| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 8 389                                            | 1 714                                                  | ~512 MiB (1.6 % of plaintext)  | ~8.3 MiB/s                                 |
+| 16 KiB    | VM disks, databases                | 2 097 152   | 2 098                                            | 429                                                    | ~128 MiB (0.39 %)              | ~2.1 MiB/s                                 |
+| 256 KiB   | generic FastCDC default            | 131 072     | 132                                              | 27                                                     | ~8 MiB (0.024 %)               | ~130 KiB/s                                 |
+| 1 MiB     | backup-tool default (restic-class) | 32 768      | 33                                               | 7                                                      | ~2 MiB (0.006 %)               | ~33 KiB/s                                  |
 | **8 MiB** | large extreme — pure resumability  | 4 096       | 5                                                | 1                                                      | ~256 KiB (0.0008 %)            | ~4 KiB/s                                   |
 
 The spread is roughly **2 000×** across regimes on every axis — the same op set covers all
@@ -389,16 +389,16 @@ of it, only the constants change.
 
 **Cumulative ≠ simultaneous.** Steady-state journal fill is bounded by *reclaim latency*, not
 by total traffic over the operation: buckets are freed as soon as the trim point passes them
-(JOURNAL-DESIGN§1.4). Reclaim's job is flushing ChunkIndex leaves (256 KiB regions packing
-4 678 chunks each); the leaf-flush rate it must sustain is `chunks_per_second / 4 678`
-leaves/s — equivalently, `(producer_plaintext_rate / avg_chunk_size) / 4 678` leaves/s. At
-530 MiB/s plaintext:
+(JOURNAL-DESIGN§1.4). Reclaim's job is flushing ChunkIndex leaves (256 KiB nodes holding about
+4 200 chunks each, INDEX-DESIGN§4.3); the leaf-fill rate it must sustain is
+`chunks_per_second / 4 200` leaves/s — equivalently,
+`(producer_plaintext_rate / avg_chunk_size) / 4 200` leaves/s. At 530 MiB/s plaintext:
 
-- **4 KiB regime:** ~135 K chunks/s ÷ 4 678 = ~29 leaves/s = ~7.4 MiB/s of leaf rewrites.
+- **4 KiB regime:** ~135 K chunks/s ÷ 4 200 = ~32 leaves/s = ~8.1 MiB/s of leaf writes.
   Comfortably within NVMe write bandwidth (~1–3 GiB/s typical) but no longer trivial; this
   is where reclaim genuinely has to keep up. Cumulative journal traffic exceeds a 64 MiB
   journal by ~8×, so its buckets cycle continuously.
-- **16 KiB regime (canonical VM / DB workload):** ~7 leaves/s ≈ 1.8 MiB/s leaf rewrites.
+- **16 KiB regime (canonical VM / DB workload):** ~8 leaves/s ≈ 2.0 MiB/s of leaf writes.
   A 64 MiB journal cycles ~2× over the 60-second write. JOURNAL-DESIGN§1.4's *idle* /
   *background-flush* bands cover the producer comfortably.
 - **256 KiB and above:** journal traffic is in the noise; reclaim is essentially never the
@@ -412,13 +412,13 @@ larger per-object ChunkList chain).
 
 **HDD-only pools.** A pool whose only writable disk is rotational clamps the producer to
 whatever reclaim sustains there. At the 4 KiB extreme this would be a real bottleneck (HDD
-write throughput is far below the 7.5 MiB/s leaf-flush demand); at 1 MiB or above it is
+write throughput is far below the ~8 MiB/s leaf-write demand); at 1 MiB or above it is
 unnoticeable. Chunked workloads typically imply hot-tier (NVMe/SSD) presence anyway, so
 this is a corner case.
 
 **Per-object footprint** (orthogonal to WAL but worth noting at the small extreme): a 32 GiB
-object's `ChunkList` chain is `chunks ÷ 6 551` regions × 256 KiB. At 4 KiB chunks that's
-~320 MiB of ChunkList per object (1 % of plaintext); at 8 MiB chunks it's a single 256 KiB
+object's `ChunkList` chain is `chunks ÷ 4 896` regions × 256 KiB. At 4 KiB chunks that's
+~430 MiB of ChunkList per object (1.3 % of plaintext); at 8 MiB chunks it's a single 256 KiB
 region. ChunkIndex footprint scales similarly. The very-small-chunk regime is therefore
 viable but pays for itself in dedup hit-rate, not in raw efficiency — fine for VM-disk
 workloads with high common-chunk ratios across snapshots, less so for one-shot writes of
@@ -426,22 +426,21 @@ unique data.
 
 ### 1.4 Journal pins and deferred btree flushes
 
-Each in-memory dirty btree node carries a **journal pin** — the LSN of the oldest journal entry
-whose update has not yet been merged into the on-disk node:
+Each in-memory node with entries not yet written to its region — its `LoadedNode`
+(BTREE-DESIGN§1.3) — holds a **journal pin** over those pending entries:
 
 ```rust
-struct DirtyNode {                           // in-memory only
-    block_ref: BlockRef,                     // current on-disk location
-    last_persisted_lsn: u64,                 // journal_seq of the node's newest run
-    pending_lsn_min: u64,                    // oldest WAL entry pinning this node
-    pending_lsn_max: u64,                    // newest WAL entry pinning this node
-    pending_count: u32,                      // entries waiting to be merged
-    in_memory: NodeContent,                  // merged live state (sorted)
+struct JournalPin {                          // in-memory only, one per LoadedNode
+    lsn_min: u64,                            // oldest journal entry pending in this node
+    lsn_max: u64,                            // newest journal entry pending in this node
+    count: u32,                              // entries pending
 }
 ```
 
+The node's newest run records the newest merged LSN in its `journal_seq` (BTREE-DESIGN§1.2).
+
 **Trim point.** Each jset records `last_seq`, the oldest jset replay still needs: the seq of the
-newest `Checkpoint`, or of the lowest live `pending_lsn_min` if that is older, or of the oldest
+newest `Checkpoint`, or of the lowest live pin's `lsn_min` if that is older, or of the oldest
 retained history (JOURNAL-DESIGN§1.6) if that is older still. A journal bucket whose jsets are all
 older than the newest durable `last_seq` is free; it is discarded and its slot reused for new
 jsets. No header or cursor is written to trim. Implementations that checkpoint every dirty node
@@ -454,21 +453,22 @@ Reclaim scheduling follows journal fill — the share of journal buckets not fre
 | ---------- | --------------------------------------------------------------------------- |
 | < 25 %     | Idle. No flushes scheduled.                                                 |
 | 25 – 60 %  | Background flushes at low priority — flush nodes with highest pin pressure. |
-| 60 – 85 %  | Aggressive: rank dirty nodes by `(pending_lsn_max − pending_lsn_min)` × `pending_count` and flush the top fraction. |
+| 60 – 85 %  | Aggressive: rank pinned nodes by `(lsn_max − lsn_min)` × `count` and flush the top fraction. |
 | > 85 %     | New mutations stall until reclaim catches up.                               |
 
-A flush rewrites the affected leaf via the COW path (METADATA-DESIGN§1), then each parent up to the root,
-updating `BlockHeader.lsn = pending_lsn_max` and clearing the journal pin. The next `Checkpoint`
-(JOURNAL-DESIGN§1.5) commits the new roots atomically. "Stall" means a mutation waits for, or
+A flush appends one run (or page run) holding the node's pending entries to its region
+(BTREE-DESIGN§1.2, BTREE-DESIGN§1.7), with `journal_seq = lsn_max`, and clears the pin; a parent
+changes only when compaction moves a node to a fresh region (BTREE-DESIGN§1.4). The next
+`Checkpoint` (JOURNAL-DESIGN§1.5) commits the new root list atomically. "Stall" means a mutation waits for, or
 performs inline, the reclaim the embedder's driver has not yet run; the engine owns no thread.
 
 **Memory reclaim.** A node may be evicted from the in-memory btree cache only after its pending
-journal entries have been merged and the resulting page persisted. Clean nodes (no pending
-updates) can be discarded immediately.
+journal entries have been written as a run. Clean nodes (no pending entries) and their cached
+blocks can be discarded immediately.
 
-**Read path.** Lookups consult the in-memory dirty-node mirror first. Cold reads load the node
-from disk, then the engine **replays** journal entries in `[node.last_persisted_lsn,
-journal_head]` whose key range intersects the node, producing the merged live view. This replay
+**Read path.** Lookups consult the node's pending entries first, then its runs. Cold reads load
+the node's header and run index blocks from disk, then the engine **replays** journal entries
+newer than the newest run's `journal_seq` whose key range intersects the node. This replay
 is bounded by journal size (~800 K entries worst-case), but the reclaim thresholds keep typical
 lag under ~10 K entries per node.
 
@@ -477,22 +477,21 @@ ENGINE-DESIGN§2 and the flush thread cooperate through them without a shared co
 
 - **Per-tree write mutex** (mutation path). One mutex per snapshot-aware btree, plus one for
   the open jset. Writers reserve space in the open jset, copy their entry in and take its LSN
-  under that lock, then update the in-memory mirror — the steps that must be atomic across
+  under that lock, then update the in-memory state — the steps that must be atomic across
   concurrent writers. It is released before any per-node bookkeeping or I/O.
-- **Per-DirtyNode rwlock** (flush path). One rwlock per loaded node. Because rewrites are
-  full-node COW (a fresh page at a fresh location), the flush thread holds only the *shared*
-  lock on the source DirtyNode while it builds the new page contents. The *exclusive* lock
-  is taken only at the moment the parent `BlockRef` is swapped — milliseconds, regardless of
-  node size. The mutation path also takes the per-DirtyNode exclusive lock briefly, after
-  releasing the per-tree mutex, to bump `pending_lsn_max` / `pending_count` on affected
-  nodes; this is uncontended in steady state because the flush thread holds shared most of
-  the time.
+- **Per-node rwlock** (flush path). One rwlock per `LoadedNode`. A flush writes a new run
+  after the node's existing blocks and never touches them, so it holds only the *shared* lock
+  while it builds the run; the *exclusive* lock is taken only to move the flushed entries out
+  of the pending set and clear the pin, and, at compaction, to swap the node to its fresh
+  region. The mutation path also takes the exclusive lock briefly, after releasing the
+  per-tree mutex, to add its entry to the pin of each affected node; this is uncontended in
+  steady state.
 
 The two domains are independent: a flush of node A runs concurrently with a mutation hitting
-node B, and a mutation on node A only contends with a flush of node A at the brief
-exclusive-swap moment. **Readers** consult the arc-swap'd index handle and are never blocked
-on either lock — never on the per-tree mutex (writers release it before any disk I/O), never
-on a DirtyNode lock (readers go through the arc-swap'd snapshot, not the live DirtyNode).
+node B, and a mutation on node A only contends with a flush of node A at the brief exclusive
+moment. **Readers** see the in-memory state as of the last completed mutation (ENGINE-DESIGN§2)
+and are never blocked on the per-tree mutex (writers release it before any disk I/O). On a
+single-threaded embedder the locks are uncontended by construction.
 
 ### 1.5 Commits, checkpoints and recovery
 

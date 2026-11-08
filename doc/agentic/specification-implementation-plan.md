@@ -18,11 +18,10 @@ Section numbers in item titles from SPEC3 on are sections of the system design (
 - [ ] **SPEC5 — Rename §9.** Prerequisite: SPEC-D1.
 - [ ] **SPEC6 — §9.1 `TransformResult`.** State whether it is an in-memory result or an on-disk record, and link its definition.
 - [ ] **SPEC7 — §9.2 compression granularity.** Prerequisite: [BLOB-D2](blob-decisions.md).
-- [ ] **SPEC8 — WAL nonce rationale (§6.4, §9.1, §9.3).** Explain the `LSN || 0` nonce construction and why it never repeats; resolve the §9.3 wording that both uses and excludes AES-GCM (GCM is for the WAL only).
+- [ ] **SPEC8 — Journal nonce rationale (§6.4, §9.1, §9.3).** Explain the jset `seq || 0` nonce construction under the `fs_uuid`-bound journal key (ENCRYPTION-DESIGN§1) and why it never repeats; resolve the §9.3 wording that both uses and excludes AES-GCM (GCM is for the journal only).
 - [ ] **SPEC10 — §9.4 key storage and per-tag keys; §9.5 trust tiers.** Prerequisites: [ENCRYPTION-D3](encryption-decisions.md), [ENCRYPTION-D4](encryption-decisions.md), [ENCRYPTION-D5](encryption-decisions.md).
 - [ ] **SPEC11 — §7.4 ordering.** Explain hybrid-logical-clock ordering without the acronym and link the clock definition in §10.4.
 - [ ] **SPEC12 — §10.3 hydration and §10.7 conflict resolution.** Prerequisites: [CLUSTER-D2](cluster-decisions.md), [CLUSTER-D3](cluster-decisions.md).
-- [ ] **SPEC13 — §11 dormant-subscription oplog retention.** Explain "extended oplog retention for dormant subscriptions" (mentioned in §16) inside §11.
 - [ ] **SPEC14 — Move §16 Architecture to the front.** Prerequisite: SPEC-D2.
 - [ ] **SPEC15 — Relocate §15 Engine & Persistence detail into ENGINE-DESIGN's format sections.** Prerequisite: SPEC-D2.
 - [ ] **SPEC16 — §11.9 build-system example with third-party dependencies.** Extend the incremental-rebuild example to projects that pull external dependencies, each with their own projects.

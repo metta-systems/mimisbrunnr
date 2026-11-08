@@ -12,7 +12,7 @@ Every assertion an object makes is a **term**; the index is an inverted index ov
 ## Selected design
 
 - **Terms.** A tag, an attribute value under its key, and a relation to a target are terms. Tags keep their `TagId` as `TermId`; attribute and relation terms get dense `TermId`s when first written. A term is identified exactly by its dictionary key and value: there is no value hash, no hash secret and no collision case.
-- **Six trees**, all BTREE-DESIGN§1 large-node trees:
+- **Seven trees**, all BTREE-DESIGN§1 large-node trees:
 
   | Tree | Key → value | Section |
   |---|---|---|
@@ -24,7 +24,7 @@ Every assertion an object makes is a **term**; the index is an inverted index ov
   | Chunk index, chunk lists | chunk hash → extent; per-object chunk recipe | INDEX-DESIGN§4.3 |
 
 - **Equality, range and prefix** queries are all dictionary lookups or scans: one ordered structure replaces a hash index and a separate range tree.
-- **Posting lists** are roaring containers keyed by the high 48 bits of the object id, so ids carry full node and local identity, a small update rewrites one container, and snapshot diffs and sync deltas work per container. Lists of up to four objects live inline in their dictionary entry.
+- **Posting lists** are roaring containers keyed by the high 48 bits of the object id, so ids carry full node and local identity, a small update rewrites one container, and local snapshot diffs work per container. Lists of up to four objects live inline in their dictionary entry.
 - **Derived terms** — tags implied by rules, values bucketed by rules, hierarchy roll-ups — live in postings only, computed from direct terms by the ontology's rules (INDEX-DESIGN§2.4). Hierarchical keys store their values as tries of path components (INDEX-DESIGN§4.2); n-grammed keys index the n-grams of their distinct values, not of objects (INDEX-DESIGN§4.2).
 - **Bounded memory.** Readers walk trees through a page cache; no index is mirrored whole in memory.
 - **TermIds are local to their pool.** Sync carries values, never term ids ([cluster-design.md](cluster-design.md)).
@@ -196,7 +196,9 @@ first; a chain whose total length disagrees with the counts in the head is a for
   (BTREE-DESIGN§1.2); full compaction (BTREE-DESIGN§1.4) folds runs.
 - **Lookup** is one tree descent; listing an object's values goes through the term table
   (INDEX-DESIGN§4.1) for each non-tag term.
-- **Diffing** for sync streams sorted runs newer than the peer's watermark (SNAPSHOTS-DESIGN§1.2).
+- **Diffing** between two local snapshots reads only the blocks whose snapshot range includes
+  the changed snapshots (BTREE-DESIGN§1.2); sync ships forward-entry changes from such a diff
+  (CLUSTER-DESIGN§1).
 
 ### 2.4 Derived terms
 
@@ -297,8 +299,9 @@ the window's **container** (INDEX-DESIGN§3.2).
 - All entries of one term are contiguous in key order, so a query reads a term's containers in
   id order with one range scan, and two terms intersect by walking both scans in step and
   skipping windows absent from either.
-- Snapshot diffs and bitmap-delta sync compare containers per `(term_id, high)`; the
-  dictionary entry's `generation` and `last_modify_lsn` say whether a term changed at all.
+- Local snapshot diffs compare containers per `(term_id, high)`; the dictionary entry's
+  `generation` and `last_modify_lsn` say whether a term changed at all. Postings never travel
+  in sync; each node derives its own (CLUSTER-DESIGN "Selected design").
 
 ### 3.2 Containers
 
@@ -397,7 +400,7 @@ const DICT_FLAG_WHITEOUT: u8 = 1 << 7;       // snapshot whiteout (SNAPSHOTS-DES
 ```
 
 `(cardinality, generation, last_modify_lsn)` let the query planner order intersections and let a
-peer see which terms changed without reading postings.
+local diff see which terms changed without reading postings.
 
 **Term table.** A BTREE-DESIGN§1 tree of `BtreeKind::TermTable`, keyed by `term_id: u64`
 (snapshot-agnostic: a term never changes once created), holding what the dictionary key cannot:
@@ -412,7 +415,7 @@ struct TermRecord {                          // 8-byte head
 }
 // followed by:
 //   Attr, inline:       the value's INDEX-DESIGN§1.1 encoding (≤ 96 bytes), padded to 8
-//   Attr, out of line:  BlobRef (16 B) to a blob-zone extent holding the encoding
+//   Attr, out of line:  BlobRef (16 B) to a data-bucket extent holding the encoding
 //   Relation:           target: u64
 //   Attr, hierarchy node: parent: u64, then the component's encoding as for inline Attr
 //   NGram, RollUp:      nothing (the dictionary key holds everything)
@@ -543,7 +546,7 @@ region's `NodePtr` and the index of the region's first entry.
 
 ```rust
 #[repr(C)]
-struct ChunkParamsRecord {                   // 16 bytes — head region only
+struct ChunkParamsRecord {                   // 16 bytes — in every region's kind header
     algo: u8,                                //  [0..1]   ChunkingAlgo discriminant
     flags: u8,                               //  [1..2]   reserved
     _pad: [u8; 2],                           //  [2..4]

@@ -12,7 +12,7 @@ Times, size, mode, uid and gid come from the pool (UNIX-DESIGN "Selected design"
 
 ## UNIX-D3 — Host symlinks on import and export
 
-UNIX-DESIGN§1 and SPECIFICATION-DESIGN§12.2 have no symlink kind: several paths are several `unix-path` values. The code disagrees: `Importer` records host symlinks as `ImportKind::Symlink(target)`, `Exporter` has `ExportAction::CreateSymlink`, [UNIX4](unix-implementation-plan.md) plans symlinks under `/ctx/`, and `demo-data/systems.metta.unix-interop.toml` declares a `symlink-target` attribute. Options for an imported symlink: (a) if it resolves to a file inside the imported tree, add its path as another `unix-path` of the target's object, otherwise follow it as a regular file; (b) always follow it; (c) skip it and report it. Then remove `ImportKind::Symlink`, `CreateSymlink`, UNIX4 and the demo attribute, or amend the design. Blocks [UNIX4](unix-implementation-plan.md).
+UNIX-DESIGN§1 and SPECIFICATION-DESIGN§12.2 have no symlink kind: several paths are several `unix-path` values. The code disagrees: `Importer` records host symlinks as `ImportKind::Symlink(target)`, `Exporter` has `ExportAction::CreateSymlink`, [UNIX4](unix-implementation-plan.md) plans symlinks under `/ctx/`, and `demo-data/systems.metta.unix-interop.toml` declares a `symlink-target` attribute. Options for an imported symlink: (a) if it resolves to a file inside the imported tree, add its path as another `unix-path` of the target's object, otherwise follow it as a regular file; (b) always follow it; (c) skip it and report it. Then remove `ImportKind::Symlink`, `CreateSymlink`, UNIX4 and the demo attribute, or amend the design. Blocks [UNIX4](unix-implementation-plan.md) and [UNIX9](unix-implementation-plan.md).
 
 ## UNIX-D4 — `mimir project` command surface and archive formats
 
@@ -20,7 +20,7 @@ SPECIFICATION-DESIGN§12.4 and §12.5 show `export --format tar.gz | deb` and `i
 
 ## UNIX-D5 — Tag-path segments for qualified names and attribute values
 
-`/tags/` paths are sets of tag names. A tag whose bare name is ambiguous is reachable only by qualified name (`systems.metta.music:album`, ONTOLOGY-DESIGN "Tags and attribute keys"), which contains `.` and `:`; attribute values (`artist = Aphex Twin`) have no segment form at all. Decide the spelling: qualified names as-is or with a short module alias, and whether attribute values appear as `key=value` segments (with escaping for `/` and `=`), as a nested `key/value` pair of directories, or not at all. Shapes [UNIX5](unix-implementation-plan.md) and the FUSE layout.
+`/tags/` paths are sets of tag names. A tag whose bare name is ambiguous is reachable only by qualified name (`systems.metta.music:album`, ONTOLOGY-DESIGN "Tags and attribute keys"), which contains `.` and `:`; attribute values (`artist = Aphex Twin`) have no segment form at all. Decide the spelling: qualified names as-is or with a short module alias, and whether attribute values appear as `key=value` segments (with escaping for `/` and `=`), as a nested `key/value` pair of directories, or not at all. Shapes the FUSE layout.
 
 ## Future work
 

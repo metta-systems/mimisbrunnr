@@ -1,6 +1,6 @@
 # Snapshots — design
 
-Scope: snapshot tree, snapshot-aware keys across every snapshot-aware tree, history sidecars, snapshot WAL ops, snapshot-aware queries and blob reads.
+Scope: snapshot tree, snapshot-aware keys across every snapshot-aware tree, history sidecars, snapshot journal ops, snapshot-aware queries and blob reads.
 Governing spec: SNAPSHOTS-DESIGN§1 (SNAPSHOTS-DESIGN§1.1 snapshot tree, SNAPSHOTS-DESIGN§1.2 key positions, SNAPSHOTS-DESIGN§1.3 visibility, SNAPSHOTS-DESIGN§1.6 bucket retention, SNAPSHOTS-DESIGN§1.7 retention policy, SNAPSHOTS-DESIGN§1.8 rollback).
 
 Plan: [snapshots-implementation-plan.md](snapshots-implementation-plan.md) · Open decisions: [snapshots-decisions.md](snapshots-decisions.md) · Completed: [snapshots-completed.md](snapshots-completed.md) · Order: [operations-plan.md](operations-plan.md)
@@ -81,17 +81,17 @@ parent-pointer walk.
 ### 1.2 Snapshot-aware bkey position
 
 In snapshot-aware btrees, every bkey position carries an extra `snapshot: u32` field appended
-to the kind-specific key fields. With BTREE-DESIGN§1.6 packing, `snapshot` is typically a 0-bit field in
-a leaf sorted run (one snapshot dominates the sorted run's keys), or a few bits at most — its
-on-disk overhead is in the noise. The unpacked in-memory struct still pays the 4 bytes; this
+to the kind-specific key fields. With the BTREE-DESIGN§1.6 key format, `snapshot` is typically a width-0 field in
+a run (one snapshot dominates the run's keys), or one or two bytes at most — its on-disk
+overhead is in the noise. The unpacked in-memory struct still pays the 4 bytes; this
 section's struct definitions show the field explicitly.
 
 **Where the field appears.** Every leaf-entry struct in this document marked snapshot-aware
 below carries a `snapshot: u32` field immediately after the kind-specific sort-key fields
-(e.g. `oid` for Forward, `(term_id, high)` for Postings, `(kind, key, context, value, term_id)`
+(e.g. `oid` for Forward, `(term_id, high)` for Postings, `(kind, key, context, parent, value, term_id)`
 for TermDictionary). The
 field is part of the **key**, not the value — it participates in ordering and is what the
-BTREE-DESIGN§1.6 format descriptor packs to ~0 bits when one snapshot dominates.
+BTREE-DESIGN§1.6 key format encodes in zero bytes when one snapshot dominates a run.
 
 **Inheritance for nested structures.** Out-of-line data a snapshot-aware entry points at —
 an out-of-line term value, a forward-overflow chain — is shared across snapshots; only the
@@ -209,7 +209,7 @@ Divergence happens only where modifications occur. If N already has children fro
 snapshots / rollbacks, those nodes follow N₂ in the sibling chain (`N₂.next_sibling`) — the
 total ordering reflects creation recency, head-first.
 
-The `SnapshotCreate` WAL op (JOURNAL-DESIGN§1.3) records this as
+The `SnapshotCreate` journal op (JOURNAL-DESIGN§1.3) records this as
 `{ new_id, parent_id, current_replacement, label }` where `new_id ↔ N₂` (the frozen snapshot),
 `parent_id ↔ N` (the previous current), and `current_replacement ↔ N₁` (the new writable head
 to which subsequent mutations are tagged).
@@ -227,7 +227,7 @@ snapshot-aware btrees — `Forward`, `TermDictionary`, `Postings`, `Sequences`, 
 `ObjectHistory`, the yes-rows of SNAPSHOTS-DESIGN§1.2's table — serves every
 snapshot in the set. A burst of sync-snapshot expiries costs one pass, not one per snapshot.
 
-**Synchronous step (`SnapshotDelete` WAL op).**
+**Synchronous step (`SnapshotDelete` journal op).**
 1. In the snapshots btree, set `SNAPSHOT_FLAG_DELETED` in `SnapshotNode.flags`. The node remains in
    place — its `depth` and `skiplist` are still consulted during ancestry checks for siblings
    and descendants — but no new reads are accepted *at* the deleted snapshot id. The snapshot
@@ -238,7 +238,7 @@ snapshot in the set. A burst of sync-snapshot expiries costs one pass, not one p
    btree (RECONCILE-DESIGN§1.3). A pass already running picks the new snapshot up for the
    leaves it has not reached, and a next pass covers the leaves it already passed.
 
-**Cleanup pass (reconcile-driven, no per-key WAL).** For each tree:
+**Cleanup pass (reconcile-driven, no per-key journal entries).** For each tree:
 
 ```
 let mut cursor = scan_state.cursor;            // resumed from ReconcileScan record (RECONCILE-DESIGN§1.3)

@@ -22,6 +22,7 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, and co
 - **What a peer already has.** A sender ships only changes a peer has not seen, and a peer's acknowledgement is its watermark for tombstone expiry (METADATA-DESIGN "Object deletion"). How that knowledge is kept — a snapshot of the sender per peer, a version vector of per-origin hybrid timestamps, or what the merge model needs — is [CLUSTER-D7](cluster-decisions.md), decided together with the merge model.
 - **The ontology syncs as records.** A bundle carries the ontology records changed between its snapshots, by uid, ahead of its other changes (ONTOLOGY-DESIGN "Cluster propagation"). Declarations edited on two nodes merge by union of provenance, other fields last-writer-wins by hybrid timestamp.
 - **Merge rules** for object state are [CLUSTER-D2](cluster-decisions.md); **collection order** under concurrent inserts is [CLUSTER-D6](cluster-decisions.md).
+- **Open parts of CLUSTER-DESIGN§1.** How the base snapshot `A` is chosen for a peer, or whether changes are selected by per-origin timestamps instead, and what an acknowledgement names (CLUSTER-D7); whether a delta carries the terms at `A` (CLUSTER-D2); the shape of sequence deltas (CLUSTER-D6). §1 specifies the bundle for the snapshot-based selection.
 
 ## Format specification
 
@@ -31,8 +32,7 @@ The numbered sections below are the normative on-disk and algorithmic specificat
 
 With key-level snapshots, the changes between two of the sender's snapshots `A` and `B` (now)
 are the keys whose `snapshot` is in `ancestors(B) \ ancestors(A)`, read from the trees of direct
-state. How `A` is chosen for a peer — or whether changes are selected by per-origin timestamps
-instead — is CLUSTER-D7:
+state:
 
 ```
 let new_only = ancestors(B) - ancestors(A);     // snapshot ids unique to B's lineage
@@ -46,17 +46,16 @@ for tree in [ObjectTable /* radix records and ObjectHistory */, Forward, Ontolog
 
 The scan reads only blocks whose snapshot range meets `new_only`, so its cost follows the
 changes, not the pool. Each emitted entry becomes an object delta: the object's record fields and
-its direct terms at `B`, translated to uids and values, with the terms at `A` when the receiver
-needs the difference (CLUSTER-D2).
+its direct terms added and removed between `A` and `B`, translated to uids and values.
 
 ```text
 SyncBundle = [version,                     // positional CBOR (FORMAT-DESIGN§1.6)
               from_node: uint,
-              from_snapshot: uint,         // what the peer had (CLUSTER-D7 may replace these
-              to_snapshot: uint,           //   with a version vector)
+              from_snapshot: uint,         // A: what the peer had
+              to_snapshot: uint,           // B
               ontology: [OntologyRecord],  // by uid, applied first
               objects: [ObjectDelta],      // HLC-ordered
-              sequences: [SequenceDelta]]  // CLUSTER-D6
+              sequences: [SequenceDelta]]
 
 ObjectDelta = [oid: uint, hlc: HybridTimestamp,
                record: [state, length, content_hash, created_ns, modified_ns] / null,
@@ -68,8 +67,7 @@ Term = [0, tag_uid: bytes(16)]
 ```
 
 The bundle is signed and shipped to peers (per the SPECIFICATION-DESIGN§9.4 key hierarchy).
-After applying it, the receiver acknowledges what it now has; what the acknowledgement names and
-what either side keeps for the next exchange are CLUSTER-D7.
+After applying it, the receiver acknowledges `to_snapshot`.
 
 A new node's first bundle diffs from the empty snapshot: the sender's whole direct state.
 

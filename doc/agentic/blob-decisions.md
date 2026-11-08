@@ -1,4 +1,4 @@
-# Blob zone and content paths — open decisions
+# Blob storage and content paths — open decisions
 
 Design: [blob-design.md](blob-design.md) · Plan: [blob-implementation-plan.md](blob-implementation-plan.md)
 

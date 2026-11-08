@@ -143,13 +143,13 @@ struct DataBlockHead {                       // 8 bytes
 }
 // followed by:
 //   keys:          entry_count × key_width bytes, ascending
-//   entry flags:   entry_count × u8          ENTRY_FLAG_*
+//   entry flags:   entry_count × u8          RUN_ENTRY_FLAG_*
 //   value ends:    entry_count × u16         end offset of each value (absent for fixed-size values)
 //   zero pad to value_area
 //   values:        each starting 8-byte aligned
 
-const ENTRY_FLAG_WHITEOUT: u8 = 1 << 0;  // delete; no value bytes
-const ENTRY_FLAG_LARGE:    u8 = 1 << 1;  // value is LargeValueRef, bytes live in value blocks
+const RUN_ENTRY_FLAG_WHITEOUT: u8 = 1 << 0;  // delete; no value bytes
+const RUN_ENTRY_FLAG_LARGE:    u8 = 1 << 1;  // value is LargeValueRef, bytes live in value blocks
 
 #[repr(C)]
 struct LargeValueRef {                       // 8 bytes
@@ -213,7 +213,7 @@ snapshots, every tree is shallow:
 | Tree                | Depth  | Levels | Notes                                      |
 | ------------------- | ------ | ------ | ------------------------------------------ |
 | Object table (METADATA-DESIGN§1)   | 1      | 2      | 6 511 leaves under 1 inner (R = 1)       |
-| Forward index (INDEX-DESIGN§2)  | 1      | 2      | ~2 500 leaves (~64 B per object) under 1 inner |
+| Forward index (INDEX-DESIGN§2)  | 1      | 2      | ~3 000 leaves (~58 B per object at 8 direct assertions) under 1 inner |
 | Term dictionary (INDEX-DESIGN§4.1) | 0–1 | 1–2    | 5 000 tag entries fit one leaf; depth 1 once attribute values number in the millions |
 | Postings (INDEX-DESIGN§3.1)     | 1      | 2      | one entry per (term, 65 536-id window)     |
 
@@ -268,7 +268,7 @@ each run's format fits its own keys exactly, and runs in one node may differ.
 | Postings          | 20 B (term, window, snapshot) | 3–6 B | Term constant across a term's windows |
 | Term dictionary   | ~49 B        | 12–24 B         | kind and key constant; value bytes kept |
 | Alloc table       | 4 B (bucket) | 2 B             | Sequential bucket numbers         |
-| Subscriptions     | 12 B (sub_id + snap) | 2–4 B   | Sequential ids                    |
+| Subscriptions     | 8 B (sub_id) | 1–2 B           | Sequential ids                    |
 | Snapshots         | 4 B          | 2 B             | Sequential snapshot ids           |
 | Chunk index       | 32 B         | 32 B            | Hashes do not compress            |
 

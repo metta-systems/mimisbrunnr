@@ -1,19 +1,19 @@
 # Encryption — design
 
-Scope: `crates/transform` (`Encryptor`), encrypted WAL entries in `crates/wal`, encrypted blocks in `crates/storage`, key material in the superblock and pool state.
-Governing spec: SPECIFICATION-DESIGN§9.3 (ciphers per zone), SPECIFICATION-DESIGN§9.4 (key hierarchy), SPECIFICATION-DESIGN§9.5 (trust tiers), ENCRYPTION-DESIGN§1.
+Scope: `crates/transform` (`Encryptor`), encrypted journal sets in `crates/wal`, encrypted blocks in `crates/storage`, key material in the superblock and pool state.
+Governing spec: SPECIFICATION-DESIGN§9.3 (ciphers per bucket kind), SPECIFICATION-DESIGN§9.4 (key hierarchy), SPECIFICATION-DESIGN§9.5 (trust tiers), ENCRYPTION-DESIGN§1.
 
 Plan: [encryption-implementation-plan.md](encryption-implementation-plan.md) · Open decisions: [encryption-decisions.md](encryption-decisions.md) · Completed: [encryption-completed.md](encryption-completed.md) · Order: [operations-plan.md](operations-plan.md)
 
 ## Goal
 
-Every zone is encrypted with the cipher SPECIFICATION-DESIGN§9.3 assigns it, under keys derived from one master key, with no change to the plaintext formats.
+Each kind of stored data — node blocks, data extents, journal sets — is encrypted with the cipher SPECIFICATION-DESIGN§9.3 assigns it, under keys derived from one master key, with no change to the plaintext formats.
 
 ## Selected design
 
-- **Ciphers:** node-bucket blocks XTS-AES-256 (tweak = block address and bucket generation); data extents HCTR2 (tweak from the owner: `object_id`, or the chunk hash for shared chunks, ENCRYPTION-DESIGN§1); WAL AES-256-GCM (AAD `header[0..36]`, nonce `LSN || 0`, 16 B tag before the trailing CRC); sync traffic ChaCha20-Poly1305; Adiantum as the fallback without AES instructions.
-- **Key hierarchy:** `MasterKEK → DiskKey` (SPECIFICATION-DESIGN§9.4); the superblock records `encryption_keyid`.
-- Sector padding for XTS/HCTR2 is already in the pipeline; WAL entries compress before they encrypt.
+- **Ciphers:** node-bucket blocks XTS-AES-256 (tweak = block address and bucket generation); data extents HCTR2 (tweak from the owner: `object_id`, or the chunk hash for shared chunks, ENCRYPTION-DESIGN§1); journal sets AES-256-GCM (AAD the `JsetHeader` with its checksum zeroed, nonce `seq || 0`, 16 B tag after the ciphertext, ENCRYPTION-DESIGN§1); sync traffic ChaCha20-Poly1305; Adiantum as the fallback without AES instructions.
+- **Key hierarchy:** `MasterKEK → DiskKey` (SPECIFICATION-DESIGN§9.4), with the journal key derived using the pool's `fs_uuid`; the superblock records `encryption_keyid`.
+- Sector padding for XTS/HCTR2 is already in the pipeline; journal entries compress before they encrypt.
 
 ## Format specification
 

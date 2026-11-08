@@ -9,7 +9,7 @@ Order: [operations-plan.md](operations-plan.md) · Open decisions: [operations-d
 Mímisbrunnr is the associative filesystem of the Mettā operating system. Once a pool exists on a node and Mímir answers queries against it, three things differ from a hierarchical filesystem:
 
 1. **Retrieval is associative.** A caller obtains an `ObjectId` set by submitting a `Query` over assertions (`Tag`, `Attr`, `Relation`), direct or derived through the ontology. No path is supplied and none exists.
-2. **Metadata is answerable locally.** The metadata plane (tag bitmaps, forward index, ontology, object table) is replicated to every participating node. Once converged, a query needs no network round-trip and its latency does not grow with cluster size. Bytes cross the wire only for convergence traffic and when an application opens a blob the node does not hold.
+2. **Metadata is answerable locally.** The metadata plane (object records, forward entries, ontology; each node derives its own term index from them) is replicated to every participating node. Once converged, a query needs no network round-trip and its latency does not grow with cluster size. Bytes cross the wire only for convergence traffic and when an application opens a blob the node does not hold.
 3. **Storage policy follows ontology.** Direct assertions combine with ontology rules into derived terms; placement, tier, compression and encryption follow from rules over the resulting set. One tagging operation re-classifies an object; no separate relocation call exists.
 
 ### Role
@@ -31,11 +31,11 @@ Mímisbrunnr is the associative filesystem of the Mettā operating system. Once 
 
 - Object lifecycle: create, tag, untag, set attributes and relations, derived terms from ontology rules, ontology constraints, tombstone deletion.
 - Query evaluation: bitmap algebra over `HasTag`, `HasKey`, `HasAttr`, `Under`, `Related`, `And` / `Or` / `Not`; faceted exploration; optional `snapshot_id`.
-- Pool management: multiple block devices, attach and detach, zone layout, ontology-driven placement and tiering.
+- Pool management: multiple block devices, attach and detach, bucket allocation, ontology-driven placement and tiering.
 - Metadata replication with eventual convergence, each node authoritative for its own writes.
 - Subscriptions over `ChangeInterest`.
 - Access surfaces: the Mímir API and the FUSE adapter (tag navigation, Unix path projection under `/ctx/`); ontology authors through modules; operators through `brunnr`.
-- Persistence formats: superblock, WAL, object table, indices, ontology; little-endian, CRC-protected, CBOR for structured payloads.
+- Persistence formats: superblock, journal, object table, indices, ontology; little-endian, checksum-protected, positional CBOR for heterogeneous payloads.
 - Per-node snapshots capturing the assertion graph and the blob contents it references.
 
 **Out of scope:**
@@ -99,11 +99,11 @@ Workspace-level evidence (`just test`, `just clippy`) backs every claim: a regre
 |---|---|
 | Concurrency | Sync only: blocking I/O, no async runtime; `std::thread` only in `std`-gated code. |
 | `std` | Library crates are `#![no_std]` + `alloc`; host-only parts sit behind a default `std` feature. Dependencies are taken with `default-features = false` where they offer it. |
-| Structured on-disk data | Binary records where the shape is known from the kind (WAL payloads included); positional, versioned CBOR via `ciborium` only for heterogeneous data (FORMAT-DESIGN§1.6). |
+| Structured on-disk data | Binary records where the shape is known from the kind (journal payloads included); positional, versioned CBOR via `ciborium` only for heterogeneous data (FORMAT-DESIGN§1.6). |
 | JSON | Never on disk; allowed in CLI output, logs and test fixtures. |
 | TOML | Human-edited sources only (ontology module sources, compiled on the host). Never on disk. |
 | Content hash | BLAKE3. |
-| Block and sorted-run CRC | CRC32C (`crc32c`). |
+| Block and run checksums | One algorithm for every checksum slot; which is [OPERATIONS-D4](operations-decisions.md). |
 | Fixed-size on-disk structs | `bytemuck::{Pod, Zeroable}`, `#[repr(C)]`, naturally aligned. |
 | Bitfields | `bitbybit` + `arbitrary-int`. |
 | Endianness | Little-endian on disk; big-endian hosts are out of scope. |
@@ -121,17 +121,17 @@ Logical types live in `mimisbrunnr-types`; each on-disk wire struct lives in the
 | Concept | Crate |
 |---|---|
 | IDs (`ObjectId`, `TagId`, `NodeId`, `DiskId`, `SubscriptionId`, `ModuleId`), `Assertion`, `Value`, `Query`, tag definitions and storage policy types, disk and tier types, watch event types, `HybridTimestamp`, `ContentPresence`, object state enums, value CBOR codec | types |
-| Block headers and kinds, `BtreeNodeHeader`, sorted-run headers and formats, superblock, zone map, `RootPointer`, `BlockRef`, `BlobRef`, bucket allocation, `LoadedNode`, `JournalPin` | storage |
-| WAL header, entry header and flags, ops | wal |
+| Block headers and kinds, `BtreeNodeHeader`, run and page-run headers, key formats, superblock, root list, `BlockRef`, `BlobRef`, `NodePtr`, bucket allocation, `LoadedNode`, `JournalPin` | storage |
+| Journal set header, entry header and flags, ops | wal |
 | `ObjectRecord`, content locator, object table and `ObjectRoots`, extent lists, replica and backpointer types | meta |
-| Forward, tag, KV, range and chunk indices | index |
-| `OntologyState`, `ImplicationDag`, `OntologyModule` | ontology |
+| Term dictionary, term table, postings, forward index, sequences, chunk index | index |
+| `OntologyState` (records, name and uid maps, closure tables), module records | ontology |
 | `QueryExecutor`, `FacetedExplorer`, `QueryParser` | query |
 | Hasher, compressor, encryptor, pipeline | transform |
-| `Engine`, `DiskEngine`, `OpLog` | engine |
+| `Engine`, `DiskEngine` | engine |
 | `SubscriptionEngine`, runtime `Subscription` | watch |
-| `PoolManager`, pool state root | pool |
-| `PathProjection`, `PathContextManager`, `Importer` | unix |
+| `PoolManager`, pool state record, disk descriptors | pool |
+| `PathProjection`, `Importer` | unix |
 | `VfsTree`, `TagVfs`, `MimisbrunnrFs` | fuse |
 | SQL parser, planner, executor | sql |
 
@@ -146,12 +146,12 @@ Logical types live in `mimisbrunnr-types`; each on-disk wire struct lives in the
 7. Borrow fields in place; no `read_unaligned`, no copying fields out to dodge alignment.
 8. Zero-copy and compact (FORMAT-DESIGN goal 1): a reader can borrow the struct, or a slice of them, in place from a mapped or read sector with `bytemuck::try_from_bytes` / `try_cast_slice`; no fixed-shape data on a read hot path goes through CBOR.
 
-Records with a variable part (WAL payloads) are a fixed head plus one array or byte string, encoded by hand (FORMAT-DESIGN§1.6). Heterogeneous data (`Value`, query ASTs, the ontology image, subscription records, placement-rule values) is positional CBOR with a leading schema version, through the `crates/types` helpers; derived `serde` field-name encodings never reach the disk.
+Records with a variable part (journal payloads) are a fixed head plus one array or byte string, encoded by hand (FORMAT-DESIGN§1.6). Heterogeneous data (`Value`, query ASTs, ontology records, subscription records, placement-rule values) is positional CBOR with a leading schema version, through the `crates/types` helpers; derived `serde` field-name encodings never reach the disk.
 
 ## CRC and magic
 
-- Block CRC: CRC32C over `BlockHeader || payload` with the CRC slot zeroed. Sorted-run CRC per BTREE-DESIGN§1.1.
-- Magic: `b"MIMR"` for 4 KiB blocks, `b"MIMB"` for 256 KiB regions, `b"MIMISBRUNNR\0\0\0\0\0"` for the superblock, `b"WALR"` for WAL entries, `b"BSET"` for sorted runs.
+- Checksums: the OPERATIONS-D4 algorithm over each structure with its checksum slot zeroed — superblock, node header block, run index and data blocks, page runs (BTREE-DESIGN§1.1–1.2, BTREE-DESIGN§1.7), journal sets (JOURNAL-DESIGN§1.2).
+- Magic: `b"MIMR"` for 4 KiB blocks, `b"MIMB"` for 256 KiB regions, `b"MIMISBRUNNR\0\0\0\0\0"` for the superblock, `b"JSET"` for journal sets, `b"BSET"` for key runs, `b"PAGE"` for page runs.
 - `BlockKind` and `BtreeKind` discriminants are pinned by the spec and never renumbered.
 
 ## Tests

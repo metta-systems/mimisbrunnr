@@ -18,7 +18,7 @@ A subscription is a saved query plus a cursor into the journal. A consumer polls
 - **Not snapshot-aware.** Subscriptions watch the head. Creating, deleting or rolling back a snapshot never moves a consumer's cursor, membership or pending events.
 - **Pull and acknowledge.** `poll(sub, max)` returns pending events in order, tagged with their LSN; `ack(lsn)` removes them and advances the persisted cursor. Delivery is at least once; consumers deduplicate by LSN. Debouncing and wake-ups run in the engine's `step` (ENGINE-DESIGN "Selected design"); no thread is needed.
 - **Ids are never reused**: removing the subscription with the largest id leaves a high-water marker record (SUBSCRIPTIONS-DESIGN§1).
-- **Remote changes are local operations.** Ops received by cluster sync are applied as ordinary local journal entries (CLUSTER-DESIGN), so subscriptions see them exactly as they see local mutations; their events carry the origin's hybrid timestamp.
+- **Remote changes are local operations.** Changes received by cluster sync are applied as ordinary local journal entries (CLUSTER-DESIGN), so subscriptions see them exactly as they see local mutations; their events carry the origin's hybrid timestamp.
 
 ## Why not inotify
 
@@ -40,8 +40,9 @@ Every mutation is already a journal entry with an LSN, so a watch is a saved que
 ## Evaluation
 
 **Index.** Each subscription's compiled query yields the terms it reads (tags, attribute
-values, n-gram and roll-up terms, `_object` when it contains `Not`) and the keys it reads by
-range (`HasKey`, comparisons, `Contains`, `Under`). The engine keeps, in memory:
+values, roll-up terms, `_object` when it contains `Not`) and the keys it reads by range
+(`HasKey`, comparisons, `Contains`, `Under`). N-gram terms are not indexed: an object's closure
+delta never contains them, so `Contains` reaches subscriptions through its key. The engine keeps, in memory:
 
 - `term_to_subs: TermId → [SubscriptionId]`
 - `key_to_subs: TagId → [SubscriptionId]` for keys read by range

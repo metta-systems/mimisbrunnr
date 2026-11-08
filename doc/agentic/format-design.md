@@ -11,7 +11,7 @@ cluster-sync layer.
 Goals:
 
 1. **Zero-copy, compact access.** The pool is a filesystem read as disk sectors, often mapped as
-   memory pages. A mapping of any zone yields naturally aligned structures a reader borrows in
+   memory pages. A mapping of any bucket yields naturally aligned structures a reader borrows in
    place (`&T`, `&[T]`) — no copy and no deserialisation on the hot path (object lookup, tag and
    attribute lookup, query evaluation, blob read). Layouts are compact: no framing, padding or
    indirection a fixed layout can avoid.
@@ -50,7 +50,7 @@ Goals:
 - Logical block: **4 KiB**. Every persistent structure is laid out so that:
   - Records that must be updated atomically fit in one logical block, or
   - Records spanning multiple blocks use a shadow-paging / log-structured update.
-- All offsets in superblocks and zone maps are byte offsets, but always 4 KiB-aligned.
+- Block addresses are bucket-relative `(bucket_no, sector)` in 4 KiB sectors (ENGINE-DESIGN§1.3).
 
 ### 1.3 Per-block header (`BlockHeader`)
 
@@ -137,7 +137,7 @@ enum BtreeKind {
     ChunkList             = 11,  // INDEX-DESIGN§4.3 per-object FastCDC chunk-list region (positional, no sorted runs)
     // Physical reverse mapping
     Backpointer           = 12,  // METADATA-DESIGN§2.2 reverse-mapping B+ tree (snapshot-agnostic)
-    // Catalogs (snapshot-aware)
+    // Catalogs
     Ontology              = 13,  // ONTOLOGY-DESIGN§1 ontology records: tags, rules, modules (snapshot-aware)
     Subscriptions         = 14,  // SUBSCRIPTIONS-DESIGN§1 subscription records (snapshot-agnostic)
     // Snapshot tree itself
@@ -170,9 +170,9 @@ that encounters an unknown `(kind, format_version)` aborts with a clear "format 
 
 ### 1.4 CRC
 
-CRC32C (Castagnoli, hardware-accelerated on x86 SSE 4.2 and ARMv8 CRC). Sufficient for 4 KiB blocks
-and faster than CRC32. BLAKE3 is used for *content* integrity (per-object), not for block
-checksums.
+Every block, run, page and journal-set checksum uses one pool-wide block checksum algorithm,
+chosen by [OPERATIONS-D4](operations-decisions.md) (CRC32C is the current candidate). BLAKE3 is
+used for *content* integrity (per-object), not for block checksums.
 
 ### 1.5 Large node format
 
@@ -219,13 +219,13 @@ Specified in [JOURNAL-DESIGN§1](journal-design.md#1-journal).
 
 Specified in [INDEX-DESIGN§1](index-design.md#1-values-and-terms).
 
-## 5. Object Record Table
+## 5. Object Table
 
-Specified in [METADATA-DESIGN§1](metadata-design.md#1-object-record-table).
+Specified in [METADATA-DESIGN§1](metadata-design.md#1-object-table).
 
-## 6. Location and Backpointer Tables
+## 6. Replicas and Backpointers
 
-Specified in [METADATA-DESIGN§2](metadata-design.md#2-location-and-backpointer-tables).
+Specified in [METADATA-DESIGN§2](metadata-design.md#2-replicas-and-backpointers).
 
 ## 7. Forward Index
 
@@ -241,8 +241,9 @@ Specified in [INDEX-DESIGN§4](index-design.md#4-dictionary-range-scans-and-chun
 
 ## 10. Subscriptions, Path Contexts, Ontology
 
-These structures change less frequently and are loaded fully into memory at mount, but persisted
-on every checkpoint.
+These structures change less often than the index. Ontology records and subscription records are
+loaded at mount; subscription membership and pending events are read on demand; path projections
+are index terms with no structure of their own.
 
 ### 10.1 Ontology persistence
 
@@ -264,17 +265,17 @@ Specified in [POOL-DESIGN§1](pool-design.md#1-pool-state).
 
 Specified in [SNAPSHOTS-DESIGN§1](snapshots-design.md#1-snapshots).
 
-### 11.7 Cluster diff between snapshots
+### 11.7 Sync bundles from snapshot diffs
 
-Specified in [CLUSTER-DESIGN§1](cluster-design.md#1-cluster-diff-between-snapshots).
+Specified in [CLUSTER-DESIGN§1](cluster-design.md#1-sync-bundles-from-snapshot-diffs).
 
 ## 12. Allocation Layer
 
 Specified in [ALLOCATION-DESIGN§1](allocation-design.md#1-allocation-layer).
 
-## 13. In-Memory Mirror Structures
+## 13. In-Memory State
 
-Specified in [ENGINE-DESIGN§2](engine-design.md#2-in-memory-mirror-structures).
+Specified in [ENGINE-DESIGN§2](engine-design.md#2-in-memory-state).
 
 ## 14. Encryption Integration
 
@@ -286,8 +287,9 @@ The on-disk format evolves through a **two-version superblock**: the pool record
 version it currently *writes* with and the minimum version of any data still *on disk*. The
 two values move independently — new writes use the current version immediately, while older
 data retains its original format until rewritten by background migration (FORMAT-DESIGN§15.4).
-`BlockHeader.format_version` (per-block, per-kind) remains the fine-grained per-structure
-version.
+The fine-grained per-structure version is the `format_version` in each structure's
+`BlockPreamble` (per kind), with `record_version` inside fixed records and the leading schema
+version of positional CBOR records (FORMAT-DESIGN§1.6).
 
 ### 15.1 Superblock version fields
 
@@ -319,7 +321,8 @@ a stable bit position; `&~ supported` is the missing-feature set.
 
 On mount, the binary:
 
-1. Picks the active superblock copy by `(seq, lsn)` (ENGINE-DESIGN§1.2).
+1. Picks the superblock copy with a valid checksum and the highest `checkpoint_hint.lsn`
+   (ENGINE-DESIGN§1.1).
 2. Refuses mount if `superblock.incompat_features &~ self.supported_incompat != 0`.
 3. Mounts read-only if `superblock.ro_compat_features &~ self.supported_ro_compat != 0`.
 4. Otherwise mounts read-write.
@@ -343,8 +346,8 @@ the new value and the appropriate feature bits are set. Subsequent writes use th
 Existing data is untouched; `fs_min_on_disk` is unchanged.
 
 **Step 2 — migrate old data.** The reconcile engine (RECONCILE-DESIGN§1) launches a scan that walks all
-snapshot-aware btrees, rewriting any record whose `BlockHeader.format_version` is older than
-the current writing version. Each rewrite is COW; partial migrations are crash-safe.
+snapshot-aware btrees, rewriting any node or record whose `format_version` or `record_version`
+is older than the current writing version. Each rewrite is COW; partial migrations are crash-safe.
 
 When the scan completes, `fs_min_on_disk` advances to match `fs_format_version` at the next
 checkpoint.
@@ -388,20 +391,22 @@ For each `BtreeKind` / `BlockKind`, schema evolution follows one of three patter
 
 ## 16. Summary of On-Disk Footprint (10 M objects, 5 000 tags, ~100 live snapshots)
 
-Steady-state footprint. The journal holds the unmaterialised tail plus retained history (its bucket list, typically 64 MiB on a host); per-key
+Steady-state footprint. The journal holds the unflushed tail, plus retained history only where a
+pool sets a cap (JOURNAL-DESIGN§1.6); its bucket list is typically 64 MiB on a host. Per-key
 snapshot overhead scales with logical changes since each snapshot's parent. The forward-index
-sizing assumes 8 assertions per object (the INDEX-DESIGN§2.2 inline-spill threshold and the INDEX-DESIGN§2.1 calculation
-basis), which is a worst-case upper bound — small-object workloads (~4 assertions) cut the
-forward index roughly in half (~660 MiB at this scale).
+sizing assumes 8 direct assertions per object (the INDEX-DESIGN§2.1 entry layout: a 32 B head
+plus frame-of-reference arrays); small-object workloads (~4 assertions) cut the forward index by
+about a third (~0.4 GiB at this scale). Tree sizes are for one copy of each node; with
+`metadata_replicas` R every tree-node row is R times larger.
 
 | Structure              | Size      | Notes                                              |
 | ---------------------- | --------- | -------------------------------------------------- |
 | Superblock × 3         | 12 KiB    | Fixed                                              |
-| Journal                | ~64 MiB   | Journal buckets (JOURNAL-DESIGN§1) plus retained history; mirrored across hot devices |
+| Journal                | ~64 MiB   | Journal buckets (JOURNAL-DESIGN§1); retained history only with a pool cap; per hot device holding the journal (mirroring, JOURNAL-D1) |
 | Bucket alloc table     | ~160 MiB  | 16 M buckets × ~10 B/entry (8 B value + ~2 B packed `bucket_no`) + sorted-run overhead (BTREE-DESIGN§1.1 headers, format descriptors, tail padding) |
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
 | Object table (records) | ~1.6 GiB  | Positional — 1.19 GiB of records in 6 511 leaves × 256 KiB (¾ of each region holds pages, the rest absorbs page runs); content locators included |
-| Object table (radix, roots) | < 1 MiB | One inner node per origin node (depth 1 total); `ObjectRoots` one leaf |
+| Object table (radix, roots) | < 1 MiB | One inner node per origin node at R = 1 (depth 1), a few at R = 2 (depth 2, METADATA-DESIGN§1); `ObjectRoots` one leaf |
 | Backpointers           | ~267 MiB  | METADATA-DESIGN§2.2 — 10 M extents × ~28 B packed                 |
 | Forward index          | ~0.6 GiB  | INDEX-DESIGN§2 — ~58 B per object at 8 direct assertions/object (32 B head + frame-of-reference term arrays); implied tags are not stored. Includes any `unix-path` and other path-projection attributes (UNIX-DESIGN§1) — those are ordinary `Attr` terms. |
 | Postings               | 200–400 MiB | INDEX-DESIGN§3 — roaring containers, one tree entry per (term, 65 536-id window); 5 000 tags |
@@ -414,7 +419,7 @@ forward index roughly in half (~660 MiB at this scale).
 
 **Snapshot key overhead breakdown.** "Snapshot key overhead" is the sum of *divergent* keys —
 keys whose value at one snapshot differs from its value at an ancestor. Shared keys cost nothing
-extra (one entry, visible in every snapshot whose ancestry reaches it via SNAPSHOTS-DESIGN§1.3). The ~50 MiB
+extra (one entry, visible in every snapshot whose ancestry reaches it via SNAPSHOTS-DESIGN§1.3). The ~80 MiB
 figure assumes the canonical workload of 100 snapshots taken roughly hourly over an actively
 mutated pool with **~5 000 mutations/snapshot** (≈ 0.05 % of the 10 M objects diverging per
 snapshot, typical for sync-driven snapshotting):

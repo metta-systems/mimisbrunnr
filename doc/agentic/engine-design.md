@@ -14,7 +14,7 @@ The engine orchestrates mutations journal-first, keeps one long-lived `LoadedNod
 - **No zones.** A device is three superblock copies and buckets; every structure, metadata or data, lives in allocated buckets classified by bucket kind (ALLOCATION-DESIGN§1.2). There is no fixed index, metadata or blob area and nothing to grow.
 - **Root list.** Every tree the engine owns is one entry of the root list, keyed by tree kind (ENGINE-DESIGN§1.2); an absent entry loads as an empty tree. The list travels in `Checkpoint` entries; the superblock holds only a hint to the newest one.
 - **Commit.** Flush dirty trees (append a run or page run, or compact into a fresh region), then commit a `Checkpoint` entry with the new root list; regions the new root no longer reaches are freed after it is durable. A crash before the checkpoint leaves the previous root's regions intact.
-- **No legacy blob.** The `MIXI` CBOR blob is retired: counters are derived at boot (`next_oid_local` from the pool's own `ObjectRoots` entry, `next_tag_id` from the ontology, `last_applied_lsn` from the latest checkpoint), path contexts are rebuilt from the forward index, and blob bytes live in data buckets.
+- **No legacy blob.** The `MIXI` CBOR blob is retired: counters are derived at boot (`next_oid_local` from the pool's own `ObjectRoots` entry, `next_tag_id` from the ontology, `last_applied_lsn` from the latest checkpoint), path projections are answered from the index with nothing rebuilt (UNIX-DESIGN "Selected design"), and blob bytes live in data buckets.
 - **Pools are disposable** until the maintainer declares the format stable: a format change means recreating the pool. Version fields stay in every structure so that pools after that point migrate (FORMAT-DESIGN§15).
 - **One engine on host and device.** The engine and every crate it depends on build as `no_std` + `alloc` (operations-design "Deployment targets"); file-backed devices and other host parts sit behind the `std` feature. A pool opens from a `BlockDevice` alone, and opening replays the journal on every target, the device included.
 - **Driven by its embedder.** The engine starts no thread. Mutations and reads are calls; background work — commits, checkpoints, flushes, reconcile — runs in `step` calls that do a bounded amount of work, with a non-blocking query of what is due. A `std`-gated helper drives them from threads on the host; the Vesper filesystem server drives them from its own loop.
@@ -39,7 +39,7 @@ last-4096-of-device) for redundancy. The buckets holding those offsets are never
 
 ```rust
 #[repr(C)]
-struct Superblock {                          // 4096 bytes total
+struct Superblock {                          // 4092 bytes; the checksum at [4092..4096] completes the 4 KiB block
     header: BlockHeader,                     //   [0..32]   kind = Superblock
     magic_full: [u8; 16],                    //  [32..48]   "MIMISBRUNNR\0\0\0\0\0"
     fs_uuid: [u8; 16],                       //  [48..64]   pool-wide UUID
@@ -238,14 +238,13 @@ below; see JOURNAL-DESIGN§1.4's *Locking model* for the lock domains referenced
    call's durability (JOURNAL-DESIGN§1.5).
 4. Apply to the in-memory state (idempotent on lsn).
 5. Release the per-tree write mutex.
-6. Take per-DirtyNode exclusive locks briefly to bump `pending_lsn_max` /
-   `pending_count` on each affected node. Node writes are deferred to the journal-reclaim
-   step (JOURNAL-DESIGN§1.4).
+6. Take each affected `LoadedNode`'s lock briefly in exclusive mode to add the entry to its
+   journal pin. Node writes are deferred to the journal-reclaim step (JOURNAL-DESIGN§1.4).
 ```
 
 The per-tree mutex covers steps 1–4 (LSN allocation, journal append, in-memory update); step 6's
-per-DirtyNode locks are independent and uncontended in steady state because a flush holds the
-same DirtyNode lock in *shared* mode while building new runs. **Reads** see the in-memory state
+per-node locks are independent and uncontended in steady state because a flush holds the same
+lock in *shared* mode while building new runs. **Reads** see the in-memory state
 as of the last completed mutation and are never blocked on either lock domain. On a
 single-threaded embedder (the device) the locks are uncontended by construction.
 

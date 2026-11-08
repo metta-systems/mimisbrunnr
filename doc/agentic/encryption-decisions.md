@@ -16,7 +16,7 @@ SPECIFICATION-DESIGN§9.5 "semi-trusted" loses the metadata key on reboot, yet k
 
 ## ENCRYPTION-D5 — Per-tag keys
 
-SPECIFICATION-DESIGN§9.4 mentions per-tag keys without saying what they encrypt or how they combine with zone keys. Decide whether per-tag keys exist and their role.
+SPECIFICATION-DESIGN§9.4 mentions per-tag keys without saying what they encrypt or how they combine with the pool's node, data and journal keys. Decide whether per-tag keys exist and their role.
 
 ## ENCRYPTION-D6 — Transparent, per-object encryption
 

@@ -87,7 +87,7 @@ type SubscriptionId = u64;
 type ModuleId = String;
 ```
 
-Object IDs are **never recycled**. The 48-bit space is sufficient, and non-recycling eliminates an entire class of stale-reference bugs across cluster sync. A generation counter provides insurance for a hypothetical future where recycling becomes necessary.
+Object IDs are **never recycled**. The 48-bit space is sufficient, and non-recycling eliminates an entire class of stale-reference bugs across cluster sync. Records carry no generation counter: without reuse a bare `ObjectId` is unambiguous (METADATA-DESIGN "Object deletion").
 
 ### 2.2 Assertions
 
@@ -106,6 +106,8 @@ enum Value {
     Float(f64),
     Timestamp(i64),
     Blob(Vec<u8>),
+    Scoped { context: TermId, inner: Box<Value> },  // a value that applies in one context
+                                                    //   (INDEX-DESIGN§1.3)
 }
 ```
 
@@ -157,10 +159,10 @@ Example — "all portable electronics from 2024, not discontinued":
 
 ```rust
 And(vec![
-    HasTag(tag("electronics")),
-    HasTag(tag("portable")),
-    HasAttr { key: tag("year"), op: Eq, value: Int(2024) },
-    Not(Box::new(HasTag(tag("discontinued")))),
+    HasTag { tag: tag("electronics"), direct: false },
+    HasTag { tag: tag("portable"), direct: false },
+    HasAttr { key: tag("year"), op: Eq, value: Int(2024), scope: None },
+    Not(Box::new(HasTag { tag: tag("discontinued"), direct: false })),
 ])
 ```
 
@@ -175,7 +177,12 @@ The ontology defines relationships between tags themselves. It is the schema of 
 Every tag has two identities: a 128-bit `TagUid`, derived from its module id and name (random for ad-hoc tags), which names it in modules, exports and sync; and a dense local `TagId` (`u32`), which is its `TermId` in the index. A tag has a canonical name, aliases, and a qualified name `module:name` for when two modules use the same name (ONTOLOGY-DESIGN "Tags and attribute keys").
 
 ```rust
-enum TagKind { Label, AttributeKey { value_type: ValueType } }
+enum TagKind {
+    Label,
+    AttributeKey { value_type: ValueType },
+    RecordField { field: RecordField },   // size, created, modified, changed: read from the
+                                          //   object record, never asserted (core ontology)
+}
 enum ValueType { Text, Int, Float, Timestamp, Blob }
 enum Collection { Plain, Grouping, Ordered, Ranked }   // attribute keys
 
@@ -190,10 +197,12 @@ struct TagRecord {
     ngram: Option<u8>,                   // substring search over the key's values
     storage: Option<StoragePolicy>,      // §3.5
     provenance: Vec<ModuleUid>,          // modules declaring the tag
+    system: bool,                        // engine-maintained label (_object, _presence:remote,
+                                         //   _writing); users cannot assert it
 }
 ```
 
-A label is asserted or not (`favorite`, `electronic`); an attribute key carries a value (`artist = "Aphex Twin"`). Groups are attribute values: `playlist = "workout"` puts an object in the workout playlist, and an `Ordered` key gives every playlist its own order. Adding a collection type — recipe books, photo albums, project folders — is an ontology change, no code.
+The on-disk record is ONTOLOGY-DESIGN§1's `TagRecord`; this is its logical shape. A label is asserted or not (`favorite`, `electronic`); an attribute key carries a value (`artist = "Aphex Twin"`). Groups are attribute values: `playlist = "workout"` puts an object in the workout playlist, and an `Ordered` key gives every playlist its own order. Adding a collection type — recipe books, photo albums, project folders — is an ontology change, no code.
 
 `storage` is the per-tag storage policy: chunking parameters, compression algorithm, encryption mode. A tag that does not declare a `storage` policy contributes nothing to the per-axis resolution (§3.5) for objects bearing it. Most user-facing tags don't need a policy — only tags meant to drive storage behaviour (`vm-disk`, `archive`, `sensitive`) declare one.
 
@@ -243,7 +252,7 @@ value per axis from the candidates contributed by its tag set.
 
 ```rust
 struct StoragePolicy {
-    chunking:    Option<ChunkParams>,        // §8.4 (chunking is a placement decision)
+    chunking:    Option<ChunkParams>,        // §8.3 (chunking is a placement decision)
     compression: Option<CompressionAlgo>,    // §9.2
     encryption:  Option<EncryptionMode>,     // §9.3
 }
@@ -302,9 +311,10 @@ For each axis:
 2. The static invariant guarantees the non-`None` values form a chain → pick the
    most-derived; that is the ontology's resolved value.
 3. If the set is empty (no tag specifies the axis), check matching `PlacementRule`s in
-   the placement engine (§8.3); the most recently installed rule wins on ties.
-4. If still unresolved, fall through to the superblock default
-   (`Superblock.default_storage_policy`).
+   the placement engine (§8.3); how ties between rules resolve, and the precedence of admin,
+   ontology and default policies, is ONTOLOGY-D5.
+4. If still unresolved, fall through to the pool's default (the pool state record,
+   POOL-DESIGN§1.2).
 
 Cost: O(tags-on-object × axes), with no runtime ambiguity.
 
@@ -399,7 +409,7 @@ Module installation is one commit:
 4. **Apply** — put tag, rule and constraint records with the module added to their provenance, allocating `TagId`s for new tags; post every new rule's derived terms
 5. **Report** — objects already violating a new constraint are listed, not changed
 
-Each record change is an `OntologyPut` or `OntologyDelete` journal entry naming the record by uid, which is also what cluster sync ships (§12). Posting the derived terms of a new `flac → audio` is a union of `flac`'s postings into `audio`'s, container by container.
+Each record change is an `OntologyPut` or `OntologyDelete` journal entry naming the record by uid; cluster sync ships the changed records by uid (§10). Posting the derived terms of a new `flac → audio` is a union of `flac`'s postings into `audio`'s, container by container.
 
 ### 4.5 Module Upgrade
 
@@ -451,11 +461,11 @@ tag "portable"    → containers { window 0: [5, 42, 200, …] }
 electronics AND portable → window-by-window intersection → { 5, 42 }
 ```
 
-Containers are keyed by the high 48 bits of the object id, so ids keep their full node and local identity, an update rewrites one container, and snapshot diffs and sync deltas work per container. 10 M objects, 20 tags per object: ~200–400 MB of postings for direct tags (INDEX-DESIGN§3).
+Containers are keyed by the high 48 bits of the object id, so ids keep their full node and local identity, an update rewrites one container, and snapshot diffs work per container. Postings are local: cluster sync ships direct state and each node derives its own postings (§10.4). 10 M objects, 20 tags per object: ~200–400 MB of postings for direct tags (INDEX-DESIGN§3).
 
 ### 5.3 Term dictionary
 
-The dictionary is sorted by `(kind, key, context, parent, normalised value)`, where the normalised value is an order-preserving 16-byte encoding. An equality query is one lookup; a range or prefix query (`year > 2020`, `size BETWEEN 1MB AND 10MB`, `name LIKE 'cargo%'`) is one scan that unions the postings it passes. Each entry carries the term's cardinality and change counters for query planning and sync (INDEX-DESIGN§4).
+The dictionary is sorted by `(kind, key, context, parent, normalised value)`, where the normalised value is an order-preserving 16-byte encoding. An equality query is one lookup; a range or prefix query (`year > 2020`, `size BETWEEN 1MB AND 10MB`, `name LIKE 'cargo%'`) is one scan that unions the postings it passes. Each entry carries the term's cardinality and change counters for query planning and reclamation (INDEX-DESIGN§4).
 
 Values of a hierarchical key are a trie of path components (`parent` is the parent component's term), so shared prefixes are stored once, a directory listing is one scan and a subtree query unions a bounded number of postings with the help of roll-up terms on large subtrees. Keys declared with `ngram` answer substring queries (`name CONTAINS 'carg'`) from n-gram postings over their distinct values (INDEX-DESIGN§4.2).
 
@@ -499,7 +509,7 @@ There are no fixed areas: metadata and data share one bucket space, placed by bu
 
 **Atomic root commit.** All persistent tree roots form one **root list**, carried by `Checkpoint` journal entries; a checkpoint commits atomically with its journal set, so a torn write never produces a corrupt root. The superblock is rewritten only on clean unmount and when the journal's bucket list changes (§6.4 / ENGINE-DESIGN§1.2, JOURNAL-DESIGN§1.5).
 
-**Allocation is bucket-based, not bitmap-based.** Per-disk free space is tracked via two B+ trees (`BucketAllocEntry` table + `FreespaceLruEntry` LRU), rooted in each disk's `DiskDescriptorOnDisk`. A bucket carries `(generation, kind, live_sectors)` in 8 bytes; live sectors are derived from the journal on replay, and generations are held in memory. Pointers (`BlockRef`) are bucket-relative — a disk addresses 4 PiB at the default 1 MiB bucket — and are checked against the destination bucket's generation; a mismatch on a committed pointer is corruption. Tree-node pointers carry `metadata_replicas` copies on different disks. See ALLOCATION-DESIGN§1 and ENGINE-DESIGN§1.2.
+**Allocation is bucket-based, not bitmap-based.** Per-disk free space is tracked via two B+ trees (`BucketAllocEntry` table + `FreespaceLruEntry` LRU), rooted in each disk's descriptor (POOL-DESIGN§1.1). A bucket carries `(generation, kind, live_sectors)` in 8 bytes; live sectors are derived from the journal on replay, and generations are held in memory. Pointers (`BlockRef`) are bucket-relative — a disk addresses 4 PiB at the default 1 MiB bucket — and are checked against the destination bucket's generation; a mismatch on a committed pointer is corruption. Tree-node pointers carry `metadata_replicas` copies on different disks. See ALLOCATION-DESIGN§1 and ENGINE-DESIGN§1.2.
 
 ### 6.2 Object Records
 
@@ -616,14 +626,14 @@ Delete request
      │
      ▼
 ┌────────────────┐
-│ 1. TOMBSTONE   │  Object marked deleted, invisible to queries.
-│    (instant)   │  Sync op emitted to cluster.
+│ 1. TOMBSTONE   │  Object marked deleted, invisible to queries;
+│    (instant)   │  the change reaches peers with the next sync.
 └──────┬─────────┘
-       │ background
+       │ synchronously or deferred (METADATA-D3)
        ▼
 ┌────────────────┐
-│ 2. INDEX       │  Remove from all bitmaps, forward index,
-│    CLEANUP     │  collection sequences. O(tags_per_object).
+│ 2. INDEX       │  Remove from its terms' postings, forward index,
+│    CLEANUP     │  collection sequences. O(terms on the object).
 └──────┬─────────┘
        │ after grace period (all nodes caught up)
        ▼
@@ -639,23 +649,23 @@ Delete request
 └────────────────┘
 ```
 
-Index cleanup iterates the forward index (which lists exactly which bitmaps contain this ID) rather than scanning all bitmaps — O(tags_on_object), not O(total_tags).
+Index cleanup reads the forward entry and the ontology's closure (which together say exactly which postings contain this id) rather than scanning all postings — O(terms on the object), not O(terms in the pool). The phases are specified in METADATA-DESIGN "Object deletion".
 
 ### 7.2 Tombstone Grace Period
 
-Tombstones persist until all cluster nodes have acknowledged the deletion AND a minimum grace period (e.g., 7 days) has elapsed. This prevents a remote node from applying stale ops to a deleted object.
+Tombstones persist until all cluster nodes have acknowledged the deletion AND a minimum grace period (e.g., 7 days) has elapsed. This keeps a peer that has not yet seen the deletion from resurrecting the object with a concurrent change.
 
 ### 7.3 ID Non-Recycling
 
-IDs are never recycled. With 48-bit local sequence per node, exhaustion is not a practical concern. Deleted slots create sparsity in the object record array (~10% waste at typical churn rates — 128 MB at 1M deletions, acceptable). A generation counter in each record provides insurance if recycling is ever needed.
+IDs are never recycled. With 48-bit local sequence per node, exhaustion is not a practical concern. A leaf of the object table whose records are all cleared is dropped (METADATA-DESIGN§1), so deleted history costs no space.
 
 ### 7.4 Cluster Sync and Deletion
 
-Stale ops targeting deleted objects are resolved by HLC ordering. The deletion's timestamp is compared with the op's timestamp — ops generated before the deletion are dropped as stale, ops generated after are logged as conflicts.
+A deletion and a concurrent change to the same object on another node must resolve the same way on every node; the rule (delete against edit, under the chosen merge model) is CLUSTER-D2.
 
 ### 7.5 Bulk Deletion
 
-Deleting a tag (and all its associations) is a single bitmap removal. The member objects are untouched — they just lose one tag. Deleting a playlist removes the grouping, not the music.
+Deleting a tag (and all its associations) removes its postings and dictionary entry and drops it from its members' forward entries. The member objects are untouched — they just lose one tag. Deleting a playlist removes the grouping, not the music.
 
 ---
 
@@ -675,16 +685,11 @@ enum DiskState {
     Faulted,  // failed, needs resilver
 }
 
-struct DiskDescriptor {       // persisted per disk (POOL-DESIGN§1.1)
-    id: DiskId,
-    uuid: [u8; 16],           // matches the device's superblock
-    bucket_count: u32,        // capacity; usage comes from the alloc table
-    media_type: MediaType,
-    tier: StorageTier,
-    state: DiskState,
-    rotational: bool,
-}
 ```
+
+Each disk has a descriptor, keyed by its `DiskId`: its UUID (matching the device's superblock),
+media type, tier, state, a rotational flag, its bucket count and the roots of its allocation
+trees. The on-disk layout is POOL-DESIGN§1.1.
 
 Performance figures (sequential throughput, random IOPS, latency) are measured at mount and kept
 in memory, not persisted. A pool is identified by the UUID in its devices' superblocks and opened
@@ -706,6 +711,10 @@ from the devices themselves; host paths are never stored.
  │ tag:scratch  │         │ placement    │         │ tag:backup   │
  └──────────────┘         └──────────────┘         └──────────────┘
 ```
+
+The diagram shows a pool that mirrors its journal on two hot disks and keeps two copies of each
+tree node; whether the journal is mirrored is JOURNAL-D1, and the number of tree-node copies
+(`metadata_replicas`) is POOL-D1.
 
 ### 8.3 Semantic Placement Rules
 
@@ -746,9 +755,10 @@ average regardless of what the ontology says"). For ontology-driven defaults, de
 policy on the relevant `TagRecord.storage` instead (§3.5).
 
 `ChunkingAlgo::None` is the explicit "do not chunk" form — used both as the
-format-time default (`Superblock.default_storage_policy`) and as an admin override
-("force this matching set of objects to be unchunked"). The full resolution order is:
-ontology effective policy → matching `PlacementRule::Chunk` → superblock default.
+format-time default (the pool state record's default chunking, POOL-DESIGN§1.2) and as an
+admin override ("force this matching set of objects to be unchunked"). The sources are the
+ontology's effective policy, matching `PlacementRule::Chunk` rules and the pool default; their
+precedence is ONTOLOGY-D5.
 
 ### 8.4 Disk Operations
 
@@ -783,7 +793,7 @@ Every write: **hash → compress → pad → encrypt**. Reversed on read.
          ▼
   ┌─────────────────────┐
   │ Disk encryption     │  Length-preserving (HCTR2 or XTS)
-  │                     │  Tweak = object_id + sector_offset
+  │                     │  Tweak from the owner (§9.3)
   └──────┬──────────────┘
          ▼
   Raw ciphertext on disk
@@ -798,7 +808,7 @@ enum EncryptionMode {
     None,
     Hctr2 { object_id: u64 },   // wide-block, length-preserving (data buckets)
     Xts,                        // narrow-block, length-preserving (node buckets)
-    AesGcm,                     // authenticated; nonce = 64-bit LSN || 32-bit zero (WAL)
+    AesGcm,                     // authenticated; nonce = 64-bit jset seq || 32-bit zero (journal)
     ChaCha20Poly1305,           // network/sync messages
 }
 
@@ -827,7 +837,7 @@ Ontology-driven algorithm selection. Already-compressed formats (JPEG, MP3, H.26
 |Source code|4:1|Zstd level 3|
 |JPEG/MP3/video|1:1|**Skip**|
 
-Granularity: per-object for files under ~16 MB, per-block (4 KB) for large files needing random access.
+The unit compression applies to (whole object, independently decodable frames) and its on-disk framing are BLOB-D2.
 
 ### 9.3 Encryption
 
@@ -837,13 +847,13 @@ Two fundamentally different regimes using the correct cryptographic mode for eac
 |---|---|---|
 |**Data and packed buckets**|HCTR2-AES-128|Wide-block: entire sector changes on any byte edit. Hides internal structure. Length-preserving.|
 |**Node buckets** (trees, positional regions)|XTS-AES-256|Fast random-access 4 KiB block reads. Length-preserving.|
-|**WAL**|AES-256-GCM|Append-only with monotonic LSN as nonce. Authenticated.|
+|**Journal**|AES-256-GCM|Append-only; nonce = the journal set's sequence number, unique under a key bound to the pool. Authenticated.|
 |**Sync traffic**|ChaCha20-Poly1305|Network messages. Constant-time on all platforms.|
 |**Fallback**|Adiantum|Wide-block via ChaCha12, for ARM without crypto extensions.|
 
 AES-GCM is **not** used for disk encryption — it expands data, catastrophically fails on nonce reuse (power loss), and requires per-sector stored nonces. XTS and HCTR2 derive all state from a tweak and the key.
 
-**Tweak construction:** HCTR2 tweaks come from the owner of the bytes, never their location, so moves copy ciphertext unchanged: `(object_id || block_no_within_object)` for an object's own extents, so identical content in different objects encrypts differently; `(chunk_hash[0..8] || block_no_within_chunk)` for chunks, which are deduplicated at the chunk index before encryption and stored once for every object sharing them; the block identifier for packed small-object blocks. XTS tweaks on node blocks are the block's address and its bucket's generation `(disk_id, bucket_no, generation, sector)`, so a reused bucket never repeats a tweak (ENCRYPTION-DESIGN§1). Encryption is meant to be per object and switchable (ENCRYPTION-D6).
+**Tweak construction:** HCTR2 tweaks come from the owner of the bytes, never their location, so moves copy ciphertext unchanged: `(object_id || block_no_within_object)` for an object's own extents, so identical content in different objects encrypts differently; `(chunk_hash[0..8] || block_no_within_chunk)` for chunks, which are deduplicated at the chunk index before encryption and stored once for every object sharing them; the block identifier for packed small-object blocks. XTS tweaks on node blocks are the block's address and its bucket's generation `(disk_id, bucket_no, generation, sector)`, so a reused bucket never repeats a tweak (ENCRYPTION-DESIGN§1). Which objects are encrypted, and at what granularity, is ENCRYPTION-D6.
 
 **Integrity:** BLAKE3 checksums on plaintext stored in the object records (node buckets, different key) detect tampering that XTS/HCTR2 cannot.
 
@@ -860,7 +870,7 @@ User Passphrase / Hardware Key
     ▼                                ▼
  Disk Keys                      Message Keys
     │                                │
-    ├── XTS-AES-256 (512b)           ├── AES-GCM-256 (WAL)
+    ├── XTS-AES-256 (512b)           ├── AES-GCM-256 (journal, bound to fs_uuid)
     │   node buckets                 └── ChaCha20-Poly1305 (sync)
     ├── HCTR2-AES-128 (128b)
     │   data buckets pool-wide
@@ -868,7 +878,7 @@ User Passphrase / Hardware Key
         HKDF(blob_pool_key, tag_id)
 ```
 
-Per-tag blob keys enable sharing specific key scopes without revealing other data.
+Per-tag keys would allow sharing specific key scopes without revealing other data; whether they exist and what they encrypt is ENCRYPTION-D5.
 
 ### 9.5 Trust Tiers
 
@@ -893,17 +903,18 @@ Content-defined chunking (FastCDC) is only applied where the ontology indicates 
 Only ~1% of objects are typically chunked, keeping the chunk index small (~5 MB vs 4 GB if everything were chunked). When active: chunk plaintext, hash each chunk, compress per-chunk, encrypt.
 
 **Where chunk parameters come from.** Per-object chunking parameters
-(`algo`, `min_size`, `avg_size`, `max_size`) are resolved at write time per §3.5:
+(`algo`, `min_size`, `avg_size`, `max_size`) are resolved at write time per §3.5 from:
 
-1. Ontology-effective policy on the object's tag set (the deepest tag whose
-   `TagRecord.storage.chunking` is set wins; static install-time invariant
-   guarantees no ambiguity).
-2. Matching `PlacementRule::Chunk` rules (§8.3) — admin-time overrides.
-3. `Superblock.default_storage_policy.chunking` — pool-wide default
-   (`ChunkingAlgo::None` at format time).
+- the ontology-effective policy on the object's tag set (the deepest tag whose
+  `TagRecord.storage.chunking` is set wins; the static install-time invariant guarantees no
+  ambiguity);
+- matching `PlacementRule::Chunk` rules (§8.3) — admin-time overrides;
+- the pool-wide default chunking in the pool state record (POOL-DESIGN§1.2;
+  `ChunkingAlgo::None` at format time).
 
-The resolved `ChunkParams` are then **persisted in the ChunkList head region** so
-readers know exactly what was used and reconcile (§17) can detect mismatches and
+Their precedence is ONTOLOGY-D5. The resolved `ChunkParams` are then **persisted in the
+chain's `ChunkList` regions** so readers know exactly what was used and reconcile
+(RECONCILE-DESIGN§1) can detect mismatches and
 re-chunk when the policy changes. See INDEX-DESIGN§4.3 for the on-disk layout.
 
 **Two complementary structures, not one.** A chunked object is stored across two structures
@@ -1009,7 +1020,7 @@ Ontology declarations merge by union of provenance, other fields last-writer-win
 
 ### 10.9 Remote Storage Backends
 
-S3, SFTP, IPFS slot in via a `BlobBackend` trait. The placement engine treats them as additional tiers. Placement rules work identically — `Prefer { query: HasTag("archive"), tier: Glacier }` sends archives to S3 Glacier.
+S3, SFTP, IPFS slot in via a `BlobBackend` trait. The placement engine treats them as additional tiers. Placement rules work identically — `Prefer { query: HasTag { tag: tag("archive"), direct: false }, tier: Glacier }` sends archives to S3 Glacier.
 
 ⁉️can provide a namespace layer on top of ipfs, the missing link!
 
@@ -1037,7 +1048,8 @@ Mímisbrunnr replaces inotify with **query-based subscriptions** — persistent,
 struct ChangeInterest(u32);
 // Flags: TAG_ADDED | TAG_REMOVED | CONTENT_CHANGED | CREATED | DELETED | ENTERED | EXITED
 
-enum SubscriptionState { Active, Dormant }
+enum SubscriptionState { Active, Dormant, Overflowed }   // Overflowed: pending events exceeded
+                                                         //   the bound; next poll is a diff
 
 struct Subscription {
     id: SubscriptionId,             // never reused
@@ -1074,11 +1086,11 @@ struct SubscriptionEngine {
     term_to_subs: HashMap<TermId, Vec<SubscriptionId>>,  // terms the compiled queries read
     key_to_subs: HashMap<TagId, Vec<SubscriptionId>>,    // keys read by range, HasKey, Contains, Under
     content_subs: Vec<SubscriptionId>,                   // interested in content changes
-    buffers: HashMap<SubscriptionId, Vec<WatchEvent>>,   // live events not yet polled
+    // pending events and membership live in their own trees (SUBSCRIPTIONS-DESIGN§1)
 }
 ```
 
-Cost per mutation: ~microseconds (one lookup per changed term + one evaluation per reached subscription). Delivery is pull-based: `poll` returns events after the cursor and `ack` advances the cursor. Events are persisted per subscription with the mutation that produces them and survive restarts until acknowledged, up to the subscription's own bound (SUBSCRIPTIONS-DESIGN "Delivery"); no subscriber holds the journal back. Ops received by cluster sync are local journal entries, so they produce events like local mutations.
+Cost per mutation: ~microseconds (one lookup per changed term + one evaluation per reached subscription). Delivery is pull-based: `poll` returns events after the cursor and `ack` advances the cursor. Events are persisted per subscription with the mutation that produces them and survive restarts until acknowledged, up to the subscription's own bound (SUBSCRIPTIONS-DESIGN "Delivery"); no subscriber holds the journal back. Changes received by cluster sync are applied as local journal entries, so they produce events like local mutations.
 
 ### 11.4 Atomic Subscribe + Snapshot
 
@@ -1111,24 +1123,24 @@ Configurable per subscription — debounce window, max delay, max events, coales
 ### 11.7 Subscription Lifecycle
 
 ```
-SUBSCRIBE → ACTIVE (live events) → DORMANT (agent offline, cursor frozen)
-                                       → CATCH-UP (agent reconnects)
-                                           → ACTIVE (live events resume)
+SUBSCRIBE → ACTIVE (poll / ack) → DORMANT (agent offline, events accumulate)
+                                      → OVERFLOWED (bound exceeded, events dropped)
+          agent returns: poll pending events, or the diff if overflowed → ACTIVE
 ```
 
-Subscriptions persist across reboots (in the subscriptions tree, SUBSCRIPTIONS-DESIGN§1). Garbage-collected after retention period expires without reconnection.
+Subscriptions persist across reboots (in the subscription trees, SUBSCRIPTIONS-DESIGN§1). Whether a long-dormant subscription expires is SUBSCRIPTION-D2.
 
 ### 11.8 Ontology-Aware Subscriptions
 
-A subscription watching `HasTag("audio")` automatically widens when a new ontology module adds the implication "m4a → audio" — existing m4a files generate `ENTERED` events. Impossible with inotify.
+A subscription watching `HasTag { tag: tag("audio"), direct: false }` automatically widens when a new ontology module adds the implication "m4a → audio" — existing m4a files generate `ENTERED` events. Impossible with inotify.
 
 ### 11.9 Example: Build System Watcher
 
 ```rust
 let (sub, sources) = mimir.subscribe(
     And(vec![
-        HasAttr { key: "project", op: Eq, value: Text("vesper") },
-        HasTag(tag("source")),
+        HasAttr { key: tag("project"), op: Eq, value: Text("vesper"), scope: None },
+        HasTag { tag: tag("source"), direct: false },
     ]),
     ChangeInterest::CONTENT_CHANGED | ChangeInterest::CREATED | ChangeInterest::DELETED,
     BatchConfig { debounce: 200ms, max_delay: 2s, coalesce: true },
@@ -1332,8 +1344,8 @@ NVMe sequential read:                    ~200 μs/MB
 ### 14.3 Tag Mutation
 
 ```
-WAL append:                              ~2 μs (NVMe)
-Bitmap update:                           ~0.1 μs
+Journal append:                          ~2 μs (NVMe)
+Posting container update:                ~0.1 μs
 Forward index update:                    ~0.1 μs
 Total:                                   ~2.5 μs
 ```
@@ -1341,10 +1353,10 @@ Total:                                   ~2.5 μs
 ### 14.4 Subscription Evaluation per Mutation
 
 ```
-Inverted sub index lookup:               ~0.1 μs
-Bitmap contains check:                   ~0.01 μs per sub
-Full query eval (if needed):             ~1 μs per sub
-Total (3 affected subs):                 ~3 μs
+Inverted sub index lookup:               ~0.1 μs per changed term
+Per-object query eval:                   ~1 μs per reached sub
+Pending-event insert:                    ~0.1 μs per event
+Total (3 reached subs):                  ~3.5 μs
 ```
 
 ### 14.5 Transform Overhead (per MB)
@@ -1360,40 +1372,13 @@ Write (HDD)      ~10 ms          invisible      invisible     invisible
 
 ## 15. Engine & Persistence
 
-The `Engine` struct is the central coordinator, holding all in-memory indices:
-
-```rust
-struct Engine {
-    object_table: ObjectTable,
-    index: TermIndex,                 // term dictionary, term table, postings, forward, sequences
-    dag: ImplicationDag,
-    oplog: OpLog,
-    clock: HybridTimestamp,
-    node_id: u16,
-    transform: TransformPipeline,
-}
-
-/// In-memory operation log for subscriptions and sync
-struct OpLog {
-    entries: Vec<OpLogEntry>,
-}
-
-struct OpLogEntry {
-    timestamp: HybridTimestamp,
-    lsn: u64,
-    op: OpKind,
-}
-
-enum OpKind {
-    CreateObject { oid: ObjectId },
-    DeleteObject { oid: ObjectId },
-    AddTag { oid: ObjectId, tag: TagId },
-    RemoveTag { oid: ObjectId, tag: TagId },
-    SetAttr { oid: ObjectId, tag: TagId },
-    RemoveAttr { oid: ObjectId, tag: TagId },
-    WriteBlob { oid: ObjectId },
-}
-```
+The `Engine` is the central coordinator. It holds no resident copy of the indices: trees are
+read through a block cache, and only small tables stay in memory — the ontology's name maps and
+closure tables, the snapshot tree, subscription indexes, bucket generations, write points and
+reconcile state (ENGINE-DESIGN§2). Every mutation is a journal entry first; history is the
+journal's optional retained buckets (JOURNAL-DESIGN§1.6), not an in-memory log. The engine
+starts no thread: background work runs in `step` calls its embedder drives (ENGINE-DESIGN
+"Selected design").
 
 `DiskEngine` wraps `Engine` with persistence over the pool's block devices:
 
@@ -1429,7 +1414,7 @@ All engine state persists in the trees of the root list — B+ trees and positio
         │               │              │
 ┌───────▼───────┐ ┌─────▼───────┐ ┌────▼──────────┐
 │  ONTOLOGY     │ │ INDEX LAYER │ │ METADATA      │
-│               │ │ (paged+WAL) │ │ LAYER         │
+│               │ │ (B+ trees)  │ │ LAYER         │
 │ Module system │ │             │ │               │
 │ Rules and     │ │ Term dict   │ │ Object roots  │
 │ constraints   │ │ Postings    │ │ Object table  │
@@ -1439,18 +1424,18 @@ All engine state persists in the trees of the root list — B+ trees and positio
         │               │              │
 ┌───────▼───────────────▼──────────────▼───────────────────────────┐
 │                    SUBSCRIPTION ENGINE                           │
-│   Inverted sub index │ Match cache │ Catch-up │ Batch/debounce   │
+│   Term index │ Pending events │ Poll/ack │ Batch/debounce        │
 ├──────────────────────────────────────────────────────────────────┤
 │                    TRANSFORM PIPELINE                            │
 │   BLAKE3 → Compress (Zstd/LZ4) → Pad → Encrypt                   │
-│   (HCTR2 blobs / XTS metadata / GCM WAL / ChaCha sync)           │
+│   (HCTR2 data / XTS nodes / GCM journal / ChaCha sync)           │
 ├──────────────────────────────────────────────────────────────────┤
 │                 PLACEMENT & TIERING ENGINE                       │
 │   Pin/Prefer/Replicate/Colocate/AutoTier rules                   │
 │   Tag queries → ideal tier → migration planner → allocator       │
 ├──────────────────────────────────────────────────────────────────┤
 │                   TRANSACTION LAYER                              │
-│   Journal sets (mirrored) → Checkpoint → Recovery                │
+│   Journal sets → Checkpoint (root list) → Recovery               │
 │   Subscriptions keep their own pending events                    │
 ├──────────────────────────────────────────────────────────────────┤
 │                     POOL MANAGER                                 │
@@ -1470,7 +1455,7 @@ All engine state persists in the trees of the root list — B+ trees and positio
 
 ### 16.1 Storage structures
 
-How the persistent structures relate. Every mutation is a journal entry first; trees are rewritten behind it and committed by a `Checkpoint` entry carrying the new root pointer. Assertions are interned as terms; an object's direct terms go to its forward entry, and direct plus derived terms to postings. The object record says what the object is and where its content lives. Backpointers map physical space back to owners, so moves, scrub and evacuation touch only affected buckets.
+How the persistent structures relate. Every mutation is a journal entry first; trees grow behind it by appended runs and are committed by a `Checkpoint` entry carrying the new root list. Assertions are interned as terms; an object's direct terms go to its forward entry, and direct plus derived terms to postings. The object record says what the object is and where its content lives. Backpointers map physical space back to owners, so moves, scrub and evacuation touch only affected buckets.
 
 ```mermaid
 flowchart TB
@@ -1482,8 +1467,8 @@ flowchart TB
         JSets --> History
     end
 
-    subgraph Roots["Superblock + root pointer (ENGINE-DESIGN§1)"]
-        RootPtr["RootPointer<br/><i>committed by Checkpoint entry;<br/>superblock copy is a mount hint</i>"]
+    subgraph Roots["Root list + superblock (ENGINE-DESIGN§1)"]
+        RootPtr["Root list<br/><i>carried by Checkpoint entries;<br/>superblock holds a hint to the newest</i>"]
     end
 
     subgraph OntologyB["Ontology (ONTOLOGY-DESIGN)"]
@@ -1526,7 +1511,7 @@ flowchart TB
     Snapshots["Snapshot tree + ObjectHistory sidecar<br/><i>snapshot id in snapshot-aware keys</i>"]
     Subs["Subscriptions<br/><i>records, membership at cursor,<br/>pending events</i>"]
     Reconcile["Reconcile<br/><i>copygc, tiering, repair, rule rework</i>"]
-    Peers["Cluster peers<br/><i>ops by uid and value</i>"]
+    Peers["Cluster peers<br/><i>direct state by uid and value</i>"]
 
     API -->|"every mutation"| JSets
     JSets -->|"Checkpoint"| RootPtr
@@ -1610,9 +1595,9 @@ graph TB
     Aliases --> Planner
     MutexGroups --> Executor
 
-    subgraph IndexLayer["Index Layer (paged B+ trees, WAL-persisted)"]
+    subgraph IndexLayer["Index Layer (B+ trees behind the journal)"]
         TagIndex["Postings<br/><i>(TermId, id window) → roaring container<br/>tags, attribute values, relations</i>"]
-        KVIndex["Term Dictionary<br/><i>(kind, key, context, normalised value) → TermId, stats<br/>equality, range and prefix scans</i>"]
+        KVIndex["Term Dictionary<br/><i>(kind, key, context, parent, normalised value) → TermId, stats<br/>equality, range and prefix scans</i>"]
         RangeIndex["Sequences<br/><i>(TermId, position | score) → ObjectId<br/>ordered and ranked collections</i>"]
         ForwardIndex["Forward Index<br/><i>ObjectId → direct TermIds<br/>for getattr / tag listing</i>"]
     end
@@ -1634,7 +1619,7 @@ graph TB
         Rules["Placement Rules<br/><i>Pin, Prefer, Replicate,<br/>Colocate, AutoTier</i>"]
         TierCalc["Tier Calculator<br/><i>tags + access time<br/>→ ideal tier</i>"]
         Migrator["Migration Planner<br/><i>background moves,<br/>rate-limited I/O</i>"]
-        Allocator["Extent Allocator<br/><i>per-disk free space<br/>B+ tree of extents</i>"]
+        Allocator["Bucket Allocator<br/><i>per-disk bucket table,<br/>freespace LRU, write points</i>"]
     end
 
     Rules --> TierCalc
@@ -1644,8 +1629,8 @@ graph TB
     LocTable <-->|"read current /<br/>update after move"| Migrator
 
     subgraph TxnLayer["Transaction Layer"]
-        WAL["Journal<br/><i>write-once journal sets<br/>on fastest disk<br/>+ mirror</i>"]
-        Checkpoint["Checkpoint Engine<br/><i>flush dirty tree pages,<br/>commit root in journal</i>"]
+        WAL["Journal<br/><i>write-once journal sets<br/>in journal buckets<br/>on the fastest disks</i>"]
+        Checkpoint["Checkpoint Engine<br/><i>flush dirty trees,<br/>commit root list in journal</i>"]
         Recovery["Crash Recovery<br/><i>replay journal from<br/>last checkpoint</i>"]
     end
 
@@ -1672,28 +1657,28 @@ graph TB
     subgraph DiskLayer["Physical Disk Layer (Raw Block Devices)"]
         subgraph Disk0["Disk 0 — NVMe (Hot Tier)"]
             D0Super["Superblock"]
-            D0WAL["WAL (primary)"]
-            D0Index["Index Zone<br/><i>tag bitmaps,<br/>B+ trees</i>"]
-            D0Meta["Metadata Zone<br/><i>object table,<br/>forward index</i>"]
-            D0Blobs["Hot Blobs<br/><i>tag:active,<br/>tag:scratch</i>"]
+            D0WAL["Journal buckets"]
+            D0Index["Node buckets<br/><i>tree nodes and<br/>positional regions</i>"]
+            D0Meta["Node buckets<br/><i>further tree-node copies<br/>(metadata_replicas)</i>"]
+            D0Blobs["Data buckets<br/><i>hot objects:<br/>active, scratch</i>"]
         end
         subgraph Disk1["Disk 1 — SATA SSD (Warm Tier)"]
             D1Super["Superblock<br/>(mirror)"]
-            D1WAL["WAL (mirror)"]
-            D1Blobs["Warm Blobs<br/><i>default placement</i>"]
+            D1WAL["Journal buckets<br/>(when mirrored)"]
+            D1Blobs["Data buckets<br/><i>default placement</i>"]
         end
         subgraph Disk2["Disk 2 — HDD (Cold Tier)"]
             D2Super["Superblock<br/>(mirror)"]
-            D2Blobs["Cold Blobs<br/><i>tag:archive,<br/>tag:backup</i>"]
+            D2Blobs["Data buckets<br/><i>cold objects:<br/>archive, backup</i>"]
         end
         subgraph DiskN["Disk N — (any tier)"]
             DNSuper["Superblock<br/>(mirror)"]
-            DNBlobs["Blobs<br/><i>rule-driven<br/>placement</i>"]
+            DNBlobs["Data buckets<br/><i>rule-driven<br/>placement</i>"]
         end
     end
 
-    WAL -->|"primary"| D0WAL
-    WAL -->|"mirror"| D1WAL
+    WAL --> D0WAL
+    WAL -.->|"mirror (JOURNAL-D1)"| D1WAL
     Checkpoint --> D0Index
     Checkpoint --> D0Meta
     Allocator --> D0Blobs
@@ -1703,7 +1688,7 @@ graph TB
 
     subgraph BlobIO["Blob I/O Path"]
         BlobRead["Read Path<br/><i>locator → disk_id +<br/>bucket, sector → direct I/O</i>"]
-        BlobWrite["Write Path<br/><i>allocate extent →<br/>write → update loc<br/>→ WAL commit</i>"]
+        BlobWrite["Write Path<br/><i>allocate extent →<br/>write → set locator<br/>→ journal commit</i>"]
         ContentAddr["Content Addressing<br/><i>BLAKE3 hash<br/>dedup optional</i>"]
     end
 
@@ -1750,7 +1735,7 @@ graph TB
 |Placement control|Per-dataset|None|Per-object, tag-driven|
 |Tiering|Manual special vdev|None|Automatic, ontology-driven|
 |Compression|Per-dataset|Per-filesystem|Per-object, ontology-driven|
-|Encryption|Dataset-level|dm-crypt layer|Per-object, mixed modes (HCTR2/XTS/GCM)|
+|Encryption|Dataset-level|dm-crypt layer|Per structure (HCTR2 data, XTS nodes, GCM journal); per-object switching under study (ENCRYPTION-D6)|
 |Resilver time|∝ pool size|N/A|∝ affected data only|
 |Disk add rebalance|None (new writes only)|None|Semantic migration|
 |Cluster search|Not supported|Not supported|Full metadata on every node|
@@ -1765,16 +1750,16 @@ graph TB
 |Decision|Choice|Rationale|
 |---|---|---|
 |No POSIX paths|Tags + ontology queries|Associative access is fundamentally more expressive|
-|Roaring bitmaps|Primary index structure|Sub-ms intersection, excellent delta encoding for sync|
+|Roaring-style containers|Primary index structure|Sub-ms intersection; one container per id window, so updates and snapshot diffs touch one container|
 |Ontology is the schema|Tag semantics drive storage|New collection types require zero code changes|
 |Ontology modules|Versioned packages, provenance per declaration|Apps bring schemas; data outlives apps|
 |Derived terms in postings|Rules' results posted at write time, never in forward entries|Read path stays a single posting lookup|
-|Array-indexed metadata|O(1) by object ID|Faster than any tree for sequential IDs|
+|Positional metadata|A radix of record pages per origin node, indexed by object ID|No key search; a few page reads per lookup for sequential IDs|
 |ID non-recycling|48-bit space, never reuse|Eliminates stale-reference bugs across cluster|
 |Purpose-built layouts in one bucket space|Postings, positional records, extents|Each optimized for its access pattern; no fixed areas to size or grow|
 |HCTR2 for blobs|Wide-block disk encryption|Hides internal structure; correct for at-rest|
 |XTS for metadata|Narrow-block disk encryption|Fast random access; structure leak acceptable|
-|GCM/ChaCha for messages|AEAD for WAL + sync|Authentication + unique nonces in append-only contexts|
+|GCM/ChaCha for messages|AEAD for journal + sync|Authentication + unique nonces in append-only contexts|
 |Full metadata replication|Every node holds all tags|Search is always local, instant|
 |State-delta sync with HLC|Direct state a peer has not seen, derived state recomputed|No history to retain; sub-MB daily bandwidth; peers cannot disagree on derived terms|
 |Ontology-driven chunking|CDC only for mutable large files|Avoids 16× metadata overhead for immutable media|
@@ -1841,7 +1826,7 @@ The design began as a list of properties for an associative persistent filesyste
 | Non-hierarchical, associative namespace | §1 |
 | Filesystem quotas | Not designed yet ([POOL-D2](pool-decisions.md)) |
 | Endianness-adaptive metadata (after ZFS block pointers) | Replaced by a little-endian on-disk format; big-endian hosts are out of scope |
-| Journalled, atomic updates | WAL and atomic root commit (§6.4, ENGINE-DESIGN§1, JOURNAL-DESIGN§1) |
+| Journalled, atomic updates | Journal and atomic root-list commit (§6.4, ENGINE-DESIGN§1, JOURNAL-DESIGN§1) |
 | ACLs (users and groups per file) | Out of scope: access control comes from the Mettā security model |
 | Versioning and snapshots storing only changed blocks and metadata | Key-level snapshots (SNAPSHOTS-DESIGN§1) |
 | File change logs, replacing `atime` | Query subscriptions and their pending events (§11) |
@@ -1907,7 +1892,7 @@ The object-granularity content locator (§6.3) is the indirection that makes mov
 
 ### C.6 Cluster sync
 
-- **Conflicts.** Tag adds from two nodes commute; add-versus-remove needs a policy. Options weighed: add-wins (no accidental loss), last-writer-wins (intuitive), mark-conflict (user resolves). Ordered collections need a sequence CRDT such as RGA, or last-writer-wins per collection ([CLUSTER-D2](cluster-decisions.md)).
+- **Conflicts.** Tag adds from two nodes commute; add-versus-remove needs a policy. Options weighed: add-wins (no accidental loss), last-writer-wins (intuitive), mark-conflict (user resolves) ([CLUSTER-D2](cluster-decisions.md)). Ordered collections need a sequence CRDT such as RGA, or last-writer-wins per collection ([CLUSTER-D6](cluster-decisions.md)).
 - **Hubs.** Nodes that are never online together relay through an always-on hub that holds their direct state; a node offline for any time catches up by one state delta of what it has not seen (CLUSTER-D7).
 - **Node roles considered:** full, thin (metadata and stubs), blob-store only, hub.
 - **Bandwidth.** A moderately active user generates under 1 MB of metadata sync per day; a full join of 10 M objects is about 400 MB compressed. Blobs move only when opened.
@@ -1924,7 +1909,7 @@ Content-defined chunking turns one extent read into one lookup per chunk. It pay
 
 **Integrity.** XTS and HCTR2 do not authenticate. A BLAKE3 hash of the plaintext in the object record (node buckets, different key and location), optionally with per-sector hashes for large objects, detects tampering without per-sector tags.
 
-**Key hierarchy as proposed.** Passphrase or hardware key → Argon2id → master KEK → disk keys (XTS-AES-256 for index and metadata, HCTR2-AES-128 for blobs, per-tag HCTR2 keys derived by HKDF-SHA256 from the blob key and tag id) and message keys (AES-GCM for the WAL, ChaCha20-Poly1305 for sync). Platform-adaptive selection falls back to Adiantum without AES instructions. Open points: [ENCRYPTION-D3](encryption-decisions.md), [ENCRYPTION-D5](encryption-decisions.md).
+**Key hierarchy as proposed.** Passphrase or hardware key → Argon2id → master KEK → disk keys (XTS-AES-256 for node buckets, HCTR2-AES-128 for data buckets, per-tag HCTR2 keys derived by HKDF-SHA256 from the data key and tag id) and message keys (AES-GCM for the journal, ChaCha20-Poly1305 for sync). Platform-adaptive selection falls back to Adiantum without AES instructions. Open points: [ENCRYPTION-D3](encryption-decisions.md), [ENCRYPTION-D5](encryption-decisions.md).
 
 **Searching encrypted metadata.** Options weighed: decrypt in RAM on every node (simple, but every node needs the metadata key); searchable symmetric encryption (10–100× slower, research-grade); tiered trust. Tiered trust was proposed: trusted nodes hold all keys; semi-trusted nodes receive the metadata key at boot (from a trusted node, an HSM, or a passphrase) and keep it in memory only; untrusted nodes store and relay ciphertext without searching. Open point: [ENCRYPTION-D4](encryption-decisions.md).
 

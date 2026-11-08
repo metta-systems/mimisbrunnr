@@ -1,6 +1,6 @@
 ---
 name: operations
-description: Guide one incremental Mimisbrunnr work slice (storage, WAL, indices, engine, ontology, watch, pool, FUSE, CLI) using the four per-scope documents in doc/agentic/ (<scope>-design.md, <scope>-decisions.md, <scope>-implementation-plan.md, <scope>-completed.md); keep the scope format sections (indexed by format-design.md) and specification-design.md authoritative, gate on-disk format and spec decisions, use JJ and Justfile workflows, and leave the workspace green.
+description: Guide one incremental Mimisbrunnr work slice (storage, journal, indices, engine, ontology, watch, pool, FUSE, CLI) using the four per-scope documents in doc/agentic/ (<scope>-design.md, <scope>-decisions.md, <scope>-implementation-plan.md, <scope>-completed.md); keep the scope format sections (indexed by format-design.md) and specification-design.md authoritative, gate on-disk format and spec decisions, use JJ and Justfile workflows, and leave the workspace green.
 ---
 
 # Mimisbrunnr operations
@@ -51,7 +51,7 @@ description: Guide one incremental Mimisbrunnr work slice (storage, WAL, indices
 - **Cross-references use `SCOPE-DESIGN§n`:** `INDEX-DESIGN§1.2` is section 1.2 of `index-design.md`, `SPECIFICATION-DESIGN§9.3` section 9.3 of the system design, `FORMAT-DESIGN§15` section 15 of `format-design.md`. Never write a bare `§n` outside the document it refers to.
 - **Spec compliance over shortcuts.** Implement the encoding, layout and algorithm the spec mandates even when a simpler alternative compiles and passes tests. When the spec-compliant path has a real gap, ship the compliant path, add a regression test for what works, and record the gap as a plan item with a `TODO(<ITEM>)` marker (for example `TODO(BTREE4)`) next to the code. Never silently swap encodings (for example packed-key sorted runs → CBOR runs).
 - Treat disagreement between the spec, the scope design and the code as a discrepancy to resolve explicitly. A spec change is a decision (see below); never edit a format section to match code without approval.
-- `BlockKind`, `BtreeKind`, WAL op kinds, magic constants and other spec-pinned discriminants are never renumbered silently. An approved renumbering updates the spec first, then the code, layout assertions, `validation/` and tests together.
+- `BlockKind`, `BtreeKind`, journal op kinds, magic constants and other spec-pinned discriminants are never renumbered silently. An approved renumbering updates the spec first, then the code, layout assertions, `validation/` and tests together.
 - The target system's role, boundary, acceptance scenarios and glossary are in `doc/agentic/operations-design.md`. A slice that would expose an out-of-boundary operation is a decision, not an implementation detail.
 
 ## Keep the specifications current
@@ -76,7 +76,7 @@ When a slice changes or implements something a format section or the system desi
 Before implementing a slice, name the decisions it depends on and confirm they are settled in `<scope>-design.md` or the spec. Leave unrelated decisions open in `<scope>-decisions.md` instead of blocking on them or guessing. Decisions that always need the maintainer:
 
 - **On-disk format:** struct layouts and sizes, key and value encodings, codec choice (packed / VARINT / CBOR), region sizes, magic and discriminants, CRC coverage.
-- **Recovery semantics:** WAL op kinds and payloads, checkpoint and replay rules, what is persisted versus rebuilt at boot.
+- **Recovery semantics:** journal op kinds and payloads, checkpoint and replay rules, what is persisted versus rebuilt at boot.
 - **Spec amendments** to any format section, `format-design.md`, or the system design (`specification-design.md`).
 - **Crate boundaries and type ownership** (`doc/agentic/operations-design.md`), new workspace dependencies.
 - **User-visible surface:** `mimir` / `brunnr` commands and flags, FUSE layout, SQL dialect, ontology module syntax.
@@ -92,8 +92,7 @@ These apply to every slice and are never plan checkboxes.
 
 - **One design authority per scope.** Record the maintainer's choices in `<scope>-design.md`; never start a second design document for the same scope.
 - **Keep sketches labeled.** Proposals, sketches and unimplemented operations are clearly labeled as such in code and documents. When the code is reconciled, remove diagrams and comments that now conflict with it and look authoritative, subject to "Preserve design-intent comments".
-- **TODO markers point at plan items.** Use `TODO(<ITEM>)`, for example `TODO(JOURNAL2)`, so every marker resolves to one open plan item. Remove the marker when the item completes. Convert legacy `TODO(rewrite-phase-*)` markers in code you touch (until `TOOLING1` finishes them all).
-- **No silent stubs.** Never return empty data, fake success or default state from a persistence path to make code compile. An unimplemented path returns a defined error and has a plan item.
+- **TODO markers point at plan items.** Use `TODO(<ITEM>)`, for example `TODO(JOURNAL2)`, so every marker resolves to one open plan item. Remove the marker when the item completes.- **No silent stubs.** Never return empty data, fake success or default state from a persistence path to make code compile. An unimplemented path returns a defined error and has a plan item.
 
 ## Pick one incremental slice
 
@@ -132,10 +131,10 @@ A layout that needs deserialising to answer a lookup, or that a reader cannot bo
 
 - **`types`:** pure logical types and small pure codecs (`Value` and its codec, IDs). No I/O.
 - **`storage`:** block device, superblock, bucket allocation, B+ tree region envelopes and the packed-key codec. Mechanism only; it knows no index semantics.
-- **`wal`:** log format, append, checkpoint, replay, journal pins.
+- **`wal`:** journal set format, append, checkpoint, replay, journal pins.
 - **Owning crates (`meta`, `index`, `ontology`, `watch`, `pool`, `unix`, `transform`):** their wire structs, key/value types and invariant-preserving operations, persisted through `storage` regions.
 - **`query`, `sql`:** evaluation over indices; no persistence.
-- **`engine`:** orchestration: WAL-first mutation, commit, flush, boot-time load and rebuild of derived views. It does not hide another crate's invariants.
+- **`engine`:** orchestration: journal-first mutation, commit, flush, boot-time load and rebuild of derived views. It does not hide another crate's invariants.
 - **`fuse`, `bin/`:** presentation and CLI. `anyhow` and `println!` belong here only.
 
 A type lives in exactly one crate (`doc/agentic/operations-design.md`); if two crates need it, it moves to the dependency below both.
@@ -144,7 +143,7 @@ A type lives in exactly one crate (`doc/agentic/operations-design.md`); if two c
 
 - `unsafe` only through `bytemuck`; any other `unsafe` block needs a one-line invariant comment and the maintainer's agreement.
 - No `unwrap`/`expect` in library code except documented invariants. Corrupt or unexpected on-disk input (bad magic, CRC mismatch, out-of-range offsets, truncated runs) returns a defined `<Crate>Error`, never a panic or unchecked index.
-- Never report a mutation as durable before its WAL entry is written; never let WAL trimming pass entries a pending node still needs.
+- Never report a mutation as durable before its journal entry is written; never let journal trimming pass entries a pending node still needs.
 - Failure atomicity: on error before commit, leave in-memory and on-disk state consistent. Never silently lose or duplicate objects, tags, bitmap members or allocations; deletes (tombstones/whiteouts) must survive flush.
 - A reopened pool must reproduce exactly the state that was committed; every persisted structure gets a round-trip test that proves it.
 
@@ -153,7 +152,7 @@ A type lives in exactly one crate (`doc/agentic/operations-design.md`); if two c
 - Readable names that read as prose (`zone_layout`, not `zl`). Prefer modern std APIs (`div_ceil`, etc.).
 - Nightly features are allowed when they genuinely help. Tell the user about each new `#![feature(...)]` gate: the feature, why it is needed, and toolchain impact. Ask before changing the toolchain.
 - Workspace crates depend on each other as `{ workspace = true }`, never by relative `path`. New dependencies go into the root `[workspace.dependencies]` first, and are a decision.
-- Respect the cross-cutting choices in `doc/agentic/operations-design.md`: sync only, `ciborium` CBOR, no JSON on disk, CRC32C, BLAKE3 for content, little-endian, `thiserror` per crate, `log` for logging.
+- Respect the cross-cutting choices in `doc/agentic/operations-design.md`: sync only, `ciborium` CBOR, no JSON on disk, one checksum algorithm (OPERATIONS-D4), BLAKE3 for content, little-endian, `thiserror` per crate, `log` for logging.
 
 ## Use project tooling
 

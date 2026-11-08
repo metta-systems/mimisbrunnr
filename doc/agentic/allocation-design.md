@@ -11,7 +11,7 @@ Every on-disk structure except the superblock copies lives in an allocated bucke
 
 ## Selected design
 
-- `BucketAllocator { alloc, free, validate, seed_freelist }` claims a free bucket, bumps its `generation`, stamps its kind, and returns bucket-relative `BlockRef`s (ENGINE-DESIGN§1.2) into it.
+- `BucketAllocator { alloc, free, validate, seed_freelist }` claims a free bucket — whose `generation` was bumped when it was freed (`BucketGenBump`, ALLOCATION-DESIGN§1.6) — stamps its kind, and returns bucket-relative `BlockRef`s (ENGINE-DESIGN§1.2) into it.
 - **Bucket kinds** say what a bucket holds — journal, tree nodes, data extents, packed small objects — and nothing else classifies space; there are no zones.
 - **Open and closed buckets.** A bucket is *open* while a write point owns it and *closed* otherwise. A closed bucket becomes free when its live-sector count reaches zero; open-ness is in memory only, and every bucket is closed after a crash.
 - **Live sectors are derived.** The counts change with the journal entries that add or drop references and with checkpoint node rewrites; replay recomputes them, so no per-write accounting entry exists.

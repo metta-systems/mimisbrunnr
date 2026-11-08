@@ -1,4 +1,4 @@
-# Blob zone and content paths — implementation plan
+# Blob storage and content paths — implementation plan
 
 Design: [blob-design.md](blob-design.md) · Decisions: [blob-decisions.md](blob-decisions.md) · Order: [operations-plan.md](operations-plan.md)
 
@@ -6,7 +6,7 @@ Design: [blob-design.md](blob-design.md) · Decisions: [blob-decisions.md](blob-
 
 - [ ] **BLOB1 — Non-chunked write path.** Allocate a blob bucket, append, set the record's `Extent` locator (METADATA-DESIGN§1.2), journal `WriteBlob` with the real extent (today `BlockRef::ZERO`), record the backpointer. Prerequisites: [ENGINE3](engine-implementation-plan.md), [METADATA7](metadata-implementation-plan.md).
 - [ ] **BLOB2 — Read path.** `DiskEngine::read_blob` reads the bytes the record's locator names and inverts the transform; `mimir project export` works. Prerequisite: BLOB1.
-- [ ] **BLOB3 — Chunked write and read.** Drive the chunked-object WAL ops and ChunkList regions with the head-of-chain flag and `ChunkParamsRecord`. Prerequisites: BLOB2. Acceptance: a 16 MiB FastCDC object round-trips through write, flush, reopen, read; the head region's `ChunkParamsRecord` is read and tail regions skip it.
+- [ ] **BLOB3 — Chunked write and read.** Drive the chunked-object journal ops and ChunkList regions with the head-of-chain flag and the `ChunkParamsRecord` in every region's kind header (INDEX-DESIGN§4.3). Prerequisites: BLOB2. Acceptance: a 16 MiB FastCDC object round-trips through write, flush, reopen, read; every region of its chain carries the same `ChunkParamsRecord`.
 - [ ] **BLOB4 — Selective chunking.** The write path consults the resolved storage policy (SPECIFICATION-DESIGN§9.6) to choose chunked or whole-object storage and the pipeline stages.
 - [ ] **BLOB5 — Populate locator replicas.** Every copy placement writes lands in the locator's replica array (or the extent entry's), with one backpointer each. Prerequisite: BLOB1.
 - [ ] **BLOB6 — Remove the in-memory blob map.** `DiskEngine.blobs: HashMap<u64, Vec<u8>>` goes away. Prerequisite: BLOB2.

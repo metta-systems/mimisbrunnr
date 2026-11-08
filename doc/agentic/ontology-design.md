@@ -194,7 +194,7 @@ Commands: `mimir ontology list | install <file> | remove <module> | orphans | sh
 - **Install bookkeeping lists per module** (tags, implications, relations it added). Provenance sets per declaration replace them.
 - **Pairwise `mutex` relations without write semantics.** `Exclusive` groups have a defined write behaviour (ONTOLOGY-D9).
 - **Storing module source inside the pool** as the installed form. Sources compile on the host; the pool holds records.
-- **A per-op ontology update with tag ops buffered until it arrives.** Ontology ops travel in the same bundle, ahead of the ops that use them.
+- **A per-op ontology update with tag changes buffered until it arrives.** Ontology records travel in the same bundle, ahead of the changes that use them.
 - **An `auto-evict` placement rule.** Placement has no eviction rule; ageing between tiers is `PlacementRule::AutoTier`.
 
 ## Example module: software development
@@ -286,7 +286,7 @@ vesper-0.1.0-rpi4.img   project=vesper                                bundle cur
 | Stale-artifact footprint | `generated AND stale`, summing stored size |
 | Recent work | `source AND modified-week = <this week>` (a `Bucket` rule over the `modified` record field), distinct `project` |
 
-**Build integration.** After compiling, a build hook tags the output (`object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and marks the previous `current` object of the same component `stale` in place of `current`. Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
+**Build integration.** After compiling, a build hook tags the output (`object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and on the previous `current` object of the same component removes `current` and asserts `stale` itself, so it does not rely on what the `Exclusive` set does on a conflicting write (ONTOLOGY-D9). Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
 
 **Placement.** The same tags drive `PlacementRule`s (SPECIFICATION-DESIGN§8.3): `Pin { source AND NOT vendored, Hot }` and `Replicate { source AND NOT vendored, 2 }`; `Pin { intermediate OR object, Hot }`; `Replicate { bundle AND released, 3 }` with `Prefer { bundle AND released, Warm }`; `Prefer { vendored, Cold }`.
 
