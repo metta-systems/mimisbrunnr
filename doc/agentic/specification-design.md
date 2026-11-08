@@ -965,7 +965,7 @@ Hydration policy is ontology-driven — `Pin`, `StubOnly`, `Prefetch`, `AutoEvic
 
 ### 10.4 Sync Protocol — State Deltas
 
-Nodes exchange **state, not history**. Each exchange with a peer ships what changed in the sender's direct state — object records, forward entries, ontology records, collection order — between the peer's last *sync snapshot* and now, read from a snapshot diff (CLUSTER-DESIGN§1). No operation log is kept for sync, no postings or derived terms travel (each node derives its own), and tags travel by uid, values as values. The receiver journals the changes as local mutations, so its indexes, rules and subscriptions treat them as its own. Every change carries the hybrid timestamp of its origin, which orders changes without coordination:
+Nodes exchange **state, not history**. Each exchange with a peer ships what changed in the sender's direct state — object records, forward entries, ontology records, collection order — since what the peer last acknowledged (how that is tracked is CLUSTER-D7), read from a snapshot diff (CLUSTER-DESIGN§1). No operation log is kept for sync, no postings or derived terms travel (each node derives its own), and tags travel by uid, values as values. The receiver journals the changes as local mutations, so its indexes, rules and subscriptions treat them as its own. Every change carries the hybrid timestamp of its origin, which orders changes without coordination:
 
 ```rust
 /// Hybrid Logical Clock timestamp for total ordering without coordination
@@ -994,11 +994,11 @@ reads only blocks whose snapshot range includes the changed snapshots (BTREE-DES
 
 ### 10.6 Sync Modes
 
-**Incremental** (normal): the diff since the peer's sync snapshot. **Full** (a new node): the diff from the empty snapshot — the sender's whole direct state, ~400 MB for 10M objects. The receiver derives postings and the dictionary locally.
+**Incremental** (normal): the changes since what the peer acknowledged. **Full** (a new node): the diff from the empty snapshot — the sender's whole direct state, ~400 MB for 10M objects. The receiver derives postings and the dictionary locally.
 
 ### 10.7 Conflict Resolution
 
-Ontology declarations merge by union of provenance, other fields last-writer-wins (ONTOLOGY-DESIGN "Cluster propagation"). How object state changed on both sides merges — a three-way merge of term sets against the sync snapshot or an observed-remove set, last-writer-wins registers for single-valued fields, delete against edit — is CLUSTER-D2; collection order under concurrent inserts is CLUSTER-D6.
+Ontology declarations merge by union of provenance, other fields last-writer-wins (ONTOLOGY-DESIGN "Cluster propagation"). How object state changed on both sides merges — a three-way merge of term sets against a per-peer base or an observed-remove set, last-writer-wins registers for single-valued fields, delete against edit — is CLUSTER-D2; collection order under concurrent inserts is CLUSTER-D6.
 
 ### 10.8 Bandwidth Budget
 
@@ -1776,7 +1776,7 @@ graph TB
 |XTS for metadata|Narrow-block disk encryption|Fast random access; structure leak acceptable|
 |GCM/ChaCha for messages|AEAD for WAL + sync|Authentication + unique nonces in append-only contexts|
 |Full metadata replication|Every node holds all tags|Search is always local, instant|
-|State-delta sync with HLC|Direct state between sync snapshots, derived state recomputed|No history to retain; sub-MB daily bandwidth; peers cannot disagree on derived terms|
+|State-delta sync with HLC|Direct state a peer has not seen, derived state recomputed|No history to retain; sub-MB daily bandwidth; peers cannot disagree on derived terms|
 |Ontology-driven chunking|CDC only for mutable large files|Avoids 16× metadata overhead for immutable media|
 |Query subscriptions|Replace inotify entirely|Semantic filtering, offline catch-up, no lost events|
 |Path projections|Unix paths as export metadata|Same object serves multiple Unix tree layouts|
@@ -1908,7 +1908,7 @@ The object-granularity content locator (§6.3) is the indirection that makes mov
 ### C.6 Cluster sync
 
 - **Conflicts.** Tag adds from two nodes commute; add-versus-remove needs a policy. Options weighed: add-wins (no accidental loss), last-writer-wins (intuitive), mark-conflict (user resolves). Ordered collections need a sequence CRDT such as RGA, or last-writer-wins per collection ([CLUSTER-D2](cluster-decisions.md)).
-- **Hubs.** Nodes that are never online together relay through an always-on hub that holds their direct state and keeps a sync snapshot per peer; a node offline for any time catches up by one state delta from its last sync snapshot.
+- **Hubs.** Nodes that are never online together relay through an always-on hub that holds their direct state; a node offline for any time catches up by one state delta of what it has not seen (CLUSTER-D7).
 - **Node roles considered:** full, thin (metadata and stubs), blob-store only, hub.
 - **Bandwidth.** A moderately active user generates under 1 MB of metadata sync per day; a full join of 10 M objects is about 400 MB compressed. Blobs move only when opened.
 

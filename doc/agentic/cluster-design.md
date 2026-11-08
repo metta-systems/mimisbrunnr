@@ -19,7 +19,7 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, and co
 - **Only direct assertions are synced.** Derived terms, postings, the term dictionary and roll-ups are computed on each node from the synced state and ontology (INDEX-DESIGN§2.4), so peers never exchange them and cannot disagree about them. No posting containers travel.
 - **Local ids stay on their node.** Each pool numbers its tags (`TagId`) and its attribute and relation terms (`TermId`) itself (ONTOLOGY-DESIGN§1, INDEX-DESIGN§1.2). Bundles name tags by `TagUid` and terms by value — a tag uid, an attribute key's uid and a `Value`, a relation predicate's uid and a target `ObjectId` — never by a local id; a receiver resolves uids to its own `TagId`s and interns values into its own dictionary.
 - **Received changes are local operations.** A receiver applies a bundle by journalling its changes as ordinary local entries and replaying them through the same mutation path, so indexes, rules, constraints and subscriptions (SUBSCRIPTIONS-DESIGN "Selected design") treat them exactly as local mutations; each keeps its origin's hybrid timestamp.
-- **Sync snapshots.** Each exchange with a peer ends with a local snapshot on both sides, the *sync snapshot* of that peer; the next exchange diffs from it, and it is the common base the merge compares against. A peer's acknowledged sync snapshot is its watermark for tombstone expiry (METADATA-DESIGN "Object deletion").
+- **What a peer already has.** A sender ships only changes a peer has not seen, and a peer's acknowledgement is its watermark for tombstone expiry (METADATA-DESIGN "Object deletion"). How that knowledge is kept — a snapshot of the sender per peer, a version vector of per-origin hybrid timestamps, or what the merge model needs — is [CLUSTER-D7](cluster-decisions.md), decided together with the merge model.
 - **The ontology syncs as records.** A bundle carries the ontology records changed between its snapshots, by uid, ahead of its other changes (ONTOLOGY-DESIGN "Cluster propagation"). Declarations edited on two nodes merge by union of provenance, other fields last-writer-wins by hybrid timestamp.
 - **Merge rules** for object state are [CLUSTER-D2](cluster-decisions.md); **collection order** under concurrent inserts is [CLUSTER-D6](cluster-decisions.md).
 
@@ -29,9 +29,10 @@ The numbered sections below are the normative on-disk and algorithmic specificat
 
 ## 1. Sync bundles from snapshot diffs
 
-With key-level snapshots, the changes between two of the sender's snapshots `A` (the peer's last
-sync snapshot) and `B` (now) are the keys whose `snapshot` is in `ancestors(B) \ ancestors(A)`,
-read from the trees of direct state:
+With key-level snapshots, the changes between two of the sender's snapshots `A` and `B` (now)
+are the keys whose `snapshot` is in `ancestors(B) \ ancestors(A)`, read from the trees of direct
+state. How `A` is chosen for a peer — or whether changes are selected by per-origin timestamps
+instead — is CLUSTER-D7:
 
 ```
 let new_only = ancestors(B) - ancestors(A);     // snapshot ids unique to B's lineage
@@ -51,8 +52,8 @@ needs the difference (CLUSTER-D2).
 ```text
 SyncBundle = [version,                     // positional CBOR (FORMAT-DESIGN§1.6)
               from_node: uint,
-              from_snapshot: uint,         // the sender's sync snapshot for this peer
-              to_snapshot: uint,
+              from_snapshot: uint,         // what the peer had (CLUSTER-D7 may replace these
+              to_snapshot: uint,           //   with a version vector)
               ontology: [OntologyRecord],  // by uid, applied first
               objects: [ObjectDelta],      // HLC-ordered
               sequences: [SequenceDelta]]  // CLUSTER-D6
@@ -67,9 +68,8 @@ Term = [0, tag_uid: bytes(16)]
 ```
 
 The bundle is signed and shipped to peers (per the SPECIFICATION-DESIGN§9.4 key hierarchy).
-After applying it, the receiver takes its own sync snapshot for the sender and acknowledges
-`to_snapshot`; the sender then makes `B` its sync snapshot for that peer and may delete the
-previous one.
+After applying it, the receiver acknowledges what it now has; what the acknowledgement names and
+what either side keeps for the next exchange are CLUSTER-D7.
 
 A new node's first bundle diffs from the empty snapshot: the sender's whole direct state.
 

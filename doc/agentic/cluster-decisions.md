@@ -8,10 +8,10 @@ ObjectIds embed a 16-bit `NodeId` (SPECIFICATION-DESIGN§2.1). Decide how a node
 
 ## CLUSTER-D2 — Conflict resolution rules
 
-SPECIFICATION-DESIGN§10.7 names conflict resolution without specifying it. Bundles carry object state between sync snapshots (CLUSTER-DESIGN§1); define how a receiver merges an object changed on both sides. Candidates, by kind of state:
+SPECIFICATION-DESIGN§10.7 names conflict resolution without specifying it. Bundles carry changed direct state (CLUSTER-DESIGN§1); define how a receiver merges an object changed on both sides. Candidates, by kind of state:
 
 - **Term sets** (tags, attribute values, relations — attribute keys are multi-valued, so every value is a set element):
-  - (a) **three-way merge** against the sync snapshot: base + (local adds ∪ remote adds) − (removes neither side re-added). No per-term metadata; correct when every pair of nodes merges directly or through one hub, but changes reaching a node by two paths (a removal through a hub, a re-add directly) can diverge;
+  - (a) **three-way merge** against a per-peer base snapshot: base + (local adds ∪ remote adds) − (removes neither side re-added). No per-term metadata; correct when every pair of nodes merges directly or through one hub, but changes reaching a node by two paths (a removal through a hub, a re-add directly) can diverge, and it needs one base snapshot per peer. The maintainer expects it not to scale to multi-node sync;
   - (b) **observed-remove set** (add wins): each added term carries a dot (origin node, counter) and each node a version vector, so concurrent add and remove resolve the same way on every node whatever the path. Costs about 8–10 bytes per direct term in forward entries plus version vectors per peer;
   - investigate whether Mettā's topology (peers and hubs) makes (a) safe, or needs (b).
 - **Single-valued fields** (content hash and length, `state`, a ranked collection's score): last-writer-wins by hybrid timestamp, or for content, keeping the losing version as a conflict copy.
@@ -27,6 +27,16 @@ SPECIFICATION-DESIGN§10.3 has both `Partial` and `Hydrating` (with progress). D
 ## CLUSTER-D4 — Sync transport
 
 DESIGN notes suggest iroh as the sync transport; the target-system boundary ([operations-design.md](operations-design.md#boundary)) places the transport outside Mímisbrunnr (Mettā provides peer reach). Decide whether Mímisbrunnr defines a transport binding at all, and if so which.
+
+## CLUSTER-D7 — What a sender knows of each peer
+
+A sender ships only what a peer has not seen, and tombstones expire once every peer has acknowledged the deletion. Options, tied to CLUSTER-D2:
+
+- (a) **A sender snapshot per peer:** the sender keeps the snapshot it last shipped to each peer and diffs from it (CLUSTER-DESIGN§1). Simple diffs, but one retained snapshot per peer per node, and a relayed change is shipped again on every path.
+- (b) **Version vectors:** each node keeps, per origin node, the newest hybrid timestamp it has applied; a sender ships the changes newer than the peer's vector entry for each origin, selected by the timestamps carried with direct state rather than by snapshot ancestry. Scales with nodes, not with snapshots; changes relayed through hubs are recognised as seen. Needs per-change timestamps in the trees that are diffed.
+- (c) **Delta-state CRDT anti-entropy:** what (b) does, with the version vectors and dots of an observed-remove set (CLUSTER-D2 (b)) doubling as the record of what is known.
+
+Shapes [CLUSTER1](cluster-implementation-plan.md) and [CLUSTER9](cluster-implementation-plan.md), and the watermark of METADATA-DESIGN "Object deletion".
 
 ## CLUSTER-D6 — Collection order under concurrent inserts
 
