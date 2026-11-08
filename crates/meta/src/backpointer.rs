@@ -184,6 +184,9 @@ pub struct BackpointerValue {
     /// `[1..2]` padding.
     pub _pad: u8,
     /// `[2..4]` extent length in 4 KiB sectors.
+    ///
+    /// TODO(METADATA3): the spec widens this to a u24 at `[1..4]` so a 256 MiB
+    /// bucket's 65 536 sectors fit.
     pub length_sectors: u16,
     /// `[4..8]` bucket generation at insertion (used for lazy invalidation).
     pub bucket_gen: u32,

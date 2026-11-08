@@ -18,7 +18,7 @@ One region machinery that every persistent tree plugs into: large nodes that are
 - **One run format for every tree.** CBOR-valued trees (ontology, subscriptions, placement rules) store their CBOR as opaque value bytes in the same runs.
 - **Per-run key formats.** Each run picks its own key format when it is written, so a new key never forces an earlier run to change and no format-promotion step exists.
 - **Whiteouts are an entry flag** that survives flush and is dropped only by compaction.
-- **Positional regions** (radix leaves and inner nodes, chunk lists, extent lists, forward overflow) are arrays of 4 KiB pages; a flush appends only the pages that changed (BTREE-DESIGN§1.7).
+- **Positional regions** (radix leaves and inner nodes, forward overflow) are arrays of 4 KiB pages; a flush appends only the pages that changed (BTREE-DESIGN§1.7).
 - `BlockKind` and `BtreeKind` discriminants are pinned by the spec.
 
 ## Invariants
@@ -49,8 +49,7 @@ Two variants share the envelope:
   table, freespace LRU, ontology, subscriptions, chunk index, snapshots, disk descriptors,
   placement rules, cluster peers, reconcile queues, object roots): a sequence of **runs** of
   keyed entries (BTREE-DESIGN§1.2).
-- **Positional region** (object-table radix leaves and inner nodes, `ChunkList`, `ExtentList`,
-  `ForwardOverflow`): a fixed-size array of records, kept as 4 KiB pages (BTREE-DESIGN§1.7).
+- **Positional region** (object-table radix leaves and inner nodes, `ForwardOverflow`): a fixed-size array of records, kept as 4 KiB pages (BTREE-DESIGN§1.7).
 
 > **Terminology.** A *run* is the bcachefs `bset` ("btree set") — one append-only, sorted
 > commit unit within a node. Its on-disk magic is `"BSET"`.
@@ -303,11 +302,14 @@ run holding only the pages that changed since the last run — one dirty page co
 8 KiB — and compaction (BTREE-DESIGN§1.4) rewrites the region's live pages as one run in a fresh
 region when the next page run would not fit.
 
-**Chains.** A record array longer than one region (chunk lists, extent lists, forward overflow)
-continues in further regions linked **backwards**: each region's kind header names the previous
-region's `NodePtr` (absent in the first region, which carries `BTREE_NODE_FLAG_HEAD_OF_CHAIN`)
-and the index of its first record. The owner points at the newest region, so appending never
-rewrites an earlier one; a reader walks back from the newest region once to find the region
-holding a given record.
+**Chains.** A forward-overflow array longer than one region (INDEX-DESIGN§2.2) continues in
+further regions linked **backwards**: each region's kind header names the previous region's
+`NodePtr` (absent in the first region, which carries `BTREE_NODE_FLAG_HEAD_OF_CHAIN`) and the
+index of its first record. The owner points at the newest region, so appending never rewrites
+an earlier one; a reader walks back from the newest region once to find the region holding a
+given record. Moving an earlier region rewrites every region after it, since each predecessor
+pointer is in a header written once; this is acceptable only because a multi-region overflow
+needs tens of thousands of direct terms on one object. Per-object maps that grow without bound —
+extents and chunks — are keys of shared trees instead (METADATA-DESIGN§1.3, INDEX-DESIGN§4.3).
 
 ---

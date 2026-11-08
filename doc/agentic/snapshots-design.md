@@ -103,6 +103,7 @@ entry that selects it carries the snapshot id.
 | `TermDictionary`   | yes             | per-term statistics and inline postings diverge |
 | `Postings`         | yes             | one container per `(term_id, high, snapshot)`; a change diverges one container |
 | `Sequences`        | yes             | collection order diverges                      |
+| `ExtentList`, `ChunkList` | yes      | an object's extent map or chunk recipe diverges per edited range |
 | `TermTable`        | no              | a term never changes once created              |
 | `ChunkIndex`       | no              | content-addressed; refcount handles divergence |
 | `Backpointer`      | no              | physical state, not logical                    |
@@ -110,7 +111,7 @@ entry that selects it carries the snapshot id.
 | `Ontology`         | yes             | snapshot freezes the ontology version          |
 | `Subscriptions`, `SubscriptionMembers`, `SubscriptionEvents` | no | consumers watch the head; a rollback never moves a cursor (SUBSCRIPTIONS-DESIGN) |
 | `ObjectHistory`    | yes             | sidecar for `ObjectTable` (METADATA-DESIGN§1) — current view in the radix, per-snapshot overrides here |
-| `ObjectRoots`, `ExtentList` | no     | roots and high-water are physical; extent lists are reached from a record version |
+| `ObjectRoots`      | no              | roots and high-water are physical             |
 
 For the **positional object table** (METADATA-DESIGN§1), snapshot-versioning uses the
 `BtreeKind::ObjectHistory` sidecar, keyed by `(oid, snapshot)`, whose values are earlier
@@ -145,6 +146,7 @@ so the whiteout encoding is **per leaf shape**:
 | `Postings` (INDEX-DESIGN§3.2) | a `ContainerHead` with `kind = 0xFF` (`CONTAINER_WHITEOUT`) and no payload. |
 | `TermDictionary` (INDEX-DESIGN§4.1) | a `DictEntry` with bit 7 of `flags` set (`DICT_FLAG_WHITEOUT`) and every other field zero. |
 | `Sequences` (INDEX-DESIGN§3.3) | ordered: the value `oid = u64::MAX`, never a valid id; ranked: the 1-byte value `0xFF` in place of `0x00`. |
+| `ExtentList` (METADATA-DESIGN§1.3), `ChunkList` (INDEX-DESIGN§4.3) | the run entry's `RUN_ENTRY_FLAG_WHITEOUT` (BTREE-DESIGN§1.2), no value bytes. |
 | `Ontology` (ONTOLOGY-DESIGN§1) | a CBOR null (`0xF6`) at the value position, in place of the usual record. |
 | `ObjectHistory` (SNAPSHOTS-DESIGN§1.2) | a 1-byte discriminator precedes the shadowed record; `0xFF` (`KEY_TYPE_whiteout`) means whiteout, otherwise the record follows. |
 
@@ -223,8 +225,8 @@ and its existing backpointer is valid for both snapshots. Backpointers are physi
 Deleting a snapshot is **two operations**: a small synchronous step that takes the snapshot
 out of visibility, and a background cleanup that physically reclaims its keys. Deletions are
 **batched**: every snapshot marked deleted joins one pending set, and one cleanup pass over the
-snapshot-aware btrees — `Forward`, `TermDictionary`, `Postings`, `Sequences`, `Ontology`,
-`ObjectHistory`, the yes-rows of SNAPSHOTS-DESIGN§1.2's table — serves every
+snapshot-aware btrees — `Forward`, `TermDictionary`, `Postings`, `Sequences`, `ExtentList`,
+`ChunkList`, `Ontology`, `ObjectHistory`, the yes-rows of SNAPSHOTS-DESIGN§1.2's table — serves every
 snapshot in the set. A burst of sync-snapshot expiries costs one pass, not one per snapshot.
 
 **Synchronous step (`SnapshotDelete` journal op).**

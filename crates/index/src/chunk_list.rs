@@ -2,10 +2,13 @@
 //!
 //! Two on-disk wire structs:
 //!
-//! - [`ChunkParamsRecord`] (16 B) — sits immediately after the
-//!   `BtreeNodeHeader` of the chain's head region (flag
-//!   `BTREE_NODE_FLAG_HEAD_OF_CHAIN`).
-//! - [`ChunkListEntry`] (40 B) — one per FastCDC chunk of the object.
+//! - [`ChunkParamsRecord`] (16 B) — held in the object's `ChunkList`
+//!   content locator (METADATA-DESIGN§1.2).
+//! - [`ChunkListEntry`] (40 B) — the value of one `(oid, end_offset, snapshot)`
+//!   key of the shared chunk-list tree, one per FastCDC chunk.
+//!
+//! TODO(BLOB3): persist these through the shared chunk-list tree; no
+//! per-object chain regions.
 //!
 //! Note: the storage crate currently exports a 16-byte
 //! `ChunkParamsRecord` *placeholder* that holds opaque bytes; the version in

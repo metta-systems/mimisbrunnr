@@ -42,7 +42,7 @@ because each extent is evaluated independently, at the time it is processed.
 | Object on wrong tier vs. `Pin` / `Prefer` rule    | Migrate via the move path                    |
 | Compression / encryption inconsistent with ontology | Rewrite with correct transform pipeline    |
 | `Inline` object whose resolved policy now sets an encryption mode (METADATA-DESIGN§1.2) | Move the content out of the record, encrypted as the policy says |
-| ChunkList's `ChunkParamsRecord` ≠ resolved policy (INDEX-DESIGN§4.3, SPECIFICATION-DESIGN§3.5) | Re-chunk with new params                     |
+| ChunkList locator's `ChunkParamsRecord` ≠ resolved policy (INDEX-DESIGN§4.3, SPECIFICATION-DESIGN§3.5) | Re-chunk with new params (a content rewrite) |
 | `AutoTier` access-time threshold crossed          | Migrate Hot → Warm → Cold → Glacier          |
 | Bucket fragmentation > copygc threshold           | Run copy GC (ALLOCATION-DESIGN§1.6)          |
 | Disk in `Draining` state                          | Evacuate via backpointer scan (METADATA-DESIGN§2.2) |
@@ -181,16 +181,15 @@ ReconcileMove { from_loc, to_loc, owner_key }
   ⇒ BackpointerRemove(from_loc → key)
    ∘ BackpointerInsert(to_loc → key, value)
    ∘ owner-update on owner_key:
-        OwnerKind::BlobExtent      → in the radix record and every ObjectHistory version of the
-                                     oid whose locator names from_loc (SNAPSHOTS-DESIGN§1.6):
-                                     the Extent locator's replica, or the extent_index-th
-                                     ExtentEntry's (METADATA-DESIGN§1.2–1.3)
+        OwnerKind::BlobExtent      → start_offset 0 and an Extent locator: the locator's replica in
+                                     the radix record and every ObjectHistory version of the oid
+                                     naming from_loc (SNAPSHOTS-DESIGN§1.6); otherwise every
+                                     extent-tree key of the oid, at any snapshot, in the range
+                                     the owner key bounds, that names from_loc (METADATA-DESIGN§1.3)
         OwnerKind::Chunk           → ChunkIndex entry's BlobRef (INDEX-DESIGN§4.3)
         OwnerKind::BtreeNode       → the moved copy's slot in the parent's NodePtr (BTREE-DESIGN§1);
-                                     for the newest ChunkList / ExtentList region the locator's
-                                     `newest` replica in every version naming it, for an older
-                                     one the next region's predecessor pointer (a new copy of
-                                     that region)
+                                     for a forward-overflow region after the first, the next
+                                     region's predecessor pointer (a new copy of that region)
         OwnerKind::PackedBlock     → the Packed locator of every object the block names, in
                                      every version naming the block
 ```
@@ -204,8 +203,8 @@ are the only flow that needs the bundled `ReconcileMove`.
 (`{disk_id, sector, bucket_no, generation}`, ENGINE-DESIGN§1.2); the on-disk owner fields use
 narrower shapes sharing its first 8 bytes. Replay demotes `to_loc: BlockRef` into the target's shape:
 
-- `ReplicaRef` (METADATA-DESIGN§2.1, `BlobExtent` and the locator's newest list region): take the
-  first 8 bytes; write the low 16 bits of `generation` into the slot's generation tag.
+- `ReplicaRef` (METADATA-DESIGN§2.1, `BlobExtent`): take the first 8 bytes; write the low 16 bits
+  of `generation` into the slot's generation tag.
 - `BlobRef` (INDEX-DESIGN§4.3, `Chunk`): take the first 8 bytes; copy `length` from the *previous*
   owner record's `BlobRef.length` — moves preserve extent length, so the field is unchanged.
 - `BlockRef` (`BtreeNode`): copy verbatim into the moved copy's slot of the parent's `NodePtr`.

@@ -24,7 +24,7 @@ One fixed-size record per object says what the object is and where its content l
 
 - ObjectIds are never recycled (SPECIFICATION-DESIGN§7.3); each node's id high-water in `ObjectRoots` only grows.
 - A record read returns exactly the committed 128 B image.
-- Every physical extent or region an object's content uses is reachable from its content locator, and each has exactly one backpointer per replica (METADATA-DESIGN§2).
+- Every physical extent an object's content uses is reachable from its content locator or its keys in the extent or chunk-list tree, and each has exactly one backpointer per replica (METADATA-DESIGN§2).
 
 ## Object deletion
 
@@ -220,8 +220,8 @@ most 40 bytes and alignment ≤ 8, read in place from the record (the locator st
 enum ContentKind {
     None       = 0,   // no content yet (new object, or a stream before its first extent)
     Extent     = 1,   // one extent
-    ExtentList = 2,   // several extents, listed in an extent-list region (METADATA-DESIGN§1.3)
-    ChunkList  = 3,   // FastCDC chunks (INDEX-DESIGN§4.3)
+    ExtentList = 2,   // several extents, keyed by offset in the extent tree (METADATA-DESIGN§1.3)
+    ChunkList  = 3,   // FastCDC chunks, keyed by offset in the chunk-list tree (INDEX-DESIGN§4.3)
     Packed     = 4,   // a slot in a small-object bucket (BLOB-D4)
     Inline     = 5,   // the content itself, at most 40 bytes, in the locator
     Remote     = 6,   // content held by other nodes only (CLUSTER-D3)
@@ -234,11 +234,11 @@ struct ExtentLocator {                       // content_kind = Extent
 }
 
 #[repr(C)]
-struct ListLocator {                         // content_kind = ExtentList or ChunkList
-    newest: [ReplicaRef; 4],                 //  [0..32]   the R copies of the list's newest region,
-                                             //            [R..4) zero
-    generations: [u16; 4],                   // [32..40]   generation tag of each copy's bucket
+struct ChunkLocator {                        // content_kind = ChunkList
+    params: ChunkParamsRecord,               //  [0..16]   chunking the object was written with (INDEX-DESIGN§4.3)
+    _reserved: [u8; 24],                     // [16..40]
 }
+// content_kind = ExtentList: the locator is all zero; the extents are found by oid
 
 #[repr(C)]
 struct RemoteLocator {                       // content_kind = Remote
@@ -247,17 +247,13 @@ struct RemoteLocator {                       // content_kind = Remote
 }
 ```
 
-- **Extent** — `stored_length` bytes from the first sector of each replica. An object whose
-  stored form fits one extent (at most one bucket) uses this.
-- **ExtentList** — larger non-chunked objects and streams: the list's regions hold the extents in
-  order (METADATA-DESIGN§1.3); `newest` names the `metadata_replicas` copies of its newest region
-  (a tree region, replicated like every node, ENGINE-DESIGN§1.2), from which the
-  chain links back (BTREE-DESIGN§1.7).
-- **List length.** The number of extents or chunks is not in the record: it is the newest
-  region's first entry index (in its kind header) plus the entries it holds, read with the
-  region every list access reads first.
-- **ChunkList** — `newest` names the copies of the newest `ChunkList` region (INDEX-DESIGN§4.3); the
-  chunks are content-addressed and replicated by chunk-level placement, not by `replica_count`.
+- **Extent** — `stored_length` bytes from the first sector of each replica, covering `[0, length)`.
+  An object whose stored form fits one extent (METADATA-DESIGN§1.3, size limits) uses this.
+- **ExtentList** — larger non-chunked objects, streams, and objects partly overwritten: their
+  extents are keys of the shared extent tree under the object's id (METADATA-DESIGN§1.3).
+- **ChunkList** — the chunks are keys of the shared chunk-list tree under the object's id
+  (INDEX-DESIGN§4.3); the locator holds the chunking parameters. Chunks are content-addressed and
+  replicated by chunk-level placement, not by `replica_count`.
 - **Packed** — the object's bytes are one slot of a small-object block; the locator's layout is
   set by BLOB-D4 and names up to 40 bytes of slot address across its replicas.
 - **Inline** — objects of at most 40 bytes: the locator holds the bytes themselves,
@@ -294,27 +290,46 @@ object to `Packed` or `Extent`, and one that shrinks to 40 bytes or less moves i
 freeing what the old locator named. A stream (`state = Writing`) starts as `None`, becomes `Extent` with its first extent and
 `ExtentList` with its second; `length` is the durable prefix (JOURNAL-DESIGN§1.8).
 
-### 1.3 Extent lists
+### 1.3 Extent tree
 
-An extent list is a backward-linked chain of positional regions of `BtreeKind::ExtentList`
-(BTREE-DESIGN§1.7): the first region carries `BTREE_NODE_FLAG_HEAD_OF_CHAIN`, each later
-region's kind header names its predecessor and its first entry index, and each region holds
-`ExtentEntry` records in object order:
+The extents of every `ExtentList` object live in one shared BTREE-DESIGN§1 tree of
+`BtreeKind::ExtentList`, snapshot-aware, keyed by `(oid: u64, end_offset: u64, snapshot: u32)`
+through the packed-key codec, where `end_offset` is the plaintext offset one past the last byte
+the key covers. Values are fixed-size:
 
 ```rust
 #[repr(C)]
-struct ExtentEntry {                         // 48 bytes
-    stored_length: u32,                      //  [0..4]    bytes of this extent on disk
-    replica_count: u8,                       //  [4..5]
-    _pad: [u8; 3],                           //  [5..8]
-    replicas: [ReplicaRef; 4],               //  [8..40]
-    generations: [u16; 4],                   // [40..48]   generation tag of each replica's bucket
+struct ExtentEntry {                         // 56 bytes
+    logical_length: u32,                     //  [0..4]    plaintext bytes covered: [end_offset − logical_length, end_offset)
+    skip: u32,                               //  [4..8]    plaintext bytes of the extent before the covered range
+    stored_length: u32,                      //  [8..12]   bytes of the whole extent on disk
+    replica_count: u8,                       // [12..13]
+    _pad: [u8; 3],                           // [13..16]
+    replicas: [ReplicaRef; 4],               // [16..48]
+    generations: [u16; 4],                   // [48..56]   generation tag of each replica's bucket
 }
 ```
 
-A page holds 85 entries and a region 48 pages, 4 080 entries — about 16 GiB of 4 MiB extents —
-before a new region is added. Appending (`ExtendObject`, JOURNAL-DESIGN§1.3) appends the changed
-page of the newest region; a `ReconcileMove` of one extent appends the page holding its entry.
+- **Lookup.** The extent holding byte `x` is the first key `(oid, end_offset > x)` visible at the
+  reading snapshot (SNAPSHOTS-DESIGN§1.3); a range read is one range scan. A range no key covers
+  is a hole and reads as zeros.
+- **Appends** (`ExtendObject`, JOURNAL-DESIGN§1.3) put one key per new extent.
+- **Overwrites.** A write over `[a, b)` puts the new extents' keys and trims every key it
+  overlaps: a key extending past either end is replaced by its remainder, which names the same
+  physical extent with a smaller `logical_length` and, on the left, the same `skip`, on the
+  right a larger `skip`. Keys of one object at one snapshot never overlap. When the overlapped
+  key was written at an ancestor snapshot, the write also puts a whiteout at that key's position
+  in the current snapshot, so the ancestor's version stays visible only where it still applies.
+- **Encoded extents** — compressed ones — are decoded whole, then `skip` and `logical_length`
+  select the covered bytes; plain extents are read from `skip` directly, sector-aligned.
+- **Size limits.** A plain extent is at most one bucket of its disk. An encoded extent holds at
+  most `encoded_extent_max` plaintext bytes (POOL-DESIGN§1.2, default 128 KiB), so a random read
+  decodes at most that much.
+- A 4 KiB data block holds about 70 entries (56 B value, a few bytes of packed key); one object's
+  keys are contiguous in key order, so its extent map reads as a run of whole blocks.
+
+Moving an extent (copy GC, evacuation) rewrites the keys that name it, in whichever leaves hold
+them, like any key update: nothing else points at the entries.
 
 ### 1.4 Object roots
 
@@ -343,8 +358,8 @@ whole tree in one leaf.
 
 Two complementary structures translate between objects and physical space:
 
-- **Replica references** (METADATA-DESIGN§2.1) — forward: the content locator and extent-list
-  entries name each copy of each extent or region.
+- **Replica references** (METADATA-DESIGN§2.1) — forward: the content locator and extent-tree
+  entries name each copy of each extent.
 - **Backpointers** (METADATA-DESIGN§2.2) — reverse mapping `(disk_id, bucket_no, sector_offset) → owning key`.
   Used by copygc, device evacuation, scrub, resilver, and cluster reconcile. Without
   backpointers these operations cost O(pool size); with them, O(data-on-affected-bucket).
@@ -362,8 +377,7 @@ struct ReplicaRef {                          // 8 bytes
 
 **Generation tags.** A content extent's `ReplicaRef` is paired with a `u16` **generation tag**:
 the low 16 bits of its bucket's generation when the extent was written (ALLOCATION-DESIGN§1.3).
-`ExtentLocator`, `ExtentEntry` and the packed locator carry one per replica, and `ListLocator` one
-per copy of the list's newest region. A read compares the
+`ExtentLocator`, `ExtentEntry` and the packed locator carry one per replica. A read compares the
 tag with the low 16 bits of the resident generation; a mismatch is `StaleBlockRef`, as for a
 `BlockRef`. A reused bucket goes undetected only when it has been freed a multiple of 2¹⁶ times
 since the write.
@@ -385,9 +399,9 @@ array bounds the replication factor at **4**. More durability uses erasure codin
 `ReplicaRef` is **bucket-relative**, mirroring `BackpointerKey` (METADATA-DESIGN§2.2) so that
 the move path (RECONCILE-DESIGN§1.5), scrub, resilver, and copygc share field-level conversions
 instead of arithmetic on absolute block numbers. The reachable extent space per disk is
-`2^32 buckets × bucket_size`: 4 PiB at the default 1 MiB bucket, 16 PiB at the maximum 4 MiB
-bucket. `sector_offset: u16` covers any `bucket_size ≤ 256 MiB` (the format caps bucket size at
-4 MiB / 1024 sectors).
+`2^32 buckets × bucket_size`: 4 PiB at the default 1 MiB bucket, 1 EiB at the maximum 256 MiB
+bucket. `sector_offset: u16` covers exactly the format's bucket-size cap of 256 MiB (65 536
+sectors).
 
 `BlockRef` and `BlobRef` share these first 8 bytes (ENGINE-DESIGN§1.2), so converting between
 them is copying `(disk_id, sector, bucket_no)` and adding or dropping the generation. The byte
@@ -410,19 +424,21 @@ struct BackpointerKey {                      // 8 bytes logical; packed via BTRE
 #[repr(C)]
 struct BackpointerValue {                    // 24 bytes
     owner_kind: u8,                          //  [0..1]   OwnerKind
-    _pad: u8,                                //  [1..2]
-    length_sectors: u16,                     //  [2..4]   extent length in 4 KiB sectors
+    length_sectors: [u8; 3],                 //  [1..4]   u24 LE: extent length in 4 KiB sectors
+                                             //            (up to 65 536, a 256 MiB bucket)
     bucket_gen: u32,                         //  [4..8]   bucket generation at insertion time
     owner_key: [u8; 16],                     //  [8..24]  owning key (interpreted per OwnerKind)
 }
 
 #[repr(u8)]
 enum OwnerKind {
-    BlobExtent       = 1,                    // owner_key = ObjectId (u64) + extent_index (u64);
-                                             //   extent_index 0 for an Extent locator
+    BlobExtent       = 1,                    // owner_key = ObjectId (u64) + start_offset (u64): the
+                                             //   plaintext offset the extent was written at, 0 for an
+                                             //   Extent locator; every key naming the extent lies in
+                                             //   [start_offset, start_offset + its plaintext length)
     Chunk            = 2,                    // owner_key = first 16 B of chunk_hash (BLAKE3 prefix)
     BtreeNode        = 3,                    // owner_key = (BtreeKind, level, min_key prefix);
-                                             //   covers radix nodes, ChunkList and ExtentList regions
+                                             //   covers every tree node and radix node
     // 4, 5 unassigned
     PackedBlock      = 6,                    // owner_key = small-object block id (BLOB-D4); the block
                                              //   names the ObjectId of each of its slots

@@ -5,7 +5,7 @@ Design: [allocation-design.md](allocation-design.md) · Decisions: [allocation-d
 ## Pointers and entries
 
 - [ ] **ALLOCATION9 — Bucket-relative pointers and node pointers.** `BlockRef` and `BlobRef` take the ENGINE-DESIGN§1.2 layout (`disk_id`, `sector`, `bucket_no`, `u32` generation); `NodePtr` holds `Superblock.metadata_replicas` `BlockRef`s; every reader and writer, `validation/` and the journal payloads move with them. Acceptance: layouts asserted in code and `validation/`; a `BlockRef` into bucket 2³² − 1 of a 1 MiB-bucket disk round-trips; a two-disk pool with R = 2 writes each node to both disks and reads it from the second after the first copy is corrupted.
-- [ ] **ALLOCATION10 — 8-byte bucket entries and derived live sectors.** `BucketAllocEntry` and `BucketKind` per ALLOCATION-DESIGN§1.2; `live_sectors` maintained from the data entries and checkpoint node accounting, replayed from them; `BucketWrite` goes. Acceptance: write, delete and move a set of extents, crash before checkpoint, reopen: every bucket's `live_sectors` equals a recount from backpointers.
+- [ ] **ALLOCATION10 — 8-byte bucket entries and derived live sectors.** `BucketAllocEntry` and `BucketKind` per ALLOCATION-DESIGN§1.2; `live_sectors` maintained from the data entries and checkpoint node accounting, replayed from them; `BucketWrite` goes. Acceptance: write, delete and move a set of extents, crash before checkpoint, reopen: every bucket's `live_sectors` equals a recount from backpointers; on a disk formatted with 256 MiB buckets, a full bucket's `live_sectors` reads 65 536.
 
 ## Region allocation
 

@@ -33,7 +33,7 @@ The numbered sections below are the normative on-disk and algorithmic specificat
 ## 1. Allocation Layer
 
 Allocation is **bucket-based** with **generation numbers**, modelled on bcachefs. Each disk is
-divided into fixed-size buckets (typically 1 MiB; configurable 256 KiB – 4 MiB at format time).
+divided into fixed-size buckets (typically 1 MiB; configurable 256 KiB – 256 MiB per disk at format time).
 Within a bucket, writes are **append-only**: once opened, sectors are written sequentially and
 never overwritten. A bucket is reused only after its generation counter has been incremented —
 which atomically invalidates every pointer that referenced its previous contents.
@@ -61,6 +61,15 @@ A bucket is identified by `(disk_id, bucket_no)`. Bucket size is encoded as
 | 18                 | 256 KiB     | 64 M                    | ~640 MiB         |
 | 20 (default)       | 1 MiB       | 16 M                    | ~160 MiB         |
 | 22                 | 4 MiB       | 4 M                     | ~40 MiB          |
+| 26                 | 64 MiB      | 256 K                   | ~2.5 MiB         |
+| 28 (maximum)       | 256 MiB     | 64 K                    | ~640 KiB         |
+
+Bucket size is per disk, chosen at format or `add-disk` time for the device: small buckets
+where small objects and fine-grained reclaim matter (SD, small SSDs), large ones where long
+sequential runs pay (HDD; 256 MiB matches a typical SMR zone). A plain extent is at most one
+bucket (METADATA-DESIGN§1.3), so large buckets mean fewer, longer extents for big objects; copy
+GC moves whole buckets' live data, so they cost more write amplification under fragmenting
+workloads.
 
 The buckets holding the superblock copies (the first bucket and the last, ENGINE-DESIGN§1.1)
 are never handed out; `Superblock.first_usable_bucket` and the disk's `bucket_count` bound the
@@ -76,13 +85,13 @@ One **BTREE-DESIGN§1 B+ tree** per disk, rooted in its disk descriptor, keyed b
 #[repr(C)]
 struct BucketAllocEntry {                    // 8 bytes
     generation: u32,                         // [0..4]  monotonic; matched by BlockRef.generation
-    kind: u8,                                // [4..5]  BucketKind
-    flags: u8,                               // [5..6]  BUCKET_FLAG_*
-    live_sectors: u16,                       // [6..8]  live 4 KiB sectors in this bucket
+    kind_flags: u8,                          // [4..5]  low 4 bits BucketKind, high 4 bits BUCKET_FLAG_*
+    live_sectors: [u8; 3],                   // [5..8]  u24 LE: live 4 KiB sectors in this bucket
+                                             //         (up to 65 536 in a 256 MiB bucket)
 }
 
-// BucketAllocEntry.flags bits
-const BUCKET_FLAG_NEEDS_DISCARD: u8 = 1 << 0;  // freed, TRIM not yet issued (ALLOCATION-DESIGN§1.7)
+// BucketAllocEntry flag bits, in the high nibble of kind_flags
+const BUCKET_FLAG_NEEDS_DISCARD: u8 = 1 << 4;  // freed, TRIM not yet issued (ALLOCATION-DESIGN§1.7)
 
 #[repr(u8)]
 enum BucketKind {
@@ -143,7 +152,7 @@ bucket_no: u32
 ```
 
 where `sectors_per_bucket = 1 << (Superblock.bucket_size_log2 - 12)` (the count of 4 KiB
-sectors in one bucket — 256 for the default 1 MiB bucket, 1024 for the 4 MiB maximum). Only
+sectors in one bucket — 256 for the default 1 MiB bucket, 65 536 for the 256 MiB maximum). Only
 closed buckets are listed. Band 0 is the allocator's fast path and is reached *only* when
 `live_sectors == 0`. Band 255 is the most-fragmented end and absorbs the last sector or two of
 occupancy via the ceiling. Bands are recomputed lazily when `live_sectors` crosses an 8-sector

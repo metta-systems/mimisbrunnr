@@ -5,7 +5,7 @@ Design: [btree-design.md](btree-design.md) · Decisions: [btree-decisions.md](bt
 ## Region format
 
 - [ ] **BTREE9 — Write-once regions with block-addressable runs.** `BtreeNodeHeader` with its checksum written once in block 0; runs of an index block (`RunHeader`, `KeyFormat`, `RunBlockEntry`s, fence keys) and self-contained data blocks with aligned values, large values in value blocks and the whiteout entry flag (BTREE-DESIGN§1.1–1.2, BTREE-DESIGN§1.6); byte-width frame-of-reference keys replace bit packing; region load walks runs and stops at the first invalid index block. `FormatPromote` and its handling go from `crates/wal` and `crates/storage`. Acceptance: fixed expected bytes for a header block, an index block and a data block; a lookup in a 3-run node reads at most one data block per run (counted); a value of 8 KiB is read in place 8-byte aligned; a run torn in its last data block is dropped at load and earlier runs read back.
-- [ ] **BTREE10 — Positional page regions.** Radix leaves and inner nodes, chunk lists, extent lists and forward overflow as `logical_pages` pages written in page runs; backward-linked chains (BTREE-DESIGN§1.7). Prerequisite: BTREE9. Acceptance: changing one record of a full radix leaf writes 8 KiB; a never-written page reads as zeros; a chain of three regions is appended without rewriting the first two.
+- [ ] **BTREE10 — Positional page regions.** Radix leaves and inner nodes and forward overflow as `logical_pages` pages written in page runs; backward-linked chains (BTREE-DESIGN§1.7). Prerequisite: BTREE9. Acceptance: changing one record of a full radix leaf writes 8 KiB; a never-written page reads as zeros; a chain of three regions is appended without rewriting the first two.
 
 ## Live tree machinery
 

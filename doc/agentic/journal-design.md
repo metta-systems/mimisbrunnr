@@ -202,29 +202,27 @@ ChunkInsertBatch    : { chunks: [(chunk_hash: [u8;32], extent: BlockRef, length:
                    // N ≤ 1 000, chosen by the producer; one entry fits a jset (JOURNAL-DESIGN§1.2);
                    //   replay inserts each (hash → extent) into ChunkIndex (or bumps
                    //   ref_count if the hash already exists). Idempotent under LSN.
-ChunkListAppend     : { oid: u64, position_start: u64, region: NodePtr, count: u32 }
-                   // The region — a freshly written INDEX-DESIGN§4.3 ChunkList region — already
-                   //   holds `count` chunk hashes; the op records its placement in
-                   //   oid's ChunkList chain at logical positions
-                   //   [position_start, position_start + count). Hashes are not
-                   //   inlined; replay reads them from the region.
-ChunkListReplace    : { oid: u64, position: u64, new_hashes: [[u8;32]; N] }
-                   // In-place patch: replace N entries starting at `position`.
-                   //   N capped by the sector budget (~125 hashes at 32 B each).
-                   //   Replay rewrites the affected ChunkList region(s) and adjusts
+ChunkListAppend     : { oid: u64, start_offset: u64, chunks: [(chunk_hash: [u8;32], length: u32); N] }
+                   // Puts N ChunkList keys (INDEX-DESIGN§4.3) for oid, the first covering
+                   //   [start_offset, start_offset + length₀), each next one following.
+                   //   N ≤ 1 000; replay adds one ChunkIndex reference per chunk.
+ChunkListReplace    : { oid: u64, start_offset: u64, end_offset: u64,
+                        chunks: [(chunk_hash: [u8;32], length: u32); N] }
+                   // In-place patch: the keys covering [start_offset, end_offset) — chunk
+                   //   boundaries, as FastCDC re-chunks whole chunks — are replaced by N
+                   //   keys whose lengths sum to the new range. Replay drops the old keys
+                   //   (whiteouts for keys of an ancestor snapshot) and adjusts
                    //   ChunkIndex.ref_count (decrement old, increment new).
 ChunkListShrink     : { oid: u64, new_length: u64 }
-                   // Truncate oid's ChunkList to new_length entries. Replay walks the
-                   //   tail and decrements ref_count for each dropped chunk; fully-
-                   //   emptied regions are freed through live-sector accounting
-                   //   (ALLOCATION-DESIGN§1.2).
+                   // Truncate oid's chunks to the first new_length plaintext bytes, which
+                   //   fall on a chunk boundary. Replay removes the later keys and
+                   //   decrements ref_count for each dropped chunk.
 ChunkObjectFinalize : { oid: u64, content_hash: [u8;32], total_length: u64,
-                        list_newest: NodePtr }
-                   // Publishes a chunked object: sets content_kind = ChunkList,
-                   //   locator.newest = list_newest, each copy as a ReplicaRef with its
-                   //   generation tag (METADATA-DESIGN§1.2);
-                   //   content_hash = whole-plaintext hash; length = total_length. Readers see a fully
-                   //   assembled chunked object only after this op replays.
+                        params: ChunkParamsRecord }
+                   // Publishes a chunked object: sets content_kind = ChunkList and the
+                   //   locator's params (METADATA-DESIGN§1.2); content_hash = whole-plaintext
+                   //   hash; length = total_length. A re-chunk ends with one to record the new
+                   //   params (INDEX-DESIGN§4.3). Readers see a fully assembled chunked object only after this op replays.
 
 // Bucket lifecycle (ALLOCATION-DESIGN§1)
 BucketAlloc      : { disk_id: u16, bucket_no: u32, kind: u8, generation: u32 }  // bucket opened
@@ -295,8 +293,8 @@ ExtendObject     : { oid: u64, new_length: u64, extents: [(extent: BlockRef, len
                      extent_sum: u64); N] }                               // WalOpKind 33
                    // Appends extents to an object in the Writing state and makes its first
                    //   new_length bytes durable. The first extent sets an Extent locator;
-                   //   later ones go to the object's extent list (METADATA-DESIGN§1.3),
-                   //   to whose newest region replay appends a page run.
+                   //   from the second on, replay puts one extent-tree key per extent
+                   //   (METADATA-DESIGN§1.3), the Extent locator's extent becoming the first key.
 
 // Term maintenance (INDEX-DESIGN§1.2)
 ReclaimTerms     : { term_ids: [u64; N] }                               // WalOpKind 34
@@ -327,28 +325,24 @@ during long transfers matters.
 resolves the per-object chunking parameters per SPECIFICATION-DESIGN§3.5 (ontology effective policy →
 matching `PlacementRule::Chunk` → superblock default). Then:
 
-1. Allocates the first `ChunkList` region; sets `BTREE_NODE_FLAG_HEAD_OF_CHAIN` and writes the
-   resolved `ChunkParamsRecord` in its kind header (INDEX-DESIGN§4.3). The region holds 4 896
-   entries.
-2. Splits plaintext using the resolved algorithm/params (e.g. FastCDC at the resolved
-   `avg_size`). For each chunk: writes the chunk extent to a fresh blob bucket; appends
-   the `(hash, extent, length)` triple to a pending `ChunkInsertBatch` and the hash to
-   the region's entry array.
-3. When the in-flight `ChunkInsertBatch` reaches the producer's chosen size cap (bounded
-   by 1 000 chunks per entry), emits the batch as a journal entry.
-4. On fsync, writes the region's new pages as a page run (BTREE-DESIGN§1.7); when the region
-   fills, allocates the next region of the chain, whose kind header names the previous one and
-   repeats the `ChunkParamsRecord`. Each page run or new region emits
-   `ChunkListAppend { oid, position_start, region, count }`.
-5. At end-of-write, emits `ChunkObjectFinalize { oid, content_hash, total_length, list_newest }`.
-   `list_newest` points at the newest region; the chain's `ChunkParamsRecord` is the durable
-   record of the parameters this object was written with.
+1. Splits plaintext using the resolved algorithm/params (e.g. FastCDC at the resolved
+   `avg_size`). For each chunk: probes `ChunkIndex`; on a miss writes the chunk extent to a
+   fresh blob bucket and adds `(hash, extent, length)` to a pending `ChunkInsertBatch`; either
+   way adds `(hash, length)` to a pending `ChunkListAppend`.
+2. When the pending entries reach the producer's chosen size cap (at most 1 000 chunks per
+   entry), or on fsync, emits the `ChunkInsertBatch` and then the `ChunkListAppend`
+   `{ oid, start_offset, chunks }`; the ChunkList keys are ordinary tree puts, flushed with
+   every other tree at checkpoint.
+3. At end-of-write, emits `ChunkObjectFinalize { oid, content_hash, total_length, params }`;
+   the locator's `ChunkParamsRecord` is the durable record of the parameters this object was
+   written with.
 
 **Small in-place edit** (e.g. 4 KiB write at offset 1 GiB into a VM disk → FastCDC re-chunks
 the affected window, replacing 1–3 chunks):
 
 1. New chunks → `ChunkInsertBatch { chunks: [1..3] }`.
-2. `ChunkListReplace { oid, position, new_hashes: [hash; 1..3] }`.
+2. `ChunkListReplace { oid, start_offset, end_offset, chunks: [1..3] }` over the replaced
+   chunks' range.
 
 No `ChunkObjectFinalize` is needed for in-place edits — the object is already published; the
 replace op modifies its existing ChunkList. The total `content_hash` and `total_length` only
@@ -356,16 +350,15 @@ change if the edit shifts logical length, in which case a follow-up `ChunkObject
 `ChunkListShrink` for truncation) updates them.
 
 **Sync receive / resumable transfer.** Identical to bulk-write but driven by stream arrival
-order. After crash, the receiver queries the persisted ChunkList chain length and resumes
-from there — the `ChunkListAppend` chain *is* the durable progress record.
+order. After crash, the receiver reads the object's last ChunkList key and resumes from its
+`end_offset` — the replayed `ChunkListAppend` entries *are* the durable progress record.
 
-**Truncate / delete.** `ChunkListShrink { oid, new_length: 0 }` drops the chain;
+**Truncate / delete.** `ChunkListShrink { oid, new_length: 0 }` drops every key;
 `DeleteObject` then removes the object record. ChunkIndex `ref_count` decrements happen during
 shrink-replay; chunks reaching `ref_count = 0` are freed.
 
 **Crash semantics.** Each step is independently durable: chunks written to fresh buckets but
-not yet referenced from any `ChunkInsertBatch` get reclaimed by bucket-gen GC. ChunkList
-regions written but not yet referenced from a `ChunkListAppend` get reclaimed similarly. A
+not yet referenced from any `ChunkInsertBatch` get reclaimed by bucket-gen GC. A
 chunked object that crashed before `ChunkObjectFinalize` is invisible to readers — its oid's
 record's locator was never set — so no partial state is observable.
 
@@ -375,13 +368,13 @@ FastCDC's avg-chunk-size knob spans ~3 orders of magnitude in real deployments (
 4 KiB for fine-grained edits at the small end, up to 8 MiB for resumability-only large
 transfers at the other. The five-regime table below shows how the design scales:
 
-| Avg chunk | Typical workload                   | Chunks      | `ChunkInsertBatch` entries (≤ 1 000 chunks each) | ChunkList regions (4 896 entries each, at least one `ChunkListAppend` per region) | Journal bytes (64 B per chunk) | Journal append rate at 530 MiB/s plaintext |
-| --------- | ---------------------------------- | ----------- | ------------------------------------------------ | ------------------------------------------------------ | ------------------------------ | ------------------------------------------ |
-| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 8 389                                            | 1 714                                                  | ~512 MiB (1.6 % of plaintext)  | ~8.3 MiB/s                                 |
-| 16 KiB    | VM disks, databases                | 2 097 152   | 2 098                                            | 429                                                    | ~128 MiB (0.39 %)              | ~2.1 MiB/s                                 |
-| 256 KiB   | generic FastCDC default            | 131 072     | 132                                              | 27                                                     | ~8 MiB (0.024 %)               | ~130 KiB/s                                 |
-| 1 MiB     | backup-tool default (restic-class) | 32 768      | 33                                               | 7                                                      | ~2 MiB (0.006 %)               | ~33 KiB/s                                  |
-| **8 MiB** | large extreme — pure resumability  | 4 096       | 5                                                | 1                                                      | ~256 KiB (0.0008 %)            | ~4 KiB/s                                   |
+| Avg chunk | Typical workload                   | Chunks      | `ChunkInsertBatch` and `ChunkListAppend` entries (≤ 1 000 chunks each, one of each per batch) | Journal bytes (~100 B per chunk: 64 in the batch, 36 in the append) | Journal append rate at 530 MiB/s plaintext |
+| --------- | ---------------------------------- | ----------- | --------------------------------------------------------------------- | ------------------------------- | ------------------------------------------ |
+| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 8 389 of each                                                         | ~800 MiB (2.4 % of plaintext)   | ~12.9 MiB/s                                |
+| 16 KiB    | VM disks, databases                | 2 097 152   | 2 098 of each                                                         | ~200 MiB (0.61 %)               | ~3.2 MiB/s                                 |
+| 256 KiB   | generic FastCDC default            | 131 072     | 132 of each                                                           | ~12.5 MiB (0.038 %)             | ~207 KiB/s                                 |
+| 1 MiB     | backup-tool default (restic-class) | 32 768      | 33 of each                                                            | ~3.1 MiB (0.0095 %)             | ~52 KiB/s                                  |
+| **8 MiB** | large extreme — pure resumability  | 4 096       | 5 of each                                                             | ~400 KiB (0.0012 %)             | ~6.5 KiB/s                                 |
 
 The spread is roughly **2 000×** across regimes on every axis — the same op set covers all
 of it, only the constants change.
@@ -389,16 +382,16 @@ of it, only the constants change.
 **Cumulative ≠ simultaneous.** Steady-state journal fill is bounded by *reclaim latency*, not
 by total traffic over the operation: buckets are freed as soon as the trim point passes them
 (JOURNAL-DESIGN§1.4). Reclaim's job is flushing ChunkIndex leaves (256 KiB nodes holding about
-4 200 chunks each, INDEX-DESIGN§4.3); the leaf-fill rate it must sustain is
-`chunks_per_second / 4 200` leaves/s — equivalently,
-`(producer_plaintext_rate / avg_chunk_size) / 4 200` leaves/s. At 530 MiB/s plaintext:
+4 200 chunks each) and ChunkList leaves (about 5 400 chunks each, INDEX-DESIGN§4.3); the
+leaf-fill rate it must sustain is `chunks_per_second × (1/4 200 + 1/5 400)` ≈
+`chunks_per_second / 2 360` leaves/s. At 530 MiB/s plaintext:
 
-- **4 KiB regime:** ~135 K chunks/s ÷ 4 200 = ~32 leaves/s = ~8.1 MiB/s of leaf writes.
+- **4 KiB regime:** ~135 K chunks/s ÷ 2 360 = ~57 leaves/s = ~14.4 MiB/s of leaf writes.
   Comfortably within NVMe write bandwidth (~1–3 GiB/s typical) but no longer trivial; this
   is where reclaim genuinely has to keep up. Cumulative journal traffic exceeds a 64 MiB
-  journal by ~8×, so its buckets cycle continuously.
-- **16 KiB regime (canonical VM / DB workload):** ~8 leaves/s ≈ 2.0 MiB/s of leaf writes.
-  A 64 MiB journal cycles ~2× over the 60-second write. JOURNAL-DESIGN§1.4's *idle* /
+  journal by ~12×, so its buckets cycle continuously.
+- **16 KiB regime (canonical VM / DB workload):** ~14 leaves/s ≈ 3.6 MiB/s of leaf writes.
+  A 64 MiB journal cycles ~3× over the 60-second write. JOURNAL-DESIGN§1.4's *idle* /
   *background-flush* bands cover the producer comfortably.
 - **256 KiB and above:** journal traffic is in the noise; reclaim is essentially never the
   bottleneck.
@@ -406,19 +399,19 @@ by total traffic over the operation: buckets are freed as soon as the trim point
 The design therefore scales from "fine-grained dedup workload that genuinely stresses
 reclaim" to "barely-noticed bookkeeping" without changing op shapes. The producer's choice
 of FastCDC parameters trades dedup granularity (small chunks → more shared chunks across
-edits) against per-chunk overhead (small chunks → more journal bytes, more ChunkIndex leaves,
-larger per-object ChunkList chain).
+edits) against per-chunk overhead (small chunks → more journal bytes, more ChunkIndex and
+ChunkList leaves).
 
 **HDD-only pools.** A pool whose only writable disk is rotational clamps the producer to
 whatever reclaim sustains there. At the 4 KiB extreme this would be a real bottleneck (HDD
-write throughput is far below the ~8 MiB/s leaf-write demand); at 1 MiB or above it is
+write throughput is far below the ~14 MiB/s leaf-write demand); at 1 MiB or above it is
 unnoticeable. Chunked workloads typically imply hot-tier (NVMe/SSD) presence anyway, so
 this is a corner case.
 
 **Per-object footprint** (orthogonal to WAL but worth noting at the small extreme): a 32 GiB
-object's `ChunkList` chain is `chunks ÷ 4 896` regions × 256 KiB. At 4 KiB chunks that's
-~430 MiB of ChunkList per object (1.3 % of plaintext); at 8 MiB chunks it's a single 256 KiB
-region. ChunkIndex footprint scales similarly. The very-small-chunk regime is therefore
+object's `ChunkList` keys cost about 45 B per chunk. At 4 KiB chunks that's ~360 MiB per
+object (1.1 % of plaintext); at 8 MiB chunks it's ~180 KiB, sharing leaves with other objects.
+ChunkIndex footprint scales similarly. The very-small-chunk regime is therefore
 viable but pays for itself in dedup hit-rate, not in raw efficiency — fine for VM-disk
 workloads with high common-chunk ratios across snapshots, less so for one-shot writes of
 unique data.

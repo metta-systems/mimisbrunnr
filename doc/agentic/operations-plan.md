@@ -10,7 +10,7 @@ The order in which plan items across all scopes should land, by dependency. Task
 | journal | Journal sets, pins, commits and checkpoints | [journal](journal-implementation-plan.md) |
 | allocation | Buckets, generation-checked refs, freespace, discard | [allocation](allocation-implementation-plan.md) |
 | engine | Superblock, root list, commit, live trees, legacy blob retirement | [engine](engine-implementation-plan.md) |
-| metadata | Object table and content locators, extent lists, backpointers | [metadata](metadata-implementation-plan.md) |
+| metadata | Object table and content locators, extent tree, backpointers | [metadata](metadata-implementation-plan.md) |
 | index | Term dictionary, term table, postings, forward index, sequences, chunk index | [index](index-implementation-plan.md) |
 | ontology | Tag authority, modules, policy | [ontology](ontology-implementation-plan.md) |
 | subscriptions | Watch engine | [subscriptions](subscriptions-implementation-plan.md) |
@@ -87,7 +87,7 @@ The term dictionary, postings and forward index replace every index structure, s
 ### 6. Content paths and legacy blob retirement
 
 1. [BLOB1](blob-implementation-plan.md), [BLOB2](blob-implementation-plan.md), [BLOB5](blob-implementation-plan.md); then [JOURNAL11](journal-implementation-plan.md) — one barrier per commit with extent verification.
-2. [ENGINE5](engine-implementation-plan.md) — backpointers in the engine; [METADATA8](metadata-implementation-plan.md) — extent lists; then [METADATA6](metadata-implementation-plan.md) — blob reclaim and tombstone expiry (after METADATA-D3).
+2. [ENGINE5](engine-implementation-plan.md) — backpointers in the engine; [METADATA8](metadata-implementation-plan.md) — extent tree; then [METADATA6](metadata-implementation-plan.md) — blob reclaim and tombstone expiry (after METADATA-D3).
 3. [BLOB3](blob-implementation-plan.md), [BLOB4](blob-implementation-plan.md) — chunked objects, selective chunking; then [BLOB8](blob-implementation-plan.md) — tiny objects (after BLOB-D4) and [BLOB9](blob-implementation-plan.md) — streaming objects.
 4. [JOURNAL13](journal-implementation-plan.md) — optional retained history; then [BLOB6](blob-implementation-plan.md), [UNIX1](unix-implementation-plan.md), [ENGINE6](engine-implementation-plan.md), [ENGINE7](engine-implementation-plan.md), then [ENGINE8](engine-implementation-plan.md) — no legacy blob.
 

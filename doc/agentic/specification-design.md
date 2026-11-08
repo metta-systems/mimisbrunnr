@@ -559,8 +559,8 @@ The record's 40-byte **content locator** says where the content is; `content_kin
 | `content_kind` | Locator | Used for |
 |---|---|---|
 | `Extent` | up to 4 `ReplicaRef`s of one extent | objects that fit one bucket |
-| `ExtentList` | the R copies of the newest extent-list region (METADATA-DESIGN§1.3) | large non-chunked objects, streams |
-| `ChunkList` | the R copies of the newest `ChunkList` region (§9.6) | chunked objects; chunks replicate independently |
+| `ExtentList` | nothing: the extents are keys `(oid, end_offset, snapshot)` of the shared extent tree (METADATA-DESIGN§1.3) | large non-chunked objects, streams, partly overwritten objects |
+| `ChunkList` | the chunking parameters; the chunks are keys of the shared chunk-list tree (§9.6) | chunked objects; chunks replicate independently |
 | `Packed` | a slot in a small-object block | tiny objects (JOURNAL-DESIGN§1.8) |
 | `Inline` | the content itself | objects of at most 40 bytes whose storage policy sets no encryption mode of its own; one that gains such a policy moves out, but earlier copies of its bytes persist until reclaimed (METADATA-DESIGN§1.2 "Residual copies") |
 | `Remote` | the origin node | content held by other nodes only (§10.3) |
@@ -837,7 +837,7 @@ Ontology-driven algorithm selection. Already-compressed formats (JPEG, MP3, H.26
 |Source code|4:1|Zstd level 3|
 |JPEG/MP3/video|1:1|**Skip**|
 
-The unit compression applies to (whole object, independently decodable frames) and its on-disk framing are BLOB-D2.
+A compressed extent holds at most `encoded_extent_max` plaintext bytes (default 128 KiB, POOL-DESIGN§1.2) and is decoded whole, so a random read decodes at most that much; plain extents grow to a bucket (METADATA-DESIGN§1.3). Whether the cap varies per storage class, and the framing of a compressed extent, are BLOB-D2.
 
 ### 9.3 Encryption
 
@@ -913,7 +913,7 @@ Only ~1% of objects are typically chunked, keeping the chunk index small (~5 MB 
   `ChunkingAlgo::None` at format time).
 
 Their precedence is ONTOLOGY-D5. The resolved `ChunkParams` are then **persisted in the
-chain's `ChunkList` regions** so readers know exactly what was used and reconcile
+object's content locator** so readers know exactly what was used and reconcile
 (RECONCILE-DESIGN§1) can detect mismatches and
 re-chunk when the policy changes. See INDEX-DESIGN§4.3 for the on-disk layout.
 
@@ -924,13 +924,13 @@ with deliberately opposing key shapes (full layout in INDEX-DESIGN§4.3):
   in the entire pool**, refcounted. This is the dedup directory: "where does the chunk with
   hash X live?". Two unrelated objects that share chunks share these entries at the byte
   level.
-- **Chunk list** — positional, keyed by chunk position within an object. One per **chunked
-  object**. This is the per-object recipe: "to reconstruct object O, fetch chunks
+- **Chunk list** — keyed by `(object, end offset)` in one shared tree, so a byte offset finds
+  its chunk with one seek. This is the per-object recipe: "to reconstruct object O, fetch chunks
   `[hash₀, hash₁, hash₂, …]` in this order". The hashes are pointers *into* the chunk index,
   not the chunk bytes.
 
-Reading walks the list and looks up each hash; writing probes the index by hash (dedup) and
-appends the hash to the list. The pattern is the same as Git (object database vs. tree
+Reading range-scans the object's keys and looks up each hash; writing probes the index by
+hash (dedup) and puts the hash as the object's next key. The pattern is the same as Git (object database vs. tree
 object) or ZFS dedup (DDT vs. file extent map): a hash-keyed structure can't preserve order,
 and a position-keyed structure can't dedup, so both are necessary.
 
@@ -1406,7 +1406,7 @@ All engine state persists in the trees of the root list — B+ trees and positio
 │ Module system │ │             │ │               │
 │ Rules and     │ │ Term dict   │ │ Object roots  │
 │ constraints   │ │ Postings    │ │ Object table  │
-│ Closures      │ │ Sequences   │ │ Extent lists  │
+│ Closures      │ │ Sequences   │ │ Extent tree   │
 │               │ │ Forward Idx │ │ Backpointers  │
 └───────┬───────┘ └─────┬───────┘ └────┬──────────┘
         │               │              │
@@ -1479,13 +1479,13 @@ flowchart TB
     subgraph Meta["Object metadata (METADATA-DESIGN)"]
         ObjRoots["ObjectRoots<br/><i>NodeId → radix root,<br/>id high-water</i>"]
         ObjTable["Object table<br/><i>per-node radix of 128 B records:<br/>state, length, hash, content locator</i>"]
-        ExtentList["Extent lists"]
+        ExtentList["Extent tree<br/><i>(oid, end offset) → extent</i>"]
         ObjRoots --> ObjTable
     end
 
     subgraph Content["Content (BLOB-DESIGN, INDEX-DESIGN§4.3)"]
         Blobs["Blob buckets<br/><i>extents, via transform pipeline</i>"]
-        ChunkList["Chunk lists"]
+        ChunkList["Chunk-list tree<br/><i>(oid, end offset) → chunk hash</i>"]
         ChunkIndex["Chunk index<br/><i>hash → extent, refcount</i>"]
         Packed["Small-object blocks"]
         ChunkList --> ChunkIndex --> Blobs

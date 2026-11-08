@@ -68,6 +68,8 @@ PoolStateRecord = [version,
                    cluster_node_count: uint,
                    default_chunking_threshold: uint,      // objects ≤ this size are never chunked
                    default_chunking: bytes(16),           // ChunkParamsRecord (INDEX-DESIGN§4.3)
+                   encoded_extent_max: uint,              // plaintext bytes per compressed extent,
+                                                          //   default 131072 (METADATA-DESIGN§1.3)
                    move_bytes_in_flight: uint,            // RECONCILE-DESIGN§1.5, default 64 MiB
                    move_ios_in_flight: uint,              // default 64
                    reconcile_flags: uint,                 // bit 0 copygc, 1 tiering, 2 repair,

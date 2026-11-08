@@ -134,7 +134,7 @@ enum BtreeKind {
     Sequences             = 9,   // INDEX-DESIGN§3.3 ordered / ranked collection order (snapshot-aware)
     // Chunk content-addressing
     ChunkIndex            = 10,  // INDEX-DESIGN§4.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
-    ChunkList             = 11,  // INDEX-DESIGN§4.3 per-object FastCDC chunk-list region (positional, no sorted runs)
+    ChunkList             = 11,  // INDEX-DESIGN§4.3 shared chunk-list B+ tree, (oid, end_offset, snapshot) → chunk (snapshot-aware)
     // Physical reverse mapping
     Backpointer           = 12,  // METADATA-DESIGN§2.2 reverse-mapping B+ tree (snapshot-agnostic)
     // Catalogs
@@ -155,7 +155,7 @@ enum BtreeKind {
     ReconcilePending      = 25,  // RECONCILE-DESIGN§1.2 failed items awaiting device-config retry
     ReconcileScan         = 26,  // RECONCILE-DESIGN§1.3 in-progress scan cursors
     // Object metadata
-    ExtentList            = 27,  // METADATA-DESIGN§1.3 per-object extent-list region (positional, no sorted runs)
+    ExtentList            = 27,  // METADATA-DESIGN§1.3 shared extent B+ tree, (oid, end_offset, snapshot) → extent (snapshot-aware)
     ObjectRoots           = 28,  // METADATA-DESIGN§1.4 NodeId → object radix root (snapshot-agnostic)
     // Pool
     PoolState             = 29,  // POOL-DESIGN§1.2 single-entry pool state record

@@ -491,16 +491,16 @@ opposing key shapes. Both are needed; neither subsumes the other.
 | Structure    | Keyed by             | Role                                                   | Snapshot? |
 | ------------ | -------------------- | ------------------------------------------------------ | --------- |
 | `ChunkIndex` | `chunk_hash`         | **Content-addressed dedup directory.** One entry per unique chunk in the entire pool. Tells you "where does the chunk with hash X live?" → `BlobRef` to its physical extent, plus a `ref_count`. | snapshot-agnostic |
-| `ChunkList`  | position (per-object) | **Per-object recipe.** One region (chain) per chunked object. Tells you "to reconstruct object O, fetch chunks `[hash₀, hash₁, hash₂, …]` in this order". The hashes are pointers *into* `ChunkIndex` — not the chunk bytes. | snapshot-agnostic (shared prefix via COW) |
+| `ChunkList`  | `(oid, end_offset)`   | **Per-object recipe.** One shared tree; an object's keys say "to reconstruct object O, fetch chunks `[hash₀, hash₁, hash₂, …]` in this order". The hashes are pointers *into* `ChunkIndex` — not the chunk bytes. | snapshot-aware |
 
 The split is the same pattern as Git (object database vs. tree object) or ZFS dedup (DDT vs.
 file extent map):
 
-- **Read** a chunked object: walk its `ChunkList` in order → for each `chunk_hash` look up
+- **Read** a chunked object: range-scan its `ChunkList` keys in order → for each `chunk_hash` look up
   `ChunkIndex` → get `BlobRef` → read bytes from its data bucket.
 - **Write** a chunked object: FastCDC splits plaintext → for each chunk, hash it and probe
   `ChunkIndex` → if hit, bump `ref_count`; if miss, write the bytes and insert. Either way,
-  append the hash to the new object's `ChunkList`.
+  put the hash as the object's next `ChunkList` key.
 - **Dedup** falls out for free: two unrelated objects whose plaintext shares chunks share the
   storage at the byte level via the shared `ChunkIndex` entries — `ref_count` tracks how
   many `ChunkList`s reference each chunk; physical reclaim happens when it drops to zero.
@@ -533,16 +533,17 @@ chunk once, refcounted, so two objects sharing common chunks share their storage
 
 #### `ChunkList` — per-object FastCDC recipe
 
-A chunked object's record (content kind `ChunkList`, METADATA-DESIGN§1.2) points at the
-**newest** region of a backward-linked `BtreeKind::ChunkList` chain of positional regions
-(BTREE-DESIGN§1.7). The first region carries `BTREE_NODE_FLAG_HEAD_OF_CHAIN`. Every region's
-kind header (block 0, written once) holds the 16 B `ChunkParamsRecord` recording the chunking
-parameters used to produce the chain, then — in every region but the first — the previous
-region's `NodePtr` and the index of the region's first entry.
+The chunks of every chunked object (content kind `ChunkList`, METADATA-DESIGN§1.2) are keys of one
+shared BTREE-DESIGN§1 tree of `BtreeKind::ChunkList`, snapshot-aware, keyed by
+`(oid: u64, end_offset: u64, snapshot: u32)` through the packed-key codec, where `end_offset` is
+the plaintext offset one past the chunk's last byte — the same shape as the extent tree
+(METADATA-DESIGN§1.3). The chunk holding byte `x` is the first key `(oid, end_offset > x)`; a
+read is one range scan. The object record's locator holds the 16 B `ChunkParamsRecord` the
+object was chunked with.
 
 ```rust
 #[repr(C)]
-struct ChunkParamsRecord {                   // 16 bytes — in every region's kind header
+struct ChunkParamsRecord {                   // 16 bytes — in the ChunkList locator (METADATA-DESIGN§1.2)
     algo: u8,                                //  [0..1]   ChunkingAlgo discriminant
     flags: u8,                               //  [1..2]   reserved
     _pad: [u8; 2],                           //  [2..4]
@@ -559,38 +560,37 @@ enum ChunkingAlgo {
     // 3+ reserved for future algorithms
 }
 
-struct ChunkListEntry {                      // 40 bytes (8-aligned)
+struct ChunkListEntry {                      // 40 bytes, the value of a ChunkList key
     chunk_hash: [u8; 32],                    //  [0..32]   BLAKE3 of plaintext, indexes ChunkIndex
-    length: u32,                             // [32..36]   plaintext length of this chunk
+    length: u32,                             // [32..36]   plaintext length: the chunk covers
+                                             //            [end_offset − length, end_offset)
     flags: u32,                              // [36..40]   reserved (e.g. inline-tiny-chunk hint)
 }
 ```
 
-Region capacity:
-
-```
-102 entries per 4 KiB page (40 B each, 16 B of pad) × 48 logical pages = 4 896 entries per region
-```
-
-Each entry covers a single FastCDC chunk (typical 4 – 64 KiB plaintext); a single region
-therefore covers ≈ 19 MiB – 306 MiB of plaintext at the average chunk size. Larger objects
-add regions to the chain. Reads stream chunks in order: walk back from the newest region once
-to the first, then forward through the entries, looking up each chunk in `ChunkIndex` to find
-its physical extent.
+A 4 KiB data block holds about 90 entries (40 B value, a few bytes of packed key, since one
+object's `oid` is the shared base and `end_offset`s are close), so a 256 KiB leaf of 60 data
+blocks holds about 5 400 chunks: ≈ 21 MiB of plaintext at 4 KiB chunks, ≈ 1.3 GiB at 256 KiB.
+Reads stream the object's keys in order, looking up each chunk in `ChunkIndex` to find its
+physical extent. A chunk is read and decoded whole; its size is set by the chunking parameters,
+not by `encoded_extent_max`.
 
 **Re-chunking after policy change.** When the resolved storage policy (SPECIFICATION-DESIGN§3.5) for an
 object changes — typically because the operator updated a `PlacementRule::Chunk` or because
 an ontology install bumped a tag's `storage.chunking` — reconcile (RECONCILE-DESIGN§1.1) detects the
-mismatch by comparing the chain's `ChunkParamsRecord` to the resolved policy and
-queues a `WorkKind::OptionUpdate` entry, or, for a policy change affecting many objects, the policy change's scan handles them (RECONCILE-DESIGN§1.3). The re-chunk pass produces a fresh ChunkList
-chain (with the new params in its regions) and atomically swaps the record's `locator.newest` to
-the new head via `ReconcileMove`; the old chain becomes unreferenced and is reclaimed via
-bucket-gen GC.
+mismatch by comparing the locator's `ChunkParamsRecord` to the resolved policy and
+queues a `WorkKind::OptionUpdate` entry, or, for a policy change affecting many objects, the policy change's scan handles them (RECONCILE-DESIGN§1.3). The re-chunk pass is a
+content rewrite, not a move: it walks the object in windows that end on old chunk boundaries,
+re-chunks each window with the new parameters and replaces its keys with one
+`ChunkListReplace` (JOURNAL-DESIGN§1.3), so every intermediate recipe reads the same bytes; a
+final `ChunkObjectFinalize` records the new parameters in the locator. The old chunks'
+`ref_count`s drop as their windows are replaced, and chunks reaching zero are freed.
 
-The list is **snapshot-agnostic** because chunks are content-addressed: two snapshots of the
-same chunked object that happen to share a prefix simply share the prefix portion of their
-ChunkList chains by the usual COW mechanism (a divergent suffix gets its own region; the
-shared prefix is reachable from both).
+**Snapshots.** The tree is snapshot-aware like the extent tree: an edit after a snapshot puts the
+new keys and whiteouts at the current snapshot and leaves the snapshot's keys in place, so both
+versions read their own recipe. Unchanged ranges are the same keys, visible from both; changed
+ones cost only their own keys, and chunks shared by the two recipes are stored once through
+`ChunkIndex`.
 
 ---
 

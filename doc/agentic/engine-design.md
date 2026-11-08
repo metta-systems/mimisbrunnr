@@ -174,7 +174,7 @@ struct BlobRef {                             // 16 bytes
 
 Both are **bucket-relative**: their first 8 bytes have the `ReplicaRef` shape
 (METADATA-DESIGN§2.1) and the backpointer key's fields, so a disk addresses `2³²` buckets —
-4 PiB at the default 1 MiB bucket, 16 PiB at 4 MiB. A `BlockRef` names a tree node or region and
+4 PiB at the default 1 MiB bucket, 1 EiB at the 256 MiB maximum. A `BlockRef` names a tree node or region and
 is checked against the bucket's generation on dereference. A `BlobRef` names a payload extent
 (INDEX-DESIGN§4.1's out-of-line term values, INDEX-DESIGN§4.3's chunk index leaf); it carries a
 length instead of a generation, and its freshness follows from the owning record's check.
