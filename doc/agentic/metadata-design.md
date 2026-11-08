@@ -235,8 +235,9 @@ struct ExtentLocator {                       // content_kind = Extent
 
 #[repr(C)]
 struct ListLocator {                         // content_kind = ExtentList or ChunkList
-    newest: [ReplicaRef; 4],                 //  [0..32]   copies of the list's newest region
-    entry_count: u64,                        // [32..40]   extents or chunks in the whole list
+    newest: [ReplicaRef; 4],                 //  [0..32]   the R copies of the list's newest region,
+                                             //            [R..4) zero
+    generations: [u16; 4],                   // [32..40]   generation tag of each copy's bucket
 }
 
 #[repr(C)]
@@ -249,9 +250,13 @@ struct RemoteLocator {                       // content_kind = Remote
 - **Extent** — `stored_length` bytes from the first sector of each replica. An object whose
   stored form fits one extent (at most one bucket) uses this.
 - **ExtentList** — larger non-chunked objects and streams: the list's regions hold the extents in
-  order (METADATA-DESIGN§1.3); `newest` names the replicas of its newest region, from which the
+  order (METADATA-DESIGN§1.3); `newest` names the `metadata_replicas` copies of its newest region
+  (a tree region, replicated like every node, ENGINE-DESIGN§1.2), from which the
   chain links back (BTREE-DESIGN§1.7).
-- **ChunkList** — `newest` names the replicas of the newest `ChunkList` region (INDEX-DESIGN§4.3); the
+- **List length.** The number of extents or chunks is not in the record: it is the newest
+  region's first entry index (in its kind header) plus the entries it holds, read with the
+  region every list access reads first.
+- **ChunkList** — `newest` names the copies of the newest `ChunkList` region (INDEX-DESIGN§4.3); the
   chunks are content-addressed and replicated by chunk-level placement, not by `replica_count`.
 - **Packed** — the object's bytes are one slot of a small-object block; the locator's layout is
   set by BLOB-D4 and names up to 40 bytes of slot address across its replicas.
@@ -319,11 +324,12 @@ codec), with fixed-size values:
 
 ```rust
 #[repr(C)]
-struct ObjectRootEntry {                     // 32 bytes
-    root: BlockRef,                          //  [0..16]   the node's radix root; generation 0 = empty
-    next_local: u64,                         // [16..24]   one past the largest local id ever seen
-    root_level: u8,                          // [24..25]   inner levels above the leaves
-    _reserved: [u8; 7],                      // [25..32]
+struct ObjectRootEntry {                     // 16 + 16 × R bytes
+    next_local: u64,                         //  [0..8]    one past the largest local id ever seen
+    root_level: u8,                          //  [8..9]    inner levels above the leaves
+    _reserved: [u8; 7],                      //  [9..16]
+    root: NodePtr,                           // [16..)     the node's radix root, R copies;
+                                             //            all generations 0 = empty
 }
 ```
 
@@ -356,7 +362,8 @@ struct ReplicaRef {                          // 8 bytes
 
 **Generation tags.** A content extent's `ReplicaRef` is paired with a `u16` **generation tag**:
 the low 16 bits of its bucket's generation when the extent was written (ALLOCATION-DESIGN§1.3).
-`ExtentLocator`, `ExtentEntry` and the packed locator carry one per replica. A read compares the
+`ExtentLocator`, `ExtentEntry` and the packed locator carry one per replica, and `ListLocator` one
+per copy of the list's newest region. A read compares the
 tag with the low 16 bits of the resident generation; a mismatch is `StaleBlockRef`, as for a
 `BlockRef`. A reused bucket goes undetected only when it has been freed a multiple of 2¹⁶ times
 since the write.

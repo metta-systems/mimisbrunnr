@@ -204,8 +204,8 @@ are the only flow that needs the bundled `ReconcileMove`.
 (`{disk_id, sector, bucket_no, generation}`, ENGINE-DESIGN§1.2); the on-disk owner fields use
 narrower shapes sharing its first 8 bytes. Replay demotes `to_loc: BlockRef` into the target's shape:
 
-- `ReplicaRef` (METADATA-DESIGN§2.1, `BlobExtent` and list regions): take the first 8 bytes; for a
-  content extent, write the low 16 bits of `generation` into the replica's generation tag.
+- `ReplicaRef` (METADATA-DESIGN§2.1, `BlobExtent` and the locator's newest list region): take the
+  first 8 bytes; write the low 16 bits of `generation` into the slot's generation tag.
 - `BlobRef` (INDEX-DESIGN§4.3, `Chunk`): take the first 8 bytes; copy `length` from the *previous*
   owner record's `BlobRef.length` — moves preserve extent length, so the field is unchanged.
 - `BlockRef` (`BtreeNode`): copy verbatim into the moved copy's slot of the parent's `NodePtr`.

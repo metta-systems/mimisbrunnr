@@ -202,7 +202,7 @@ ChunkInsertBatch    : { chunks: [(chunk_hash: [u8;32], extent: BlockRef, length:
                    // N ≤ 1 000, chosen by the producer; one entry fits a jset (JOURNAL-DESIGN§1.2);
                    //   replay inserts each (hash → extent) into ChunkIndex (or bumps
                    //   ref_count if the hash already exists). Idempotent under LSN.
-ChunkListAppend     : { oid: u64, position_start: u64, region: BlockRef, count: u32 }
+ChunkListAppend     : { oid: u64, position_start: u64, region: NodePtr, count: u32 }
                    // The region — a freshly written INDEX-DESIGN§4.3 ChunkList region — already
                    //   holds `count` chunk hashes; the op records its placement in
                    //   oid's ChunkList chain at logical positions
@@ -221,7 +221,8 @@ ChunkListShrink     : { oid: u64, new_length: u64 }
 ChunkObjectFinalize : { oid: u64, content_hash: [u8;32], total_length: u64,
                         list_newest: NodePtr }
                    // Publishes a chunked object: sets content_kind = ChunkList,
-                   //   locator.newest = list_newest (METADATA-DESIGN§1.2);
+                   //   locator.newest = list_newest, each copy as a ReplicaRef with its
+                   //   generation tag (METADATA-DESIGN§1.2);
                    //   content_hash = whole-plaintext hash; length = total_length. Readers see a fully
                    //   assembled chunked object only after this op replays.
 
