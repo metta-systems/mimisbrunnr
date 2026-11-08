@@ -78,10 +78,10 @@ Derived terms (kinds 3 and 4, and the tags and bucketed values the ontology's ru
 never in forward entries (INDEX-DESIGN§2.4).
 
 **Allocation.** Attribute and relation terms take `TermId`s from a per-pool counter starting at
-2³², assigned in write order and never reused; the counter is not persisted but derived at boot
-as one past the largest key in the term table, high-water markers included (see
-"Reclamation"). Journal replay re-interns values in LSN order from the counter derived at the
-committed root, so it assigns the same `TermId`s.
+2³², assigned in write order and never reused; the counter is `next_term_id` in the root list
+head (ENGINE-DESIGN§1.2), so no deletion or snapshot cleanup can lower it. Journal replay
+re-interns values in LSN order from the committed checkpoint's counter, so it assigns the same
+`TermId`s.
 
 **Interning.** Writing an assertion looks its term up in the term dictionary (INDEX-DESIGN§4.1).
 If present, the existing `TermId` is used; otherwise a `TermId` is allocated and a dictionary
@@ -105,11 +105,7 @@ carries a `TermId`; sync carries values and receivers intern them.
 
 Reclaiming removes the term's dictionary entries and its term-table record, journaled as one
 `ReclaimTerms` entry (JOURNAL-DESIGN§1.3) so replay removes exactly the same terms. Its `TermId`
-is never reused: if a reclaimed term holds the largest key in the term table, its record is
-replaced by a **high-water marker** — a `TermRecord` of kind `TERM_KIND_HIGH_WATER` with no
-value — in the same entry, so the boot-time counter cannot fall back below it. A marker is
-removed once a larger key exists, by the next reclamation that touches the table. At most one
-marker exists at a time.
+is never reused, since the counter does not depend on the table's contents.
 
 ---
 
@@ -420,8 +416,6 @@ struct TermRecord {                          // 8-byte head
 //   Relation:           target: u64
 //   Attr, hierarchy node: parent: u64, then the component's encoding as for inline Attr
 //   NGram, RollUp:      nothing (the dictionary key holds everything)
-//   TERM_KIND_HIGH_WATER = 0xFF: nothing — a reclaimed term's marker (INDEX-DESIGN§1.2);
-//                        key = 0; no dictionary entry refers to it; lookups never return it
 ```
 
 Tag terms have no term-table entry; the ontology defines tags.

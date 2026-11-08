@@ -14,7 +14,7 @@ The engine orchestrates mutations journal-first, keeps one long-lived `LoadedNod
 - **No zones.** A device is three superblock copies and buckets; every structure, metadata or data, lives in allocated buckets classified by bucket kind (ALLOCATION-DESIGN§1.2). There is no fixed index, metadata or blob area and nothing to grow.
 - **Root list.** Every tree the engine owns is one entry of the root list, keyed by tree kind (ENGINE-DESIGN§1.2); an absent entry loads as an empty tree. The list travels in `Checkpoint` entries; the superblock holds only a hint to the newest one.
 - **Commit.** Flush dirty trees (append a run or page run, or compact into a fresh region), then commit a `Checkpoint` entry with the new root list; regions the new root no longer reaches are freed after it is durable. A crash before the checkpoint leaves the previous root's regions intact.
-- **No legacy blob.** The `MIXI` CBOR blob is retired: counters are derived at boot (`next_oid_local` from the pool's own `ObjectRoots` entry, `next_tag_id` from the ontology, `last_applied_lsn` from the latest checkpoint), path projections are answered from the index with nothing rebuilt (UNIX-DESIGN "Selected design"), and blob bytes live in data buckets.
+- **No legacy blob.** The `MIXI` CBOR blob is retired: counters come from the checkpoint (`next_oid_local` from the pool's own `ObjectRoots` entry, `next_term_id`, `next_tag_id` and `next_rule_id` and `last_applied_lsn` from the latest checkpoint's root list head), path projections are answered from the index with nothing rebuilt (UNIX-DESIGN "Selected design"), and blob bytes live in data buckets.
 - **Pools are disposable** until the maintainer declares the format stable: a format change means recreating the pool. Version fields stay in every structure so that pools after that point migrate (FORMAT-DESIGN§15).
 - **One engine on host and device.** The engine and every crate it depends on build as `no_std` + `alloc` (operations-design "Deployment targets"); file-backed devices and other host parts sit behind the `std` feature. A pool opens from a `BlockDevice` alone, and opening replays the journal on every target, the device included.
 - **Driven by its embedder.** The engine starts no thread. Mutations and reads are calls; background work — commits, checkpoints, flushes, reconcile — runs in `step` calls that do a bounded amount of work, with a non-blocking query of what is due. A `std`-gated helper drives them from threads on the host; the Vesper filesystem server drives them from its own loop.
@@ -106,15 +106,26 @@ entry carrying it (JOURNAL-DESIGN§1.5):
 ```rust
 // Checkpoint entry payload (JOURNAL-DESIGN§1.3)
 #[repr(C)]
-struct RootListHead {                        // 24 bytes
+struct RootListHead {                        // 40 bytes
     seq: u64,                                //  [0..8]    monotonic; larger seq wins
     lsn: u64,                                //  [8..16]   journal LSN this root corresponds to
     entry_count: u16,                        // [16..18]
     metadata_replicas: u8,                   // [18..19]   R, as in the superblock
     _pad: [u8; 5],                           // [19..24]
+    next_term_id: u64,                       // [24..32]   one past the largest TermId ever allocated
+    next_tag_id: u32,                        // [32..36]   one past the largest TagId ever allocated
+    next_rule_id: u32,                       // [36..40]   one past the largest rule id ever allocated
 }
 // followed by entry_count × RootEntry, ascending by (tree, scope)
+```
 
+**Id counters.** `TermId`s, `TagId`s and rule ids are never reused. Their counters live in the
+root list head, outside every snapshot-aware tree, so no deletion, snapshot cleanup or branch
+deletion can lower them; `ObjectId`s have the same guarantee from `ObjectRoots.next_local`
+(METADATA-DESIGN§1.4). Replay starts from the checkpoint's counters and advances each past every
+id the replayed entries allocate (JOURNAL-DESIGN§1.3), so it assigns the same ids.
+
+```rust
 #[repr(C)]
 struct RootEntry {                           // 8 + 16 × R bytes
     tree: u16,                               //  [0..2]   BtreeKind (FORMAT-DESIGN§1.3)
@@ -215,7 +226,7 @@ resident tables:
 | `ObjectRoots` | METADATA-DESIGN§1.4 — one entry per origin node | fully resident (a few entries) |
 | `ObjectHistory` (snapshot-override sidecar) | SNAPSHOTS-DESIGN§1.2 — `BtreeKind::ObjectHistory` keyed by `(oid, snapshot)` | shares `BTreeNodeCache`; read for non-head snapshots |
 | Term dictionary, term table, postings, sequences, forward index (accessors over `BTreeNodeCache`) | INDEX-DESIGN§2–§4 trees | no resident mirror; posting containers and forward entries read in place from cached blocks |
-| `TermId` counter                             | derived at boot from the term table       | resident scalar           |
+| `TermId`, `TagId`, rule id counters          | root list head (ENGINE-DESIGN§1.2), advanced by replay | resident scalars |
 | `OntologyState` (name and uid maps, closure tables) | ONTOLOGY-DESIGN§1 ontology tree      | fully resident; closure tables rebuilt when `rules_epoch` advances |
 | `SubscriptionEngine` (records, compiled queries, `term_to_subs` / `key_to_subs`) | SUBSCRIPTIONS-DESIGN§1 subscription trees | resident; membership containers and pending events read on demand |
 | `PoolManager`                                | POOL-DESIGN§1 pool state and disk descriptors | fully resident     |

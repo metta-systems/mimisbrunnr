@@ -28,7 +28,7 @@ The ontology is the single authority over tag identity, attribute keys, derivati
 - a module's tag: the first 128 bits of `BLAKE3("mimir-tag" ‖ module_id ‖ 0x00 ‖ name)`, so every node and every reinstall of the module derives the same uid;
 - an ad-hoc tag (the `local` module): 128 random bits.
 
-Its `TagId` is allocated locally from 1 upward and never reused: the counter is derived at boot as one past the largest `TagId` key in the ontology tree, which keeps a high-water tag record when the tag with the largest id is removed (ONTOLOGY-DESIGN§1).
+Its `TagId` is allocated locally from 1 upward and never reused: the counter is `next_tag_id` in the root list head (ENGINE-DESIGN§1.2), outside the snapshot-aware ontology tree.
 
 **Names.** Every tag has a canonical name and any number of aliases. A name resolves to a tag when it is unique among installed tags; when two modules declare the same name (`album` from music and from photos), each is reachable by its qualified name (`systems.metta.music:album`) and the bare name is ambiguous — an error that names both. Modules reference other modules' tags by qualified name, and the core ontology's names resolve unqualified when no other module claims them.
 
@@ -315,8 +315,7 @@ Values are positional, versioned CBOR (FORMAT-DESIGN§1.6), schema version 1:
 
 ```text
 TagRecord    = [version, uid: bytes(16), name: text, aliases: [text],
-                kind: uint,              // 0 label, 1 attribute key, 2 record field,
-                                         //   0xFF high-water marker
+                kind: uint,              // 0 label, 1 attribute key, 2 record field
                 value_type: uint,        // attribute keys and record fields: 0 text, 1 int,
                                          //   2 float, 3 timestamp, 4 blob
                 collection: uint,        // 0 plain, 1 grouping, 2 ordered, 3 ranked
@@ -343,10 +342,9 @@ ModuleRecord = [version, uid: bytes(16), id: text, module_version: text, name: t
 
 `TagId`s and rule ids inside records are local; a record's uids are what leaves the node.
 
-- **Tag ids.** `TagId`s are allocated from 1 and never reused. The counter is derived at boot as
-  one past the largest tag key. When the tag holding the largest `TagId` is removed, its record is
-  replaced by a high-water marker (`kind = 0xFF`, no name, no provenance) so the counter cannot fall
-  back; a marker is removed once a larger key exists. Rule ids follow the same rule.
+- **Tag and rule ids.** `TagId`s and rule ids are allocated from 1 and never reused. Their
+  counters are `next_tag_id` and `next_rule_id` in the root list head (ENGINE-DESIGN§1.2), so
+  removing a record, snapshot cleanup or deleting a rollback branch never lowers them.
 - **Granularity codes** for `Bucket`: 0 year, 1 month, 2 week, 3 day, 4 hour for timestamps;
   for integers, `16 + k` means power-of-two classes of width 2ᵏ.
 - **Mount.** Every record is loaded; the engine builds the name maps (canonical names, aliases,
