@@ -91,9 +91,15 @@ values — so two different values are never the same term.
 **Locality.** `TermId`s are meaningful only within their pool. Nothing that leaves the node
 carries a `TermId`; sync carries values and receivers intern them.
 
-**Reclamation.** A background scan reclaims a term when both hold:
+**Reclamation.** A background scan reclaims a term when all hold:
 
-- its cardinality is zero in every live snapshot, so no tree refers to it; and
+- its cardinality is zero in every live snapshot, so no object refers to it;
+- it has no child terms: for a hierarchy node, the dictionary holds no entry with
+  `parent` = its `TermId` in any live snapshot (INDEX-DESIGN§4.2). Interior nodes such as
+  `europe` in `europe/france/paris` have no objects of their own and live as long as a value
+  below them does. A node's children sit directly after the `(kind, key, parent)` prefix, so
+  this is one dictionary seek per candidate; a node is reclaimed only after its last child is;
+  and
 - its dictionary entry's `last_modify_lsn` is older than the oldest retained journal entry
   (JOURNAL-DESIGN§1.6), so no retained history refers to it either.
 
