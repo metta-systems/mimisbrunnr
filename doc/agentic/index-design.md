@@ -583,7 +583,7 @@ queues a `WorkKind::OptionUpdate` entry, or, for a policy change affecting many 
 content rewrite, not a move: it walks the object in windows that end on old chunk boundaries,
 re-chunks each window with the new parameters and replaces its keys with one
 `ChunkListReplace` (JOURNAL-DESIGN§1.3), so every intermediate recipe reads the same bytes; a
-final `ChunkObjectFinalize` records the new parameters in the locator. The old chunks'
+final `FinalizeObject` records the new parameters in the locator. The old chunks'
 `ref_count`s drop as their windows are replaced, and chunks reaching zero are freed.
 
 **Snapshots.** The tree is snapshot-aware like the extent tree: an edit after a snapshot puts the

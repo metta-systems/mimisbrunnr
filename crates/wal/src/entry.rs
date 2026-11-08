@@ -168,6 +168,7 @@ pub enum WalOpKind {
     ChunkListAppend = 10,
     ChunkListReplace = 11,
     ChunkListShrink = 12,
+    // TODO(JOURNAL14): becomes `FinalizeObject` (any object, with chunk params).
     ChunkObjectFinalize = 13,
     /// Bucket lifecycle (METADATA-DESIGN§2.1 / ALLOCATION-DESIGN§1).
     BucketAlloc = 14,

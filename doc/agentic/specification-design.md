@@ -600,7 +600,7 @@ enum WalOpKind {
     AddRelation, RemoveRelation,
     WriteBlob,                                 // non-chunked objects
     ChunkInsertBatch, ChunkListAppend,         // chunked-object flow (§9.6)
-    ChunkListReplace, ChunkListShrink, ChunkObjectFinalize,
+    ChunkListReplace, ChunkListShrink, FinalizeObject,
     BucketAlloc, BucketGenBump, BucketDiscard, // §6.1 allocation
     BackpointerInsert, BackpointerRemove,
     SnapshotCreate, SnapshotDelete,

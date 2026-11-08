@@ -85,4 +85,13 @@ chunking axis (SPECIFICATION-DESIGN§3.5); the format-time default is no chunkin
 **Other pool-state trees** (`placement_rules_root`, `cluster_peers_root`) are root-list entries
 like every other tree (ENGINE-DESIGN§1.2), so one checkpoint advances them all atomically.
 
+**Administrative changes commit by checkpoint.** Changes to the pool state record, the disk
+descriptors, placement rules and cluster peers have no journal ops. An administrative command
+applies its change to those trees and forces a checkpoint (JOURNAL-DESIGN§1.5) before it
+returns; the change is durable exactly when that checkpoint is, and a crash before it leaves the
+pool as it was. These changes are rare, so a checkpoint each costs nothing that matters.
+Consequences that touch other state go through the ordinary paths: an `add-disk` or a new
+placement rule enqueues reconcile work in the same checkpoint, and the moves it causes are
+journalled as usual.
+
 ---

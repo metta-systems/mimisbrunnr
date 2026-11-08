@@ -181,7 +181,9 @@ record rules:
   written; recovery uses it to verify data written in the same commit (JOURNAL-DESIGN§1.5).
 
 ```rust
-CreateObject     : { oid: u64, created_ns: i64 }               // raises the origin node's next_local
+CreateObject     : { oid: u64, created_ns: i64, state: u8 }    // raises the origin node's next_local;
+                   //   state is Active (content appears whole at FinalizeObject or WriteBlob)
+                   //   or Writing (a stream, readable up to its durable length, JOURNAL-DESIGN§1.8)
 DeleteObject     : { oid: u64, lsn: u64 }
 AddTag           : { oid: u64, tag: u32 }                     // a direct tag (INDEX-DESIGN§2.4)
 RemoveTag        : { oid: u64, tag: u32 }
@@ -194,7 +196,7 @@ WriteBlob        : { oid: u64, content_hash: [u8;32], extent: BlockRef, size: u6
                    //   (METADATA-DESIGN§1.2). Larger non-chunked objects are written
                    //   through ExtendObject into an extent list (METADATA-DESIGN§1.3).
                    //   Chunked objects (INDEX-DESIGN§4.3) use the
-                   // ChunkInsertBatch / ChunkListAppend / ChunkObjectFinalize flow
+                   // ChunkInsertBatch / ChunkListAppend / FinalizeObject flow
                    // described in JOURNAL-DESIGN§1.3.1.
 
 // FastCDC chunked objects (INDEX-DESIGN§4.3, JOURNAL-DESIGN§1.3.1)
@@ -217,12 +219,14 @@ ChunkListShrink     : { oid: u64, new_length: u64 }
                    // Truncate oid's chunks to the first new_length plaintext bytes, which
                    //   fall on a chunk boundary. Replay removes the later keys and
                    //   decrements ref_count for each dropped chunk.
-ChunkObjectFinalize : { oid: u64, content_hash: [u8;32], total_length: u64,
-                        params: ChunkParamsRecord }
-                   // Publishes a chunked object: sets content_kind = ChunkList and the
-                   //   locator's params (METADATA-DESIGN§1.2); content_hash = whole-plaintext
-                   //   hash; length = total_length. A re-chunk ends with one to record the new
-                   //   params (INDEX-DESIGN§4.3). Readers see a fully assembled chunked object only after this op replays.
+FinalizeObject      : { oid: u64, content_hash: [u8;32], total_length: u64,
+                        chunk_params: ChunkParamsRecord }
+                   // Closes a write: sets content_hash and length = total_length; for a
+                   //   stream, moves Writing → Active. chunk_params is all zero for an
+                   //   object that is not chunked; otherwise it sets content_kind = ChunkList
+                   //   and the locator's params (METADATA-DESIGN§1.2). A re-chunk ends with
+                   //   one to record the new params (INDEX-DESIGN§4.3). An Active object
+                   //   written through the chunked flow shows its content only after this op.
 
 // Bucket lifecycle (ALLOCATION-DESIGN§1)
 BucketAlloc      : { disk_id: u16, bucket_no: u32, kind: u8, generation: u32 }  // bucket opened
@@ -333,9 +337,13 @@ matching `PlacementRule::Chunk` → superblock default). Then:
    entry), or on fsync, emits the `ChunkInsertBatch` and then the `ChunkListAppend`
    `{ oid, start_offset, chunks }`; the ChunkList keys are ordinary tree puts, flushed with
    every other tree at checkpoint.
-3. At end-of-write, emits `ChunkObjectFinalize { oid, content_hash, total_length, params }`;
+3. At end-of-write, emits `FinalizeObject { oid, content_hash, total_length, chunk_params }`;
    the locator's `ChunkParamsRecord` is the durable record of the parameters this object was
    written with.
+
+**Chunked streams** (an object created `Writing`) follow the same steps, except that the first
+`ChunkListAppend` sets `content_kind = ChunkList` and each one advances the durable `length` to
+its end, so the prefix is readable before `FinalizeObject` and survives a crash (JOURNAL-DESIGN§1.8).
 
 **Small in-place edit** (e.g. 4 KiB write at offset 1 GiB into a VM disk → FastCDC re-chunks
 the affected window, replacing 1–3 chunks):
@@ -344,9 +352,9 @@ the affected window, replacing 1–3 chunks):
 2. `ChunkListReplace { oid, start_offset, end_offset, chunks: [1..3] }` over the replaced
    chunks' range.
 
-No `ChunkObjectFinalize` is needed for in-place edits — the object is already published; the
+No `FinalizeObject` is needed for in-place edits — the object is already published; the
 replace op modifies its existing ChunkList. The total `content_hash` and `total_length` only
-change if the edit shifts logical length, in which case a follow-up `ChunkObjectFinalize` (or
+change if the edit shifts logical length, in which case a follow-up `FinalizeObject` (or
 `ChunkListShrink` for truncation) updates them.
 
 **Sync receive / resumable transfer.** Identical to bulk-write but driven by stream arrival
@@ -358,9 +366,10 @@ order. After crash, the receiver reads the object's last ChunkList key and resum
 shrink-replay; chunks reaching `ref_count = 0` are freed.
 
 **Crash semantics.** Each step is independently durable: chunks written to fresh buckets but
-not yet referenced from any `ChunkInsertBatch` get reclaimed by bucket-gen GC. A
-chunked object that crashed before `ChunkObjectFinalize` is invisible to readers — its oid's
-record's locator was never set — so no partial state is observable.
+not yet referenced from any `ChunkInsertBatch` get reclaimed by bucket-gen GC. An `Active`
+object written through the chunked flow that crashed before `FinalizeObject` shows no content —
+its locator was never set — so no partial state is observable; a chunked stream keeps its
+durable prefix.
 
 **Throughput model — 32 GiB bulk write, no dedup, across the FastCDC parameter space.**
 
@@ -576,10 +585,15 @@ Object bytes do not go through the journal, with one exception:
 |---|---|
 | Tiny: whole object ≤ `INLINE_WRITE_MAX` (2 KiB by default, set per pool) | `WriteInline` carries the bytes; one jset write makes the object durable. A later checkpoint moves inline objects into small-object buckets that pack many objects per block, so a 200-byte file does not occupy a 4 KiB blob sector ([BLOB-DESIGN](blob-design.md)). |
 | Small to large | Bytes go to blob extents at the stream's write point (ALLOCATION-DESIGN§1.5); `WriteBlob` or the chunked flow (JOURNAL-DESIGN§1.3.1) records them, with `extent_sum`s. |
-| Streaming (camera recording, logs, downloads) | The object is created in the `Writing` state (METADATA-DESIGN§1.1); bytes are appended to extents taken whole bucket by bucket from a per-stream write point, so the stream is physically sequential; `ExtendObject` (or `ChunkListAppend` for chunked streams) makes each prefix durable, typically under `Buffered` durability once per second or on request. Closing the object sets its final length and content hash, computed incrementally while streaming, and moves it to `Active`. |
+| Streaming (camera recording, logs, downloads) | The object is created in the `Writing` state (METADATA-DESIGN§1.1); bytes are appended to extents taken whole bucket by bucket from a per-stream write point, so the stream is physically sequential; `ExtendObject` (or `ChunkListAppend` for chunked streams) makes each prefix durable, typically under `Buffered` durability once per second or on request. Closing the object (`FinalizeObject`) sets its final length and content hash, computed incrementally while streaming, and moves it to `Active`. |
 
-After a crash a `Writing` object ends at its last journaled length; bytes written beyond it are
-reclaimed. Readers may follow a `Writing` object up to its durable length.
+**A stream survives an interrupted write.** Power loss, a crash or a writer that never closes
+leaves the object `Writing` at its last journaled length, with every byte up to it intact and
+readable; only bytes written beyond it are reclaimed. Nothing at mount discards or truncates a
+`Writing` object: a video recording cut off by a dead battery reads back up to its last durable
+second. A writer may reopen the stream and keep appending from its durable length, or close it;
+closing a stream whose incremental hash state was lost reads the durable prefix once to compute
+the content hash.
 
 ---
 
