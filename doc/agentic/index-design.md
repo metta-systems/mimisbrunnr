@@ -233,6 +233,7 @@ share one.
 | Add direct term `a` | add the object to `postings(t)` for each `t ∈ closure(D ∪ {a}) − closure(D)` |
 | Remove direct term `a` | `before = closure(D)`, `after = closure(D − {a})`; remove the object from `postings(t)` for each `t ∈ before − after` |
 | Delete the object | remove it from `postings(t)` for each `t ∈ closure(D)` |
+| Any mutation of the object, for `Bucket` rules on `changed` | `changed` becomes the mutation time; when `bucket(now)` differs from `bucket(old changed)`, move the object between the two bucket terms and the tags `ValueImplies` derives from them; tag writes read the record for this and to reject a missing or tombstoned object, and never rewrite it |
 | A record field changes (content write) | `before` and `after` are `closure(D)` with the old and new record; only the field's bucket terms and the tags `ValueImplies` derives from them can differ; remove the object from `before − after`, add it to `after − before` |
 | The record's state, locator kind or stream state changes | add the object to the labels in `labels(after) − labels(before)`, remove it from those in `labels(before) − labels(after)`; a tombstone removes it from `_object` |
 | New `Implies` `a → b` | for each `t ∈ {b} ∪ ancestors[b]`: `postings(t) |= postings(a)` |

@@ -327,7 +327,7 @@ TagRecord    = [version, uid: bytes(16), name: text, aliases: [text],
                 record_field: uint,      // kind 2: 1 length, 2 created_ns, 3 modified_ns,
                                          //   4 changed (latest of modified_ns, the forward
                                          //   entry's modified_ns and state_ns); 0 otherwise
-                flags: uint]             // bit 0: system label, asserted only by the engine
+                flags: uint]             // bit 0: system label, derived by the engine
 
 RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)]]
     kind 0 Implies       params = [from: TagId, to: TagId]
