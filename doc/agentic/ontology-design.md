@@ -40,7 +40,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 | Attribute key | a tag used as the key of `Attr(key, value)`, with a value type (`text`, `int`, `float`, `timestamp`, `blob`) | `artist`, `year`, `unix-path` |
 | Record field | a name for a field of the object record (METADATA-DESIGN§1.1), declared by the core ontology; never asserted, readable as a SQL column and usable as a `Bucket` input | `size`, `created`, `modified`, `changed` |
 
-**System labels.** The core ontology declares labels the engine asserts and retracts from the object record, and that users and applications cannot assert or remove (an attempt is a defined error): `_object` (the object is live; the universe of `Not`, SPECIFICATION-DESIGN§2.3), `_presence:remote` (its content is held by other nodes only, METADATA-DESIGN§1.2), `_writing` (a stream not yet closed). Their records carry the system flag.
+**System labels.** The core ontology declares labels the engine derives from the object record (INDEX-DESIGN§2.4), and that users and applications cannot assert or remove (an attempt is a defined error): `_object` (the object is live; the universe of `Not`, SPECIFICATION-DESIGN§2.3), `_presence:remote` (its content is held by other nodes only, METADATA-DESIGN§1.2), `_writing` (a stream not yet closed). Their records carry the system flag.
 
 **Collection flavour** — on a label or an attribute key:
 

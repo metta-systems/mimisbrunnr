@@ -32,7 +32,7 @@ Every assertion an object makes is a **term**; the index is an inverted index ov
 ## Invariants
 
 - Every posting of a term is in exactly one place: its dictionary entry's inline list or the postings tree, never both.
-- Postings and forward lists agree: at each snapshot, an object is in a term's postings iff the term is in the object's forward list or in the derived closure of its direct terms under that snapshot's ontology (INDEX-DESIGN§2.4).
+- Postings and forward lists agree: at each snapshot, an object is in a term's postings iff the term is in the object's forward list or in the derived closure of its direct terms and object record under that snapshot's ontology (INDEX-DESIGN§2.4).
 - A term's `TermId` is never reused, and two dictionary entries never denote the same term.
 - Posting ids are full `ObjectId`s (16-bit node, 48-bit local).
 
@@ -194,8 +194,9 @@ interned or reclaimed (INDEX-DESIGN§4.2).
 Postings hold direct and derived members alike, so `HasTag` (whether the tag is direct or
 implied) and queries on bucketed or rolled-up terms remain single posting reads. System labels
 (`_object`, `_presence:remote`, `_writing`, ONTOLOGY-DESIGN "Tags and attribute keys") are
-direct terms the engine asserts from the object record and are held in the forward entry like
-any other.
+derived from the object record, never held in the forward entry: the record is their only
+source, forward entries hold only asserted terms, and `HasTag { direct: true }` never matches
+them.
 
 **Closure tables.** At mount, and whenever `rules_epoch` advances, the engine builds from the rules,
 for every tag `t`:
@@ -213,6 +214,8 @@ closure(D) = tags(D) ∪ ⋃ ancestors[d] for d ∈ tags(D)
                                        and Attr(out_key, bucket(v)) for each Bucket rule on k
            ∪ for each record field f with a Bucket rule (size, created, modified, changed):
                                        Attr(out_key, bucket(record.f))
+           ∪ labels(record): _object when the record is live, _presence:remote when its content
+                             locator is Remote, _writing while its stream is open
            ∪ for each hierarchical value node in D: the roll-up terms of its ancestors (INDEX-DESIGN§4.2)
 ```
 
@@ -227,6 +230,7 @@ share one.
 | Remove direct term `a` | `before = closure(D)`, `after = closure(D − {a})`; remove the object from `postings(t)` for each `t ∈ before − after` |
 | Delete the object | remove it from `postings(t)` for each `t ∈ closure(D)` |
 | A record field changes (content write) | for each `Bucket` rule on the field, move the object from the old bucket term to the new one |
+| The record's state, locator kind or stream state changes | add the object to the labels in `labels(after) − labels(before)`, remove it from those in `labels(before) − labels(after)`; a tombstone removes it from `_object` |
 | New `Implies` `a → b` | for each `t ∈ {b} ∪ ancestors[b]`: `postings(t) |= postings(a)` |
 | New `ValueImplies` or `Bucket` on key `k` | for every term of key `k` the rule matches: OR that term's postings into the derived term's postings; for `Bucket`, one dictionary scan of `k` groups its value terms by bucket |
 | Removed rule | see below |

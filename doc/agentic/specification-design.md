@@ -141,8 +141,9 @@ enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge, Prefix, Contains }
   `Not(q)` is `_object − q`, so tombstoned objects never appear.
 - **System terms.** Engine-maintained labels expose record facts to queries: `_object`
   (live), `_presence:remote` (content held by other nodes only), `_writing` (a stream not yet
-  closed). Users and applications cannot assert or remove them (ONTOLOGY-DESIGN "Tags and
-  attribute keys").
+  closed). They are derived from the record into postings and never stored as asserted terms;
+  users and applications cannot assert or remove them (ONTOLOGY-DESIGN "Tags and attribute
+  keys", INDEX-DESIGN§2.4).
 - **Record fields** (`size`, `created`, `modified`, `changed`) are not attributes: SQL exposes
   them as columns filtered after the indexed part of a query, and ontology `Bucket` rules take
   them as inputs, so `created-month = 2026-11` or `size-class = 1-10MiB` are derived, indexed
