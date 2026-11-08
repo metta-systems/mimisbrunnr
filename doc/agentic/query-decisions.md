@@ -13,7 +13,6 @@ The SQL dialect is user-visible surface. Proposed capabilities, each to be spell
 - relation traversal from a selected set (`JOIN RELATION 'derived-from' ON subject` was one proposal), forward and reverse;
 - transitive closure over predicates (`CLOSURE OF <start> OVER 'derived-from', 'links', 'bundles'`, or `WITH RECURSIVE` mapped onto closure);
 - collection membership in sequence order (`IN COLLECTION playlist = 'workout' ORDER BY POSITION`);
-- path-context projection (`IN CONTEXT 'rpi4-sdcard'` exposing `unix_path`, `mode` as columns);
 - faceting (`SELECT tag, COUNT(*) FROM TAGS OF (<select>) ORDER BY 2 DESC LIMIT 20`);
 - a streaming subscription (`SUBSCRIBE TO <select> ON CHANGE content, created, deleted WITH DEBOUNCE 200ms`), which would register a subscription ([subscriptions-design.md](subscriptions-design.md));
 - `EXPLAIN` as SQL, alongside `--explain`.

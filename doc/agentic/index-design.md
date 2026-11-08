@@ -16,7 +16,7 @@ Every assertion an object makes is a **term**; the index is an inverted index ov
 
   | Tree | Key → value | Section |
   |---|---|---|
-  | Term dictionary | `(kind, key, context, parent, NormalisedValue, term_id, snapshot)` → statistics + inline postings | INDEX-DESIGN§4.1 |
+  | Term dictionary | `(kind, key, parent, NormalisedValue, term_id, snapshot)` → statistics + inline postings | INDEX-DESIGN§4.1 |
   | Term table | `term_id` → kind, key and full value | INDEX-DESIGN§4.1 |
   | Postings | `(term_id, id >> 16, snapshot)` → one roaring container | INDEX-DESIGN§3.1–3.2 |
   | Forward | `(oid, snapshot)` → the object's term ids | INDEX-DESIGN§2 |
@@ -46,7 +46,7 @@ The numbered sections below are the normative on-disk and algorithmic specificat
 
 `Value` (the contents of attributes) is the only data type whose shape varies enough that fixed
 binary layout is wasteful. It is encoded as positional **CBOR** (FORMAT-DESIGN§1.6): a
-two-element array of an integer type tag and the payload, or three elements for `Scoped`:
+two-element array of an integer type tag and the payload:
 
 ```
 Value ::= [0, text]                      // Text(string)      payload: CBOR major type 3
@@ -54,7 +54,7 @@ Value ::= [0, text]                      // Text(string)      payload: CBOR majo
         | [2, float]                     // Float(f64)        payload: CBOR major type 7, 64-bit
         | [3, int]                       // Timestamp(i64)    payload: CBOR major type 0/1
         | [4, bytes]                     // Blob(bytes)       payload: CBOR major type 2
-        | [5, context, inner]            // Scoped { context: TermId (u64), inner: Value }  INDEX-DESIGN§1.3
+                                         // tag 5 unassigned
 ```
 
 Integers use the shortest CBOR form; a float is always written as a 64-bit CBOR float, so one
@@ -104,31 +104,6 @@ replaced by a **high-water marker** — a `TermRecord` of kind `TERM_KIND_HIGH_W
 value — in the same entry, so the boot-time counter cannot fall back below it. A marker is
 removed once a larger key exists, by the next reclamation that touches the table. At most one
 marker exists at a time.
-
-### 1.3 Scoped values
-
-`Value::Scoped { context, inner }` lets the same attribute key carry different values under
-different scopes without inflating the tag namespace — e.g. an object's `unix-path` value
-scoped by the group `unix-path-context = rpi4-sdcard`. The scope is the `TermId` of any term with
-the grouping, ordered or ranked collection flavour (ONTOLOGY-DESIGN "Tags and attribute keys") —
-a grouping label or a grouping attribute value.
-
-- A scoped value is its own term: `(key, Scoped { C, v })` and `(key, v)` are different terms,
-  so they have different postings without branching at the lookup site.
-- The dictionary key carries the scope in its `context` field (INDEX-DESIGN§4.1; `0` for unscoped
-  values), ahead of the normalised inner value. A scan over `(Attr, key, context, *)` therefore
-  lists every scoped value under one context — the manifest of a path projection — with no
-  separate manifest structure.
-- The query optimiser may rewrite `attr = K AND scope = C` as a lookup of `Scoped { C, K }`.
-
-A `Scoped` whose inner value is also `Scoped` is a format error. Attributes that are never
-context-scoped (e.g. `created_ns`) never use this variant.
-
-**Type validation.** `Scoped` is **transparent to ontology type-checking**: an attribute
-declared with `value_type = "text"` accepts both `Text(...)` and `Scoped { context, inner: Text(...) }`.
-The validator strips the `Scoped` wrapper and checks `inner`. It additionally checks that
-`context` is a term with a collection flavour other than plain; other terms cannot be used as
-scopes.
 
 ---
 
@@ -358,16 +333,14 @@ BTREE-DESIGN§1 tree of `BtreeKind::Sequences`:
 **Term dictionary.** A BTREE-DESIGN§1 tree of `BtreeKind::TermDictionary`, keyed by
 
 ```
-(kind: u8, key: u32, context: u64, parent: u64, value: NormalisedValue, term_id: u64, snapshot: u32)
+(kind: u8, key: u32, parent: u64, value: NormalisedValue, term_id: u64, snapshot: u32)
 ```
 
 through the packed-key codec; zero fields pack to almost nothing.
 
-- Tag terms: `kind = 0`, `key` = the tag, `context = parent = 0`, `value` all zero, `term_id` =
-  the tag.
-- Attribute terms: `kind = 1`, `key` = the attribute's key tag, `context` = the scope `TermId` of
-  a `Scoped` value or `0`, `parent = 0`, `value` = `NormalisedValue` of the (inner) value
-  (INDEX-DESIGN§4.2). For a hierarchical key each term is one path node: `parent` = the parent
+- Tag terms: `kind = 0`, `key` = the tag, `parent = 0`, `value` all zero, `term_id` = the tag.
+- Attribute terms: `kind = 1`, `key` = the attribute's key tag, `parent = 0`, `value` =
+  `NormalisedValue` of the value (INDEX-DESIGN§4.2). For a hierarchical key each term is one path node: `parent` = the parent
   node's `TermId` (`0` at the root) and `value` = the normalised component (INDEX-DESIGN§4.2).
 - Relation terms: `kind = 2`, `key` = the predicate, `value` = the target's `ObjectId`
   big-endian in bytes `[0..8]`, zero elsewhere.
@@ -425,7 +398,7 @@ struct TermRecord {                          // 8-byte head
 
 Tag terms have no term-table entry; the ontology defines tags.
 
-**Equality lookup** of `(key, v)`: normalise `v`; seek to `(1, key, context, 0, norm, 0)`; for every
+**Equality lookup** of `(key, v)`: normalise `v`; seek to `(1, key, 0, norm, 0)`; for every
 entry with that prefix, an `EXACT` entry matches outright, otherwise the term table's full value
 is compared. The matching entry's postings are its inline list or its postings-tree range. Most
 values (integers, floats, timestamps, text up to 14 bytes) are exact and take one descent.
@@ -445,8 +418,8 @@ orders the values they encode.
 | Text | first 14 bytes of UTF-8, then `min(length, 255)`, then `1` if longer than 14 bytes else `0` | length ≤ 14 |
 | Blob | first 14 bytes, then `min(length, 255)`, then a continuation byte as for Text | length ≤ 14 |
 
-A **range** query `lo ≤ key < hi` scans the dictionary from `(1, key, context, 0, norm(lo))` to
-`(1, key, context, 0, norm(hi))` and unions the postings of the entries it passes; entries whose
+A **range** query `lo ≤ key < hi` scans the dictionary from `(1, key, 0, norm(lo))` to
+`(1, key, 0, norm(hi))` and unions the postings of the entries it passes; entries whose
 normalised value equals a bound's and are not `EXACT` are compared against the term table's full
 value. A **prefix** query on text is the range from the prefix to its successor. Blob values are
 equality-only: a range over Blob values is rejected by the query layer.

@@ -25,7 +25,6 @@ Section numbers in item titles from SPEC3 on are sections of the system design (
 - [ ] **SPEC14 — Move §16 Architecture to the front.** Prerequisite: SPEC-D2.
 - [ ] **SPEC15 — Relocate §15 Engine & Persistence detail into ENGINE-DESIGN's format sections.** Prerequisite: SPEC-D2.
 - [ ] **SPEC16 — §11.9 build-system example with third-party dependencies.** Extend the incremental-rebuild example to projects that pull external dependencies, each with their own projects.
-- [ ] **SPEC17 — §12.3 scoped values.** Expand on `Value::Scoped` and scoped tags.
 - [ ] **SPEC18 — §13.1 derivations.** Clarify derived tags and the `stale` / `dirty` lifecycle tags.
 - [ ] **SPEC19 — §2.1 NodeId uniqueness.** Prerequisite: [CLUSTER-D1](cluster-decisions.md).
 - [ ] **SPEC20 — Bulk deletion in §7.5.** State that deleting a tag changes forward entries, postings and the dictionary only, never object records (METADATA-DESIGN "Deleting a tag").

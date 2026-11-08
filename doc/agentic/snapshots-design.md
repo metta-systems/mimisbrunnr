@@ -88,7 +88,7 @@ section's struct definitions show the field explicitly.
 
 **Where the field appears.** Every leaf-entry struct in this document marked snapshot-aware
 below carries a `snapshot: u32` field immediately after the kind-specific sort-key fields
-(e.g. `oid` for Forward, `(term_id, high)` for Postings, `(kind, key, context, parent, value, term_id)`
+(e.g. `oid` for Forward, `(term_id, high)` for Postings, `(kind, key, parent, value, term_id)`
 for TermDictionary). The
 field is part of the **key**, not the value — it participates in ordering and is what the
 BTREE-DESIGN§1.6 key format encodes in zero bytes when one snapshot dominates a run.

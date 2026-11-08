@@ -239,11 +239,11 @@ Specified in [INDEX-DESIGN§3](index-design.md#3-postings).
 
 Specified in [INDEX-DESIGN§4](index-design.md#4-dictionary-range-scans-and-chunks).
 
-## 10. Subscriptions, Path Contexts, Ontology
+## 10. Subscriptions, Unix Paths, Ontology
 
 These structures change less often than the index. Ontology records and subscription records are
-loaded at mount; subscription membership and pending events are read on demand; path projections
-are index terms with no structure of their own.
+loaded at mount; subscription membership and pending events are read on demand; Unix paths are
+attribute terms with no structure of their own.
 
 ### 10.1 Ontology persistence
 
@@ -253,9 +253,9 @@ Specified in [ONTOLOGY-DESIGN§1](ontology-design.md#1-ontology-persistence).
 
 Specified in [SUBSCRIPTIONS-DESIGN§1](subscriptions-design.md#1-subscriptions).
 
-### 10.3 Path projections
+### 10.3 Unix paths
 
-Specified in [UNIX-DESIGN§1](unix-design.md#1-path-projections).
+Specified in [UNIX-DESIGN§1](unix-design.md#1-unix-paths).
 
 ### 10.4 Pool state
 

@@ -93,7 +93,7 @@ Each operates on the result bitmap from the executor.
 - **Relation traversal:** following a predicate from the current set yields the targets' bitmap (forward direction from forward entries; reverse direction from the postings of the relation term `(predicate, target)`, [QUERY4](query-implementation-plan.md)), which further predicates intersect. The relation indices do the work of a join; no hash or merge join exists. "Sources of the release executable": find the executable, follow `derived-from`, intersect with `source`, project `name, lang`.
 - **Transitive closure:** iterative frontier expansion — `next = ⋃ targets(frontier, predicates) − visited`, until empty — for full provenance or dependency trees ([QUERY10](query-implementation-plan.md)).
 
-How relation traversal, closure, collection order, path contexts and faceting are spelled in SQL is [QUERY-D2](query-decisions.md).
+How relation traversal, closure, collection order and faceting are spelled in SQL is [QUERY-D2](query-decisions.md).
 
 ### Non-goals
 

@@ -47,11 +47,11 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 | Flavour | Meaning |
 |---|---|
 | plain | membership only |
-| grouping | the label, or each value of the key, is a named group usable as a scope (`Value::Scoped`, INDEX-DESIGN§1.3) |
+| grouping | the label, or each value of the key, is a named group (a project, an album), which browsing and faceting present as a group rather than a property |
 | ordered | each group keeps a user-defined order (INDEX-DESIGN§3.3) |
 | ranked | each group keeps members ordered by a score (INDEX-DESIGN§3.3) |
 
-`playlist` is an attribute key with the ordered flavour: `playlist = workout` is the workout playlist, a term with postings and a sequence. `unix-path-context` is an attribute key with the grouping flavour (ordered when a manifest order matters).
+`playlist` is an attribute key with the ordered flavour: `playlist = workout` is the workout playlist, a term with postings and a sequence. `project` is an attribute key with the grouping flavour.
 
 **Attribute key options:**
 
@@ -188,7 +188,8 @@ Commands: `mimir ontology list | install <file> | remove <module> | orphans | sh
 
 - **One ontology image per snapshot**, rewritten whole on every change. Ad-hoc tags make changes frequent; records make each change one entry.
 - **Node-local `TagId`s as the sync identity.** Two nodes allocate ids independently; uids name tags across nodes.
-- **Prefix-named tag families** (`playlist:workout`, `unix-path-context:rpi4`) as a tag kind beside attributes. An attribute value is already a term with postings; the collection flavour gives it group semantics.
+- **Prefix-named tag families** (`playlist:workout`) as a tag kind beside attributes. An attribute value is already a term with postings; the collection flavour gives it group semantics.
+- **Values scoped to a context** (`Scoped { context, inner }`: one key carrying a different value per path context, such as a file's path in each export). Exports are built by applications from queries (UNIX-DESIGN "Export"), so per-export data lives with the export, not on every object.
 - **A `Hierarchical` tag kind materialising every path prefix.** Hierarchy is a key option with trie storage and adaptive roll-ups (INDEX-DESIGN§4.2).
 - **Per-object n-gram postings.** N-grams index distinct values (INDEX-DESIGN§4.2).
 - **Install bookkeeping lists per module** (tags, implications, relations it added). Provenance sets per declaration replace them.

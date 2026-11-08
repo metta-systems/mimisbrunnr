@@ -106,8 +106,6 @@ enum Value {
     Float(f64),
     Timestamp(i64),
     Blob(Vec<u8>),
-    Scoped { context: TermId, inner: Box<Value> },  // a value that applies in one context
-                                                    //   (INDEX-DESIGN§1.3)
 }
 ```
 
@@ -124,7 +122,7 @@ enum Query {
     HasTag { tag: TagId, direct: bool },  // direct = false: carries the tag directly or derived —
                                           //   "vehicle" matches "car", "truck" (§3.3)
     HasKey(TagId),                        // has any value of the attribute key
-    HasAttr { key: TagId, op: CmpOp, value: Value, scope: Option<Scope> },
+    HasAttr { key: TagId, op: CmpOp, value: Value },
     Under { key: TagId, path: Value },    // hierarchical keys: the value or anything below it
     Related { predicate: TagId, target: ObjectId },
     And(Vec<Query>),
@@ -132,7 +130,6 @@ enum Query {
     Not(Box<Query>),                      // complement within the live objects
 }
 
-enum Scope { Unscoped, In(Value /* the grouping value naming the scope */), Any }
 enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge, Prefix, Contains }
 ```
 
@@ -161,7 +158,7 @@ Example — "all portable electronics from 2024, not discontinued":
 And(vec![
     HasTag { tag: tag("electronics"), direct: false },
     HasTag { tag: tag("portable"), direct: false },
-    HasAttr { key: tag("year"), op: Eq, value: Int(2024), scope: None },
+    HasAttr { key: tag("year"), op: Eq, value: Int(2024) },
     Not(Box::new(HasTag { tag: tag("discontinued"), direct: false })),
 ])
 ```
@@ -191,8 +188,8 @@ struct TagRecord {
     name: String,
     aliases: Vec<String>,
     kind: TagKind,
-    collection: Collection,              // grouping: values name groups and may scope other
-                                         //   values; ordered / ranked: each group keeps a sequence
+    collection: Collection,              // grouping: values name groups (a project, an album);
+                                         //   ordered / ranked: each group keeps a sequence
     hierarchy_separator: Option<char>,   // values are paths: "europe/france/paris"
     ngram: Option<u8>,                   // substring search over the key's values
     storage: Option<StoragePolicy>,      // §3.5
@@ -465,7 +462,7 @@ Containers are keyed by the high 48 bits of the object id, so ids keep their ful
 
 ### 5.3 Term dictionary
 
-The dictionary is sorted by `(kind, key, context, parent, normalised value)`, where the normalised value is an order-preserving 16-byte encoding. An equality query is one lookup; a range or prefix query (`year > 2020`, `size BETWEEN 1MB AND 10MB`, `name LIKE 'cargo%'`) is one scan that unions the postings it passes. Each entry carries the term's cardinality and change counters for query planning and reclamation (INDEX-DESIGN§4).
+The dictionary is sorted by `(kind, key, parent, normalised value)`, where the normalised value is an order-preserving 16-byte encoding. An equality query is one lookup; a range or prefix query (`year > 2020`, `size BETWEEN 1MB AND 10MB`, `name LIKE 'cargo%'`) is one scan that unions the postings it passes. Each entry carries the term's cardinality and change counters for query planning and reclamation (INDEX-DESIGN§4).
 
 Values of a hierarchical key are a trie of path components (`parent` is the parent component's term), so shared prefixes are stored once, a directory listing is one scan and a subtree query unions a bounded number of postings with the help of roll-up terms on large subtrees. Keys declared with `ngram` answer substring queries (`name CONTAINS 'carg'`) from n-gram postings over their distinct values (INDEX-DESIGN§4.2).
 
@@ -1139,7 +1136,7 @@ A subscription watching `HasTag { tag: tag("audio"), direct: false }` automatica
 ```rust
 let (sub, sources) = mimir.subscribe(
     And(vec![
-        HasAttr { key: tag("project"), op: Eq, value: Text("vesper"), scope: None },
+        HasAttr { key: tag("project"), op: Eq, value: Text("vesper") },
         HasTag { tag: tag("source"), direct: false },
     ]),
     ChangeInterest::CONTENT_CHANGED | ChangeInterest::CREATED | ChangeInterest::DELETED,
@@ -1160,29 +1157,24 @@ loop {
 
 ### 12.1 Path Projections
 
-Unix paths are not how files live in Mímisbrunnr — they are metadata about how files appear when projected onto a Unix tree. The same object can have different paths in different contexts:
+Unix paths are not how files live in Mímisbrunnr — they are metadata. An object's `unix-path`
+values are where it appears in the Unix view of the pool, usually where it was imported from:
 
 ```
 Object: vesper-kernel-binary
-
-  unix-path-context = "project-tree"
-    unix-path="target/aarch64-unknown-none/release/vesper"
-
-  unix-path-context = "rpi4-sdcard"
-    unix-path="/boot/kernel8.img"
-    unix-mode=0o755
-    unix-uid=0
-    unix-gid=0
-
-  unix-path-context = "debian-package"
-    unix-path="usr/lib/vesper/kernel"
+  unix-path = "target/aarch64-unknown-none/release/vesper"
+  unix-mode = 0o755
+  project = vesper   component = kernel   type = executable
 ```
 
-### 12.2 Path Contexts
+### 12.2 Exports
 
-A **path context** is a value of the grouping attribute key `unix-path-context`, defined in
-the `unix-interop` ontology module. Members of the context carry `unix-path-context = "<name>"`;
-their per-context paths and metadata are ordinary attribute assertions scoped to that term.
+Where a file appears *outside* the pool — at `/boot/kernel8.img` on an SD-card image, at
+`usr/lib/vesper/kernel` in a Debian package — is the business of the application producing that
+export, not of the filesystem. The application selects objects with a query, decides their
+paths, order and modes (from attributes, a template, or its own rules), and writes the result.
+It may keep its manifest as an ordinary object, versioned and synced like any other. The pool
+stores no per-export data on the exported objects.
 
 There is **no symlink kind**. Unix needs symlinks because each inode has only one path;
 Mímisbrunnr objects can hold many `unix-path` assertions, so an object that should appear
@@ -1195,44 +1187,37 @@ objects exist in Mímisbrunnr.
 
 ### 12.3 Storage
 
-Path projections reuse the existing tag/attribute machinery:
+The Unix view reuses the existing attribute machinery:
 
-- **Membership** in a context: the object carries `unix-path-context = "<name>"`.
-- **Path** in a context: an `Attr(unix-path, Value::Scoped { context: term, inner: Text(...) })`
-  assertion, where `term` is the context's `TermId`. Unscoped values (plain `Text(...)`) are
-  visible in every context as the default. `unix-path` is a hierarchical key (§3.1), so paths
-  are stored as a trie of components and a directory listing is one dictionary scan.
-- **Per-context overrides** (mode, uid, gid): same `Scoped` form, applied to the matching
-  attribute.
-- **Ordered manifest** (for tarball export): the context term's sequence in the sequences
-  tree (INDEX-DESIGN§3.3), when `unix-path-context` is declared ordered.
+- **Path:** `Attr(unix-path, Text(...))`, any number per object. `unix-path` is a hierarchical,
+  n-grammed key (§3.1), so paths are stored as a trie of components: resolving a path walks
+  its components, a directory listing is one dictionary scan, and a name search is an n-gram
+  lookup (INDEX-DESIGN§4.2).
+- **Mode, uid, gid:** `unix-mode`, `unix-uid`, `unix-gid` attributes.
 
-See UNIX-DESIGN§1 for the full encoding contract and INDEX-DESIGN§1.3 for `Value::Scoped`.
+See UNIX-DESIGN§1 for the full encoding contract.
 
 ### 12.4 Export
 
-Generating a tarball reads the manifest sequentially:
-
-```
-mimir project export rpi4-sdcard --format tar.gz -o sdcard.tar.gz
-mimir project export debian-package --format deb -o vesper_0.1.0_arm64.deb
-```
+An exporting application runs a query, reads the objects' content and attributes, and writes
+its archive or image (§12.2). The filesystem offers the query, ordered collections
+(INDEX-DESIGN§3.3) for applications that keep a member order, and object reads; archive formats
+are the application's.
 
 ### 12.5 Import
 
-Ingesting a Unix tree: walk directory, create objects (dedup by content hash, METADATA-D6), set context membership and scoped paths, and auto-tag with the unix-interop module's path conventions (`lang = rust`, `type = source`):
+Ingesting a Unix tree: walk directory, create objects (dedup by content hash, METADATA-D6), set each object's `unix-path` and mode, uid and gid, and auto-tag with the unix-interop module's path conventions (`lang = rust`, `type = source`):
 
 ```
-mimir project import ./vesper-checkout \
-    --context project-vesper --project vesper --auto-tag
+mimir project import ./vesper-checkout --project vesper --auto-tag
 ```
 
 ### 12.6 FUSE Bridge
 
-For tools that require Unix paths, a FUSE shim mounts a specific path context:
+For tools that require Unix paths, a FUSE shim mounts the Unix view, optionally narrowed by a query:
 
 ```
-brunnr mount-unix --context project-vesper /mnt/vesper
+brunnr mount-unix /mnt/vesper --query "project = vesper"
 ```
 
 Read/write through the FUSE bridge goes through Mímisbrunnr — blobs updated, tags preserved.
@@ -1240,13 +1225,13 @@ Read/write through the FUSE bridge goes through Mímisbrunnr — blobs updated, 
 The FUSE VFS provides two navigation modes:
 
 - **`/tags/`** — TMSU/tagsistant-style tag navigation. Entering `/tags/electronic/ambient/` shows objects tagged with both. Tag paths use `BTreeSet<TagId>` for canonical ordering (path order doesn't matter). Faceted refinement only shows tags with non-empty intersection of the current result set.
-- **`/ctx/<context>/`** — Path context navigation, showing the projected Unix tree for a named context.
+- **`/paths/`** — the Unix tree formed by the objects' `unix-path` values.
 
 ```rust
 struct TagVfs {
     // Index access (paged through the engine's node cache; INDEX-DESIGN)
     index: TermIndex,                 // term dictionary, postings, forward index;
-                                      //   /ctx/ paths resolve through the unix-path trie
+                                      //   /paths/ resolve through the unix-path trie
     // Lazy inode allocation
     entries: HashMap<u64, TagVfsEntry>,
     next_ino: u64,
@@ -1259,7 +1244,7 @@ struct MimisbrunnrFs {
 
 ### 12.7 Multiple Projections
 
-The same objects serve all projections simultaneously — no file copying. A kernel binary has a project-tree path, an install path, a package path, and a TFTP debug path, all referring to the same blob.
+The same objects serve every view and every export simultaneously — no file copying. A kernel binary appears at its `unix-path` in the pool's Unix view, and at whatever paths an SD-card builder, a package builder or a TFTP server give it in their outputs, all reading the same blob.
 
 Core principle: **Unix paths are a projection, not the truth.** Like projecting a 3D model onto a 2D blueprint.
 
@@ -1449,7 +1434,7 @@ All engine state persists in the trees of the root list — B+ trees and positio
 │   Node A ◄──► Node B ◄──► Hub ◄──► Node C                        │
 ├──────────────────────────────────────────────────────────────────┤
 │                UNIX INTEROP LAYER                                │
-│   Path contexts │ Projections │ FUSE bridge │ Tarball export     │
+│   unix-path view │ Import │ FUSE bridge │ queries for exporters  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1478,7 +1463,7 @@ flowchart TB
     end
 
     subgraph TermIndex["Term index (INDEX-DESIGN)"]
-        Dict["Term dictionary<br/><i>(kind, key, context, parent, value) → TermId,<br/>stats, inline postings</i>"]
+        Dict["Term dictionary<br/><i>(kind, key, parent, value) → TermId,<br/>stats, inline postings</i>"]
         TermTable["Term table<br/><i>TermId → full value</i>"]
         Postings["Postings<br/><i>(TermId, window) → roaring container<br/>direct + derived terms</i>"]
         Sequences["Sequences<br/><i>ordered / ranked collections</i>"]
@@ -1597,7 +1582,7 @@ graph TB
 
     subgraph IndexLayer["Index Layer (B+ trees behind the journal)"]
         TagIndex["Postings<br/><i>(TermId, id window) → roaring container<br/>tags, attribute values, relations</i>"]
-        KVIndex["Term Dictionary<br/><i>(kind, key, context, parent, normalised value) → TermId, stats<br/>equality, range and prefix scans</i>"]
+        KVIndex["Term Dictionary<br/><i>(kind, key, parent, normalised value) → TermId, stats<br/>equality, range and prefix scans</i>"]
         RangeIndex["Sequences<br/><i>(TermId, position | score) → ObjectId<br/>ordered and ranked collections</i>"]
         ForwardIndex["Forward Index<br/><i>ObjectId → direct TermIds<br/>for getattr / tag listing</i>"]
     end
@@ -1835,8 +1820,8 @@ The design began as a list of properties for an associative persistent filesyste
 | Content-addressable storage | BLAKE3 content hashes and exact-content dedup (§9) |
 | Attributes read through the open handle, through a typed file-attribute interface rather than POSIX xattrs | Tags, attributes and relations as fields of Mettā's typed interfaces |
 | Tags and `attribute=value` pairs in place of filenames, with system-assigned MIME type and source URL | Assertions (§2.2); `name` is an ordinary attribute |
-| Scoped attribute namespaces (a development `project` differs from a business `project`) | Scoped values and tags (§12.3) |
-| Naming-context attributes for user navigation | Path contexts and projections (§12) |
+| Scoped attribute namespaces (a development `project` differs from a business `project`) | Qualified tag names: two modules may each declare `project` (§3.1) |
+| Naming-context attributes for user navigation | Queries, faceted navigation and the `unix-path` view (§5.6, §12) |
 | Trace objects: metadata and accounting kept after the data is gone, with a backup URL | Tombstones (§7) and content-presence stubs (§10.3) |
 | Helper components that set and query the relevant attributes so users need not tag by hand | Ontology modules (§4) and the source-project example (§13) |
 

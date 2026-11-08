@@ -34,7 +34,7 @@ Mímisbrunnr is the associative filesystem of the Mettā operating system. Once 
 - Pool management: multiple block devices, attach and detach, bucket allocation, ontology-driven placement and tiering.
 - Metadata replication with eventual convergence, each node authoritative for its own writes.
 - Subscriptions over `ChangeInterest`.
-- Access surfaces: the Mímir API and the FUSE adapter (tag navigation, Unix path projection under `/ctx/`); ontology authors through modules; operators through `brunnr`.
+- Access surfaces: the Mímir API and the FUSE adapter (tag navigation, the `unix-path` view under `/paths/`); ontology authors through modules; operators through `brunnr`.
 - Persistence formats: superblock, journal, object table, indices, ontology; little-endian, checksum-protected, positional CBOR for heterogeneous payloads.
 - Per-node snapshots capturing the assertion graph and the blob contents it references.
 

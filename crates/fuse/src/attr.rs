@@ -7,8 +7,8 @@
 /// File-kind discriminant — the only two shapes the FUSE bridge currently
 /// presents (read-only directories and read-only regular files).
 ///
-/// TODO(UNIX4): add `Symlink` once `/ctx/` projections start
-/// emitting symlinks.
+/// TODO(UNIX4): add `Symlink` if UNIX-D3 keeps host symlinks in the
+/// `/paths/` view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VfsAttrKind {
     /// A directory (lookup / readdir target).
