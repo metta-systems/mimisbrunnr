@@ -230,7 +230,7 @@ enum ContentKind {
 #[repr(C)]
 struct ExtentLocator {                       // content_kind = Extent
     replicas: [ReplicaRef; 4],               //  [0..32]   copies of the extent, [replica_count..4] zero
-    _reserved: [u8; 8],                      // [32..40]
+    generations: [u16; 4],                   // [32..40]   generation tag of each replica's bucket
 }
 
 #[repr(C)]
@@ -298,15 +298,16 @@ region's kind header names its predecessor and its first entry index, and each r
 
 ```rust
 #[repr(C)]
-struct ExtentEntry {                         // 40 bytes
+struct ExtentEntry {                         // 48 bytes
     stored_length: u32,                      //  [0..4]    bytes of this extent on disk
     replica_count: u8,                       //  [4..5]
     _pad: [u8; 3],                           //  [5..8]
     replicas: [ReplicaRef; 4],               //  [8..40]
+    generations: [u16; 4],                   // [40..48]   generation tag of each replica's bucket
 }
 ```
 
-A page holds 102 entries and a region 48 pages, 4 896 entries — about 19 GiB of 4 MiB extents —
+A page holds 85 entries and a region 48 pages, 4 080 entries — about 16 GiB of 4 MiB extents —
 before a new region is added. Appending (`ExtendObject`, JOURNAL-DESIGN§1.3) appends the changed
 page of the newest region; a `ReconcileMove` of one extent appends the page holding its entry.
 
@@ -352,6 +353,13 @@ struct ReplicaRef {                          // 8 bytes
     bucket_no: u32,                          // [4..8]   bucket within the disk
 }
 ```
+
+**Generation tags.** A content extent's `ReplicaRef` is paired with a `u16` **generation tag**:
+the low 16 bits of its bucket's generation when the extent was written (ALLOCATION-DESIGN§1.3).
+`ExtentLocator`, `ExtentEntry` and the packed locator carry one per replica. A read compares the
+tag with the low 16 bits of the resident generation; a mismatch is `StaleBlockRef`, as for a
+`BlockRef`. A reused bucket goes undetected only when it has been freed a multiple of 2¹⁶ times
+since the write.
 
 **Symmetric replicas.** Every physical copy of an extent or region is one `ReplicaRef` in
 `[0, replica_count)`; there is no distinguished "primary". `replicas[0]` is the read-preferred

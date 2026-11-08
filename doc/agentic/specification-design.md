@@ -574,6 +574,8 @@ struct ReplicaRef {             // 8 bytes — bucket-relative, mirrors Backpoin
 }
 ```
 
+Each content replica is stored with a 16-bit generation tag, checked on read (METADATA-DESIGN§2.1).
+
 **Symmetric replicas.** Every physical copy is one `ReplicaRef`; there is no distinguished "primary". `replicas[0]` is the read-preferred copy by convention. The cap of 4 bounds the replication factor — more durability uses erasure coding (a separate code path; see RECONCILE-DESIGN§1).
 
 A complementary **backpointer table** (`(disk_id, bucket_no, sector_offset) → owning key`) is maintained for copygc, scrub, evacuation, and resilver — turning O(pool size) operations into O(data on affected bucket). See METADATA-DESIGN§2.2.

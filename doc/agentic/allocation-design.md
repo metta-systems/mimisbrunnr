@@ -122,6 +122,9 @@ bucket's `generation` at write time. Dereference protocol:
    - a backpointer or a cached-replica reference is **stale**: it is skipped and dropped
      lazily.
 
+Content extents are checked the same way through the 16-bit generation tag stored beside each
+`ReplicaRef` (METADATA-DESIGN§2.1), compared with the low 16 bits of the resident generation.
+
 Generation comparison also resolves torn-write detection on freed blocks and stale-replica
 handling. The per-run and per-block checksums catch in-bucket corruption independently.
 

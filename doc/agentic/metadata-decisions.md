@@ -12,4 +12,4 @@ Import reuses an object whose content already exists (UNIX-DESIGN "Import"), whi
 
 ## Future work
 
-- None recorded.
+- Full 32-bit generations on content extents in place of the 16-bit tags (METADATA-DESIGN§2.1): a 12-byte `ReplicaRef`, so `ExtentLocator` holds three replicas in 40 bytes and `ExtentEntry` grows to 56 bytes. Worth it if the extent layouts change for another reason and free bytes appear, or if size evaluations show the wider records are affordable.
