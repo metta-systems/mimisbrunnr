@@ -843,7 +843,7 @@ Two fundamentally different regimes using the correct cryptographic mode for eac
 
 AES-GCM is **not** used for disk encryption — it expands data, catastrophically fails on nonce reuse (power loss), and requires per-sector stored nonces. XTS and HCTR2 derive all state from a tweak and the key.
 
-**Tweak construction:** HCTR2 tweaks come from the owner of the bytes, never their location, so moves copy ciphertext unchanged: `(object_id || block_no_within_object)` for an object's own extents, so identical content in different objects encrypts differently; `(chunk_hash[0..8] || block_no_within_chunk)` for chunks, which are deduplicated at the chunk index before encryption and stored once for every object sharing them; the block identifier for packed small-object blocks. XTS tweaks on node blocks are the block's address `(disk_id, bucket_no, sector)` (ENCRYPTION-DESIGN§1).
+**Tweak construction:** HCTR2 tweaks come from the owner of the bytes, never their location, so moves copy ciphertext unchanged: `(object_id || block_no_within_object)` for an object's own extents, so identical content in different objects encrypts differently; `(chunk_hash[0..8] || block_no_within_chunk)` for chunks, which are deduplicated at the chunk index before encryption and stored once for every object sharing them; the block identifier for packed small-object blocks. XTS tweaks on node blocks are the block's address and its bucket's generation `(disk_id, bucket_no, generation, sector)`, so a reused bucket never repeats a tweak (ENCRYPTION-DESIGN§1). Encryption is meant to be per object and switchable (ENCRYPTION-D6).
 
 **Integrity:** BLAKE3 checksums on plaintext stored in the object records (node buckets, different key) detect tampering that XTS/HCTR2 cannot.
 

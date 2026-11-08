@@ -11,7 +11,7 @@ Every zone is encrypted with the cipher SPECIFICATION-DESIGN§9.3 assigns it, un
 
 ## Selected design
 
-- **Ciphers:** node-bucket blocks XTS-AES-256 (tweak = block address); data extents HCTR2 (tweak from the owner: `object_id`, or the chunk hash for shared chunks, ENCRYPTION-DESIGN§1); WAL AES-256-GCM (AAD `header[0..36]`, nonce `LSN || 0`, 16 B tag before the trailing CRC); sync traffic ChaCha20-Poly1305; Adiantum as the fallback without AES instructions.
+- **Ciphers:** node-bucket blocks XTS-AES-256 (tweak = block address and bucket generation); data extents HCTR2 (tweak from the owner: `object_id`, or the chunk hash for shared chunks, ENCRYPTION-DESIGN§1); WAL AES-256-GCM (AAD `header[0..36]`, nonce `LSN || 0`, 16 B tag before the trailing CRC); sync traffic ChaCha20-Poly1305; Adiantum as the fallback without AES instructions.
 - **Key hierarchy:** `MasterKEK → DiskKey` (SPECIFICATION-DESIGN§9.4); the superblock records `encryption_keyid`.
 - Sector padding for XTS/HCTR2 is already in the pipeline; WAL entries compress before they encrypt.
 
@@ -24,9 +24,12 @@ The numbered sections below are the normative on-disk and algorithmic specificat
 The on-disk layout is encryption-aware but encryption-agnostic:
 
 - **Node buckets** (tree nodes and positional regions, ALLOCATION-DESIGN§1.2): blocks encrypted
-  with **XTS-AES-256**, tweak = the block's address `(disk_id, bucket_no, sector)`. Fixed layout
-  is preserved (no expansion). Headers are encrypted along with payload — verifiers decrypt then
-  check magic.
+  with **XTS-AES-256**, tweak = `(disk_id, bucket_no, generation, sector)` — the block's address
+  and the bucket's generation (ALLOCATION-DESIGN§1.3), so a reused bucket never encrypts new
+  content under an old tweak, which would expose equal 16-byte blocks across the bucket's
+  lives. The tweak follows the location: moving a node (copy GC, RECONCILE-DESIGN§1.5) decrypts
+  and re-encrypts it. Fixed layout is preserved (no expansion). Which node blocks are encrypted,
+  and whether whole or by run or entry, is [ENCRYPTION-D6](encryption-decisions.md).
 - **Data and packed buckets**: encrypted with **HCTR2-AES-128**, length-preserving. The tweak
   depends on who owns the bytes, never on where they are, so moves (RECONCILE-DESIGN§1.5) copy
   ciphertext without re-encrypting:
@@ -39,7 +42,9 @@ The on-disk layout is encryption-aware but encryption-agnostic:
 - **Journal**: each journal set's entries are **AES-256-GCM** authenticated as one unit when
   `JSET_FLAG_ENCRYPTED` is set (JOURNAL-DESIGN§1.2).
   - **Key**: the pool's journal key from the key hierarchy — one key for the whole journal, so
-    mirrored copies of a set on different disks are byte-identical.
+    mirrored copies of a set on different disks are byte-identical. It is derived with the
+    pool's `fs_uuid` as input (ENGINE-DESIGN§1.1): jset sequence numbers restart in every pool,
+    so a pool recreated under the same passphrase must not reuse the previous pool's key.
   - **Nonce**: 96 bits = 64-bit jset `seq` || 32-bit zero. Nonces are unique by construction —
     sequence numbers are monotonically allocated and never repeat under one key. AES-GCM is
     *not* a nonce-misuse-resistant scheme; uniqueness must be enforced and reuse is catastrophic.
@@ -55,8 +60,16 @@ The on-disk layout is encryption-aware but encryption-agnostic:
 - **Sync bundles**: **ChaCha20-Poly1305** with random nonces.
 
 Keys never leave the in-memory key hierarchy (`MasterKEK → DiskKey`). The superblock stores only
-key *identifiers*. A node booting without the master key still mounts the disk read-only at the
-unencrypted-layout level (block headers, but not payloads).
+key *identifiers*.
+
+**Without the keys** a node can read the superblocks and the journal-set headers (authenticated,
+not encrypted) and nothing else of an encrypted pool: the root list travels in encrypted journal
+sets (ENGINE-DESIGN§1.2), so no tree is reachable. What remains readable of a pool that encrypts
+only some objects depends on ENCRYPTION-D6.
+
+**Integrity.** XTS and HCTR2 do not authenticate. Random modification of a block is caught by
+its checksum and of object content by its BLAKE3 hash; writing back an older valid version of a
+block or bucket is [ENCRYPTION-D7](encryption-decisions.md).
 
 ---
 

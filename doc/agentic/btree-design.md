@@ -120,7 +120,9 @@ struct RunBlockEntry {                       // 16 bytes
     max_snapshot: u32,                       // [12..16]  … and largest, in the block; 0 otherwise
 }
 
-const RUN_FLAG_ENCRYPTED:        u16 = 1 << 0;  // data blocks encrypted (ENCRYPTION-DESIGN§1)
+const RUN_FLAG_ENCRYPTED:        u16 = 1 << 0;  // data blocks encrypted; whether encryption is
+                                                //   marked here, per pool or per entry is
+                                                //   ENCRYPTION-D6
 const RUN_BLOCK_FLAG_VALUE:      u16 = 1 << 0;  // raw bytes of large values, no block head
 ```
 
