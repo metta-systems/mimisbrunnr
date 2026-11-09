@@ -320,6 +320,8 @@ struct ExtentEntry {                         // 56 bytes
   right a larger `skip`. Keys of one object at one snapshot never overlap. When the overlapped
   key was written at an ancestor snapshot, the write also puts a whiteout at that key's position
   in the current snapshot, so the ancestor's version stays visible only where it still applies.
+  An extent no key or record version names any more is freed; one a snapshot's key still names
+  stays (SNAPSHOTS-DESIGN§1.6, "References").
 - **Encoded extents** — compressed ones — are decoded whole, then `skip` and `logical_length`
   select the covered bytes; plain extents are read from `skip` directly, sector-aligned.
 - **Size limits.** A plain extent is at most one bucket of its disk. An encoded extent holds at

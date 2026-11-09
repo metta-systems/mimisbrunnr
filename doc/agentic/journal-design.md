@@ -268,13 +268,14 @@ ChunkListReplace    : { oid: u64, start_offset: u64, end_offset: u64,
                         chunks: [(chunk_hash: [u8;32], length: u32); N] }
                    // In-place patch: the keys covering [start_offset, end_offset) — chunk
                    //   boundaries, as FastCDC re-chunks whole chunks — are replaced by N
-                   //   keys whose lengths sum to the new range. Replay drops the old keys
-                   //   (whiteouts for keys of an ancestor snapshot) and adjusts
-                   //   ChunkIndex.ref_count (decrement old, increment new).
+                   //   keys whose lengths sum to the new range. Replay removes the old keys
+                   //   written at the current snapshot and whiteouts those of an ancestor
+                   //   snapshot; ref_count rises for each new key and falls only for each
+                   //   key physically removed (SNAPSHOTS-DESIGN§1.6).
 ChunkListShrink     : { oid: u64, new_length: u64 }
                    // Truncate oid's chunks to the first new_length plaintext bytes, which
-                   //   fall on a chunk boundary. Replay removes the later keys and
-                   //   decrements ref_count for each dropped chunk.
+                   //   fall on a chunk boundary. Replay removes or whiteouts the later keys
+                   //   as ChunkListReplace does, with the same ref_count rule.
 FinalizeObject      : { oid: u64, content_hash: [u8;32], total_length: u64,
                         chunk_params: ChunkParamsRecord }
                    // Closes a write: sets content_hash and length = total_length; for a
@@ -283,6 +284,9 @@ FinalizeObject      : { oid: u64, content_hash: [u8;32], total_length: u64,
                    //   and the locator's params (METADATA-DESIGN§1.2). A re-chunk ends with
                    //   one to record the new params (INDEX-DESIGN§4.3). An Active object
                    //   written through the chunked flow shows its content only after this op.
+                   //   Converting between chunked and not chunked ends with one that
+                   //   switches content_kind and range-deletes the old representation's keys
+                   //   (oid, *) at the current snapshot (INDEX-DESIGN§4.3).
 
 // Bucket lifecycle (ALLOCATION-DESIGN§1)
 BucketAlloc      : { disk_id: u16, bucket_no: u32, kind: u8, generation: u32 }  // bucket opened

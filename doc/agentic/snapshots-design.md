@@ -310,16 +310,26 @@ prevent generation bumps once *all* snapshots have moved on), retention is enfor
   ancestor of any live snapshot can see that key.
 - Copy GC (ALLOCATION-DESIGN§1.6) treats an extent as live if any backpointer's `bucket_gen` matches the bucket
   *and* its owner's snapshot is still reachable through the snapshot tree.
-- When the deleting snapshot pass (SNAPSHOTS-DESIGN§1.5) removes a key, the corresponding backpointer is
-  removed too. Once a bucket has no live backpointers, its generation can be bumped.
+- Once a bucket has no live backpointers, its generation can be bumped.
 
-**Extents shared by record versions.** An object's head record and its `ObjectHistory` versions
-may name the same extent or list region — a state change pushes down a version whose locator is
-unchanged. A backpointer names the owner (`oid`, extent index), not a version, so the move path
-(RECONCILE-DESIGN§1.5) updates **every** version of the oid whose locator names the moved
-location: the radix record and each matching `ObjectHistory` entry, under the move's single LSN.
-An object has at most as many versions as snapshots it changed in, so the update is bounded by
-that, and an extent stays live while any version names it.
+**References.** A reference to an extent or chunk is a key or locator that physically exists: an
+`ExtentList` or `ChunkList` key at any snapshot, or a record's locator in the radix or in
+`ObjectHistory`. A whiteout is not a reference. A reference ends only when its key or version is
+physically removed — overwritten at the snapshot that wrote it, or dropped by snapshot cleanup
+(SNAPSHOTS-DESIGN§1.5) — never when a later snapshot whiteouts it.
+
+- **Chunks:** `ChunkIndex.ref_count` counts physical `ChunkList` keys; a put raises it, a
+  physical removal lowers it, a whiteout leaves it; at zero the chunk is freed.
+- **Extents:** there is no counter. One physical extent may be named by several keys — split
+  pieces after an overwrite, and keys of several snapshots — and by several record versions,
+  under one backpointer per replica. When a reference is physically removed, the engine looks for
+  any other: the oid's keys at every snapshot within the backpointer's owner range
+  `[start_offset, start_offset + length)` (METADATA-DESIGN§2.2) and the oid's record versions. If
+  none names the extent, its backpointers are removed and its sectors leave `live_sectors`.
+
+The move path (RECONCILE-DESIGN§1.5) updates every reference the same search finds, under the
+move's single LSN. An object has at most as many versions as snapshots it changed in, and an
+extent's keys lie within its owner range, so both are bounded.
 
 Snapshot retention scales with **logical changes**, not bucket counts.
 

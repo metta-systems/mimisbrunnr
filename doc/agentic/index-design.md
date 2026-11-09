@@ -556,7 +556,8 @@ struct ChunkParamsRecord {                   // 16 bytes — in the ChunkList lo
 
 #[repr(u8)]
 enum ChunkingAlgo {
-    None      = 0,                           // not chunked — record exists for re-chunk overrides
+    None      = 0,                           // not chunked: in policies and the pool default only,
+                                             //   never in a ChunkList locator
     FixedSize = 1,                           // for resumability without CDC overhead
     FastCDC   = 2,                           // content-defined; default for the chunked path
     // 3+ reserved for future algorithms
@@ -586,7 +587,20 @@ content rewrite, not a move: it walks the object in windows that end on old chun
 re-chunks each window with the new parameters and replaces its keys with one
 `ChunkListReplace` (JOURNAL-DESIGN§1.3), so every intermediate recipe reads the same bytes; a
 final `FinalizeObject` records the new parameters in the locator. The old chunks'
-`ref_count`s drop as their windows are replaced, and chunks reaching zero are freed.
+`ref_count`s drop as their keys are physically removed, and chunks reaching zero are freed; keys
+a snapshot still holds keep their chunks (SNAPSHOTS-DESIGN§1.6). Window size is BLOB-D6.
+
+- **Concurrent writes.** Reading a window, writing its new chunks and emitting its
+  `ChunkListReplace` are not one step, so an application may write into the window meanwhile.
+  Before journalling the replace, the engine checks that the object's keys in the window are
+  the ones it read; under the engine's single writer the check and the entry are atomic. If they
+  changed, the window is redone from the new keys.
+- **Chunking turned on or off.** When the resolved policy makes an `Extent` or `ExtentList`
+  object chunked, or a chunked one not chunked, the pass writes the whole new representation —
+  chunk keys, or extent keys — while readers still see the old one, then one `FinalizeObject`
+  switches `content_kind` and range-deletes the old representation's keys `(oid, *)` at the
+  current snapshot in the same commit. A snapshot keeps its own version; the same concurrent-write
+  check covers the whole object.
 
 **Snapshots.** The tree is snapshot-aware like the extent tree: an edit after a snapshot puts the
 new keys and whiteouts at the current snapshot and leaves the snapshot's keys in place, so both

@@ -28,6 +28,10 @@ Tiny objects are packed into small-object buckets at checkpoint (JOURNAL-DESIGN�
 
 `content_hash` is BLAKE3 of the whole plaintext (METADATA-DESIGN§1.1). For a chunked object an in-place edit (JOURNAL-DESIGN§1.3.1) changes the hash, and recomputing it means reading the whole object — 32 GiB for a 4 KiB edit of a VM image. Direction under consideration: a Merkle-style hash for chunked objects, computed over the ordered chunk hashes (and lengths) instead of the bytes, so an edit recomputes it from the `ChunkList` keys alone. Open: the exact construction (flat hash over the chunk list, or a tree so a range edit updates O(log n) nodes), whether exact-content deduplication (METADATA-D6) and sync compare it with byte hashes of non-chunked objects (the same bytes chunked differently would hash differently), and whether non-chunked objects keep the byte hash. Blocks the hash maintenance of `ChunkListReplace` and `ChunkListShrink`.
 
+## BLOB-D6 — Re-chunk window size
+
+Re-chunking walks an object in windows ending on old chunk boundaries (INDEX-DESIGN§4.3), so the last new chunk of each window is cut at the window edge instead of where the chunker would cut it, losing a little deduplication per window; a window is also what the concurrent-write check redoes. Larger windows mean fewer forced cuts and longer redos. Options: a pool-state value (e.g. 64 MiB default), a fixed multiple of the new `max_size`, or left to the implementation and not pinned. Shapes [BLOB3](blob-implementation-plan.md).
+
 ## Future work
 
 - None recorded.
