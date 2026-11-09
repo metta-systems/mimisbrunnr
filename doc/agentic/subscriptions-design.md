@@ -39,17 +39,27 @@ Every mutation is already a journal entry with an LSN, so a watch is a saved que
 
 ## Evaluation
 
-**Index.** Each subscription's compiled query yields the terms it reads (tags, attribute
-values, roll-up terms, `_object` when it contains `Not`) and the keys it reads by range
-(`HasKey`, comparisons, `Contains`, `Under`). N-gram terms are not indexed: an object's closure
-delta never contains them, so `Contains` reaches subscriptions through its key. The engine keeps, in memory:
+**The match index.** Every persisted query whose matches must follow mutations is a
+**watcher**: a subscription, or a placement or hydration rule (POOL-DESIGN§1, SPECIFICATION-DESIGN§8.3).
+Each watcher's compiled query yields the terms it reads (tags, attribute values, roll-up terms,
+`_object` when it contains `Not`) and the keys it reads by range (`HasKey`, comparisons,
+`Contains`, `Under`). N-gram terms are not indexed: an object's closure delta never contains
+them, so `Contains` reaches watchers through its key. The engine keeps one match index, in
+memory:
 
-- `term_to_subs: TermId → [SubscriptionId]`
-- `key_to_subs: TagId → [SubscriptionId]` for keys read by range
-- `content_subs: [SubscriptionId]` — subscriptions whose interest includes content changes
-- `unresolved: name → [SubscriptionId]` — names a query uses that do not exist yet: an attribute
+- `term_to_watchers: TermId → [WatcherId]`
+- `key_to_watchers: TagId → [WatcherId]` for keys read by range
+- `content_watchers: [WatcherId]` — watchers whose query or interest depends on content or
+  record fields (content changes, `size`, `modified`)
+- `unresolved: name → [WatcherId]` — names a query uses that do not exist yet: an attribute
   value with no dictionary entry, keyed `(key, NormalisedValue)`, or a tag whose `TagUid` no
   installed module defines
+
+A `WatcherId` names a subscription or a rule. What a reached watcher does with a match differs:
+a subscription stores events (below); a placement or hydration rule enqueues reconcile work for
+the object (RECONCILE-DESIGN§1.1), whose worker then recomputes the object's desired state. A new
+or changed rule is a scan of its query's result (RECONCILE-DESIGN§1.3); after that, mutations
+reach it only through the index.
 
 **Names that appear later.** A query may name a value no object has yet (`artist = "Nobody"`)
 or a tag from a module not installed yet. Compilation records each such name in `unresolved`.
@@ -60,16 +70,16 @@ waiting subscriptions are recompiled in that commit and indexed under the new `T
 like any other. `ReclaimTerms` (INDEX-DESIGN§1.2) returns the subscriptions of each reclaimed
 term to `unresolved`, so a value written again under a new `TermId` is still caught.
 
-**Which subscriptions a mutation reaches.** Maintaining postings already computes the terms that
-enter and leave an object's closure (INDEX-DESIGN§2.4). The subscriptions reached are those
-under each such term in `term_to_subs`, those under its key in `key_to_subs`, and, for a content
-write, `content_subs`. Object creation and deletion change `_object` and the object's terms like
-any other mutation.
+**Which watchers a mutation reaches.** Maintaining postings already computes the terms that
+enter and leave an object's closure (INDEX-DESIGN§2.4). The watchers reached are those under
+each such term in `term_to_watchers`, those under its key in `key_to_watchers`, and, for a
+content or record-field change, `content_watchers`. Object creation and deletion change
+`_object` and the object's terms like any other mutation.
 
-**Per-object evaluation.** For each reached subscription, *after* is the compiled query
-evaluated against the object's terms after the mutation — its forward entry plus closure, with
-range and `Contains` predicates compared through the term table — and *before* is the same
-against its terms before (both closures are at hand). No postings are read.
+**Per-object evaluation.** For each reached watcher, *after* is `matches(query, view)`
+(QUERY-DESIGN "Per-object evaluation") over the object's view after the mutation, and *before*
+the same over its view before (both closures are at hand). No postings are read. A rule acts on
+*after* alone; a subscription turns the pair into an event:
 
 | Before | After | Event |
 |---|---|---|
@@ -79,8 +89,8 @@ against its terms before (both closures are at hand). No postings are read.
 | no | no | none |
 
 **Rule changes.** A rule install or removal reworks postings container by container
-(INDEX-DESIGN§2.4); each container delta of a term in `term_to_subs` is handed to the
-subscriptions under that term, whose objects are evaluated as above. A module adding
+(INDEX-DESIGN§2.4); each container delta of a term in `term_to_watchers` is handed to the
+watchers under that term, whose objects are evaluated as above. A module adding
 `m4a → audio` delivers `Entered` for every existing `m4a` object in bulk, stored as one bulk
 event per id window (SUBSCRIPTIONS-DESIGN§1): in the commit that installs it, or window by window
 as a resumable rework advances (INDEX-DESIGN§2.4).

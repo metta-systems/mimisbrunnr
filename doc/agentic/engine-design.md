@@ -242,7 +242,7 @@ resident tables:
 | Term dictionary, term table, postings, sequences, forward index (accessors over `BTreeNodeCache`) | INDEX-DESIGN§2–§4 trees | no resident mirror; posting containers and forward entries read in place from cached blocks |
 | `TermId`, `TagId`, rule id counters          | root list head (ENGINE-DESIGN§1.2), advanced by replay | resident scalars |
 | `OntologyState` (name and uid maps, closure tables) | ONTOLOGY-DESIGN§1 ontology tree      | fully resident; closure tables rebuilt when `rules_epoch` advances |
-| `SubscriptionEngine` (records, compiled queries, `term_to_subs` / `key_to_subs`) | SUBSCRIPTIONS-DESIGN§1 subscription trees | resident; membership containers and pending events read on demand |
+| `SubscriptionEngine` (records, compiled queries) and the `MatchIndex` of subscriptions and placement and hydration rules (SUBSCRIPTIONS-DESIGN "Evaluation") | SUBSCRIPTIONS-DESIGN§1 subscription trees; rules from their pool trees | resident; membership containers and pending events read on demand |
 | `PoolManager`                                | POOL-DESIGN§1 pool state and disk descriptors | fully resident     |
 | Bucket generations (`Vec<u32>` per disk) | ALLOCATION-DESIGN§1.3, per-disk alloc table | fully resident (4 B per bucket) |
 | `WritePoints` (`(disk, bucket kind, stream tag) → open bucket`) | derived; opens journalled as `BucketAlloc` | resident; ~hundreds of entries |

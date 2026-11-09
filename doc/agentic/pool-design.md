@@ -7,7 +7,7 @@ Plan: [pool-implementation-plan.md](pool-implementation-plan.md) · Open decisio
 
 ## Goal
 
-A pool spans any number of disks across tiers; placement and tiering follow placement rules over each object's assertion set, so retagging an object re-places it without a separate relocation call.
+A pool spans any number of disks across tiers; placement and tiering follow placement rules over each object's assertion set, so retagging an object re-places it without a separate relocation call: rules are watchers in the match index shared with subscriptions (SUBSCRIPTIONS-DESIGN "Evaluation") and match through the one per-object evaluator (QUERY-DESIGN "Per-object evaluation").
 
 ## Selected design
 

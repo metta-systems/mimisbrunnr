@@ -37,6 +37,30 @@ rest, and `Not` reads the `_object` container of the window. `LIMIT` stops the s
 post-operations consume windows, not a materialised result. Memory is bounded by a few
 containers per operand, whatever the result size — the property the device needs.
 
+**Per-object evaluation.** The second question a query answers is whether *one* object
+matches. An `ObjectView` holds what is known about one object without reading postings: its
+forward entry, the closure of its direct terms (INDEX-DESIGN§2.4), its system labels and its
+record fields. `matches(&CompiledQuery, &ObjectView) -> bool` evaluates the same compiled form
+the set executor runs:
+
+- `HasTag` tests the closure, `HasTag { direct }` the forward entry;
+- `HasAttr`, ranges, prefixes and `Contains` compare the object's values of the key through the
+  term table, with full values at non-exact boundaries as in a dictionary scan;
+- `Under` walks the object's hierarchy node's parents (INDEX-DESIGN§4.2);
+- `Related` tests the object's relation terms;
+- record-field predicates (`size`, `created`, `modified`, `changed`) read the record;
+- `And`, `Or` combine; `Not(q)` is `_object ∧ ¬q`.
+
+It is the only per-object evaluator. Subscriptions, placement and hydration rules, the reconcile
+worker's desired-state computation, the executor's `direct` filter and SQL's record-field filter
+all call it, so an object matches a query in the same way wherever the question is asked. The two
+evaluators agree by construction and by test: for any query `q` and object `o`,
+`matches(q, o) ⇔ o ∈ execute(q)`.
+
+Which persisted queries a mutation can affect is found through the match index
+(SUBSCRIPTIONS-DESIGN "Evaluation"), shared by subscriptions and by placement and hydration
+rules.
+
 ## SQL layer
 
 The indices already behave like a columnar engine: the query algebra is SQL's `WHERE` clause, and bitmap intersection is what a database executor does with predicates. SQL adds what surrounds `WHERE` — projection, ordering, pagination, aggregation, relation traversal — as post-processing on the result bitmap. It needs no new storage structures and no on-disk format.

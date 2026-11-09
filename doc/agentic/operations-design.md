@@ -126,10 +126,10 @@ Logical types live in `mimisbrunnr-types`; each on-disk wire struct lives in the
 | `ObjectRecord`, content locator, object table and `ObjectRoots`, extent tree, replica and backpointer types | meta |
 | Term dictionary, term table, postings, forward index, sequences, chunk index | index |
 | `OntologyState` (records, name and uid maps, closure tables), module records | ontology |
-| `QueryExecutor`, `FacetedExplorer`, `QueryParser` | query |
+| `QueryExecutor`, `FacetedExplorer`, `QueryParser`, `ObjectView` and the per-object `matches` | query |
 | Hasher, compressor, encryptor, pipeline | transform |
 | `Engine`, `DiskEngine` | engine |
-| `SubscriptionEngine`, runtime `Subscription` | watch |
+| `SubscriptionEngine`, runtime `Subscription`, `MatchIndex` (subscriptions and placement and hydration rules) | watch |
 | `PoolManager`, pool state record, disk descriptors | pool |
 | `PathProjection`, `Importer` | unix |
 | `VfsTree`, `TagVfs`, `MimisbrunnrFs` | fuse |

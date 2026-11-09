@@ -114,7 +114,11 @@ Work enters through two paths:
 **1. Per-key triggers.** A mutation whose new state is checked against the relevant rule as
 part of the mutation — a write placed on the wrong tier because its preferred disk is full, a
 replica write that failed, a node copy that failed verification — inserts one `ReconcileWork`
-entry in the same journal entry batch. Triggers are deterministic functions of the mutation,
+entry in the same journal entry batch. A mutation that changes which placement or hydration
+rules an object matches is found through the match index those rules share with subscriptions
+(SUBSCRIPTIONS-DESIGN "Evaluation"): each reached rule whose match changed enqueues one entry for
+the object, and the worker recomputes its desired state with the one per-object evaluator
+(QUERY-DESIGN "Per-object evaluation"). Triggers are deterministic functions of the mutation,
 so replay re-creates them.
 
 **2. Scans.** A scan walks one structure with a resumable cursor and acts on, or queues, each
@@ -124,7 +128,7 @@ mismatch it finds:
 | --- | --- |
 | Disk set to `Draining` or removed | the disk's backpointer range `(disk_id, *)` (METADATA-DESIGN§2.2) |
 | Disk failed | the failed disk's backpointer range, re-replicating from surviving copies or peers |
-| Placement-rule change (POOL-DESIGN§1) | the postings of the terms the old and new rule queries touch |
+| Placement- or hydration-rule change (POOL-DESIGN§1) | the results of the old and new rule queries; afterwards the rule follows mutations through the match index |
 | Ontology change altering compression, encryption, tier or chunking for a tag | that tag's postings |
 | Snapshot marked deleted | the snapshot-aware trees, one cursor each (SNAPSHOTS-DESIGN§1.5) |
 | Rollback | the object table's history entries on the abandoned branch (SNAPSHOTS-DESIGN§1.8) |

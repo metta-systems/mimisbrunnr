@@ -749,7 +749,7 @@ precedence is ONTOLOGY-D5.
 
 **Disk addition:** Semantic rebalance — archives move to HDD, active projects move to SSD. Unlike ZFS where only new writes go to the new disk.
 
-**Disk removal:** Backpointer range scan over the disk's buckets, which yields exactly the objects with data on it. Each object migrated to a destination chosen by evaluating placement rules against its tags. Disk enters `Draining` state during removal — reads still served, no new writes.
+**Disk removal:** Backpointer range scan over the disk's buckets, which yields exactly the objects with data on it. Each object migrated to a destination chosen by evaluating placement rules against it with the per-object evaluator (QUERY-DESIGN "Per-object evaluation"). Disk enters `Draining` state during removal — reads still served, no new writes.
 
 **Resilver:** Proportional to data on the failed disk, not pool size. Prioritized by surviving replica count. ~20× faster than ZFS resilver for typical configurations.
 
@@ -1063,19 +1063,20 @@ The key events `ENTERED` and `EXITED` don't exist in inotify. When a file gains 
 
 ### 11.3 Inverted Subscription Index
 
-Subscriptions are indexed by the terms and keys their compiled queries read. A mutation reaches the subscriptions of every term that entered or left the object's closure — so tagging an object `flac` reaches a subscription on `audio` — and each is evaluated against the object's own terms, without reading postings:
+Subscriptions — and placement and hydration rules, which follow mutations the same way — are indexed by the terms and keys their compiled queries read, in one **match index**. A mutation reaches the watchers of every term that entered or left the object's closure — so tagging an object `flac` reaches a subscription on `audio` — and each is evaluated against the object's own terms by the one per-object evaluator (QUERY-DESIGN "Per-object evaluation"), without reading postings. A reached subscription stores an event; a reached rule enqueues reconcile work for the object:
 
 ```rust
-struct SubscriptionEngine {
-    subscriptions: HashMap<SubscriptionId, Subscription>,
-    term_to_subs: HashMap<TermId, Vec<SubscriptionId>>,  // terms the compiled queries read
-    key_to_subs: HashMap<TagId, Vec<SubscriptionId>>,    // keys read by range, HasKey, Contains, Under
-    content_subs: Vec<SubscriptionId>,                   // interested in content changes
-    // pending events and membership live in their own trees (SUBSCRIPTIONS-DESIGN§1)
+struct MatchIndex {
+    term_to_watchers: HashMap<TermId, Vec<WatcherId>>,  // terms the compiled queries read
+    key_to_watchers: HashMap<TagId, Vec<WatcherId>>,    // keys read by range, HasKey, Contains, Under
+    content_watchers: Vec<WatcherId>,                   // depend on content or record fields
+    unresolved: HashMap<Name, Vec<WatcherId>>,          // names not interned or installed yet
 }
+enum WatcherId { Subscription(SubscriptionId), Rule(RuleRef) }   // placement or hydration rule
+// subscription records, pending events and membership live in their own trees (SUBSCRIPTIONS-DESIGN§1)
 ```
 
-Cost per mutation: ~microseconds (one lookup per changed term + one evaluation per reached subscription). Delivery is pull-based: `poll` returns events after the cursor and `ack` advances the cursor. Events are persisted per subscription with the mutation that produces them and survive restarts until acknowledged, up to the subscription's own bound (SUBSCRIPTIONS-DESIGN "Delivery"); no subscriber holds the journal back. Changes received by cluster sync are applied as local journal entries, so they produce events like local mutations.
+Cost per mutation: ~microseconds (one lookup per changed term + one evaluation per reached watcher). Delivery is pull-based: `poll` returns events after the cursor and `ack` advances the cursor. Events are persisted per subscription with the mutation that produces them and survive restarts until acknowledged, up to the subscription's own bound (SUBSCRIPTIONS-DESIGN "Delivery"); no subscriber holds the journal back. Changes received by cluster sync are applied as local journal entries, so they produce events like local mutations.
 
 ### 11.4 Atomic Subscribe + Snapshot
 
