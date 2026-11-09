@@ -108,7 +108,9 @@ ack(sub, lsn)                                         // everything up to lsn is
 - **Poll** reads the subscription's pending events from its cursor in key order — the order
   the mutations committed — expanding bulk entries object by object, and applies debouncing.
 - **Ack** removes the events up to `lsn`, applies them to the stored membership, and persists
-  the new cursor and `cursor_ns` (the time of the acknowledged entry), in one journal entry.
+  the new cursor and `cursor_ns` (the time of the acknowledged entry), in one `SubscriptionAck`
+  journal entry. Creating, changing and removing a subscription are `SubscriptionPut` and
+  `SubscriptionDelete` (JOURNAL-DESIGN§1.3).
 
 A crash between `poll` and `ack` redelivers the same events with the same LSNs; consumers
 deduplicate by LSN. `Buffered` durability (JOURNAL-DESIGN§1.5) applies to acks like any mutation.

@@ -285,7 +285,7 @@ No step overwrites or scrubs these copies, so an object that must never have exi
 its own encryption has to carry that policy from its first write.
 - **Remote** — no local replica; reads go to `origin_node` or a peer holding it.
 
-A write of at most 40 bytes stores `Inline` unless its policy sets an encryption mode; a rewrite that grows past 40 bytes moves the
+A completed write of at most 40 bytes in total (`WriteInline`, JOURNAL-DESIGN§1.3) stores `Inline` unless its policy sets an encryption mode; a rewrite that grows past 40 bytes moves the
 object to `Packed` or `Extent`, and one that shrinks to 40 bytes or less moves it back,
 freeing what the old locator named. A stream (`state = Writing`) starts as `None`, becomes `Extent` with its first extent and
 `ExtentList` with its second; `length` is the durable prefix (JOURNAL-DESIGN§1.8).

@@ -346,7 +346,9 @@ BTREE-DESIGN§1 tree of `BtreeKind::Sequences`:
 Each member's position or score is also its forward entry's order slot (INDEX-DESIGN§2.1), the
 direct state the sequences tree is maintained from, as postings are. Removing a member, moving it,
 re-scoring it or deleting the object reads the slot to find the sequence key, so none of them
-scans the sequence. A renumber rewrites the order slot of every member it moves.
+scans the sequence. A renumber rewrites the order slot of every member it moves. Placing a
+member is `SetOrder` and a renumber `RenumberSequence` (JOURNAL-DESIGN§1.3); the position
+encoding is CLUSTER-D6.
 
 ---
 

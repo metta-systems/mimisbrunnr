@@ -179,6 +179,60 @@ record rules:
   rejects a payload whose length disagrees with its head.
 - An extent checksum (`extent_sum`) is the OPERATIONS-D4 checksum of the extent's bytes as
   written; recovery uses it to verify data written in the same commit (JOURNAL-DESIGN§1.5).
+- A `ReplicaSet` (72 bytes) is `replica_count: u8`, 7 bytes of padding and
+  `replicas: [BlockRef; 4]`, slots `[replica_count..4)` zero: the copies of one extent or block
+  written together (METADATA-DESIGN§2.1).
+
+**Op kinds.** `EntryHead.op_kind` takes these values, numbered contiguously and grouped by
+subsystem; a reader rejects any other value.
+
+| Value | Op | Group |
+|---|---|---|
+| 0 | `Checkpoint` | commit |
+| 1 | `CreateObject` | objects and terms |
+| 2 | `DeleteObject` | objects and terms |
+| 3 | `AddTag` | objects and terms |
+| 4 | `RemoveTag` | objects and terms |
+| 5 | `SetAttr` | objects and terms |
+| 6 | `RemoveAttr` | objects and terms |
+| 7 | `AddRelation` | objects and terms |
+| 8 | `RemoveRelation` | objects and terms |
+| 9 | `SetOrder` | collections |
+| 10 | `RenumberSequence` | collections |
+| 11 | `WriteBlob` | content |
+| 12 | `WriteInline` | content |
+| 13 | `ExtendObject` | content |
+| 14 | `PackObjects` | content |
+| 15 | `FinalizeObject` | content |
+| 16 | `ChunkInsertBatch` | chunked content |
+| 17 | `ChunkListAppend` | chunked content |
+| 18 | `ChunkListReplace` | chunked content |
+| 19 | `ChunkListShrink` | chunked content |
+| 20 | `ReclaimTerms` | terms |
+| 21 | `OntologyPut` | ontology |
+| 22 | `OntologyDelete` | ontology |
+| 23 | `SubscriptionPut` | subscriptions |
+| 24 | `SubscriptionDelete` | subscriptions |
+| 25 | `SubscriptionAck` | subscriptions |
+| 26 | `BucketAlloc` | buckets |
+| 27 | `BucketGenBump` | buckets |
+| 28 | `BucketDiscard` | buckets |
+| 29 | `BackpointerInsert` | backpointers |
+| 30 | `BackpointerRemove` | backpointers |
+| 31 | `SnapshotCreate` | snapshots |
+| 32 | `SnapshotDelete` | snapshots |
+| 33 | `SnapshotUnlink` | snapshots |
+| 34 | `SnapshotDepthUpdate` | snapshots |
+| 35 | `ReconcileEnqueue` | reconcile |
+| 36 | `ReconcileDequeue` | reconcile |
+| 37 | `ReconcileMove` | reconcile |
+| 38 | `ReconcileReplicate` | reconcile |
+| 39 | `ReconcileDropReplica` | reconcile |
+| 40 | `ReconcileScanStep` | reconcile |
+
+Changes to pool administration trees have no ops; they commit by checkpoint (POOL-DESIGN§1.2).
+Postings, pending subscription events and `live_sectors` have none either: replay derives them
+from the ops that cause them.
 
 ```rust
 CreateObject     : { oid: u64, created_ns: i64, state: u8 }    // raises the origin node's next_local;
@@ -191,8 +245,10 @@ SetAttr          : { oid: u64, key: u32, value: Value }       // Value tagged-un
 RemoveAttr       : { oid: u64, term_id: u64 }                   // the attribute term (INDEX-DESIGN§1.2)
 AddRelation      : { oid: u64, predicate: u32, target: u64 }
 RemoveRelation   : { oid: u64, predicate: u32, target: u64 }
-WriteBlob        : { oid: u64, content_hash: [u8;32], extent: BlockRef, size: u64, extent_sum: u64 }
-                   // One-extent objects only: sets the record's Extent locator
+WriteBlob        : { oid: u64, content_hash: [u8;32], size: u64, extent_sum: u64,
+                     replicas: ReplicaSet }
+                   // One-extent objects only: sets the record's Extent locator with every
+                   //   replica written (METADATA-DESIGN§1.2); a backpointer per replica follows
                    //   (METADATA-DESIGN§1.2). Larger non-chunked objects are written
                    //   through ExtendObject into an extent list (METADATA-DESIGN§1.3).
                    //   Chunked objects (INDEX-DESIGN§4.3) use the
@@ -241,9 +297,6 @@ BackpointerRemove: { key: BackpointerKey }                                // exp
 // Implicit removal: a BucketGenBump invalidates all of that bucket's backpointers lazily
 // (stale entries detected by gen mismatch on the next scan, no per-bp WAL op needed).
 
-// Postings need no ops of their own: AddTag / SetAttr / AddRelation and their removals
-// change term postings, which live in ordinary B+ tree entries (INDEX-DESIGN§3.1) and
-// replay like any other entry. Op kinds 20 and 21 are unassigned.
 
 // Snapshot lifecycle (SNAPSHOTS-DESIGN§1)
 SnapshotCreate   : { new_id: u32, parent_id: u32, current_replacement: u32, label: Option<String> }
@@ -277,11 +330,16 @@ ReconcileDequeue : { key: WorkKey, pending: bool }                     // comple
 ReconcileMove    : { from_loc: BlockRef, to_loc: BlockRef, owner_key: bytes }
                    // atomic location-update for move-path completion;
                    //   owner_key capped at 16 bytes (METADATA-DESIGN§2.2)
+ReconcileReplicate: { existing: BlockRef, new_loc: BlockRef, owner_key: bytes }
+                   // A new copy of the data at `existing` was written at new_loc (replica
+                   //   repair, a raised Replicate rule): adds it to the owner's replicas and
+                   //   inserts its backpointer (RECONCILE-DESIGN§1.5)
+ReconcileDropReplica: { loc: BlockRef, owner_key: bytes }
+                   // Removes one replica from its owner and its backpointer (over-replicated,
+                   //   or a copy on a draining disk once enough others exist); never the last
 ReconcileScanStep: { scan_id: u64, record: ScanRecord }  // a scan started, advanced or finished
                    //   (empty record); emitted at checkpoints only (RECONCILE-DESIGN§1.3);
                    //   cursor_key capped at 256 bytes
-
-// WalOpKind 30 unassigned: each run carries its own key format (BTREE-DESIGN§1.6)
 
 Checkpoint       : { gc_reserve_buckets: u32, roots: RootList }   // RootListHead + RootEntry × N
                    //   (ENGINE-DESIGN§1.2)
@@ -290,29 +348,55 @@ Checkpoint       : { gc_reserve_buckets: u32, roots: RootList }   // RootListHea
                    //   valid Checkpoint and replays the entries after it.
 
 // Data paths (JOURNAL-DESIGN§1.8)
-WriteInline      : { oid: u64, content_hash: [u8;32], data: bytes }      // WalOpKind 32
+WriteInline      : { oid: u64, content_hash: [u8;32], data: bytes }
                    // A whole object of at most INLINE_WRITE_MAX bytes, carried in the
-                   //   journal itself; a later checkpoint moves it into a small-object bucket.
-ExtendObject     : { oid: u64, new_length: u64, extents: [(extent: BlockRef, length: u32,
-                     extent_sum: u64); N] }                               // WalOpKind 33
+                   //   journal itself. A completed write of at most 40 bytes sets the
+                   //   record's Inline locator (METADATA-DESIGN§1.2) and is never packed;
+                   //   a larger one is packed into a small-object block by PackObjects.
+PackObjects      : { block: ReplicaSet, slots: [(oid: u64, slot: [u8; 8]); N] }
+                   // Small-object block written with these objects' bytes: sets each
+                   //   object's Packed locator to its slot (slot address layout per BLOB-D4)
+                   //   and inserts the block's PackedBlock backpointer per replica; the
+                   //   WriteInline entries it packs no longer pin the journal.
+ExtendObject     : { oid: u64, new_length: u64, extents: [(length: u32, _pad: u32,
+                     extent_sum: u64, replicas: ReplicaSet); N] }
                    // Appends extents to an object in the Writing state and makes its first
                    //   new_length bytes durable. The first extent sets an Extent locator;
                    //   from the second on, replay puts one extent-tree key per extent
                    //   (METADATA-DESIGN§1.3), the Extent locator's extent becoming the first key.
 
 // Term maintenance (INDEX-DESIGN§1.2)
-ReclaimTerms     : { term_ids: [u64; N] }                               // WalOpKind 34
+ReclaimTerms     : { term_ids: [u64; N] }
                    // Removes each listed term's dictionary entries and term-table record.
                    //   The TermId counter is untouched (ENGINE-DESIGN§1.2).
 
 // Ontology (ONTOLOGY-DESIGN§1)
-OntologyPut      : { record_kind: u8, a: u64, b: u64, record: bytes }     // WalOpKind 35
+OntologyPut      : { record_kind: u8, a: u64, b: u64, record: bytes }
                    // Inserts or replaces one ontology record (TagRecord, RuleRecord or
                    //   ModuleRecord, positional CBOR). A rule or constraint record advances
                    //   rules_epoch; the postings it changes follow in the same commit. Replay
                    //   raises next_tag_id or next_rule_id past the record's id.
-OntologyDelete   : { record_kind: u8, a: u64, b: u64 }                    // WalOpKind 36
+OntologyDelete   : { record_kind: u8, a: u64, b: u64 }
                    // Removes one ontology record; the id counters are untouched.
+
+// Subscriptions (SUBSCRIPTIONS-DESIGN§1)
+SubscriptionPut  : { id: u64, record: bytes }
+                   // Inserts or replaces one SubscriptionRecord (positional CBOR); a new id
+                   //   seeds its membership from the current query result.
+SubscriptionDelete: { id: u64 }
+                   // Removes the record, its membership and its pending events.
+SubscriptionAck  : { id: u64, lsn: u64, cursor_ns: i64 }
+                   // Removes the pending events up to lsn, applies them to the stored
+                   //   membership and sets the cursor (SUBSCRIPTIONS-DESIGN "Delivery").
+
+// Ordered and ranked collections (INDEX-DESIGN§3.3)
+SetOrder         : { oid: u64, term_id: u64, order: u64 }
+                   // Sets the object's order slot for a collection term it carries and moves
+                   //   its Sequences key. The shape of `order` (sparse u64 position, or a
+                   //   variable-length position) is CLUSTER-D6.
+RenumberSequence : { term_id: u64 }
+                   // Respaces the term's positions; deterministic, so replay recomputes every
+                   //   member's new position and order slot from the tree alone.
 ```
 
 Replay applies entries strictly in LSN order. Each in-memory mutation is idempotent under
@@ -353,9 +437,9 @@ the affected window, replacing 1–3 chunks):
    chunks' range.
 
 No `FinalizeObject` is needed for in-place edits — the object is already published; the
-replace op modifies its existing ChunkList. The total `content_hash` and `total_length` only
-change if the edit shifts logical length, in which case a follow-up `FinalizeObject` (or
-`ChunkListShrink` for truncation) updates them.
+replace op modifies its existing ChunkList, and a length change follows from the replaced
+range. Any edit also changes the object's `content_hash`; how that hash is maintained without
+re-reading the whole object — likely a Merkle-style hash over the chunk hashes — is BLOB-D5.
 
 **Sync receive / resumable transfer.** Identical to bulk-write but driven by stream arrival
 order. After crash, the receiver reads the object's last ChunkList key and resumes from its
@@ -583,7 +667,7 @@ Object bytes do not go through the journal, with one exception:
 
 | Write | Path |
 |---|---|
-| Tiny: whole object ≤ `INLINE_WRITE_MAX` (2 KiB by default, set per pool) | `WriteInline` carries the bytes; one jset write makes the object durable. A later checkpoint moves inline objects into small-object buckets that pack many objects per block, so a 200-byte file does not occupy a 4 KiB blob sector ([BLOB-DESIGN](blob-design.md)). |
+| Tiny: whole object ≤ `INLINE_WRITE_MAX` (2 KiB by default, set per pool) | `WriteInline` carries the bytes; one jset write makes the object durable. An object of at most 40 bytes is stored in its record's `Inline` locator; larger ones are later packed into small-object blocks, many per block (`PackObjects`), so a 200-byte file does not occupy a 4 KiB blob sector ([BLOB-DESIGN](blob-design.md)). |
 | Small to large | Bytes go to blob extents at the stream's write point (ALLOCATION-DESIGN§1.5); `WriteBlob` or the chunked flow (JOURNAL-DESIGN§1.3.1) records them, with `extent_sum`s. |
 | Streaming (camera recording, logs, downloads) | The object is created in the `Writing` state (METADATA-DESIGN§1.1); bytes are appended to extents taken whole bucket by bucket from a per-stream write point, so the stream is physically sequential; `ExtendObject` (or `ChunkListAppend` for chunked streams) makes each prefix durable, typically under `Buffered` durability once per second or on request. Closing the object (`FinalizeObject`) sets its final length and content hash, computed incrementally while streaming, and moves it to `Active`. |
 

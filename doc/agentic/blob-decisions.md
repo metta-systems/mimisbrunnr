@@ -24,6 +24,10 @@ The outcome sets which algorithms the host writes, which the device reads and wr
 
 Tiny objects are packed into small-object buckets at checkpoint (JOURNAL-DESIGN§1.8). Decide the layout: (a) slotted 4 KiB blocks — a slot directory of `(offset, length)` per block, objects addressed as `(block, slot)`, freed slots reused when the block is rewritten; (b) size classes — fixed-size slots per bucket (64 B, 128 B, … 2 KiB), addressed by index, with a free bitmap; (c) append-only log buckets compacted by copy GC like other buckets. The choice sets the `Packed` content locator (at most 40 bytes for all replicas, each with its 16-bit generation tag, METADATA-DESIGN§1.2 and METADATA-DESIGN§2.1) and how space is reclaimed on delete. Whatever the layout, each packed block names the `ObjectId` of each of its slots, so one `OwnerKind::PackedBlock` backpointer per block lets copygc find and update every object in it (METADATA-DESIGN§2.2). Blocks [BLOB8](blob-implementation-plan.md).
 
+## BLOB-D5 — Content hash of chunked objects
+
+`content_hash` is BLAKE3 of the whole plaintext (METADATA-DESIGN§1.1). For a chunked object an in-place edit (JOURNAL-DESIGN§1.3.1) changes the hash, and recomputing it means reading the whole object — 32 GiB for a 4 KiB edit of a VM image. Direction under consideration: a Merkle-style hash for chunked objects, computed over the ordered chunk hashes (and lengths) instead of the bytes, so an edit recomputes it from the `ChunkList` keys alone. Open: the exact construction (flat hash over the chunk list, or a tree so a range edit updates O(log n) nodes), whether exact-content deduplication (METADATA-D6) and sync compare it with byte hashes of non-chunked objects (the same bytes chunked differently would hash differently), and whether non-chunked objects keep the byte hash. Blocks the hash maintenance of `ChunkListReplace` and `ChunkListShrink`.
+
 ## Future work
 
 - None recorded.

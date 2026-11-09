@@ -592,26 +592,11 @@ The journal is the **redo log** of every mutation, kept in an ordered list of al
 
 **Data paths.** File data goes to blob extents beside the journal; tiny objects ride inside it until packed; streams are append-only objects made durable step by step (JOURNAL-DESIGN§1.8).
 
-```rust
-enum WalOpKind {
-    CreateObject, DeleteObject,
-    AddTag, RemoveTag,
-    SetAttr, RemoveAttr,
-    AddRelation, RemoveRelation,
-    WriteBlob,                                 // non-chunked objects
-    ChunkInsertBatch, ChunkListAppend,         // chunked-object flow (§9.6)
-    ChunkListReplace, ChunkListShrink, FinalizeObject,
-    BucketAlloc, BucketGenBump, BucketDiscard, // §6.1 allocation
-    BackpointerInsert, BackpointerRemove,
-    SnapshotCreate, SnapshotDelete,
-    SnapshotUnlink, SnapshotDepthUpdate,
-    ReconcileEnqueue, ReconcileDequeue, ReconcileMove, ReconcileScanStep,
-    Checkpoint,
-    WriteInline, ExtendObject,                 // tiny objects and streams (JOURNAL-DESIGN§1.8)
-    ReclaimTerms,                              // unused attribute terms (INDEX-DESIGN§1.2)
-    OntologyPut, OntologyDelete,               // ontology records (ONTOLOGY-DESIGN§1)
-}
-```
+**Ops.** Each entry is one op: object and term changes, content writes (whole, chunked, inline,
+packed, streamed), bucket and backpointer bookkeeping, snapshots, reconcile moves and replica
+changes, ontology records, subscriptions, collection order and the checkpoint. The numbered list
+and every payload are in JOURNAL-DESIGN§1.3. Pool administration has no ops; it commits by
+checkpoint (POOL-DESIGN§1.2).
 
 ---
 

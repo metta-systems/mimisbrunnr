@@ -194,6 +194,25 @@ ReconcileMove { from_loc, to_loc, owner_key }
                                      every version naming the block
 ```
 
+Changing the number of copies projects the same way, onto the same owners:
+
+```
+ReconcileReplicate { existing, new_loc, owner_key }
+  ⇒ BackpointerInsert(new_loc → key, value)
+   ∘ owner-update: add new_loc as a replica beside `existing`, raising replica_count
+     (BlobExtent: in the locator or the extent-tree keys found as for a move; PackedBlock: in
+     the Packed locator of every object the block names)
+
+ReconcileDropReplica { loc, owner_key }
+  ⇒ BackpointerRemove(loc → key)
+   ∘ owner-update: remove loc from the replicas, lowering replica_count; refused when it is
+     the last replica
+```
+
+A tree node always has exactly `metadata_replicas` copies, so its repair is a `ReconcileMove`
+of the lost copy's slot to a new location, never a change of count. A chunk has one location in
+`ChunkIndex`, so neither op applies to `OwnerKind::Chunk`.
+
 All projected mutations apply under the move's LSN, so a crash either replays all of them or
 none. `BackpointerInsert` / `BackpointerRemove` remain first-class journal ops because they are
 also emitted directly by non-move callers (object deletion, fresh writes, node frees) — moves
