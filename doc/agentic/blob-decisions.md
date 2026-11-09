@@ -32,6 +32,20 @@ Tiny objects are packed into small-object buckets at checkpoint (JOURNAL-DESIGN�
 
 Re-chunking walks an object in windows ending on old chunk boundaries (INDEX-DESIGN§4.3), so the last new chunk of each window is cut at the window edge instead of where the chunker would cut it, losing a little deduplication per window; a window is also what the concurrent-write check redoes. Larger windows mean fewer forced cuts and longer redos. Options: a pool-state value (e.g. 64 MiB default), a fixed multiple of the new `max_size`, or left to the implementation and not pinned. Shapes [BLOB3](blob-implementation-plan.md).
 
+## BLOB-D7 — Replicas of chunks
+
+A `ChunkIndex` entry names one location (`blob: BlobRef`, INDEX-DESIGN§4.3), so every chunk has exactly one copy: a `Replicate` rule asking for more does nothing for a chunked object, the replica ops (`ReconcileReplicate`, `ReconcileDropReplica`) do not apply to chunks (RECONCILE-DESIGN§1.5), and losing the disk holding a chunk breaks every object that uses it — through deduplication, possibly many. Non-chunked extents and packed blocks do not have this gap.
+
+The difficulty is sharing: one chunk serves objects with different policies, so its copy count must satisfy the most demanding of them, and can only fall when that object goes.
+
+Options:
+
+- (a) **A replica set per `ChunkIndex` entry** — `replica_count`, up to four `ReplicaRef`s and their generation tags in place of the single `BlobRef` (the entry grows from 56 to about 88 bytes). A chunk's target count is the highest `Replicate` requirement among the objects referencing it: raised when a more demanding object starts using it, lowered by a reconcile pass when one stops; the replica ops then apply to `OwnerKind::Chunk` like any owner.
+- (b) **One pool-wide copy count for all chunks** — every chunk gets the pool's chunk replication factor regardless of the objects using it. No per-chunk policy tracking, but over-replicates chunks only cheap objects use, and still needs (a)'s replica set in the entry.
+- (c) **Redundancy below the chunk** — chunks live in erasure-coded or mirrored buckets (`BucketKind::Stripe`), so the single `BlobRef` names a location the bucket layer already protects. Keeps the entry, but depends on an erasure-coding design that does not exist yet.
+
+Blocks correct `Replicate` behaviour for chunked objects ([BLOB3](blob-implementation-plan.md), [RECONCILE4](reconcile-implementation-plan.md)).
+
 ## Future work
 
 - None recorded.

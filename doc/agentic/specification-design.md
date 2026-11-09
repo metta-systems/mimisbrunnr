@@ -560,7 +560,7 @@ The record's 40-byte **content locator** says where the content is; `content_kin
 |---|---|---|
 | `Extent` | up to 4 `ReplicaRef`s of one extent | objects that fit one bucket |
 | `ExtentList` | nothing: the extents are keys `(oid, end_offset, snapshot)` of the shared extent tree (METADATA-DESIGN§1.3) | large non-chunked objects, streams, partly overwritten objects |
-| `ChunkList` | the chunking parameters; the chunks are keys of the shared chunk-list tree (§9.6) | chunked objects; chunks replicate independently |
+| `ChunkList` | the chunking parameters; the chunks are keys of the shared chunk-list tree (§9.6) | chunked objects; each chunk is stored once, shared by every object using it (BLOB-D7) |
 | `Packed` | a slot in a small-object block | tiny objects (JOURNAL-DESIGN§1.8) |
 | `Inline` | the content itself | objects of at most 40 bytes whose storage policy sets no encryption mode of its own; one that gains such a policy moves out, but earlier copies of its bytes persist until reclaimed (METADATA-DESIGN§1.2 "Residual copies") |
 | `Remote` | the origin node | content held by other nodes only (§10.3) |

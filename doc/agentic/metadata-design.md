@@ -253,7 +253,8 @@ struct RemoteLocator {                       // content_kind = Remote
   extents are keys of the shared extent tree under the object's id (METADATA-DESIGN§1.3).
 - **ChunkList** — the chunks are keys of the shared chunk-list tree under the object's id
   (INDEX-DESIGN§4.3); the locator holds the chunking parameters. Chunks are content-addressed and
-  replicated by chunk-level placement, not by `replica_count`.
+  shared, so the record's `replica_count` does not apply to them; a chunk has the one location
+  its `ChunkIndex` entry names (BLOB-D7).
 - **Packed** — the object's bytes are one slot of a small-object block; the locator's layout is
   set by BLOB-D4 and names up to 40 bytes of slot address across its replicas.
 - **Inline** — objects of at most 40 bytes: the locator holds the bytes themselves,
