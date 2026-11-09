@@ -10,6 +10,18 @@ Every tree node is written `metadata_replicas` (R) times on different disks, and
 
 The original requirements list filesystem quotas; the design has none. Decide whether quotas exist and what they bound (bytes or objects per tag query, per ontology module, per Mettā principal), and whether they are enforced at write time or reported by reconcile. Without paths, a quota is naturally a placement-style rule over a query.
 
+## POOL-D3 — Time-triggered rules
+
+Placement and hydration rules follow mutations through the match index (SUBSCRIPTIONS-DESIGN "Evaluation"), which is consulted only when an object changes. Rules that depend on time passing — `AutoTier` (tier by access age), hydration's `AutoEvict`, and any rule comparing a timestamp with "now" (e.g. modified more than 30 days ago) — are never re-checked for an object nobody touches. The query language has no now-relative predicate yet either.
+
+Direction: **bucket terms with time wheels**, so that several granularities are served.
+
+- Each time-based rule names a timestamp (`modified`, `created`, access time per [METADATA-D7](metadata-decisions.md)) and a threshold. The timestamp has `Bucket` terms at the granularities in use (hour, day, week…), created internally when no ontology rule declares them (ONTOLOGY-DESIGN "Rules and constraints").
+- A time wheel per granularity fires at each bucket boundary. When a boundary passes, the objects that just crossed a rule's threshold are the postings of one bucket term — the one that has aged out — so a trigger is one posting read per rule per tick, and the matching objects enqueue reconcile work.
+- Thresholds finer than the coarsest fitting bucket use a deadline wheel: an object entering the boundary bucket gets an entry keyed `(deadline, oid, rule)`, popped by the engine's `step` when due.
+
+To decide: the granularities offered and which wheel serves each; whether the wheel's pending deadlines are persisted (a tree) or rebuilt from bucket postings at mount; how a now-relative predicate is written in the query language; how ticks missed while the pool was offline are caught up (one catch-up read per elapsed bucket); and the cost bound per tick. Blocks `AutoTier` and `AutoEvict` ([POOL4](pool-implementation-plan.md), [RECONCILE5](reconcile-implementation-plan.md)).
+
 ## Future work
 
 - None recorded.

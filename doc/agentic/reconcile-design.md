@@ -43,7 +43,7 @@ because each extent is evaluated independently, at the time it is processed.
 | Compression / encryption inconsistent with ontology | Rewrite with correct transform pipeline    |
 | `Inline` object whose resolved policy now sets an encryption mode (METADATA-DESIGN§1.2) | Move the content out of the record, encrypted as the policy says |
 | ChunkList locator's `ChunkParamsRecord` ≠ resolved policy (INDEX-DESIGN§4.3, SPECIFICATION-DESIGN§3.5) | Re-chunk with new params (a content rewrite) |
-| `AutoTier` access-time threshold crossed          | Migrate Hot → Warm → Cold → Glacier          |
+| `AutoTier` access-time threshold crossed (how time triggers fire is POOL-D3; access time is METADATA-D7) | Migrate Hot → Warm → Cold → Glacier          |
 | Bucket fragmentation > copygc threshold           | Run copy GC (ALLOCATION-DESIGN§1.6)          |
 | Disk in `Draining` state                          | Evacuate via backpointer scan (METADATA-DESIGN§2.2) |
 | Disk failure detected, replicas missing           | Resilver (CLUSTER-DESIGN§1) — re-replicate from peers |

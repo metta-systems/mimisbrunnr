@@ -10,6 +10,19 @@ SPECIFICATION-DESIGN§7.1 puts index cleanup (phase 2) in a background task afte
 
 Import reuses an object whose content already exists (UNIX-DESIGN "Import"), which needs objects found by `content_hash`; only chunks are indexed by hash (INDEX-DESIGN§4.3). Options: (a) a `ContentHash` tree keyed by a hash prefix, valued by object ids, maintained on content writes and deletion — about 16–24 bytes per object; (b) no index: deduplicate within one import run only, and across the pool through chunking where policy chunks objects; (c) a record-field column usable as a query filter, with no lookup structure — a scan. Shapes [UNIX10](unix-implementation-plan.md).
 
+## METADATA-D7 — Representing access time
+
+Nothing records when an object was last read: reads never dirty the object record (METADATA-DESIGN§1.1), and `modified_ns` and `state_ns` move only on writes. `AutoTier` moves objects between tiers by access age, and a Unix `atime` needs a value, so access must be recorded somewhere — without turning every read into a metadata write, which would cost most on SD and SSD and on read-heavy workloads.
+
+Options:
+
+- (a) **A coarse access day in the record** (`accessed_day: u16` or `u32`, days since an epoch, from `_reserved`), updated only when a read lands on a later day than the stored one — relatime-style: at most one record write per object per day, and none for objects not read.
+- (b) **An access-day bucket term outside the record** — the object's latest access day as a system-maintained bucket term, updated at most once a day per object; feeds time-triggered rules ([POOL-D3](pool-decisions.md)) directly as postings, but each update moves the object between two terms' postings.
+- (c) **Approximate heat outside the metadata** — a resident, periodically checkpointed sketch (e.g. per-bucket or per-object-window access counters) that tiering reads; no per-object exact time, no record writes, lost precision.
+- (d) **No access time** — `AutoTier` works on `modified`, and `atime` reports `modified`.
+
+To decide: the representation, its granularity, whether reads by sync or reconcile count as access, whether it is snapshot-aware (an access on the head should not rewrite a snapshot's version), and what `atime` reports.
+
 ## Future work
 
 - **A larger `ObjectRecord` for a future format.** A 64-byte locator makes the record 160 bytes (152 used, 8 reserved).
