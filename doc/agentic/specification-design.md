@@ -1427,274 +1427,110 @@ All engine state persists in the trees of the root list — B+ trees and positio
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 16.1 Storage structures
+### 16.1 Finding a pool and committing state
 
-How the persistent structures relate. Every mutation is a journal entry first; trees grow behind it by appended runs and are committed by a `Checkpoint` entry carrying the new root list. Assertions are interned as terms; an object's direct terms go to its forward entry, and direct plus derived terms to postings. The object record says what the object is and where its content lives. Backpointers map physical space back to owners, so moves, scrub and evacuation touch only affected buckets.
+Each disk's superblock names its journal buckets and hints at the newest checkpoint. Every mutation is a journal entry first; trees grow behind it in 256 KiB regions and are committed by a `Checkpoint` entry carrying the root list and the id counters. Mounting reads the newest checkpoint and replays the entries after it, deriving postings, `live_sectors`, backpointers and pending events from them.
 
 ```mermaid
 flowchart TB
-    API["Engine API<br/><i>create · tag · set · write · delete<br/>query · read</i>"]
-
-    subgraph Journal["Journal (JOURNAL-DESIGN)"]
-        JSets["Journal sets<br/><i>write-once, group commit,<br/>mirrored on hot devices</i>"]
-        History["Retained history<br/><i>optional, per-pool cap</i>"]
-        JSets --> History
+    subgraph Disk["Each disk"]
+        SB["Superblock ×3<br/><i>Preamble MIMR · disk_uuid · geometry<br/>bucket_size (≤256 MiB) · R<br/>journal bucket list · CheckpointHint</i>"]
+        Buckets["Buckets<br/><i>BucketKind: Journal · Node · Data · Packed · Reserved<br/>generation per bucket (resident)</i>"]
     end
 
-    subgraph Roots["Root list + superblock (ENGINE-DESIGN§1)"]
-        RootPtr["Root list<br/><i>carried by Checkpoint entries;<br/>superblock holds a hint to the newest</i>"]
+    subgraph Journal["Journal (Journal buckets, JOURNAL-DESIGN)"]
+        JSET["Journal sets<br/><i>Preamble JRNL · seq · last_seq · hlc_base<br/>entries: op kinds 0–39 · checksum u64</i>"]
+        CKPT["Checkpoint entry<br/><i>RootListHead: seq · lsn · R<br/>id_counters[IdKind] (Term, Tag, Rule, Subscription,<br/>Snapshot, PlacementRule, Disk, Scan)<br/>+ RootEntry × N (BtreeKind → NodePtr)</i>"]
+        JSET --> CKPT
     end
 
-    subgraph OntologyB["Ontology (ONTOLOGY-DESIGN)"]
-        OntTree["Ontology tree<br/><i>tag, rule, module records<br/>TagUid ↔ TagId</i>"]
-        Closures["Closure tables<br/><i>built at mount, in memory</i>"]
-        OntTree --> Closures
+    SB -->|"hint → newest checkpoint jset"| JSET
+    SB -->|"journal bucket list"| JSET
+    CKPT -->|"NodePtr = R copies of each root"| Trees
+
+    subgraph Trees["Trees (Node buckets, 256 KiB regions, BTREE-DESIGN)"]
+        REG["Region block 0<br/><i>Preamble BREG + BtreeKind · node_seq · level<br/>layout: runs | pages · checksum u64</i>"]
+        RUN["Run: index block (Preamble BIDX)<br/><i>KeyFormat · RunBlockEntry[] (checksum, min/max snapshot)<br/>fence keys</i> → data blocks"]
+        PG["Page run: index block (Preamble BPGS)<br/><i>PageRunEntry[] (page_no, checksum)</i> → pages"]
+        REG --> RUN
+        REG --> PG
     end
 
-    subgraph TermIndex["Term index (INDEX-DESIGN)"]
-        Dict["Term dictionary<br/><i>(kind, key, parent, value) → TermId,<br/>stats, inline postings</i>"]
-        TermTable["Term table<br/><i>TermId → full value</i>"]
-        Postings["Postings<br/><i>(TermId, window) → roaring container<br/>direct + derived terms</i>"]
-        Sequences["Sequences<br/><i>ordered / ranked collections</i>"]
-        Dict --- TermTable
-        Dict --> Postings
-    end
+    Trees -->|"BlockRef: disk · bucket · sector · generation"| Buckets
+    Replay["Mount / replay"] -->|"read checkpoint, then apply entries after it"| CKPT
+    Replay -.->|"derive postings, live_sectors,<br/>backpointers, pending events"| Trees
 
-    Forward["Forward index<br/><i>oid → direct TermIds</i>"]
+    ADMIN["Pool admin changes<br/>(disks, placement rules, pool state, peers)"] -->|"forced checkpoint, no ops"| CKPT
+```
 
+### 16.2 What points to what
+
+Solid arrows are stored references; dashed arrows are derived or maintained relationships with no pointer on disk. The object record says what an object is and where its content lives; an object's direct terms are in its forward entry, and direct, derived and system terms in postings; backpointers map physical space back to owners, so moves, scrub and evacuation touch only the buckets concerned.
+
+```mermaid
+flowchart LR
     subgraph Meta["Object metadata (METADATA-DESIGN)"]
-        ObjRoots["ObjectRoots<br/><i>NodeId → radix root,<br/>id high-water</i>"]
-        ObjTable["Object table<br/><i>per-node radix of 128 B records:<br/>state, length, hash, content locator</i>"]
-        ExtentList["Extent tree<br/><i>(oid, end offset) → extent</i>"]
-        ObjRoots --> ObjTable
+        OR["ObjectRoots<br/><i>NodeId → radix root (NodePtr), next_local</i>"]
+        OT["ObjectTable radix<br/><i>positional pages · 128 B ObjectRecord<br/>state · length · content_hash · times · snapshot<br/>40 B locator</i>"]
+        OH["ObjectHistory<br/><i>(oid, snapshot) → older record</i>"]
+        ET["ExtentList tree<br/><i>(oid, end_offset, snapshot) → ExtentEntry<br/>replicas + 16-bit generation tags · skip</i>"]
+        OR --> OT
+        OT -.->|"pushed-down versions"| OH
     end
 
     subgraph Content["Content (BLOB-DESIGN, INDEX-DESIGN§4.3)"]
-        Blobs["Blob buckets<br/><i>extents, via transform pipeline</i>"]
-        ChunkList["Chunk-list tree<br/><i>(oid, end offset) → chunk hash</i>"]
-        ChunkIndex["Chunk index<br/><i>hash → extent, refcount</i>"]
-        Packed["Small-object blocks"]
-        ChunkList --> ChunkIndex --> Blobs
+        DATA["Data buckets<br/><i>extents ≤ 1 bucket; compressed ≤ 128 KiB</i>"]
+        PACK["Packed buckets<br/><i>small-object blocks</i>"]
+        CL["ChunkList tree<br/><i>(oid, end_offset, snapshot) → chunk hash</i>"]
+        CI["ChunkIndex<br/><i>hash → BlobRef, ref_count (one copy: BLOB-D7)</i>"]
     end
 
-    subgraph Physical["Physical space (ALLOCATION-DESIGN, METADATA-DESIGN§2.2)"]
-        Alloc["Bucket alloc + freespace LRU<br/><i>per disk</i>"]
-        Backptr["Backpointers<br/><i>(disk, bucket, sector) → owner</i>"]
+    OT -->|"Inline (≤ 40 B)"| OT
+    OT -->|"Extent locator"| DATA
+    OT -->|"ExtentList"| ET --> DATA
+    OT -->|"ChunkList (+ ChunkParams)"| CL --> CI --> DATA
+    OT -->|"Packed"| PACK
+
+    subgraph Index["Term index (INDEX-DESIGN)"]
+        FW["Forward<br/><i>(oid, snapshot) → direct terms<br/>+ order slots</i>"]
+        TD["TermDictionary<br/><i>(kind, key, parent, value) → TermId, inline postings</i>"]
+        TT["TermTable<br/><i>TermId → full value</i>"]
+        PO["Postings<br/><i>(TermId, high, snapshot) → roaring container<br/>direct + derived + system labels</i>"]
+        SQ["Sequences<br/><i>collection order</i>"]
+        FW -->|"TermIds"| TT
+        TD --> PO
+        FW -.->|"closure via rules"| PO
+        FW -.->|"order slots"| SQ
     end
 
-    Snapshots["Snapshot tree + ObjectHistory sidecar<br/><i>snapshot id in snapshot-aware keys</i>"]
-    Subs["Subscriptions<br/><i>records, membership at cursor,<br/>pending events</i>"]
-    Reconcile["Reconcile<br/><i>copygc, tiering, repair, rule rework</i>"]
-    Peers["Cluster peers<br/><i>direct state by uid and value</i>"]
+    OT -.->|"system labels from record"| PO
 
-    API -->|"every mutation"| JSets
-    JSets -->|"Checkpoint"| RootPtr
-    RootPtr -.->|"roots of every tree"| TermIndex
-    RootPtr -.-> Meta
-    RootPtr -.-> OntologyB
-
-    API -->|"intern assertion"| Dict
-    API -->|"direct terms"| Forward
-    Closures -->|"derive"| Postings
-    Forward -->|"cleanup on delete,<br/>rework on rule change"| Postings
-    API -->|"query: lookups and scans"| Dict
-    Postings -->|"oid sets"| API
-    Sequences -.-> API
-
-    API -->|"state, metadata"| ObjTable
-    ObjTable -->|"Extent"| Blobs
-    ObjTable -->|"ExtentList"| ExtentList --> Blobs
-    ObjTable -->|"ChunkList"| ChunkList
-    ObjTable -->|"Packed"| Packed
-    ObjTable -.->|"Remote"| Peers
-
-    Alloc --> Blobs
-    Blobs -.-> Backptr
-    Packed -.-> Backptr
-    Backptr -->|"owner of moved data"| Reconcile
-    Reconcile -->|"update locator"| ObjTable
-    Reconcile --> Alloc
-
-    Snapshots -.-> Postings
-    Snapshots -.-> Forward
-    Snapshots -.-> ObjTable
-    API -->|"events of reached<br/>subscriptions"| Subs
-    Snapshots -.->|"snapshot diffs"| Peers
-    OntTree -.->|"uids"| Peers
-```
-
-### 16.2 Component diagram
-
-The component view below shows the main data and control paths.
-
-```mermaid
-graph TB
-    subgraph ClientLayer["Client Layer"]
-        CLI["CLI / Shell<br/><i>query DSL, tag ops,<br/>browse, import</i>"]
-        API["Library API<br/><i>Rust crate interface</i>"]
-        FUSE["Optional FUSE<br/><i>POSIX compat shim</i>"]
+    subgraph Ont["Ontology & snapshots"]
+        ON["Ontology tree<br/><i>tags, rules (state), modules</i>"]
+        SN["Snapshots tree<br/><i>first-child / next-sibling</i>"]
     end
+    ON -.->|"closure tables, rules_epoch"| PO
+    SN -.->|"visibility of every snapshot-aware key"| FW
 
-    subgraph QueryEngine["Query Engine"]
-        Parser["Query Parser<br/><i>text → Query AST</i>"]
-        Planner["Query Planner<br/><i>reorder, optimize,<br/>choose index</i>"]
-        Executor["Set Executor<br/><i>bitmap AND/OR/NOT,<br/>range scans</i>"]
-        FacetCounter["Facet Counter<br/><i>co-occurrence,<br/>refinement tags</i>"]
+    subgraph Phys["Physical space (ALLOCATION-DESIGN, METADATA-DESIGN§2.2)"]
+        BP["Backpointer tree<br/><i>(disk, bucket, sector) → owner</i>"]
+        BA["BucketAlloc / FreespaceLru<br/><i>per disk, rooted in DiskDescriptors</i>"]
     end
+    BP -->|"owner: BlobExtent (oid, start) · Chunk · PackedBlock · BtreeNode"| OT
+    DATA -.-> BP
+    PACK -.-> BP
+    BA -.->|"live_sectors"| DATA
 
-    CLI --> Parser
-    API --> Parser
-    FUSE --> Parser
-    Parser --> Planner
-    Planner --> Executor
-    Executor --> FacetCounter
-
-    subgraph DataModel["Data Model"]
-        direction TB
-        Objects["Objects<br/><i>ObjectId: u64<br/>content hash, size,<br/>timestamps</i>"]
-        Assertions["Assertions<br/><i>Tag(TagId)<br/>Attr(key, value)<br/>Relation(pred, target)</i>"]
-        Values["Values<br/><i>Text, Int, Float,<br/>Timestamp, Blob</i>"]
-        Objects --- Assertions
-        Assertions --- Values
+    subgraph Watch["Subscriptions & rules"]
+        SUB["Subscriptions · Members · Events"]
+        MI["MatchIndex (resident)<br/><i>terms/keys → subscriptions, placement & hydration rules</i>"]
+        PR["PlacementRules · PoolState · DiskDescriptors · ClusterPeers"]
     end
-
-    subgraph Ontology["Ontology Layer"]
-        ImplGraph["Rules<br/><i>flac → audio, mime → flac,<br/>created → created-month</i>"]
-        Aliases["Names and aliases<br/><i>laptop = notebook,<br/>module:name</i>"]
-        MutexGroups["Constraints<br/><i>current ⊕ stale,<br/>lossless requires audio</i>"]
-        Materializer["Closures<br/><i>derived terms of<br/>direct terms</i>"]
-    end
-
-    ImplGraph --> Materializer
-    Aliases --> Planner
-    MutexGroups --> Executor
-
-    subgraph IndexLayer["Index Layer (B+ trees behind the journal)"]
-        TagIndex["Postings<br/><i>(TermId, id window) → roaring container<br/>tags, attribute values, relations</i>"]
-        KVIndex["Term Dictionary<br/><i>(kind, key, parent, normalised value) → TermId, stats<br/>equality, range and prefix scans</i>"]
-        RangeIndex["Sequences<br/><i>(TermId, position | score) → ObjectId<br/>ordered and ranked collections</i>"]
-        ForwardIndex["Forward Index<br/><i>ObjectId → direct TermIds<br/>for getattr / tag listing</i>"]
-    end
-
-    Executor --> TagIndex
-    Executor --> KVIndex
-    Executor --> RangeIndex
-    Materializer --> TagIndex
-
-    subgraph MetadataLayer["Metadata Layer"]
-        ObjTable["Object Table<br/><i>per-node radix of<br/>128B ObjectRecords</i>"]
-        LocTable["Content Locator<br/><i>in each record:<br/>extent, extent list, chunk list,<br/>packed slot, remote</i>"]
-    end
-
-    Executor --> ObjTable
-    ObjTable --> LocTable
-
-    subgraph PlacementEngine["Placement & Tiering Engine"]
-        Rules["Placement Rules<br/><i>Pin, Prefer, Replicate,<br/>Colocate, AutoTier</i>"]
-        TierCalc["Tier Calculator<br/><i>tags + access time<br/>→ ideal tier</i>"]
-        Migrator["Migration Planner<br/><i>background moves,<br/>rate-limited I/O</i>"]
-        Allocator["Bucket Allocator<br/><i>per-disk bucket table,<br/>freespace LRU, write points</i>"]
-    end
-
-    Rules --> TierCalc
-    TierCalc --> Migrator
-    Migrator --> Allocator
-    TagIndex -.->|"query matching<br/>objects"| TierCalc
-    LocTable <-->|"read current /<br/>update after move"| Migrator
-
-    subgraph TxnLayer["Transaction Layer"]
-        WAL["Journal<br/><i>write-once journal sets<br/>in journal buckets<br/>on the fastest disks</i>"]
-        Checkpoint["Checkpoint Engine<br/><i>flush dirty trees,<br/>commit root list in journal</i>"]
-        Recovery["Crash Recovery<br/><i>replay journal from<br/>last checkpoint</i>"]
-    end
-
-    TagIndex -->|"mutations"| WAL
-    ForwardIndex -->|"mutations"| WAL
-    ObjTable -->|"mutations"| WAL
-    WAL --> Checkpoint
-    Recovery --> WAL
-
-    subgraph PoolManager["Pool Manager"]
-        Topology["Topology Map<br/><i>DiskDescriptor[]<br/>media type, tier,<br/>capacity, health</i>"]
-        Rebalancer["Rebalancer<br/><i>on disk add/remove:<br/>semantic migration</i>"]
-        Resilverer["Resilverer<br/><i>on disk fail/replace:<br/>backpointer scan<br/>priority by replica count</i>"]
-        HealthMon["Health Monitor<br/><i>SMART, I/O errors,<br/>latency tracking</i>"]
-    end
-
-    Topology --> Allocator
-    Topology --> TierCalc
-    Rebalancer --> Migrator
-    Resilverer --> Migrator
-    HealthMon --> Topology
-    HealthMon --> Resilverer
-
-    subgraph DiskLayer["Physical Disk Layer (Raw Block Devices)"]
-        subgraph Disk0["Disk 0 — NVMe (Hot Tier)"]
-            D0Super["Superblock"]
-            D0WAL["Journal buckets"]
-            D0Index["Node buckets<br/><i>tree nodes and<br/>positional regions</i>"]
-            D0Meta["Node buckets<br/><i>further tree-node copies<br/>(metadata_replicas)</i>"]
-            D0Blobs["Data buckets<br/><i>hot objects:<br/>active, scratch</i>"]
-        end
-        subgraph Disk1["Disk 1 — SATA SSD (Warm Tier)"]
-            D1Super["Superblock<br/>(mirror)"]
-            D1WAL["Journal buckets<br/>(when mirrored)"]
-            D1Blobs["Data buckets<br/><i>default placement</i>"]
-        end
-        subgraph Disk2["Disk 2 — HDD (Cold Tier)"]
-            D2Super["Superblock<br/>(mirror)"]
-            D2Blobs["Data buckets<br/><i>cold objects:<br/>archive, backup</i>"]
-        end
-        subgraph DiskN["Disk N — (any tier)"]
-            DNSuper["Superblock<br/>(mirror)"]
-            DNBlobs["Data buckets<br/><i>rule-driven<br/>placement</i>"]
-        end
-    end
-
-    WAL --> D0WAL
-    WAL -.->|"mirror (JOURNAL-D1)"| D1WAL
-    Checkpoint --> D0Index
-    Checkpoint --> D0Meta
-    Allocator --> D0Blobs
-    Allocator --> D1Blobs
-    Allocator --> D2Blobs
-    Allocator --> DNBlobs
-
-    subgraph BlobIO["Blob I/O Path"]
-        BlobRead["Read Path<br/><i>locator → disk_id +<br/>bucket, sector → direct I/O</i>"]
-        BlobWrite["Write Path<br/><i>allocate extent →<br/>write → set locator<br/>→ journal commit</i>"]
-        ContentAddr["Content Addressing<br/><i>BLAKE3 hash<br/>dedup optional</i>"]
-    end
-
-    LocTable --> BlobRead
-    BlobRead --> DiskLayer
-    BlobWrite --> Allocator
-    BlobWrite --> WAL
-    ContentAddr --> BlobWrite
-
-    classDef client fill:#e8f4f8,stroke:#2980b9,stroke-width:2px,color:#000
-    classDef query fill:#fef9e7,stroke:#f39c12,stroke-width:2px,color:#000
-    classDef data fill:#fdf2e9,stroke:#e67e22,stroke-width:2px,color:#000
-    classDef ontology fill:#f4ecf7,stroke:#8e44ad,stroke-width:2px,color:#000
-    classDef index fill:#eafaf1,stroke:#27ae60,stroke-width:2px,color:#000
-    classDef meta fill:#fdebd0,stroke:#d35400,stroke-width:2px,color:#000
-    classDef placement fill:#ebf5fb,stroke:#2e86c1,stroke-width:2px,color:#000
-    classDef txn fill:#fdedec,stroke:#e74c3c,stroke-width:2px,color:#000
-    classDef pool fill:#e8daef,stroke:#7d3c98,stroke-width:2px,color:#000
-    classDef disk fill:#d5dbdb,stroke:#566573,stroke-width:2px,color:#000
-    classDef blob fill:#d6eaf8,stroke:#2874a6,stroke-width:2px,color:#000
-
-    class CLI,API,FUSE client
-    class Parser,Planner,Executor,FacetCounter query
-    class Objects,Assertions,Values data
-    class ImplGraph,Aliases,MutexGroups,Materializer ontology
-    class TagIndex,KVIndex,RangeIndex,ForwardIndex index
-    class ObjTable,LocTable meta
-    class Rules,TierCalc,Migrator,Allocator placement
-    class WAL,Checkpoint,Recovery txn
-    class Topology,Rebalancer,Resilverer,HealthMon pool
-    class D0Super,D0WAL,D0Index,D0Meta,D0Blobs,D1Super,D1WAL,D1Blobs,D2Super,D2Blobs,DNSuper,DNBlobs disk
-    class BlobRead,BlobWrite,ContentAddr blob
+    PO -.->|"closure deltas"| MI
+    MI --> SUB
+    MI -->|"enqueue work"| RC["Reconcile trees<br/><i>Work · Pending · Scan</i>"]
+    PR --> MI
+    RC -->|"moves, replicas"| BP
 ```
 
 ---
