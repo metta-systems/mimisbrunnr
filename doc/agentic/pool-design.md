@@ -70,6 +70,9 @@ PoolStateRecord = [version,
                    default_chunking: bytes(16),           // ChunkParamsRecord (INDEX-DESIGN§4.3)
                    encoded_extent_max: uint,              // plaintext bytes per compressed extent,
                                                           //   default 131072 (METADATA-DESIGN§1.3)
+                   rule_rework_inline_max: uint,          // estimated rework work units above which
+                                                          //   a rule change runs as a resumable
+                                                          //   rework (INDEX-DESIGN§2.4)
                    move_bytes_in_flight: uint,            // RECONCILE-DESIGN§1.5, default 64 MiB
                    move_ios_in_flight: uint,              // default 64
                    reconcile_flags: uint,                 // bit 0 copygc, 1 tiering, 2 repair,

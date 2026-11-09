@@ -189,6 +189,9 @@ choosing the closest ancestor as it goes.
 
 ### 1.4 Snapshot creation
 
+Creation is refused with a defined error while any rule is `installing` or `removing`
+(INDEX-DESIGN§2.4, "When the rework runs"), so a snapshot's postings always match its rules.
+
 Snapshot creation is O(1): allocate two new `SnapshotId`s as children of the current snapshot's
 node — one becomes the new snapshot's ID; the other replaces the current view's ID. No keys are
 copied. Both children inherit visibility of all ancestor keys through the tree. The new pair

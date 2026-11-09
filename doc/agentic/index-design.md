@@ -244,10 +244,6 @@ share one.
 | New `ValueImplies` or `Bucket` on key `k` | for every term of key `k` the rule matches: OR that term's postings into the derived term's postings; for `Bucket`, one dictionary scan of `k` groups its value terms by bucket |
 | Removed rule | see below |
 
-Adding a `Bucket` rule to a populated key reworks every object with that key; the engine runs it
-as a resumable job (RECONCILE-DESIGN§1) and keeps the previous `rules_epoch` for reads until the
-job commits.
-
 **Removing a rule.** For an `Implies` rule `a → b`, with the new ontology's tables:
 
 ```text
@@ -265,10 +261,32 @@ postings change anyway — so the work is proportional to the change, not to `po
 `ValueImplies` and `Bucket` removals follow the same pattern with the rule's matching value terms
 in place of `a`.
 
-Rule changes rework postings in the same commit that changes the rule records (ONTOLOGY-DESIGN
-"Install", "Upgrade", ONTOLOGY-DESIGN§1), or through a resumable job for bulk rules as above, so the
-invariant holds at every committed root. Reads of an older snapshot use that snapshot's records and
-tables.
+**When the rework runs.** Before committing a rule change (ONTOLOGY-DESIGN "Install",
+"Upgrade", ONTOLOGY-DESIGN§1), the engine estimates its postings work: the containers to OR, the
+value terms to scan, the suspects whose forward entries to read, and the objects a new
+constraint must check.
+
+- **At most `rule_rework_inline_max`** (POOL-DESIGN§1.2): the rework runs in the same commit as
+  the rule records, the rule is `active` at once, and the invariant holds at every committed
+  root.
+- **Above it:** the rule records commit with the rule in state `installing` (or `removing`), and
+  a reconcile scan (RECONCILE-DESIGN§1.3) reworks postings one 65 536-id window per step, each
+  step its own commit. Writes meanwhile compute closures with the rule set as it will be —
+  pending rules applied — so an object written during the scan is already right and the scan,
+  reaching it, changes nothing. When the scan completes, one commit sets the rule `active` (or
+  deletes it) and advances `rules_epoch`.
+- **While a rule is pending,** queries on the terms it derives see a result between the old
+  rules' and the new rules': it grows window by window for an added rule and shrinks for a
+  removed one. That is the contract until the rule is active; `mimir ontology status` lists
+  pending rules and their progress. The invariant holds again, for every term, at the commit
+  that ends the scan.
+- **No snapshot is created while a rule is pending:** `SnapshotCreate` fails with a defined
+  error until the scan completes (SNAPSHOTS-DESIGN§1.4), so every snapshot's postings match its
+  rules exactly.
+- **Constraints** installed this way check existing objects as part of the scan and report
+  violators when it completes (ONTOLOGY-DESIGN "Install").
+
+Reads of an older snapshot use that snapshot's records and tables.
 
 ---
 

@@ -133,15 +133,15 @@ needs = "systems.metta.core:audio"
 
 ### Install
 
-Install is all-or-nothing and runs as one commit:
+Install validates all-or-nothing and commits its records in one commit:
 
 1. **Duplicate module** — installing an installed `module_uid` adds the installer to its record and changes nothing else; a different version is an upgrade.
 2. **References** — every qualified name the module uses must resolve to an installed tag; an unresolved reference fails the install.
 3. **Cycles and order** — rules that would close an `Implies` / `ValueImplies` cycle fail the install, and so does a `Bucket` whose `key` is another `Bucket`'s `out_key`.
 4. **Storage-policy chain invariant** — SPECIFICATION-DESIGN§3.5.
 5. **Records** — tag, rule and constraint records are put with the module added to their provenance; new tags get `TagId`s.
-6. **Derived postings** — every new rule's derived terms are posted (INDEX-DESIGN§2.4) in the same commit.
-7. **Constraints on existing data** — objects already violating a new `Exclusive` or `Requires` are reported, not changed.
+6. **Derived postings** — every new rule's derived terms are posted (INDEX-DESIGN§2.4): in the same commit when the work is small, otherwise by a resumable rework during which the rule is `installing` (INDEX-DESIGN§2.4, "When the rework runs").
+7. **Constraints on existing data** — objects already violating a new `Exclusive` or `Requires` are reported, not changed; with a resumable rework, when it completes.
 
 ### Upgrade
 
@@ -328,7 +328,8 @@ TagRecord    = [version, uid: bytes(16), name: text, aliases: [text],
                                          //   entry's modified_ns and state_ns); 0 otherwise
                 flags: uint]             // bit 0: system label, derived by the engine
 
-RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)]]
+RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)],
+                state: uint]             // 0 active, 1 installing, 2 removing (INDEX-DESIGN§2.4)
     kind 0 Implies       params = [from: TagId, to: TagId]
     kind 1 ValueImplies  params = [key: TagId, value: Value, to: TagId]
     kind 2 Bucket        params = [key: TagId, out_key: TagId, granularity: uint]
@@ -352,8 +353,8 @@ ModuleRecord = [version, uid: bytes(16), id: text, module_version: text, name: t
   a few MiB even at 100 000 tags.
 - **Updates.** Each change is an `OntologyPut` or `OntologyDelete` journal entry
   (JOURNAL-DESIGN§1.3) carrying the record key and value; a module install is a batch of them in
-  one commit. A `rules_epoch` counter in memory advances when a rule or constraint record
-  changes; only then are closure tables rebuilt and postings reworked, in the same commit
-  (INDEX-DESIGN§2.4). Creating or renaming a tag touches one record and no postings.
+  one commit. A `rules_epoch` counter in memory advances when a rule or constraint becomes
+  active or is removed; closure tables are rebuilt then and postings reworked in that commit, or
+  beforehand by a resumable rework while the rule is pending (INDEX-DESIGN§2.4). Creating or renaming a tag touches one record and no postings.
 - **Snapshots.** Keys carry the snapshot id (SNAPSHOTS-DESIGN§1.2), so a snapshot sees the
   ontology as it was; reads of a snapshot build closure tables from that snapshot's records.

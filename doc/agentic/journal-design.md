@@ -377,9 +377,11 @@ ReclaimTerms     : { term_ids: [u64; N] }
 // Ontology (ONTOLOGY-DESIGN§1)
 OntologyPut      : { record_kind: u8, a: u64, b: u64, record: bytes }
                    // Inserts or replaces one ontology record (TagRecord, RuleRecord or
-                   //   ModuleRecord, positional CBOR). A rule or constraint record advances
-                   //   rules_epoch; the postings it changes follow in the same commit. Replay
-                   //   raises next_tag_id or next_rule_id past the record's id.
+                   //   ModuleRecord, positional CBOR). An active rule or constraint record
+                   //   advances rules_epoch and its postings follow in the same commit; one in
+                   //   state installing or removing starts a resumable rework instead
+                   //   (INDEX-DESIGN§2.4). Replay raises next_tag_id or next_rule_id past the
+                   //   record's id.
 OntologyDelete   : { record_kind: u8, a: u64, b: u64 }
                    // Removes one ontology record; the id counters are untouched.
 

@@ -69,8 +69,9 @@ against its terms before (both closures are at hand). No postings are read.
 **Rule changes.** A rule install or removal reworks postings container by container
 (INDEX-DESIGN§2.4); each container delta of a term in `term_to_subs` is handed to the
 subscriptions under that term, whose objects are evaluated as above. A module adding
-`m4a → audio` delivers `Entered` for every existing `m4a` object in bulk, in the commit that
-installs it, stored as one bulk event per id window (SUBSCRIPTIONS-DESIGN§1).
+`m4a → audio` delivers `Entered` for every existing `m4a` object in bulk, stored as one bulk
+event per id window (SUBSCRIPTIONS-DESIGN§1): in the commit that installs it, or window by window
+as a resumable rework advances (INDEX-DESIGN§2.4).
 
 Active and dormant subscriptions are evaluated alike: a dormant one accumulates pending events
 until its consumer returns or its bound is exceeded. An overflowed subscription is no longer

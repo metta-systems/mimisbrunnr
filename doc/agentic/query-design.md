@@ -24,7 +24,8 @@ Every query operator evaluates through bitmap algebra over an index built for it
 and values. Compilation resolves them once: tags to `TermId`s, attribute equalities to
 dictionary lookups, ranges and prefixes to dictionary key ranges, `Contains` to n-gram term
 sets. The compiled query is cached with the `rules_epoch` and the dictionary entries it read,
-and recompiled when either changes. Subscriptions and placement rules keep compiled forms
+and recompiled when either changes. Terms derived by a rule still being reworked return the
+partial result the rework has reached (INDEX-DESIGN§2.4). Subscriptions and placement rules keep compiled forms
 resident.
 
 **Stream window by window.** The executor produces the result one 65 536-id window at a time

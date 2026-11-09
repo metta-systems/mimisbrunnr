@@ -128,7 +128,7 @@ mismatch it finds:
 | Ontology change altering compression, encryption, tier or chunking for a tag | that tag's postings |
 | Snapshot marked deleted | the snapshot-aware trees, one cursor each (SNAPSHOTS-DESIGN§1.5) |
 | Rollback | the object table's history entries on the abandoned branch (SNAPSHOTS-DESIGN§1.8) |
-| Rule change in the ontology | the postings to rework (INDEX-DESIGN§2.4) |
+| Rule change above the inline rework limit | the postings to rework and objects to check, one 65 536-id window per step; its last step activates or deletes the pending rule (INDEX-DESIGN§2.4) |
 | Term reclamation | the term dictionary (INDEX-DESIGN§1.2) |
 | Copy-GC reserve low | the freespace LRU's most fragmented bands (ALLOCATION-DESIGN§1.6) |
 
