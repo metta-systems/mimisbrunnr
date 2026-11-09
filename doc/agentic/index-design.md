@@ -78,8 +78,8 @@ Derived terms (kinds 3 and 4, and the tags and bucketed values the ontology's ru
 never in forward entries (INDEX-DESIGN§2.4).
 
 **Allocation.** Attribute and relation terms take `TermId`s from a per-pool counter starting at
-2³², assigned in write order and never reused; the counter is `next_term_id` in the root list
-head (ENGINE-DESIGN§1.2), so no deletion or snapshot cleanup can lower it. Journal replay
+2³², assigned in write order and never reused; the counter is the `Term` entry of the root
+list head's id counters (ENGINE-DESIGN§1.2), so no deletion or snapshot cleanup can lower it. Journal replay
 re-interns values in LSN order from the committed checkpoint's counter, so it assigns the same
 `TermId`s.
 

@@ -101,7 +101,7 @@ struct WorkValue {                           // 24 bytes
 | ------------------ | --- | --- |
 | `ReconcileWork`    | `WorkKey` | Queued mismatches found by triggers and scans, processed in key order |
 | `ReconcilePending` | `WorkKey` | Items that failed for lack of a device; retried after a device-configuration event |
-| `ReconcileScan`    | `scan_id: u64` | One `ScanRecord` per running scan (RECONCILE-DESIGN§1.3) |
+| `ReconcileScan`    | `scan_id: u64` | One `ScanRecord` per running scan (RECONCILE-DESIGN§1.3); ids from the `Scan` id counter (ENGINE-DESIGN§1.2) |
 
 A work entry records only where to look. The worker reads the current owner through the
 backpointer at the key's location and evaluates desired state then; if nothing is wrong any

@@ -27,7 +27,10 @@ The numbered sections below are the normative on-disk and algorithmic specificat
 ### 1.1 Disk descriptors
 
 `RootPointer.disk_descriptors_root` (ENGINE-DESIGN§1.2) roots a BTREE-DESIGN§1 B+ tree of
-`BtreeKind::DiskDescriptors`, snapshot-agnostic, keyed by `disk_id: u16`, with fixed-size values:
+`BtreeKind::DiskDescriptors`, snapshot-agnostic, keyed by `disk_id: u16`, with fixed-size values.
+A disk's `disk_id` is drawn from the `Disk` id counter (ENGINE-DESIGN§1.2) when it is added and
+never reused after it is removed, since `BlockRef`s, replica references and backpointers carry it;
+placement-rule ids come from the `PlacementRule` counter the same way. The descriptor:
 
 ```rust
 #[repr(C)]

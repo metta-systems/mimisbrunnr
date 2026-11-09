@@ -28,7 +28,7 @@ The ontology is the single authority over tag identity, attribute keys, derivati
 - a module's tag: the first 128 bits of `BLAKE3("mimir-tag" ‖ module_id ‖ 0x00 ‖ name)`, so every node and every reinstall of the module derives the same uid;
 - an ad-hoc tag (the `local` module): 128 random bits.
 
-Its `TagId` is allocated locally from 1 upward and never reused: the counter is `next_tag_id` in the root list head (ENGINE-DESIGN§1.2), outside the snapshot-aware ontology tree.
+Its `TagId` is allocated locally from 1 upward and never reused: the counter is the `Tag` entry of the root list head's id counters (ENGINE-DESIGN§1.2), outside the snapshot-aware ontology tree.
 
 **Names.** Every tag has a canonical name and any number of aliases. A name resolves to a tag when it is unique among installed tags; when two modules declare the same name (`album` from music and from photos), each is reachable by its qualified name (`systems.metta.music:album`) and the bare name is ambiguous — an error that names both. Modules reference other modules' tags by qualified name, and the core ontology's names resolve unqualified when no other module claims them.
 
@@ -344,7 +344,7 @@ ModuleRecord = [version, uid: bytes(16), id: text, module_version: text, name: t
 `TagId`s and rule ids inside records are local; a record's uids are what leaves the node.
 
 - **Tag and rule ids.** `TagId`s and rule ids are allocated from 1 and never reused. Their
-  counters are `next_tag_id` and `next_rule_id` in the root list head (ENGINE-DESIGN§1.2), so
+  counters are the `Tag` and `Rule` id counters in the root list head (ENGINE-DESIGN§1.2), so
   removing a record, snapshot cleanup or deleting a rollback branch never lowers them.
 - **Granularity codes** for `Bucket`: 0 year, 1 month, 2 week, 3 day, 4 hour for timestamps;
   for integers, `16 + k` means power-of-two classes of width 2ᵏ.

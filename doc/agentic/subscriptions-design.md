@@ -17,7 +17,7 @@ A subscription is a saved query plus a cursor into the journal. A consumer polls
 - **Membership as of the acknowledged cursor** is stored as posting containers in a snapshot-agnostic tree of its own; `ack` applies the acknowledged events to it. It is the baseline for the result-set diff a subscription falls back to when its pending events exceed its `retention` bound.
 - **Not snapshot-aware.** Subscriptions watch the head. Creating, deleting or rolling back a snapshot never moves a consumer's cursor, membership or pending events.
 - **Pull and acknowledge.** `poll(sub, max)` returns pending events in order, tagged with their LSN; `ack(lsn)` removes them and advances the persisted cursor. Delivery is at least once; consumers deduplicate by LSN. Debouncing and wake-ups run in the engine's `step` (ENGINE-DESIGN "Selected design"); no thread is needed.
-- **Ids are never reused**: removing the subscription with the largest id leaves a high-water marker record (SUBSCRIPTIONS-DESIGN§1).
+- **Ids are never reused**: they come from the pool's `Subscription` id counter (ENGINE-DESIGN§1.2).
 - **Remote changes are local operations.** Changes received by cluster sync are applied as ordinary local journal entries (CLUSTER-DESIGN), so subscriptions see them exactly as they see local mutations; their events carry the origin's hybrid timestamp.
 
 ## Why not inotify
@@ -215,8 +215,7 @@ SubscriptionRecord = [version,
                       interest: uint,        // ChangeInterest bits
                       cursor: uint,          // LSN of the last acknowledged event
                       cursor_ns: int,        // time of that journal entry
-                      state: uint,           // 0 Active, 1 Dormant, 2 Overflowed,
-                                             //   0xFF high-water marker
+                      state: uint,           // 0 Active, 1 Dormant, 2 Overflowed
                       retention: Retention,  // SUBSCRIPTION-D2: the bound on pending events
                       debounce_ms: uint,
                       pending_count: uint,   // pending events (bulk entries count their objects)
@@ -224,11 +223,8 @@ SubscriptionRecord = [version,
                                              //   to (SNAPSHOTS-DESIGN§1.8); 0 otherwise
 ```
 
-**Ids.** Ids are allocated from 1 and never reused. The counter is derived at boot as one past
-the largest key. When the subscription with the largest id is removed, its record is replaced by
-a high-water marker (`state = 0xFF`, other fields empty) so the counter cannot fall back; a
-marker is removed once a larger id exists. This is the pattern of term and tag ids
-(INDEX-DESIGN§1.2, ONTOLOGY-DESIGN§1).
+**Ids.** Ids are allocated from 1 and never reused, from the `Subscription` id counter in the root
+list head (ENGINE-DESIGN§1.2), like every local id.
 
 **Membership.** `RootPointer.subscription_members_root` roots a B+ tree of
 `BtreeKind::SubscriptionMembers`, snapshot-agnostic, keyed by `(id: u64, high: u64)` with

@@ -386,8 +386,8 @@ OntologyPut      : { record_kind: u8, a: u64, b: u64, record: bytes }
                    //   ModuleRecord, positional CBOR). An active rule or constraint record
                    //   advances rules_epoch and its postings follow in the same commit; one in
                    //   state installing or removing starts a resumable rework instead
-                   //   (INDEX-DESIGN§2.4). Replay raises next_tag_id or next_rule_id past the
-                   //   record's id.
+                   //   (INDEX-DESIGN§2.4). Replay raises the Tag or Rule id counter past
+                   //   the record's id.
 OntologyDelete   : { record_kind: u8, a: u64, b: u64 }
                    // Removes one ontology record; the id counters are untouched.
 

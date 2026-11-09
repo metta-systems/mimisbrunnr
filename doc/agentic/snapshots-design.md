@@ -33,7 +33,9 @@ consumed by keys unique to each snapshot.
 
 ### 1.1 Snapshot tree
 
-A `SnapshotId` is a `u32` (4 G snapshots before recycling concerns). Snapshot relationships are
+A `SnapshotId` is a `u32`, allocated from the `Snapshot` id counter in the root list head
+(ENGINE-DESIGN§1.2) and never reused: snapshot ids are part of every snapshot-aware key and of
+what peers acknowledge (CLUSTER-DESIGN§1). Snapshot relationships are
 stored in the **snapshots btree** (`BtreeKind::Snapshots`, a BTREE-DESIGN§1 B+ tree keyed by `SnapshotId`):
 
 ```rust
