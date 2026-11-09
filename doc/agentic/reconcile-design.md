@@ -182,8 +182,8 @@ equivalent primitive mutations:
 
 ```
 ReconcileMove { from_loc, to_loc, owner_key }
-  ⇒ BackpointerRemove(from_loc → key)
-   ∘ BackpointerInsert(to_loc → key, value)
+  ⇒ remove the backpointer at from_loc
+   ∘ insert the backpointer at to_loc, same owner
    ∘ owner-update on owner_key:
         OwnerKind::BlobExtent      → start_offset 0 and an Extent locator: the locator's replica in
                                      the radix record and every ObjectHistory version of the oid
@@ -202,13 +202,13 @@ Changing the number of copies projects the same way, onto the same owners:
 
 ```
 ReconcileReplicate { existing, new_loc, owner_key }
-  ⇒ BackpointerInsert(new_loc → key, value)
+  ⇒ insert the backpointer at new_loc
    ∘ owner-update: add new_loc as a replica beside `existing`, raising replica_count
      (BlobExtent: in the locator or the extent-tree keys found as for a move; PackedBlock: in
      the Packed locator of every object the block names)
 
 ReconcileDropReplica { loc, owner_key }
-  ⇒ BackpointerRemove(loc → key)
+  ⇒ remove the backpointer at loc
    ∘ owner-update: remove loc from the replicas, lowering replica_count; refused when it is
      the last replica
 ```
@@ -218,9 +218,8 @@ of the lost copy's slot to a new location, never a change of count. A chunk has 
 `ChunkIndex`, so neither op applies to `OwnerKind::Chunk`.
 
 All projected mutations apply under the move's LSN, so a crash either replays all of them or
-none. `BackpointerInsert` / `BackpointerRemove` remain first-class journal ops because they are
-also emitted directly by non-move callers (object deletion, fresh writes, node frees) — moves
-are the only flow that needs the bundled `ReconcileMove`.
+none. Backpointers of fresh writes, node frees and dropped references are derived the same way
+from their own ops (METADATA-DESIGN§2.2 "Lifecycle"); there are no backpointer ops.
 
 **Type adaptation.** `BlockRef` is the uniform 16-byte handle used in journal entries
 (`{disk_id, sector, bucket_no, generation}`, ENGINE-DESIGN§1.2); the on-disk owner fields use

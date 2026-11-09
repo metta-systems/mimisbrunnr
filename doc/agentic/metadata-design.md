@@ -454,7 +454,7 @@ it whatever the struct's field order.
 **`owner_key` padding.** Variants whose logical key is shorter than 16 bytes must **zero the
 trailing bytes** of `owner_key`. Equality of two `BackpointerValue` records is byte-wise over the
 full 16 B, and replay of a `ReconcileMove` (JOURNAL-DESIGN§1.3, RECONCILE-DESIGN§1.5) decomposes
-into `BackpointerRemove(old_key) ∘ BackpointerInsert(new_key) ∘ owner-update` on exact-match keys
+into removing the old backpointer, inserting the new one and updating the owner, on exact-match keys
 — non-zero padding would silently break that match.
 
 The pair `(BackpointerKey, BackpointerValue)` is 32 bytes unpacked; with BTREE-DESIGN§1.6 key packing
@@ -475,12 +475,23 @@ per sorted run.
 
 #### Lifecycle
 
-- **Insert** on every blob, chunk, packed-block and tree-node write. Journalled as `BackpointerInsert` (JOURNAL-DESIGN§1.3).
-- **Remove** on object deletion or extent rewrite. Journalled as `BackpointerRemove`. May be
-  elided when the bucket's generation will be bumped (lazy invalidation).
-- **Update** on copygc / reconcile move. The move path emits a single `ReconcileMove` WAL op
-  (JOURNAL-DESIGN§1.3, RECONCILE-DESIGN§1.5); replay projects it into the equivalent `BackpointerRemove(old) ∘
-  BackpointerInsert(new) ∘ owner-update` sequence and applies all three under one LSN.
+Backpointers have no journal ops of their own. Like postings and `live_sectors`
+(ALLOCATION-DESIGN§1.2), they are a deterministic projection of ops that exist for other reasons,
+applied under those ops' LSNs, so the mutation path and replay produce the same tree:
+
+| Op | Backpointer change |
+|---|---|
+| `WriteBlob` | insert one per replica: `BlobExtent`, owner `(oid, 0)` |
+| `ExtendObject` | insert one per replica of each extent: `BlobExtent`, owner `(oid, start_offset)`, where `start_offset` is the object's durable length before that extent |
+| `ChunkInsertBatch` | insert one per new chunk: `Chunk`, owner = hash prefix |
+| `PackObjects` | insert one per replica of the block: `PackedBlock`, owner = block id |
+| `Checkpoint` | insert one per copy of every region the new root reaches and the old did not: `BtreeNode`; remove those of every region it no longer reaches. Regions written after the last checkpoint have none — a crash leaves them unreferenced |
+| an op that ends an extent's or chunk's last reference (an overwrite, `ChunkListReplace`/`Shrink`, snapshot cleanup, deletion reclaim; SNAPSHOTS-DESIGN§1.6) | remove its backpointers |
+| `ReconcileMove`, `ReconcileReplicate`, `ReconcileDropReplica` | move, add or remove one, with the owner update (RECONCILE-DESIGN§1.5) |
+
+Every field of a `BackpointerValue` comes from the op: the owner kind and key as above, the
+length and `bucket_gen` from the replica set's `BlockRef`s. A removal may also be left to lazy
+invalidation when the bucket's generation is about to be bumped.
 
 #### Operations enabled
 

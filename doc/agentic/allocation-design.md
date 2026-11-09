@@ -108,12 +108,16 @@ enum BucketKind {
 **Live-sector accounting.** `live_sectors` changes only through entries that already exist for
 other reasons, so replay recomputes it without accounting entries of its own:
 
-- data: `WriteBlob`, `ExtendObject`, `WriteInline` packing, `ChunkInsertBatch` and chunk-list
-  ops add the sectors they reference; deletion reclaim, chunk reference drops and
-  `ReconcileMove` subtract or move them (JOURNAL-DESIGN§1.3);
+- data: `WriteBlob`, `ExtendObject`, `PackObjects` and `ChunkInsertBatch` add the sectors they
+  reference; ending an extent's or chunk's last reference (SNAPSHOTS-DESIGN§1.6) subtracts them;
+  `ReconcileMove`, `ReconcileReplicate` and `ReconcileDropReplica` move, add or subtract them
+  (JOURNAL-DESIGN§1.3);
 - tree nodes: a checkpoint adds the sectors of the regions its root newly reaches and
   subtracts those of the regions it no longer reaches. Node sectors written after the last
   checkpoint are not live: a crash leaves them unreferenced.
+
+Backpointers are derived by the same ops at the same points (METADATA-DESIGN§2.2 "Lifecycle"),
+so a bucket's `live_sectors` always equals the sectors its live backpointers cover.
 
 The alloc table is housed in `Node` buckets like every other tree and committed by the same
 checkpoint (ENGINE-DESIGN§1.2).
@@ -195,8 +199,8 @@ Each bucket is processed via the standard move path (RECONCILE-DESIGN§1.5):
    the owner is `BlobExtent`).
 3. Write to a fresh bucket via the move path.
 4. Emit a single `ReconcileMove { from_loc, to_loc, owner_key }` WAL op (JOURNAL-DESIGN§1.3, RECONCILE-DESIGN§1.5). Replay
-   projects this into `BackpointerRemove(old_key) ∘ BackpointerInsert(new_key, new_value) ∘
-   owner-update` applied as a single LSN's worth of btree mutations.
+   projects this into removing the old backpointer, inserting the new one and updating the
+   owner, applied as a single LSN's worth of btree mutations.
 5. Once a checkpoint has committed every move out of the bucket, bump its generation
    (`BucketGenBump`) and mark it free with `BUCKET_FLAG_NEEDS_DISCARD`. The generation bump
    invalidates any backpointers missed during the scan.

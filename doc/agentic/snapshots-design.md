@@ -222,7 +222,7 @@ The `SnapshotCreate` journal op (JOURNAL-DESIGN§1.3) records this as
 `parent_id ↔ N` (the previous current), and `current_replacement ↔ N₁` (the new writable head
 to which subsequent mutations are tagged).
 
-A new `BackpointerInsert` is **not** issued for shared extents — the underlying blob is unchanged
+No backpointer is added for shared extents — the underlying blob is unchanged
 and its existing backpointer is valid for both snapshots. Backpointers are physical, not logical
 (METADATA-DESIGN§2.2 / SNAPSHOTS-DESIGN§1.2 table), so they're snapshot-agnostic.
 

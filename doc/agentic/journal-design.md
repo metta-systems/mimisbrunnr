@@ -216,23 +216,21 @@ subsystem; a reader rejects any other value.
 | 26 | `BucketAlloc` | buckets |
 | 27 | `BucketGenBump` | buckets |
 | 28 | `BucketDiscard` | buckets |
-| 29 | `BackpointerInsert` | backpointers |
-| 30 | `BackpointerRemove` | backpointers |
-| 31 | `SnapshotCreate` | snapshots |
-| 32 | `SnapshotSwitch` | snapshots |
-| 33 | `SnapshotDelete` | snapshots |
-| 34 | `SnapshotUnlink` | snapshots |
-| 35 | `SnapshotDepthUpdate` | snapshots |
-| 36 | `ReconcileEnqueue` | reconcile |
-| 37 | `ReconcileDequeue` | reconcile |
-| 38 | `ReconcileMove` | reconcile |
-| 39 | `ReconcileReplicate` | reconcile |
-| 40 | `ReconcileDropReplica` | reconcile |
-| 41 | `ReconcileScanStep` | reconcile |
+| 29 | `SnapshotCreate` | snapshots |
+| 30 | `SnapshotSwitch` | snapshots |
+| 31 | `SnapshotDelete` | snapshots |
+| 32 | `SnapshotUnlink` | snapshots |
+| 33 | `SnapshotDepthUpdate` | snapshots |
+| 34 | `ReconcileEnqueue` | reconcile |
+| 35 | `ReconcileDequeue` | reconcile |
+| 36 | `ReconcileMove` | reconcile |
+| 37 | `ReconcileReplicate` | reconcile |
+| 38 | `ReconcileDropReplica` | reconcile |
+| 39 | `ReconcileScanStep` | reconcile |
 
 Changes to pool administration trees have no ops; they commit by checkpoint (POOL-DESIGN§1.2).
-Postings, pending subscription events and `live_sectors` have none either: replay derives them
-from the ops that cause them.
+Postings, pending subscription events, `live_sectors` and backpointers have none either: replay
+derives them from the ops that cause them (METADATA-DESIGN§2.2 "Lifecycle").
 
 ```rust
 CreateObject     : { oid: u64, created_ns: i64, state: u8 }    // raises the origin node's next_local;
@@ -294,12 +292,6 @@ BucketGenBump    : { disk_id: u16, bucket_no: u32, new_generation: u32 }  // buc
 // live_sectors has no op: replay derives it from the entries that add and drop references
 //   (ALLOCATION-DESIGN§1.2).
 BucketDiscard    : { disk_id: u16, bucket_no: u32 }                       // TRIM issued
-
-// Backpointers (METADATA-DESIGN§2.2)
-BackpointerInsert: { key: BackpointerKey, value: BackpointerValue }
-BackpointerRemove: { key: BackpointerKey }                                // explicit removal
-// Implicit removal: a BucketGenBump invalidates all of that bucket's backpointers lazily
-// (stale entries detected by gen mismatch on the next scan, no per-bp WAL op needed).
 
 
 // Snapshot lifecycle (SNAPSHOTS-DESIGN§1)
