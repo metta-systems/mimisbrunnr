@@ -52,72 +52,37 @@ Goals:
   - Records spanning multiple blocks use a shadow-paging / log-structured update.
 - Block addresses are bucket-relative `(bucket_no, sector)` in 4 KiB sectors (ENGINE-DESIGN§1.3).
 
-### 1.3 Per-block header (`BlockHeader`)
+### 1.3 Preamble
 
-Every persistent header — both 4 KiB block headers (this section) and 256 KiB region headers
-(BTREE-DESIGN§1.1) — begins with the same 8-byte `BlockPreamble`. A generic reader can read those 8 bytes
-to identify the structure (atomic 4 KiB block vs. append-only 256 KiB region) and dispatch to
-the right parser:
+Every persistent header begins with the same 8-byte `Preamble`, so a reader identifies any
+structure from its first 8 bytes and dispatches to its parser:
 
 ```rust
-#[repr(C, packed)]
-struct BlockPreamble {            // 8 bytes — first field of every persistent header
-    magic: [u8; 4],               // "MIMR" = 4 KiB block; "MIMB" = 256 KiB region (BTREE-DESIGN§1.1)
-    kind: u16,                    // BlockKind (when magic = "MIMR") or BtreeKind ("MIMB")
-    format_version: u16,          // per-kind structural version
+#[repr(C)]
+struct Preamble {                 // 8 bytes — first field of every persistent header
+    magic: u32,                   // [0..4]  which structure (table below), little-endian ASCII
+    version: u16,                 // [4..6]  that structure's layout version (FORMAT-DESIGN§15)
+    kind: u16,                    // [6..8]  BtreeKind for a region; 0 for every other structure
 }
 ```
 
-Every block-sized persistent structure that is written or replaced as a unit begins with a
-32-byte `BlockHeader`:
+| Magic | Structure | Defined in |
+|---|---|---|
+| `MIMR` | superblock | ENGINE-DESIGN§1.1 |
+| `BREG` | B+ tree or positional region, block 0 | BTREE-DESIGN§1.1 |
+| `BIDX` | run index block | BTREE-DESIGN§1.2 |
+| `BPGS` | page-run index block | BTREE-DESIGN§1.7 |
+| `JRNL` | journal set | JOURNAL-DESIGN§1.2 |
+
+Each header ends with its `checksum: u64` (FORMAT-DESIGN§1.4), computed with that field zeroed.
+Blocks without a header of their own — run data blocks, pages — have their checksum in the
+index block's entry for them.
+
+Regions (256 KiB B+ tree nodes and radix leaves; BTREE-DESIGN§1) carry their tree's
+`BtreeKind` in `Preamble.kind`:
 
 ```rust
-#[repr(C, packed)]
-struct BlockHeader {              // 32 bytes
-    pre: BlockPreamble,           // [0..8]   magic = "MIMR", kind ∈ BlockKind
-    payload_length: u32,          // [8..12]  bytes following the header (excl. trailing CRC).
-                                  //          u32 (not u16) leaves headroom for >64 KiB blocks
-                                  //          in a future format revision; values for the current
-                                  //          4 KiB block are < 4096.
-    generation: u64,              // [12..20] monotonic per-block generation, for COW
-    lsn: u64,                     // [20..28] journal LSN that produced this block
-    flags: u32,                   // [28..32] BLOCK_FLAG_*
-}
-
-// BlockHeader.flags bits
-const BLOCK_FLAG_ENCRYPTED:    u32 = 1 << 0;  // payload encrypted (XTS-AES-256)
-const BLOCK_FLAG_CONTINUATION: u32 = 1 << 1;  // continuation of a chained record
-```
-
-A block is `BlockHeader | payload | u32 CRC32C(BlockHeader || payload)` — total = 4096 bytes by
-construction. CRC is computed with the CRC slot itself zeroed.
-
-`BlockKind` enumerates:
-
-```rust
-// Discriminants are pinned: any insertion goes at the end with the next free
-// value; existing variants never renumber. On-disk records carry these
-// numbers literally, so reordering is a format break. Variants are grouped
-// here by functional role for readability — the numeric values, not the
-// declaration order, are what's stable.
-#[repr(u16)]
-enum BlockKind {
-    // Filesystem identity, on-disk geometry, and pool composition
-    Superblock        = 0,   // per-disk identity + format pointers (ENGINE-DESIGN§1.1)
-    // 1 unassigned (devices have no zones, ENGINE-DESIGN§1)
-    // 2 unassigned (pool state is a tree, POOL-DESIGN§1.2)
-    // 3..=4 unassigned (journal sets carry their own header, JOURNAL-DESIGN§1.2)
-    // 5..=9 unassigned (index data lives in BtreeKind trees, INDEX-DESIGN)
-    // 10 unassigned (object assertions live in the forward index, INDEX-DESIGN§2)
-}
-```
-
-Large-node regions (256 KiB B+ tree nodes and radix leaves; BTREE-DESIGN§1) carry **`BtreeNodeHeader.kind`**
-of type `BtreeKind` instead of `BlockHeader.kind`:
-
-```rust
-// Discriminants are pinned per BlockKind's rule: insertions append, existing
-// variants never renumber. Grouped by functional role for readability.
+// Grouped by functional role for readability.
 #[repr(u16)]
 enum BtreeKind {
     // Logical radix (current view + per-snapshot history sidecars)
@@ -165,14 +130,16 @@ enum BtreeKind {
 }
 ```
 
-The **format_version** is *per-kind*, not global. Old kinds are evolved independently. A reader
-that encounters an unknown `(kind, format_version)` aborts with a clear "format too new" error.
+`Preamble.version` is per structure (and, for regions, per `BtreeKind`), not global: each evolves
+independently. A reader that encounters an unknown `(magic, kind, version)` aborts with a clear
+"format too new" error.
 
-### 1.4 CRC
+### 1.4 Checksums
 
-Every block, run, page and journal-set checksum uses one pool-wide block checksum algorithm,
-chosen by [OPERATIONS-D4](operations-decisions.md) (CRC32C is the current candidate). BLAKE3 is
-used for *content* integrity (per-object), not for block checksums.
+Every header, run data block, page and journal-set checksum is a 64-bit slot (`u64`) holding
+the pool-wide block checksum, whose algorithm is [OPERATIONS-D4](operations-decisions.md); an
+algorithm with a 32-bit result is stored zero-extended, so the choice changes no layout. BLAKE3
+is used for *content* integrity (per-object), not for block checksums.
 
 ### 1.5 Large node format
 
@@ -205,7 +172,7 @@ than the reader knows is a defined error, governed by the FORMAT-DESIGN§15 feat
 Rewriting a record always writes the current version, so records migrate in place as they are
 rewritten (FORMAT-DESIGN§15.4). Values nested inside a record (`Value`, a query AST) are
 versioned by that record; a `Value`'s own extension point is its type tag. Journal payloads are
-versioned by `JsetHeader.version` instead (JOURNAL-DESIGN§1.2).
+versioned by the jset's `Preamble.version` instead (JOURNAL-DESIGN§1.2).
 
 ## 2. Superblock and Atomic Root
 
@@ -287,8 +254,8 @@ The on-disk format evolves through a **two-version superblock**: the pool record
 version it currently *writes* with and the minimum version of any data still *on disk*. The
 two values move independently — new writes use the current version immediately, while older
 data retains its original format until rewritten by background migration (FORMAT-DESIGN§15.4).
-The fine-grained per-structure version is the `format_version` in each structure's
-`BlockPreamble` (per kind), with `record_version` inside fixed records and the leading schema
+The fine-grained per-structure version is the `version` in each structure's `Preamble`
+(per magic and, for regions, per kind), with `record_version` inside fixed records and the leading schema
 version of positional CBOR records (FORMAT-DESIGN§1.6).
 
 ### 15.1 Superblock version fields
@@ -346,7 +313,7 @@ the new value and the appropriate feature bits are set. Subsequent writes use th
 Existing data is untouched; `fs_min_on_disk` is unchanged.
 
 **Step 2 — migrate old data.** The reconcile engine (RECONCILE-DESIGN§1) launches a scan that walks all
-snapshot-aware btrees, rewriting any node or record whose `format_version` or `record_version`
+snapshot-aware btrees, rewriting any node or record whose `Preamble.version` or `record_version`
 is older than the current writing version. Each rewrite is COW; partial migrations are crash-safe.
 
 When the scan completes, `fs_min_on_disk` advances to match `fs_format_version` at the next
@@ -375,11 +342,11 @@ formatted pool at version `V`.
 
 ### 15.6 Per-structure migration rules
 
-For each `BtreeKind` / `BlockKind`, schema evolution follows one of three patterns:
+For each structure (a `BtreeKind`, or a non-region magic), schema evolution follows one of three patterns:
 
-1. **Additive** — new fields appended in reserved/padding regions; bump that kind's
-   `format_version`. Old readers ignore unknown bytes. Classified `compat`.
-2. **Layout** — new on-disk shape; allocate a new `BtreeKind` (or `BlockKind`) and keep the old
+1. **Additive** — new fields appended in reserved/padding regions; bump that structure's
+   `Preamble.version`. Old readers ignore unknown bytes. Classified `compat`.
+2. **Layout** — new on-disk shape; allocate a new `BtreeKind` (or bump a non-region structure's version) and keep the old
    one defined. The reconcile-driven migration (FORMAT-DESIGN§15.4) rewrites instances into the new kind.
    Mid-migration the pool may contain both shapes; new writes always use the new one. Typically
    `ro_compat` (old readers can still read the old shape) or `incompat` (depends on whether

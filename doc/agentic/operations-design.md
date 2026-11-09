@@ -150,9 +150,9 @@ Records with a variable part (journal payloads) are a fixed head plus one array 
 
 ## CRC and magic
 
-- Checksums: the OPERATIONS-D4 algorithm over each structure with its checksum slot zeroed — superblock, node header block, run index and data blocks, page runs (BTREE-DESIGN§1.1–1.2, BTREE-DESIGN§1.7), journal sets (JOURNAL-DESIGN§1.2).
-- Magic: `b"MIMR"` for 4 KiB blocks, `b"MIMB"` for 256 KiB regions, `b"MIMISBRUNNR\0\0\0\0\0"` for the superblock, `b"JSET"` for journal sets, `b"BSET"` for key runs, `b"PAGE"` for page runs.
-- `BlockKind` and `BtreeKind` discriminants are pinned by the spec and never renumbered.
+- Checksums: 64-bit slots holding the OPERATIONS-D4 algorithm over each structure with its checksum slot zeroed — superblock, node header block, run index and data blocks, page runs (BTREE-DESIGN§1.1–1.2, BTREE-DESIGN§1.7), journal sets (JOURNAL-DESIGN§1.2) (FORMAT-DESIGN§1.4).
+- Magic: every header starts with the 8-byte `Preamble` (FORMAT-DESIGN§1.3) — `b"MIMR"` superblock (which also carries `b"MIMISBRUNNR\0\0\0\0\0"` for device probing), `b"BREG"` region, `b"BIDX"` run index block, `b"BPGS"` page-run index block, `b"JRNL"` journal set.
+- `BtreeKind` discriminants are pinned by the spec.
 
 ## Tests
 

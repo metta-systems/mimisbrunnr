@@ -47,7 +47,11 @@ pub const BLOCK_FLAG_ENCRYPTED: u32 = 1 << 0;
 /// Flag: continuation of a chained record.
 pub const BLOCK_FLAG_CONTINUATION: u32 = 1 << 1;
 
-/// 32-byte header that prefixes every persistent 4 KiB block. FORMAT-DESIGN§1.3.
+/// 32-byte header that prefixes every persistent 4 KiB block.
+///
+/// TODO(BTREE11): the spec replaces `BlockHeader`, `BlockKind` and the packed
+/// `BlockPreamble` with one aligned `Preamble { magic, version, kind }` and
+/// 64-bit checksum slots (FORMAT-DESIGN§1.3–1.4).
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct BlockHeader {

@@ -206,7 +206,7 @@ with the terms themselves, in its forward entry's `modified_ns` (INDEX-DESIGN§2
 never dirties the record. A Unix ctime is the later of the two (and of `state_ns`).
 
 `record_version` is `1`. A reader decodes every record version since the format was declared
-stable and upgrades a record when it next rewrites its leaf; `BtreeNodeHeader.format_version`
+stable and upgrades a record when it next rewrites its leaf; the region's `Preamble.version`
 versions the leaf layout around the records (FORMAT-DESIGN§15.6).
 
 ### 1.2 Content locator

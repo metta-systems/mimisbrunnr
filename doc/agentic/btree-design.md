@@ -19,7 +19,7 @@ One region machinery that every persistent tree plugs into: large nodes that are
 - **Per-run key formats.** Each run picks its own key format when it is written, so a new key never forces an earlier run to change and no format-promotion step exists.
 - **Whiteouts are an entry flag** that survives flush and is dropped only by compaction.
 - **Positional regions** (radix leaves and inner nodes, forward overflow) are arrays of 4 KiB pages; a flush appends only the pages that changed (BTREE-DESIGN§1.7).
-- `BlockKind` and `BtreeKind` discriminants are pinned by the spec.
+- Every header starts with the 8-byte `Preamble` and ends with a 64-bit checksum (FORMAT-DESIGN§1.3–1.4); `BtreeKind` discriminants are pinned by the spec.
 
 ## Invariants
 
@@ -52,7 +52,7 @@ Two variants share the envelope:
 - **Positional region** (object-table radix leaves and inner nodes, `ForwardOverflow`): a fixed-size array of records, kept as 4 KiB pages (BTREE-DESIGN§1.7).
 
 > **Terminology.** A *run* is the bcachefs `bset` ("btree set") — one append-only, sorted
-> commit unit within a node. Its on-disk magic is `"BSET"`.
+> commit unit within a node. Its index block's magic is `"BIDX"`.
 
 ### 1.1 Region envelope
 
@@ -63,7 +63,7 @@ the rest of block 0 is zero.
 ```rust
 #[repr(C)]
 struct BtreeNodeHeader {                     // 64 bytes, block 0, written once
-    pre: BlockPreamble,                      //  [0..8]   magic = "MIMB", kind ∈ BtreeKind (FORMAT-DESIGN§1.3)
+    pre: Preamble,                           //  [0..8]   magic "BREG", kind ∈ BtreeKind (FORMAT-DESIGN§1.3)
     node_seq: u64,                           //  [8..16]  bumped each time the node moves to a fresh region
     created_lsn: u64,                        // [16..24]  journal LSN when the region was created
     region_size_log2: u8,                    // [24..25]  18 = 256 KiB
@@ -72,8 +72,8 @@ struct BtreeNodeHeader {                     // 64 bytes, block 0, written once
     flags: u8,                               // [27..28]  BTREE_NODE_FLAG_*
     logical_pages: u16,                      // [28..30]  positional: pages in the record array
     kind_header_len: u16,                    // [30..32]  bytes of kind-specific header after this one
-    _reserved: [u8; 28],                     // [32..60]  zero
-    crc: u32,                                // [60..64]  checksum of block 0, this field zeroed
+    _reserved: [u8; 24],                     // [32..56]  zero
+    checksum: u64,                           // [56..64]  of block 0, this field zeroed (FORMAT-DESIGN§1.4)
 }
 
 // BtreeNodeHeader.flags bits
@@ -81,12 +81,12 @@ const BTREE_NODE_FLAG_HEAD_OF_CHAIN: u8 = 1 << 1;  // first region of a position
                                                    // (BTREE-DESIGN§1.7); bit 0 unassigned
 ```
 
-`BlockPreamble` is the 8-byte common prefix shared with `BlockHeader` (FORMAT-DESIGN§1.3), so a generic
-reader can identify any persistent header by its first 8 bytes. `BlockHeader` describes a
-write-once 4 KiB unit with a trailing CRC; `BtreeNodeHeader` describes a region that grows by
-appending, whose later blocks carry their own checksums.
+`Preamble` is the 8-byte prefix of every persistent header (FORMAT-DESIGN§1.3). Block 0 is
+written once; the region grows by appending runs or page runs, whose index blocks begin with
+their own preambles and carry the checksums of the blocks they describe.
 
-Checksums in this section (`crc` fields) use the pool's block checksum (OPERATIONS-D4).
+Every `checksum` field in this section is a 64-bit slot holding the pool's block checksum
+(FORMAT-DESIGN§1.4).
 
 ### 1.2 Runs and blocks
 
@@ -95,15 +95,15 @@ After block 0 a region holds runs back to back. A run is one **index block** fol
 
 ```rust
 #[repr(C)]
-struct RunHeader {                           // 32 bytes, start of the index block
-    magic: u32,                              //  [0..4]   "BSET"
-    seq: u32,                                //  [4..8]   1 for the first run, +1 per run
-    journal_seq: u64,                        //  [8..16]  newest journal LSN merged into this run
-    block_count: u16,                        // [16..18]  data blocks after this index block
-    flags: u16,                              // [18..20]  RUN_FLAG_*
-    entry_count: u32,                        // [20..24]
-    _reserved: u32,                          // [24..28]
-    crc: u32,                                // [28..32]  checksum of the index block, this field zeroed
+struct RunHeader {                           // 40 bytes, start of the index block
+    pre: Preamble,                           //  [0..8]   magic "BIDX", kind 0 (FORMAT-DESIGN§1.3)
+    seq: u32,                                //  [8..12]  1 for the first run, +1 per run
+    block_count: u16,                        // [12..14]  data blocks after this index block
+    flags: u16,                              // [14..16]  RUN_FLAG_*
+    journal_seq: u64,                        // [16..24]  newest journal LSN merged into this run
+    entry_count: u32,                        // [24..28]
+    _reserved: u32,                          // [28..32]
+    checksum: u64,                           // [32..40]  of the index block, this field zeroed
 }
 // followed in the index block by:
 //   KeyFormat                                   (BTREE-DESIGN§1.6)
@@ -111,12 +111,13 @@ struct RunHeader {                           // 32 bytes, start of the index blo
 //   fence keys: block_count × KeyFormat.key_width bytes — the first key of each data block
 
 #[repr(C)]
-struct RunBlockEntry {                       // 16 bytes
-    crc: u32,                                //  [0..4]   checksum of the data block
-    entry_count: u16,                        //  [4..6]   0 for a value block
-    flags: u16,                              //  [6..8]   RUN_BLOCK_FLAG_*
-    min_snapshot: u32,                       //  [8..12]  snapshot-aware trees: smallest snapshot id
-    max_snapshot: u32,                       // [12..16]  … and largest, in the block; 0 otherwise
+struct RunBlockEntry {                       // 24 bytes
+    checksum: u64,                           //  [0..8]   of the data block
+    entry_count: u16,                        //  [8..10]  0 for a value block
+    flags: u16,                              // [10..12]  RUN_BLOCK_FLAG_*
+    min_snapshot: u32,                       // [12..16]  snapshot-aware trees: smallest snapshot id
+    max_snapshot: u32,                       // [16..20]  … and largest, in the block; 0 otherwise
+    _pad: u32,                               // [20..24]
 }
 
 const RUN_FLAG_ENCRYPTED:        u16 = 1 << 0;  // data blocks encrypted; whether encryption is
@@ -280,20 +281,20 @@ A positional region holds a fixed-size record array of `logical_pages` 4 KiB pag
 ```rust
 #[repr(C)]
 struct PageRunHeader {                       // 32 bytes, start of the page-run index block
-    magic: u32,                              //  [0..4]   "PAGE"
-    seq: u32,                                //  [4..8]   1 for the first run, +1 per run
-    journal_seq: u64,                        //  [8..16]
-    page_count: u16,                         // [16..18]  pages in this run
-    _reserved: [u8; 10],                     // [18..28]
-    crc: u32,                                // [28..32]  checksum of the index block, this field zeroed
+    pre: Preamble,                           //  [0..8]   magic "BPGS", kind 0 (FORMAT-DESIGN§1.3)
+    seq: u32,                                //  [8..12]  1 for the first run, +1 per run
+    page_count: u16,                         // [12..14]  pages in this run
+    _reserved: u16,                          // [14..16]
+    journal_seq: u64,                        // [16..24]
+    checksum: u64,                           // [24..32]  of the index block, this field zeroed
 }
 // followed by [PageRunEntry; page_count]
 
 #[repr(C)]
-struct PageRunEntry {                        // 8 bytes
-    page_no: u16,                            // [0..2]  index into the record array
-    _pad: u16,                               // [2..4]
-    crc: u32,                                // [4..8]  checksum of the page
+struct PageRunEntry {                        // 16 bytes
+    page_no: u16,                            //  [0..2]   index into the record array
+    _pad: [u8; 6],                           //  [2..8]
+    checksum: u64,                           //  [8..16]  of the page
 }
 ```
 

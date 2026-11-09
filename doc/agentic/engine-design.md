@@ -39,49 +39,49 @@ last-4096-of-device) for redundancy. The buckets holding those offsets are never
 
 ```rust
 #[repr(C)]
-struct Superblock {                          // 4092 bytes; the checksum at [4092..4096] completes the 4 KiB block
-    header: BlockHeader,                     //   [0..32]   kind = Superblock
-    magic_full: [u8; 16],                    //  [32..48]   "MIMISBRUNNR\0\0\0\0\0"
-    fs_uuid: [u8; 16],                       //  [48..64]   pool-wide UUID
-    disk_uuid: [u8; 16],                     //  [64..80]   this device's UUID
-    node_id: u16,                            //  [80..82]
-    disk_id: u16,                            //  [82..84]
-    media_type: u8,                          //  [84..85]   MediaType discriminator
-    tier: u8,                                //  [85..86]   StorageTier discriminator
-    block_size_log2: u8,                     //  [86..87]   12 == 4 KiB
-    bucket_size_log2: u8,                    //  [87..88]   e.g. 20 = 1 MiB bucket
-    device_capacity: u64,                    //  [88..96]
-    creation_timestamp_ns: i64,              //  [96..104]
-    last_mount_timestamp_ns: i64,            // [104..112]
-    mount_count: u64,                        // [112..120]
+struct Superblock {                          // 4096 bytes
+    pre: Preamble,                           //   [0..8]    magic "MIMR", version 1, kind 0 (FORMAT-DESIGN§1.3)
+    magic_full: [u8; 16],                    //   [8..24]   "MIMISBRUNNR\0\0\0\0\0", for device probing
+    fs_uuid: [u8; 16],                       //  [24..40]   pool-wide UUID
+    disk_uuid: [u8; 16],                     //  [40..56]   this device's UUID
+    node_id: u16,                            //  [56..58]
+    disk_id: u16,                            //  [58..60]
+    media_type: u8,                          //  [60..61]   MediaType discriminator
+    tier: u8,                                //  [61..62]   StorageTier discriminator
+    block_size_log2: u8,                     //  [62..63]   12 == 4 KiB
+    bucket_size_log2: u8,                    //  [63..64]   e.g. 20 = 1 MiB bucket
+    device_capacity: u64,                    //  [64..72]
+    creation_timestamp_ns: i64,              //  [72..80]
+    last_mount_timestamp_ns: i64,            //  [80..88]
+    mount_count: u64,                        //  [88..96]
 
-    btree_node_size_log2: u8,                // [120..121]  default 18 = 256 KiB (BTREE-DESIGN§1)
-    metadata_replicas: u8,                   // [121..122]  R: copies of every tree node (ENGINE-DESIGN§1.2)
-    copygc_reserve_pct: u8,                  // [122..123]  default 8 (range 5..=21)
-    _pad0: u8,                               // [123..124]
-    first_usable_bucket: u32,                // [124..128]  first bucket after the one holding the superblocks
+    btree_node_size_log2: u8,                //  [96..97]   default 18 = 256 KiB (BTREE-DESIGN§1)
+    metadata_replicas: u8,                   //  [97..98]   R: copies of every tree node (ENGINE-DESIGN§1.2)
+    copygc_reserve_pct: u8,                  //  [98..99]   default 8 (range 5..=21)
+    _pad0: u8,                               //  [99..100]
+    first_usable_bucket: u32,                // [100..104]  first bucket after the one holding the superblocks
 
     // Checkpoint hint (ENGINE-DESIGN§1.2): where the newest Checkpoint entry was when this
     // superblock was written. Rewritten only on clean unmount and when the journal bucket
     // list changes.
-    checkpoint_hint: CheckpointHint,         // [128..152]
+    checkpoint_hint: CheckpointHint,         // [104..128]
 
     // Format versioning (FORMAT-DESIGN§15).
-    encryption_keyid: [u8; 16],              // [152..168]  key identifier (not the key)
-    fs_format_version: u32,                  // [168..172]  current writing version
-    fs_min_on_disk: u32,                     // [172..176]  minimum version of any record on disk
-    compat_features: u64,                    // [176..184]  old readers tolerate
-    ro_compat_features: u64,                 // [184..192]  old readers mount RO
-    incompat_features: u64,                  // [192..200]  old readers refuse
-    downgrade_log_ref: BlockRef,             // [200..216]  chain of historical features
+    encryption_keyid: [u8; 16],              // [128..144]  key identifier (not the key)
+    fs_format_version: u32,                  // [144..148]  current writing version
+    fs_min_on_disk: u32,                     // [148..152]  minimum version of any record on disk
+    compat_features: u64,                    // [152..160]  old readers tolerate
+    ro_compat_features: u64,                 // [160..168]  old readers mount RO
+    incompat_features: u64,                  // [168..176]  old readers refuse
+    downgrade_log_ref: BlockRef,             // [176..192]  chain of historical features
 
     // Journal location (JOURNAL-DESIGN§1.1).
-    journal_bucket_count: u16,               // [216..218]  0 = this disk carries no journal
-    _pad1: [u8; 6],                          // [218..224]
-    journal_buckets: [u32; 256],             // [224..1248] bucket numbers in journal order;
+    journal_bucket_count: u16,               // [192..194]  0 = this disk carries no journal
+    _pad1: [u8; 6],                          // [194..200]
+    journal_buckets: [u32; 256],             // [200..1224] bucket numbers in journal order;
                                              //             the first journal_bucket_count are valid
-    _reserved: [u8; 2844],                   // [1248..4092] zeroed, available for future fields
-    // trailing CRC32C at [4092..4096] lives inside BlockHeader's frame
+    _reserved: [u8; 2864],                   // [1224..4088] zeroed, available for future fields
+    checksum: u64,                           // [4088..4096] of the block, this field zeroed (FORMAT-DESIGN§1.4)
 }
 
 #[repr(C)]
@@ -94,7 +94,7 @@ struct CheckpointHint {                      // 24 bytes
 }
 ```
 
-`format_version` in the BlockHeader gates field interpretation. Reserved space is zero-initialised
+`Preamble.version` gates field interpretation. Reserved space is zero-initialised
 so flipping bytes from 0 → 1 in a future version is a strict additive change. Pool-wide policy
 (default chunking, throttles) lives in pool state (POOL-DESIGN§1), not in the superblock.
 

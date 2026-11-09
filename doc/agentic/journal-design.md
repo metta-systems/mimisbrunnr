@@ -87,16 +87,15 @@ consecutive jsets acknowledged together.
 ```rust
 #[repr(C)]
 struct JsetHeader {                          // 64 bytes
-    magic:        u32,                       //  [0..4]   "JSET"
-    version:      u16,                       //  [4..6]   jset format version
-    flags:        u16,                       //  [6..8]   JSET_FLAG_*
+    pre:          Preamble,                  //  [0..8]   magic "JRNL", jset version, kind 0 (FORMAT-DESIGN§1.3)
     seq:          u64,                       //  [8..16]  monotonic jset sequence number
     last_seq:     u64,                       // [16..24]  oldest seq still needed (JOURNAL-DESIGN§1.4)
     hlc_base:     HybridTimestamp,           // [24..40]  entry timestamps are offsets from this
     payload_len:  u32,                       // [40..44]  bytes of entries as stored (after compression)
     entry_count:  u32,                       // [44..48]
     plain_len:    u32,                       // [48..52]  bytes of entries before compression
-    _pad:         u32,                       // [52..56]
+    flags:        u16,                       // [52..54]  JSET_FLAG_*
+    _pad:         u16,                       // [54..56]
     checksum:     u64,                       // [56..64]  over the whole jset with this field zero
 }
 // followed by: entries (payload_len bytes), then, if JSET_FLAG_ENCRYPTED, a 16-byte AEAD tag;
@@ -160,7 +159,7 @@ Payloads are binary records (FORMAT-DESIGN§1.6), not CBOR: every op's shape is 
 `op_kind`, so a record carries no field names or type information, its bytes are fixed by its
 field values alone (what AEAD authentication needs), and replay reads fields in place. The only
 CBOR inside a payload is an attribute `Value` (INDEX-DESIGN§1.1). Jsets are versioned by
-`JsetHeader.version`; the journal is replayed and trimmed, never migrated in place.
+their `Preamble.version`; the journal is replayed and trimmed, never migrated in place.
 
 ### 1.3 Op payloads
 
