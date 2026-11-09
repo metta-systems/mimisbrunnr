@@ -47,6 +47,18 @@ delta never contains them, so `Contains` reaches subscriptions through its key. 
 - `term_to_subs: TermId → [SubscriptionId]`
 - `key_to_subs: TagId → [SubscriptionId]` for keys read by range
 - `content_subs: [SubscriptionId]` — subscriptions whose interest includes content changes
+- `unresolved: name → [SubscriptionId]` — names a query uses that do not exist yet: an attribute
+  value with no dictionary entry, keyed `(key, NormalisedValue)`, or a tag whose `TagUid` no
+  installed module defines
+
+**Names that appear later.** A query may name a value no object has yet (`artist = "Nobody"`)
+or a tag from a module not installed yet. Compilation records each such name in `unresolved`.
+When a write interns a new term, the engine looks the term up in `unresolved` (one lookup per
+new term, which is rare beside writes); when an install adds tags, it looks up their uids. The
+waiting subscriptions are recompiled in that commit and indexed under the new `TermId` or
+`TagId` before the mutation is evaluated, so the first object to carry the value reaches them
+like any other. `ReclaimTerms` (INDEX-DESIGN§1.2) returns the subscriptions of each reclaimed
+term to `unresolved`, so a value written again under a new `TermId` is still caught.
 
 **Which subscriptions a mutation reaches.** Maintaining postings already computes the terms that
 enter and leave an object's closure (INDEX-DESIGN§2.4). The subscriptions reached are those
@@ -122,6 +134,12 @@ and it stops being evaluated. The next `poll` returns the result-set diff (below
 it. A subscriber that never acknowledges costs only its own bounded events; the journal trims
 at its own pace (JOURNAL-DESIGN§1.6).
 
+**Head switches.** Switching the pool's head to another snapshot (SNAPSHOTS-DESIGN§1.8) changes
+the visible state of every object that differs between the two without running the mutation
+path, so no events describe it. The switch marks every subscription `Overflowed` in its own
+commit and drops its pending events, which describe a branch the head has left. The next `poll`
+returns a `HeadSwitched { to }` marker, then the result-set diff against the new head.
+
 **Why membership is stored as of the acknowledged cursor.** The stored membership has one
 use: when a subscription overflows and its pending events are dropped, the engine compares the
 current result with what the subscriber last saw and reports the difference. That comparison
@@ -142,7 +160,9 @@ A returning consumer polls like any other ([SUBSCRIPTION6](subscriptions-impleme
   `Deleted` for deleted objects and `Exited` otherwise. Members in both sets report
   `ContentChanged` when `ObjectRecord.modified_ns > cursor_ns` and, if the interest asks for
   tag changes, a description change when the forward entry's `modified_ns > cursor_ns`
-  (INDEX-DESIGN§2.1). Order and intermediate states are lost; cost is proportional to the result
+  (INDEX-DESIGN§2.1). After a head switch the timestamps compare across branches and mean
+  nothing, so the diff reports only `Entered` and `Exited`, every member in both sets as
+  `ContentChanged`. Order and intermediate states are lost; cost is proportional to the result
   set, not the gap. Afterwards the stored membership is the current result and the cursor is
   the current LSN.
 
@@ -199,7 +219,9 @@ SubscriptionRecord = [version,
                                              //   0xFF high-water marker
                       retention: Retention,  // SUBSCRIPTION-D2: the bound on pending events
                       debounce_ms: uint,
-                      pending_count: uint]   // pending events (bulk entries count their objects)
+                      pending_count: uint,   // pending events (bulk entries count their objects)
+                      switched_to: uint]     // Overflowed by a head switch: the snapshot switched
+                                             //   to (SNAPSHOTS-DESIGN§1.8); 0 otherwise
 ```
 
 **Ids.** Ids are allocated from 1 and never reused. The counter is derived at boot as one past
@@ -237,6 +259,8 @@ enum EventKind {
     TagAdded = 4, TagRemoved = 5, ContentChanged = 6,
     BulkEntered = 7, BulkExited = 8,         // rule rework (SUBSCRIPTIONS-DESIGN "Evaluation")
 }
+// HeadSwitched is not a stored event: a poll of a subscription whose record has switched_to ≠ 0
+// returns it first, then the result-set diff, and clears the field.
 ```
 
 Inserts happen with the mutation that produces them and are re-created by journal replay; an

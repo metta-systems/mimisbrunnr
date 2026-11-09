@@ -24,7 +24,9 @@ Every query operator evaluates through bitmap algebra over an index built for it
 and values. Compilation resolves them once: tags to `TermId`s, attribute equalities to
 dictionary lookups, ranges and prefixes to dictionary key ranges, `Contains` to n-gram term
 sets. The compiled query is cached with the `rules_epoch` and the dictionary entries it read,
-and recompiled when either changes. Terms derived by a rule still being reworked return the
+and recompiled when either changes; a name that did not resolve (a value with no dictionary
+entry, a tag not installed) is recorded with it, and interning that value or installing that tag
+also recompiles it (SUBSCRIPTIONS-DESIGN "Evaluation"). Terms derived by a rule still being reworked return the
 partial result the rework has reached (INDEX-DESIGN§2.4). Subscriptions and placement rules keep compiled forms
 resident.
 

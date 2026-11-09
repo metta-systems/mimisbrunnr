@@ -86,7 +86,8 @@ re-interns values in LSN order from the committed checkpoint's counter, so it as
 **Interning.** Writing an assertion looks its term up in the term dictionary (INDEX-DESIGN§4.1).
 If present, the existing `TermId` is used; otherwise a `TermId` is allocated and a dictionary
 entry and a term-table entry are inserted. Identity is exact — the dictionary compares full
-values — so two different values are never the same term.
+values — so two different values are never the same term. A newly interned term is offered to
+the subscriptions and cached queries waiting for its value (SUBSCRIPTIONS-DESIGN "Evaluation").
 
 **Locality.** `TermId`s are meaningful only within their pool. Nothing that leaves the node
 carries a `TermId`; sync carries values and receivers intern them.
@@ -105,7 +106,8 @@ carries a `TermId`; sync carries values and receivers intern them.
 
 Reclaiming removes the term's dictionary entries and its term-table record, journaled as one
 `ReclaimTerms` entry (JOURNAL-DESIGN§1.3) so replay removes exactly the same terms. Its `TermId`
-is never reused, since the counter does not depend on the table's contents.
+is never reused, since the counter does not depend on the table's contents. Subscriptions
+naming a reclaimed term wait for its value again (SUBSCRIPTIONS-DESIGN "Evaluation").
 
 ---
 

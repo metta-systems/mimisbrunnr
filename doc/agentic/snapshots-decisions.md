@@ -15,6 +15,8 @@ To decide:
   - (c) bound reworks so the ban is short: pause the rework for a snapshot, then resume.
 - **How big a rework realistically is.** The choice depends on measured rework durations for realistic rule changes on large pools — a new `Implies` over a tag on millions of objects, a `Bucket` on a key with millions of values, a rule removal with many suspects — taken by [ONTOLOGY18](ontology-implementation-plan.md).
 
+A head switch (SNAPSHOTS-DESIGN§1.8) is refused under the same condition and falls under the same choice.
+
 Affects [ONTOLOGY6](ontology-implementation-plan.md), the retention policy (SNAPSHOTS-DESIGN§1.7) and CLUSTER-D7.
 
 ## Future work

@@ -220,15 +220,16 @@ subsystem; a reader rejects any other value.
 | 29 | `BackpointerInsert` | backpointers |
 | 30 | `BackpointerRemove` | backpointers |
 | 31 | `SnapshotCreate` | snapshots |
-| 32 | `SnapshotDelete` | snapshots |
-| 33 | `SnapshotUnlink` | snapshots |
-| 34 | `SnapshotDepthUpdate` | snapshots |
-| 35 | `ReconcileEnqueue` | reconcile |
-| 36 | `ReconcileDequeue` | reconcile |
-| 37 | `ReconcileMove` | reconcile |
-| 38 | `ReconcileReplicate` | reconcile |
-| 39 | `ReconcileDropReplica` | reconcile |
-| 40 | `ReconcileScanStep` | reconcile |
+| 32 | `SnapshotSwitch` | snapshots |
+| 33 | `SnapshotDelete` | snapshots |
+| 34 | `SnapshotUnlink` | snapshots |
+| 35 | `SnapshotDepthUpdate` | snapshots |
+| 36 | `ReconcileEnqueue` | reconcile |
+| 37 | `ReconcileDequeue` | reconcile |
+| 38 | `ReconcileMove` | reconcile |
+| 39 | `ReconcileReplicate` | reconcile |
+| 40 | `ReconcileDropReplica` | reconcile |
+| 41 | `ReconcileScanStep` | reconcile |
 
 Changes to pool administration trees have no ops; they commit by checkpoint (POOL-DESIGN§1.2).
 Postings, pending subscription events and `live_sectors` have none either: replay derives them
@@ -305,6 +306,11 @@ BackpointerRemove: { key: BackpointerKey }                                // exp
 // Snapshot lifecycle (SNAPSHOTS-DESIGN§1)
 SnapshotCreate   : { new_id: u32, parent_id: u32, current_replacement: u32, label: Option<String> }
                    // label capped at 256 bytes
+SnapshotSwitch   : { target: u32, new_head: u32 }
+                   // Switches the head to live snapshot `target` (SNAPSHOTS-DESIGN§1.8): links
+                   //   new_head as target's first child, retags the current pointer to it,
+                   //   starts the object-table re-head scan, and marks every subscription
+                   //   Overflowed with switched_to = target, dropping its pending events.
 SnapshotDelete   : { id: u32 }                                            // marks for async cleanup
 // Note: snapshot deletion does NOT emit per-key WAL ops. The actual
 // re-tag / drop happens via a reconcile-driven scan whose progress is

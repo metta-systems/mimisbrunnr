@@ -351,30 +351,44 @@ Snapshot space cost is per-key. Per-snapshot overhead in steady state:
   are cheap because divergence is small.
 - Labelled / pinned snapshots: kept until explicitly removed. Cost = sum of unique keys.
 
-### 1.8 Rollback
+### 1.8 Switching the head
 
 ```
-brunnr rollback --to <snapshot_label>
+brunnr switch --to <snapshot_label>
 ```
 
-1. Resolve the label to a `SnapshotId` `S`.
-2. Allocate a fresh `SnapshotId` `S'` and link it as a new child of `S`: prepend it to S's
-   child sibling list (`S'.next_sibling = S.first_child; S.first_child = S'`). The first-child /
+The head can be switched to **any live snapshot**: an ancestor of the current head (a rollback),
+a snapshot on a branch the head left earlier (forward again), or one on a sibling branch. Every
+branch whose snapshots are not deleted stays reachable, so the head can move between them
+freely.
+
+1. Resolve the label to a live `SnapshotId` `T`.
+2. Allocate a fresh `SnapshotId` `T'` and link it as a new child of `T`: prepend it to T's
+   child sibling list (`T'.next_sibling = T.first_child; T.first_child = T'`). The first-child /
    next-sibling topology (SNAPSHOTS-DESIGN§1.1) admits any number of children, so this works regardless of
-   how many sibling branches `S` has accumulated from prior snapshots and rollbacks.
-3. Atomically retag the pool's "current" pointer to `S'`. The view now reflects `S`'s state;
-   subsequent writes are tagged with `S'` and diverge from `S` at this point. The previously
-   current branch remains intact as another sibling of `S'` until explicitly deleted.
-4. Re-head the object table: every radix record written on the abandoned branch after `S` is
-   pushed down into `ObjectHistory` at its own snapshot id and replaced by the version `S` sees
-   (taken from `ObjectHistory`, or a whiteout for an object created after `S`). The records to
-   swap are the `ObjectHistory` and radix entries with snapshot ids on the abandoned branch,
-   found by a resumable reconcile scan; until it completes, reads at `S'` resolve through the
-   rule of SNAPSHOTS-DESIGN§1.2, which already returns the right versions.
+   how many sibling branches `T` has accumulated from prior snapshots and switches.
+3. Atomically retag the pool's "current" pointer to `T'`. The view now reflects `T`'s state;
+   subsequent writes are tagged with `T'` and diverge from `T` at this point. The branch the
+   head left remains intact as another branch of the tree until its snapshots are deleted.
+4. Re-head the object table: let `A` be the nearest common ancestor of the old head `H` and
+   `T`. Every radix record whose visible version differs between `H` and `T` — those with
+   versions written on the path from `A` to `H` or from `A` to `T` — is pushed down into
+   `ObjectHistory` at its own snapshot id and replaced by the version `T` sees (taken from
+   `ObjectHistory`, or a whiteout for an object `T` does not have). The records to swap are
+   found by a resumable reconcile scan over those snapshot ids; until it completes, reads at
+   `T'` resolve through the rule of SNAPSHOTS-DESIGN§1.2, which already returns the right
+   versions.
+5. Every subscription is marked overflowed in the same commit (SUBSCRIPTIONS-DESIGN
+   "Delivery"): no mutation path ran for the objects whose state changed, so each subscriber's
+   next poll is a result-set diff against the new head.
 
-No data is copied. For the key-level trees the rollback is O(1); for the object table it costs
-O(records changed on the abandoned branch since `S`), done in the background. Reads pay the
-snapshot-iteration cost (SNAPSHOTS-DESIGN§1.3) until the abandoned branch is deleted via
+Steps 2–5 are one `SnapshotSwitch { target: T, new_head: T' }` journal entry
+(JOURNAL-DESIGN§1.3); replay repeats them. Like snapshot creation, a switch is refused while a
+rule is pending (INDEX-DESIGN§2.4).
+
+No data is copied. For the key-level trees the switch is O(1); for the object table it costs
+O(records changed on the two paths from `A`), done in the background. Reads pay the
+snapshot-iteration cost (SNAPSHOTS-DESIGN§1.3) until the branches left behind are deleted via
 SNAPSHOTS-DESIGN§1.5.
 
 ---
