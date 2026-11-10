@@ -473,7 +473,7 @@ Values of ordered and ranked attribute keys (`playlist = "workout"`) keep member
 
 ### 5.5 Forward index
 
-Object → the `TermId`s it asserts directly. Used for listing an object's tags and attributes, deletion cleanup and sync; implied tags are derived from the direct ones through closure tables built from the ontology at mount. Term ids are stored as frame-of-reference arrays: about 64 bytes for an object with a dozen tags, however many tags those imply (INDEX-DESIGN§2).
+Object → the `TermId`s it asserts directly. Used for listing an object's tags and attributes, deletion cleanup and sync; implied tags are derived from the direct ones through closure tables the head builds from the ontology, or, at an older snapshot, computed per object on demand from that snapshot's rules. Term ids are stored as frame-of-reference arrays: about 64 bytes for an object with a dozen tags, however many tags those imply (INDEX-DESIGN§2).
 
 ### 5.6 Faceted Exploration
 

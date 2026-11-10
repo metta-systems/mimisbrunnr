@@ -288,7 +288,11 @@ constraint must check.
 - **Constraints** installed this way check existing objects as part of the scan and report
   violators when it completes (ONTOLOGY-DESIGN "Install").
 
-Reads of an older snapshot use that snapshot's records and tables.
+**Reads of an older snapshot** need no closure tables: its postings already hold every derived
+member, and `HasTag { direct }` reads forward entries. Only the head keeps closure tables, since
+only writes post derived terms. Where one object's closure at a snapshot is needed — listing its
+implied tags, or evaluating `matches` there — it is computed lazily by walking that snapshot's
+rule records from the object's direct terms, and cached for that snapshot under a memory bound.
 
 ---
 

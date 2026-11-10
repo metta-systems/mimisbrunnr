@@ -28,7 +28,9 @@ and recompiled when either changes; a name that did not resolve (a value with no
 entry, a tag not installed) is recorded with it, and interning that value or installing that tag
 also recompiles it (SUBSCRIPTIONS-DESIGN "Evaluation"). Terms derived by a rule still being reworked return the
 partial result the rework has reached (INDEX-DESIGN§2.4). Subscriptions and placement rules keep compiled forms
-resident.
+resident. A query at an older snapshot compiles against that snapshot's name maps, built lazily
+from its ontology records; `TagUid`s and ids are never reused, so only names can differ, and its
+execution needs no closure tables (INDEX-DESIGN§2.4).
 
 **Stream window by window.** The executor produces the result one 65 536-id window at a time
 over posting containers (INDEX-DESIGN§3.2): for each window, intersections run smallest first

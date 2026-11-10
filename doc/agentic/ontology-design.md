@@ -357,4 +357,6 @@ ModuleRecord = [version, uid: bytes(16), id: text, module_version: text, name: t
   active or is removed; closure tables are rebuilt then and postings reworked in that commit, or
   beforehand by a resumable rework while the rule is pending (INDEX-DESIGN§2.4). Creating or renaming a tag touches one record and no postings.
 - **Snapshots.** Keys carry the snapshot id (SNAPSHOTS-DESIGN§1.2), so a snapshot sees the
-  ontology as it was; reads of a snapshot build closure tables from that snapshot's records.
+  ontology as it was. Reading a snapshot builds only its name maps, lazily and cached while it is
+  open; closures there are computed per object on demand (INDEX-DESIGN§2.4), and only the head
+  keeps closure tables.
