@@ -54,7 +54,8 @@ struct SnapshotNode {                        // 64 bytes — fits one cache line
     flags: u8,                               // [46..47]  SNAPSHOT_FLAG_*
     _pad: u8,                                // [47..48]
     created_ns: i64,                         // [48..56]
-    label_len: u16,                          // [56..58]  bytes of UTF-8 label after the node; 0 = unlabelled
+    label_len: u16,                          // [56..58]  bytes of UTF-8 label after the node, ≤ 256;
+                                             //           0 = unlabelled
     _reserved: [u8; 6],                      // [58..64]
 }
 // The snapshots btree value is the 64-byte node followed by `label_len` bytes of label

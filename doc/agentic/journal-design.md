@@ -171,9 +171,10 @@ record rules:
   (ENGINE-DESIGN§1.2); `[T; N]` is N consecutive `T`.
 - A variable part follows the head, at most one per op: an array of fixed records (`[T; N]`
   with N not fixed by the type) is a `u32` count in the head and the records after it; a byte
-  string (`bytes`, `String`, a packed key) is a `u32` length in the head and the bytes after
-  it, zero-padded to a multiple of 8; `Value` is a `u32` length and its CBOR encoding.
-  `Option<String>` uses length `u32::MAX` for `None`.
+  array (`bytes`, a packed key) is a `u32` length in the head and the bytes after it, and a
+  `String` a `u16` length and its UTF-8 (FORMAT-DESIGN§1.1), either zero-padded to a multiple of
+  8; `Value` is a `u32` length and its CBOR encoding. `Option<String>` uses length `u16::MAX`
+  for `None`.
 - `EntryHead.len` covers the head and the variable part (not the trailing padding); a reader
   rejects a payload whose length disagrees with its head.
 - An extent checksum (`extent_sum`) is the OPERATIONS-D4 checksum of the extent's bytes as

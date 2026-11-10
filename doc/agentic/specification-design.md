@@ -659,15 +659,25 @@ Deleting a tag (and all its associations) removes its postings and dictionary en
 ### 8.1 Disk Topology
 
 ```rust
-enum MediaType { NVMe, Ssd, Hdd, SmrHdd, Remote }
+#[repr(u8)]
+enum MediaType {         // wear and speed class: drives write-amplification and placement defaults
+    NVMe    = 0,         // high endurance, low latency, deep queues
+    Ssd     = 1,         // SATA/SAS flash
+    SdEmmc  = 2,         // SD cards and eMMC: managed flash, low endurance, small erase budget
+    Hdd     = 3,         // seek-bound
+    SmrHdd  = 4,         // seek-bound, zone-sequential writes
+    Remote  = 5,         // network or object-store backend
+}
 
+#[repr(u8)]
 enum StorageTier { Hot = 0, Warm = 1, Cold = 2, Glacier = 3 }
 
+#[repr(u8)]
 enum DiskState {
-    Online,   // reads & writes
-    Draining, // reads only, migrating data off
-    Removed,  // data migrated, safe to detach
-    Faulted,  // failed, needs resilver
+    Online   = 0,        // reads & writes
+    Draining = 1,        // reads only, migrating data off
+    Removed  = 2,        // data migrated, safe to detach
+    Faulted  = 3,        // failed, needs resilver
 }
 
 ```

@@ -48,12 +48,14 @@ struct DiskDescriptor {                      // 24 + 32 × R bytes (R = metadata
 const DISK_FLAG_ROTATIONAL: u8 = 1 << 0;     // seek-bound: reconcile sweeps in physical order
 ```
 
-`MediaType`, `StorageTier` and `DiskState` are SPECIFICATION-DESIGN§8.1's enums with their
-declaration order as discriminants. The descriptor holds what the pool decides about the disk —
+`MediaType`, `StorageTier` and `DiskState` are SPECIFICATION-DESIGN§8.1's enums, stored as the
+`u8` values pinned there. The descriptor holds what the pool decides about the disk —
 its media class, tier and state — and the superblock what is fixed for the device: its geometry
 and `disk_id` (ENGINE-DESIGN§1.1). The one copy is `bucket_count`, the device's capacity in
-buckets, kept so that a pool reports a missing disk's capacity; the superblock's geometry is
-authoritative, and the two are compared when the device is opened. Usage is the alloc table's. The per-disk allocation trees are COW under the standard checkpoint machinery, so every
+buckets, kept only so that a pool can display a missing disk's capacity. The superblock's geometry
+is the source of truth and nothing reads `bucket_count` for allocation or validation; when an
+opened device's capacity differs — a grown partition or virtual disk — the copy is refreshed at
+the next checkpoint. Usage is the alloc table's. The per-disk allocation trees are COW under the standard checkpoint machinery, so every
 checkpoint captures a self-consistent state of every disk's allocation.
 
 **Opening a pool.** Read every supplied device's superblock; group by `fs_uuid`; load the root

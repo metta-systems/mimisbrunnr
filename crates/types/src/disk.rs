@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::ids::DiskId;
 
 /// Physical media class. Drives placement defaults (SPECIFICATION-DESIGN§8.1).
+///
+/// TODO(POOL1): `#[repr(u8)]` with the spec's pinned values, and the
+/// `SdEmmc` class (NVMe 0, Ssd 1, SdEmmc 2, Hdd 3, SmrHdd 4, Remote 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MediaType {
     NVMe,
@@ -92,6 +95,9 @@ impl fmt::Display for StorageTier {
 }
 
 /// Operational state of a disk (SPECIFICATION-DESIGN§8.1).
+///
+/// TODO(POOL1): `#[repr(u8)]` with the spec's pinned values (Online 0,
+/// Draining 1, Removed 2, Faulted 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DiskState {
     /// Reads and writes accepted normally.

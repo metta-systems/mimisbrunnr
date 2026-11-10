@@ -43,7 +43,11 @@ Goals:
   access (`+strict-align`) read every field with aligned loads.
 - No bit-packed fields cross a byte boundary (use a `u32` flags word, not C bitfields).
 - All structs are sized as a multiple of 8 bytes; explicit `_pad` arrays document tail padding.
-- Strings on disk are UTF-8, length-prefixed (`u16 len`), never NUL-terminated.
+- Strings on disk are UTF-8, length-prefixed (`u16 len`), never NUL-terminated: they are short
+  names and labels, each field with its own cap below 64 KiB. Bulk data is never a string but a
+  byte array with its own length field (`u32` or `u64`).
+- Every on-disk enum states its discriminants explicitly; none takes its value from declaration
+  order.
 
 ### 1.2 Block size
 
