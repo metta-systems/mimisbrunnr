@@ -6,19 +6,6 @@ Design: [ontology-design.md](ontology-design.md) · Plan: [ontology-implementati
 
 SPECIFICATION-DESIGN§4.2 uses TOML `[[tags]]` tables. A KDL form (`module`, `tags { "artist" text attribute }`, `implications { from "rock" to "genre" }`) reads more compactly. Decide the source format; a change rewrites the host-side compiler and the shipped modules (the compiled record form is unaffected).
 
-## ONTOLOGY-D4 — Hierarchy versus intersecting categories; the file-role model
-
-SPECIFICATION-DESIGN§13.2 builds an implication hierarchy on top of a non-hierarchical system. Decide whether the example (and the recommended modelling style) should use intersecting low-height categories instead.
-
-The software-development example module (ONTOLOGY-DESIGN "Example module") models a file's role as labels in an implication tree — `test`, `bench`, `implementation` … → `source`; `icon`, `font` … → `resource` → `source`; `object`, `library` … → `generated` — while import is described as asserting attributes (`lang`, `type`, UNIX-DESIGN "Import"). The model to settle:
-
-- **Direction: a repeatable attribute** — `kind = source`, `kind = test`, asserted side by side, so a file carries every role that applies and none ranks above another; `test` is not a kind of `source` any more than the reverse. A query intersects them (`kind = source AND kind = test`).
-- **Rejected: a hierarchical attribute** (`type = source/test`): it imposes an order between categories that have none, and works against the associative model.
-- **Not a core decision:** the key's name is the declaring module's choice (`kind`, `type`, `role` — or several, if a module needs them); the core fixes the model, not the vocabulary.
-- **Open:** whether labels such as `generated` and `vendored` stay labels or become values of the same key; and how import derives them.
-
-Once settled, the example module is reworked to the model, along with its queries and the import's path-convention module.
-
 ## ONTOLOGY-D5 — Storage policy priority
 
 SPECIFICATION-DESIGN§8.3 calls the chunking policy an admin override but ranks it below the ontology setting; SPECIFICATION-DESIGN§9.6 adds further chunking rules. Decide the precedence order of admin, ontology and default policies for each storage axis. Blocks [SPEC4](specification-implementation-plan.md).
