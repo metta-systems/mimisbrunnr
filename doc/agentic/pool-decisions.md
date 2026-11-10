@@ -22,6 +22,10 @@ Direction: **bucket terms with time wheels**, so that several granularities are 
 
 To decide: the granularities offered and which wheel serves each; whether the wheel's pending deadlines are persisted (a tree) or rebuilt from bucket postings at mount; how a now-relative predicate is written in the query language; how ticks missed while the pool was offline are caught up (one catch-up read per elapsed bucket); and the cost bound per tick. Blocks `AutoTier` and `AutoEvict` ([POOL4](pool-implementation-plan.md), [RECONCILE5](reconcile-implementation-plan.md)).
 
+## POOL-D4 — Bounds on pool composition
+
+Only id widths bound how many nodes and disks a pool has: `NodeId` (65 536) and `disk_id` (65 536 ever added, ENGINE-DESIGN§1.2). Nothing says how many may be present at once, nor whether a removed disk's `DiskDescriptor` is kept (as a tombstone naming the never-reused id) or deleted once its evacuation completes. Every structure holding one entry per node or disk — object roots, disk descriptors, cluster peers, and the checkpoint entry if [ENGINE-D2](engine-decisions.md) (c) carries them — needs a worst case. To decide: the maximum cluster node count, the maximum present disks per pool, and the fate of removed disks' descriptors.
+
 ## Future work
 
 - None recorded.

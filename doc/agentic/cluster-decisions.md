@@ -36,7 +36,7 @@ A sender ships only what a peer has not seen, and tombstones expire once every p
 - (b) **Version vectors:** each node keeps, per origin node, the newest hybrid timestamp it has applied; a sender ships the changes newer than the peer's vector entry for each origin, selected by the timestamps carried with direct state rather than by snapshot ancestry. Scales with nodes, not with snapshots; changes relayed through hubs are recognised as seen. Needs per-change timestamps in the trees that are diffed.
 - (c) **Delta-state CRDT anti-entropy:** what (b) does, with the version vectors and dots of an observed-remove set (CLUSTER-D2 (b)) doubling as the record of what is known.
 
-Shapes [CLUSTER1](cluster-implementation-plan.md) and [CLUSTER9](cluster-implementation-plan.md), and the watermark of METADATA-DESIGN "Object deletion".
+Shapes [CLUSTER1](cluster-implementation-plan.md) and [CLUSTER9](cluster-implementation-plan.md), and the watermark of METADATA-DESIGN "Object deletion". It also fixes the cluster-peer record (`BtreeKind::ClusterPeers`, `NodeId → PeerRecord`), which has no layout yet: what it holds per peer — address, keys, the snapshot last shipped or a version vector — sets its size, which [ENGINE-D2](engine-decisions.md) and [POOL-D4](pool-decisions.md) need.
 
 ## CLUSTER-D6 — Collection order under concurrent inserts
 
