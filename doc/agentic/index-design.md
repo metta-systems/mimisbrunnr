@@ -95,6 +95,8 @@ carries a `TermId`; sync carries values and receivers intern them.
 **Reclamation.** A background scan reclaims a term when all hold:
 
 - its cardinality is zero in every live snapshot, so no object refers to it;
+- no rule names it as an input or a `to` (ONTOLOGY-DESIGN "Rules and constraints"), since a rule
+  interns its target value at install and keeps it for its lifetime;
 - it has no child terms: for a hierarchy node, the dictionary holds no entry with
   `parent` = its `TermId` in any live snapshot (INDEX-DESIGN§4.2). Interior nodes such as
   `europe` in `europe/france/paris` have no objects of their own and live as long as a value
@@ -220,14 +222,19 @@ B(D)       = Attr(out_key, bucket(v))      for each Attr(k, v) ∈ D and each Bu
                                              (size, created, modified, changed)
 V(D)       = the tags named by the ValueImplies rules matching any Attr in D ∪ B(D)
 T(D)       = tags(D) ∪ V(D)
-closure(D) = B(D) ∪ T(D) ∪ ⋃ ancestors[t] for t ∈ T(D)
+G(D)       = T(D) ∪ ⋃ ancestors[t] for t ∈ T(D)                     // every tag the object has
+A(D)       = the attribute values named by the ValueImplies rules matching any Attr in D ∪ B(D)
+           ∪ the attribute values named by the Implies rules from any tag in G(D)
+closure(D) = B(D) ∪ G(D) ∪ A(D)
            ∪ labels(record): _object when the record is live, _presence:remote when its content
                              locator is Remote, _writing while its stream is open
            ∪ for each hierarchical value node in D: the roll-up terms of its ancestors (INDEX-DESIGN§4.2)
 ```
 
 The order is fixed and single-pass (ONTOLOGY-DESIGN "Rules and constraints"): a `Bucket` reads
-only direct attributes and record fields, so `B` never feeds itself.
+only direct attributes and record fields, so `B` never feeds itself, and the attribute values in
+`A` are terminal — no rule reads them. The closure tables carry, per tag, the attribute values
+its `Implies` rules (with those of its ancestors) produce, beside `ancestors[t]`.
 
 An implementation may cache tag closures by the hash of the direct tag set, since many objects
 share one.

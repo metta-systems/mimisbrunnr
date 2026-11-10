@@ -15,7 +15,7 @@ The software-development example module (ONTOLOGY-DESIGN "Example module") model
 - **Direction: a repeatable attribute** — `kind = source`, `kind = test`, asserted side by side, so a file carries every role that applies and none ranks above another; `test` is not a kind of `source` any more than the reverse. A query intersects them (`kind = source AND kind = test`).
 - **Rejected: a hierarchical attribute** (`type = source/test`): it imposes an order between categories that have none, and works against the associative model.
 - **Not a core decision:** the key's name is the declaring module's choice (`kind`, `type`, `role` — or several, if a module needs them); the core fixes the model, not the vocabulary.
-- **Open:** whether any implications remain (e.g. `lang = rust → kind = source`, through `ValueImplies` into an attribute value, which the rule kinds do not offer today); whether labels such as `generated` and `vendored` stay labels or become values of the same key; and how import derives them.
+- **Open:** whether labels such as `generated` and `vendored` stay labels or become values of the same key; and how import derives them.
 
 Once settled, the example module is reworked to the model, along with its queries and the import's path-convention module.
 

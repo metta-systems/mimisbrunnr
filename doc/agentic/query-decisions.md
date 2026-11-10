@@ -25,7 +25,7 @@ An object may carry several values of one key (two `playlist` values, several `u
 
 ## QUERY-D4 — Projecting derived attributes
 
-A derived attribute (`created-month`, `size-class`, a bucket over an attribute) is in postings only; the forward entry has no value to read. Options: (a) recompute it through the object's closure under the current rules (INDEX-DESIGN§2.4) when projected; (b) answer only from postings, by intersecting the result with the key's dictionary entries (as `GROUP BY` does); (c) reject projecting derived keys and allow them only in `WHERE` and `GROUP BY`. Shapes [QUERY7](query-implementation-plan.md) and [QUERY6](query-implementation-plan.md).
+A derived attribute (`created-month`, `size-class`, a bucket over an attribute, or a value an `Implies` or `ValueImplies` rule produces such as `kind = source`, ONTOLOGY-DESIGN "Rules and constraints") is in postings only; the forward entry has no value to read. Options: (a) recompute it through the object's closure under the current rules (INDEX-DESIGN§2.4) when projected; (b) answer only from postings, by intersecting the result with the key's dictionary entries (as `GROUP BY` does); (c) reject projecting derived keys and allow them only in `WHERE` and `GROUP BY`. Shapes [QUERY7](query-implementation-plan.md) and [QUERY6](query-implementation-plan.md).
 
 ## QUERY-D5 — Qualified tag names in SQL
 
