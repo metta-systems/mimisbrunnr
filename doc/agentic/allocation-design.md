@@ -72,8 +72,8 @@ GC moves whole buckets' live data, so they cost more write amplification under f
 workloads.
 
 The buckets holding the superblock copies (the first bucket and the last, ENGINE-DESIGN§1.1)
-are never handed out; `Superblock.first_usable_bucket` and the disk's `bucket_count` bound the
-allocatable range.
+are never handed out; `Superblock.first_usable_bucket` and the device's capacity in buckets bound
+the allocatable range.
 
 ### 1.2 Bucket alloc table
 
@@ -188,7 +188,7 @@ of the bucket.
 
 Copy GC is one work kind in the reconcile subsystem (RECONCILE-DESIGN§1, `WorkKind::Copygc`). When the
 freespace LRU's empty-band count drops below the configured reserve
-(`Superblock.copygc_reserve_pct`, default 8 %), reconcile picks the
+(the pool state's `copygc_reserve_pct`, POOL-DESIGN§1.2, default 8 %), reconcile picks the
 most-fragmented closed buckets.
 
 Each bucket is processed via the standard move path (RECONCILE-DESIGN§1.5):

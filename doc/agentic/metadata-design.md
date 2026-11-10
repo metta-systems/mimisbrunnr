@@ -130,7 +130,7 @@ reachable at depth 3 for R ≤ 2 and at depth 4 for R ≤ 4.
 // MAX_LEVELS bounds the inner-node depth above the leaf.
 const MAX_LEVELS: usize = 4;
 const LEAF_RECORDS: u64 = 1536;
-let inner_slots: u64 = 12_288 / metadata_replicas;   // Superblock.metadata_replicas
+let inner_slots: u64 = 12_288 / metadata_replicas;   // RootListHead.metadata_replicas
 
 let entry = object_roots.get(oid.node())?;        // METADATA-DESIGN§1.4
 let mut idx = oid.local();
@@ -336,7 +336,7 @@ them, like any key update: nothing else points at the entries.
 
 ### 1.4 Object roots
 
-`RootPointer.object_table_root` (ENGINE-DESIGN§1.2) is the root of a small B+ tree of
+`RootPointer.object_roots_root` (ENGINE-DESIGN§1.2) is the root of a small B+ tree of
 `BtreeKind::ObjectRoots`, snapshot-agnostic, keyed by origin `NodeId` (`u16`, packed-key
 codec), with fixed-size values:
 

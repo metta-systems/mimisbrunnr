@@ -33,8 +33,9 @@ The numbered sections below are the normative on-disk and algorithmic specificat
 
 ## 1. Large node format
 
-All B+ tree nodes and positional regions are **256 KiB** (configurable 128–512 KiB at format
-time; `Superblock.btree_node_size_log2`, default 18 = 256 KiB), divided into 4 KiB blocks:
+All B+ tree nodes and positional regions are **256 KiB** (configurable 128–512 KiB; new
+regions take the pool state's `region_size_log2`, POOL-DESIGN§1.2, default 18 = 256 KiB, and each
+region records its own size in its header), divided into 4 KiB blocks:
 block 0 holds the node header, and the remaining blocks are written strictly in order as the
 node grows. This is the bcachefs model — shallow trees, large nodes, node-internal logs — with
 two changes: nothing is rewritten in place, and every read is block-sized.

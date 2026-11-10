@@ -45,56 +45,56 @@ struct Superblock {                          // 4096 bytes
     fs_uuid: [u8; 16],                       //  [24..40]   pool-wide UUID
     disk_uuid: [u8; 16],                     //  [40..56]   this device's UUID
     node_id: u16,                            //  [56..58]
-    disk_id: u16,                            //  [58..60]
-    media_type: u8,                          //  [60..61]   MediaType discriminator
-    tier: u8,                                //  [61..62]   StorageTier discriminator
-    block_size_log2: u8,                     //  [62..63]   12 == 4 KiB
-    bucket_size_log2: u8,                    //  [63..64]   e.g. 20 = 1 MiB bucket
+    disk_id: u16,                            //  [58..60]   fixed when the disk is added; the key of
+                                             //             its DiskDescriptor (POOL-DESIGN§1.1)
+    block_size_log2: u8,                     //  [60..61]   12 == 4 KiB
+    bucket_size_log2: u8,                    //  [61..62]   e.g. 20 = 1 MiB bucket
+    _pad0: [u8; 2],                          //  [62..64]
     device_capacity: u64,                    //  [64..72]
     creation_timestamp_ns: i64,              //  [72..80]
-    last_mount_timestamp_ns: i64,            //  [80..88]
-    mount_count: u64,                        //  [88..96]
-
-    btree_node_size_log2: u8,                //  [96..97]   default 18 = 256 KiB (BTREE-DESIGN§1)
-    metadata_replicas: u8,                   //  [97..98]   R: copies of every tree node (ENGINE-DESIGN§1.2)
-    copygc_reserve_pct: u8,                  //  [98..99]   default 8 (range 5..=21)
-    _pad0: u8,                               //  [99..100]
-    first_usable_bucket: u32,                // [100..104]  first bucket after the one holding the superblocks
+    first_usable_bucket: u32,                //  [80..84]   first bucket after the one holding the superblocks
+    _pad1: u32,                              //  [84..88]
 
     // Checkpoint hint (ENGINE-DESIGN§1.2): where the newest Checkpoint entry was when this
     // superblock was written. Rewritten only on clean unmount and when the journal bucket
     // list changes.
-    checkpoint_hint: CheckpointHint,         // [104..128]
+    checkpoint_hint: CheckpointHint,         //  [88..104]
 
     // Format versioning (FORMAT-DESIGN§15).
-    encryption_keyid: [u8; 16],              // [128..144]  key identifier (not the key)
-    fs_format_version: u32,                  // [144..148]  current writing version
-    fs_min_on_disk: u32,                     // [148..152]  minimum version of any record on disk
-    compat_features: u64,                    // [152..160]  old readers tolerate
-    ro_compat_features: u64,                 // [160..168]  old readers mount RO
-    incompat_features: u64,                  // [168..176]  old readers refuse
-    downgrade_log_ref: BlockRef,             // [176..192]  chain of historical features
+    encryption_keyid: [u8; 16],              // [104..120]  key identifier (not the key)
+    fs_format_version: u32,                  // [120..124]  current writing version
+    fs_min_on_disk: u32,                     // [124..128]  minimum version of any record on disk
+    compat_features: u64,                    // [128..136]  old readers tolerate
+    ro_compat_features: u64,                 // [136..144]  old readers mount RO
+    incompat_features: u64,                  // [144..152]  old readers refuse
+    downgrade_log_ref: BlockRef,             // [152..168]  chain of historical features
 
     // Journal location (JOURNAL-DESIGN§1.1).
-    journal_bucket_count: u16,               // [192..194]  0 = this disk carries no journal
-    _pad1: [u8; 6],                          // [194..200]
-    journal_buckets: [u32; 256],             // [200..1224] bucket numbers in journal order;
+    journal_bucket_count: u16,               // [168..170]  0 = this disk carries no journal
+    _pad2: [u8; 6],                          // [170..176]
+    journal_buckets: [u32; 256],             // [176..1200] bucket numbers in journal order;
                                              //             the first journal_bucket_count are valid
-    _reserved: [u8; 2864],                   // [1224..4088] zeroed, available for future fields
+    _reserved: [u8; 2888],                   // [1200..4088] zeroed, available for future fields
     checksum: u64,                           // [4088..4096] of the block, this field zeroed (FORMAT-DESIGN§1.4)
 }
 
 #[repr(C)]
-struct CheckpointHint {                      // 24 bytes
-    jset_seq: u64,                           //  [0..8]    seq of the jset holding the Checkpoint
-    lsn: u64,                                //  [8..16]   LSN of the Checkpoint entry
-    journal_index: u16,                      // [16..18]   index into journal_buckets
-    sector: u16,                             // [18..20]   sector of the jset within that bucket
-    _reserved: u32,                          // [20..24]
+struct CheckpointHint {                      // 16 bytes
+    lsn: u64,                                //  [0..8]    LSN of the Checkpoint entry; its jset's
+                                             //            seq is lsn >> 16 (JOURNAL-DESIGN§1.2)
+    journal_index: u16,                      //  [8..10]   index into journal_buckets
+    sector: u16,                             // [10..12]   sector of the jset within that bucket
+    _reserved: u32,                          // [12..16]
 }
 ```
 
-`Preamble.version` gates field interpretation. Reserved space is zero-initialised
+The superblock holds what is fixed for the device or needed before the journal is read:
+identity, geometry, the journal's location and the format version. What the pool decides —
+tier and media class (POOL-DESIGN§1.1), the metadata replica count (`RootListHead`,
+ENGINE-DESIGN§1.2), region size and copy-GC reserve (POOL-DESIGN§1.2) — lives in the pool's own
+state, so changing it never rewrites superblocks. `Preamble.version` is the layout version of
+this block; `fs_format_version` is the version the whole pool writes with (FORMAT-DESIGN§15); the
+two are independent (ENGINE-D3). Mount history is not kept here (POOL-D5). `Preamble.version` gates field interpretation. Reserved space is zero-initialised
 so flipping bytes from 0 → 1 in a future version is a strict additive change. Pool-wide policy
 (default chunking, throttles) lives in pool state (POOL-DESIGN§1), not in the superblock.
 
@@ -106,13 +106,13 @@ entry carrying it (JOURNAL-DESIGN§1.5):
 ```rust
 // Checkpoint entry payload (JOURNAL-DESIGN§1.3)
 #[repr(C)]
-struct RootListHead {                        // 88 bytes
-    seq: u64,                                //  [0..8]    monotonic; larger seq wins
-    lsn: u64,                                //  [8..16]   journal LSN this root corresponds to
-    entry_count: u16,                        // [16..18]
-    metadata_replicas: u8,                   // [18..19]   R, as in the superblock
-    _pad: [u8; 5],                           // [19..24]
-    id_counters: [u64; 8],                   // [24..88]   next id of each IdKind, indexed by it
+struct RootListHead {                        // 80 bytes
+    lsn: u64,                                //  [0..8]    journal LSN this root corresponds to;
+                                             //            the newest checkpoint has the largest
+    entry_count: u16,                        //  [8..10]
+    metadata_replicas: u8,                   // [10..11]   R: copies of every tree node; sizes each RootEntry
+    _pad: [u8; 5],                           // [11..16]
+    id_counters: [u64; 8],                   // [16..80]   next id of each IdKind, indexed by it
 }
 // followed by entry_count × RootEntry, ascending by (tree, scope)
 
@@ -153,15 +153,16 @@ Throughout the documents, `RootPointer.<name>_root` names the root-list entry of
 
 | Name | `BtreeKind` | Section |
 |---|---|---|
-| `object_table_root` | `ObjectRoots` | METADATA-DESIGN§1.4 |
+| `object_roots_root` | `ObjectRoots` | METADATA-DESIGN§1.4 |
 | `object_history_root` | `ObjectHistory` | SNAPSHOTS-DESIGN§1.2 |
+| `extent_list_root` | `ExtentList` | METADATA-DESIGN§1.3 |
 | `forward_index_root` | `Forward` | INDEX-DESIGN§2 |
 | `term_dictionary_root`, `term_table_root`, `postings_root`, `sequences_root` | `TermDictionary`, `TermTable`, `Postings`, `Sequences` | INDEX-DESIGN§3–§4 |
-| `chunk_index_root` | `ChunkIndex` | INDEX-DESIGN§4.3 |
+| `chunk_index_root`, `chunk_list_root` | `ChunkIndex`, `ChunkList` | INDEX-DESIGN§4.3 |
 | `backpointer_root` | `Backpointer` | METADATA-DESIGN§2.2 |
 | `ontology_root` | `Ontology` | ONTOLOGY-DESIGN§1 |
 | `subscriptions_root`, `subscription_members_root`, `subscription_events_root` | `Subscriptions`, `SubscriptionMembers`, `SubscriptionEvents` | SUBSCRIPTIONS-DESIGN§1 |
-| `snapshot_chain_root` | `Snapshots` | SNAPSHOTS-DESIGN§1.1 |
+| `snapshots_root` | `Snapshots` | SNAPSHOTS-DESIGN§1.1 |
 | `pool_state_root`, `disk_descriptors_root`, `placement_rules_root`, `cluster_peers_root` | `PoolState`, `DiskDescriptors`, `PlacementRules`, `ClusterPeers` | POOL-DESIGN§1 |
 | `reconcile_work_root`, `reconcile_pending_root`, `reconcile_scan_root` | `ReconcileWork`, `ReconcilePending`, `ReconcileScan` | RECONCILE-DESIGN§1.2 |
 
@@ -194,7 +195,7 @@ is checked against the bucket's generation on dereference. A `BlobRef` names a p
 length instead of a generation, and its freshness follows from the owning record's check.
 
 **Node pointers.** A pointer to a tree node — a child slot in an inner node, a root-list entry,
-a list head — is a `NodePtr`: `Superblock.metadata_replicas` (R, 1..=4, fixed at format time)
+a list head — is a `NodePtr`: `RootListHead.metadata_replicas` (R, 1..=4)
 `BlockRef`s naming the R copies of the node, each on a different disk, the fastest tier first.
 A node is written to all R places before any pointer to it is committed; a read takes the
 first copy that verifies and repairs the others through reconcile. On a single-disk pool R = 1.

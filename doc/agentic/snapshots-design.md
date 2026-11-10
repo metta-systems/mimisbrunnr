@@ -78,7 +78,7 @@ ancestors). For older queries, the 3-entry randomised skiplist provides O(log n)
 the root. During early recovery, before this data is validated, queries fall back to a simple
 parent-pointer walk.
 
-`RootPointer.snapshot_chain_root` is the snapshots btree root.
+`RootPointer.snapshots_root` is the snapshots btree root.
 
 ### 1.2 Snapshot-aware bkey position
 

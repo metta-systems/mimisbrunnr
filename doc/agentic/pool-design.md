@@ -34,16 +34,14 @@ placement-rule ids come from the `PlacementRule` counter the same way. The descr
 
 ```rust
 #[repr(C)]
-struct DiskDescriptor {                      // 32 + 32 × R bytes (R = metadata_replicas)
+struct DiskDescriptor {                      // 24 + 32 × R bytes (R = metadata_replicas)
     disk_uuid: [u8; 16],                     //  [0..16]   matches the device's Superblock.disk_uuid
     media_type: u8,                          // [16..17]   MediaType
     tier: u8,                                // [17..18]   StorageTier
     state: u8,                               // [18..19]   DiskState
     flags: u8,                               // [19..20]   DISK_FLAG_*
-    bucket_count: u32,                       // [20..24]   buckets on the device
-    first_usable_bucket: u32,                // [24..28]   = the device's Superblock.first_usable_bucket
-    _reserved: u32,                          // [28..32]
-    buckets_root: NodePtr,                   // [32..)     ALLOCATION-DESIGN§1.2 bucket alloc table
+    bucket_count: u32,                       // [20..24]   copy of the device's capacity in buckets
+    buckets_root: NodePtr,                   // [24..)     ALLOCATION-DESIGN§1.2 bucket alloc table
     freespace_root: NodePtr,                 //            ALLOCATION-DESIGN§1.4 freespace LRU
 }
 
@@ -51,8 +49,11 @@ const DISK_FLAG_ROTATIONAL: u8 = 1 << 0;     // seek-bound: reconcile sweeps in 
 ```
 
 `MediaType`, `StorageTier` and `DiskState` are SPECIFICATION-DESIGN§8.1's enums with their
-declaration order as discriminants. Capacity is `bucket_count` buckets; usage is the alloc
-table's. The per-disk allocation trees are COW under the standard checkpoint machinery, so every
+declaration order as discriminants. The descriptor holds what the pool decides about the disk —
+its media class, tier and state — and the superblock what is fixed for the device: its geometry
+and `disk_id` (ENGINE-DESIGN§1.1). The one copy is `bucket_count`, the device's capacity in
+buckets, kept so that a pool reports a missing disk's capacity; the superblock's geometry is
+authoritative, and the two are compared when the device is opened. Usage is the alloc table's. The per-disk allocation trees are COW under the standard checkpoint machinery, so every
 checkpoint captures a self-consistent state of every disk's allocation.
 
 **Opening a pool.** Read every supplied device's superblock; group by `fs_uuid`; load the root
@@ -80,6 +81,8 @@ PoolStateRecord = [version,
                    move_ios_in_flight: uint,              // default 64
                    reconcile_flags: uint,                 // bit 0 copygc, 1 tiering, 2 repair,
                                                           //   3 ac-only (RECONCILE-DESIGN§1.9)
+                   copygc_reserve_pct: uint,              // default 8, range 5..=21 (ALLOCATION-DESIGN§1.6)
+                   region_size_log2: uint,                // new regions; default 18 = 256 KiB (BTREE-DESIGN§1)
                    errors: [ErrorEntry]]                  // newest 64 (RECONCILE-DESIGN§1.7)
 
 ErrorEntry = [lsn: uint, time_ns: int, kind: uint, detail: bytes]

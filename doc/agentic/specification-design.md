@@ -503,7 +503,7 @@ The filesystem operates directly on raw block devices. Each disk is divided into
 
 There are no fixed areas: metadata and data share one bucket space, placed by bucket kind, tier and placement rules, and a device grows by adding buckets.
 
-**Superblock.** A 4 KiB block written 3× (offsets 0, 4096, last-4096-of-device) for redundancy. Holds the common 8-byte preamble, pool and disk identity (pool UUID, disk UUID, node_id, disk_id, media_type, tier), capacity, geometry (`bucket_size_log2`, `btree_node_size_log2`, `metadata_replicas`), format-version and feature-flag fields, the journal bucket list and a hint to the newest checkpoint (§6.4). See ENGINE-DESIGN§1.1 for the full byte layout.
+**Superblock.** A 4 KiB block written 3× (offsets 0, 4096, last-4096-of-device) for redundancy. Holds what is fixed for the device or needed before the journal is read: the common 8-byte preamble, pool and disk identity (pool UUID, disk UUID, node_id, disk_id), capacity and geometry (`block_size_log2`, `bucket_size_log2`, first usable bucket), format-version and feature-flag fields, the journal bucket list and a hint to the newest checkpoint (§6.4). Tier, media class, the metadata replica count and pool policy live in pool state and the root list, so changing them never rewrites a superblock. See ENGINE-DESIGN§1.1 for the full byte layout.
 
 **Atomic root commit.** All persistent tree roots form one **root list**, carried by `Checkpoint` journal entries; a checkpoint commits atomically with its journal set, so a torn write never produces a corrupt root. The superblock is rewritten only on clean unmount and when the journal's bucket list changes (§6.4 / ENGINE-DESIGN§1.2, JOURNAL-DESIGN§1.5).
 

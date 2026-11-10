@@ -24,6 +24,10 @@ Estimated checkpoint entry size under (c), with 64 errors of 64-byte detail and 
 
 (c) depends on bounds the format does not yet have: [JOURNAL-D2](journal-decisions.md) (an entry's payload is at most 64 KiB), [POOL-D4](pool-decisions.md) (how many nodes and disks), [RECONCILE-D1](reconcile-decisions.md) (scan parameters and error detail) and the peer record's layout ([CLUSTER-D7](cluster-decisions.md)). Decide once those are settled.
 
+## ENGINE-D3 — Superblock layout version and pool format version
+
+The superblock carries two versions: `Preamble.version`, the layout of the superblock block itself, and `fs_format_version`, the version the whole pool writes with (FORMAT-DESIGN§15); today they move independently. To review once the format is declared stable: whether the superblock layout should be locked to the format version in use — one number, the superblock's layout implied by `fs_format_version` — so a reader never meets a superblock layout and pool format that disagree, at the cost of rewriting every superblock on each format advance.
+
 ## Future work
 
 - None recorded.

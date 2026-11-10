@@ -26,6 +26,16 @@ To decide: the granularities offered and which wheel serves each; whether the wh
 
 Only id widths bound how many nodes and disks a pool has: `NodeId` (65 536) and `disk_id` (65 536 ever added, ENGINE-DESIGN§1.2). Nothing says how many may be present at once, nor whether a removed disk's `DiskDescriptor` is kept (as a tombstone naming the never-reused id) or deleted once its evacuation completes. Every structure holding one entry per node or disk — object roots, disk descriptors, cluster peers, and the checkpoint entry if [ENGINE-D2](engine-decisions.md) (c) carries them — needs a worst case. To decide: the maximum cluster node count, the maximum present disks per pool, and the fate of removed disks' descriptors.
 
+## POOL-D5 — Pool event log and statistics
+
+The superblock no longer counts mounts or records the last mount time, since it is rewritten only on clean unmount and when the journal list changes (ENGINE-DESIGN§1.1). Mount history and similar operational statistics need a home that is written anyway. Sketch, not decided:
+
+- **Counters** in the pool state record (POOL-DESIGN§1.2), advanced in the checkpoint each event already writes: `mounts`, `unclean_mounts` (a mount whose replay found entries after the newest checkpoint), `last_mount_ns`, `last_clean_unmount_ns`, and per disk `mounts_seen` in its descriptor if per-device history matters.
+- **An event log** generalising today's `errors: [ErrorEntry]` (newest 64): `PoolEvent = [lsn, time_ns, kind, detail]` with kinds for mount, clean unmount, unclean recovery, disk added, removed or failed, head switch, rule rework started and finished, and the reconcile errors of RECONCILE-DESIGN§1.7; kept as the newest N, with counters surviving the window.
+- **Where it lives:** the pool state record while it stays small, or its own bounded tree if N grows; bounded by [RECONCILE-D1](reconcile-decisions.md) (`detail` cap) and part of [ENGINE-D2](engine-decisions.md)'s checkpoint size.
+
+To decide: the counter set, the event kinds, N, and whether `brunnr status` reports from it.
+
 ## Future work
 
 - None recorded.
