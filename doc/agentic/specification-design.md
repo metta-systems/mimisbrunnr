@@ -1655,7 +1655,7 @@ The design began as a list of properties for an associative persistent filesyste
 | Filesystem quotas | Not designed yet ([POOL-D2](pool-decisions.md)) |
 | Endianness-adaptive metadata (after ZFS block pointers) | Replaced by a little-endian on-disk format; big-endian hosts are out of scope |
 | Journalled, atomic updates | Journal and atomic root-list commit (§6.4, ENGINE-DESIGN§1, JOURNAL-DESIGN§1) |
-| ACLs (users and groups per file) | Out of scope: access control comes from the Mettā security model |
+| ACLs (users and groups per file) | Replaced by visibility enforced at the query boundary, over identities the Mettā security model provides (ACCESS-DESIGN) |
 | Versioning and snapshots storing only changed blocks and metadata | Key-level snapshots (SNAPSHOTS-DESIGN§1) |
 | File change logs, replacing `atime` | Query subscriptions and their pending events (§11) |
 | On-disk format upgradeable while mounted (after VxFS) | Format versioning and migration (FORMAT-DESIGN§15) |

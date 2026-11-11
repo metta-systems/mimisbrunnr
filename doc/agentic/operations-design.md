@@ -44,7 +44,7 @@ Mímisbrunnr is the associative filesystem of the Mettā operating system. Once 
 - POSIX path semantics: `open(path, …)`, `mkdir`, hard links, symlink-as-path resolution.
 - Strongly consistent cluster consensus and linearisable cross-node writes.
 - The network transport (Mettā provides peer reach).
-- Authentication, identity and access control (provided by the Mettā security model).
+- Authentication and identity (provided by the Mettā security model). What a caller may discover and touch once it reaches the filesystem is in scope: [access-design.md](access-design.md).
 - Full-text search over blob contents, media transcoding, near-duplicate deduplication. Exact-content dedup by BLAKE3 hash is in scope.
 
 **Duties:** maintainers preserve assertions across node-local writes, deliver eventual convergence and never recycle ObjectIds; operators keep replicas reachable and back up pools; application authors use `Query` and assume no path structure.
@@ -61,7 +61,7 @@ End-to-end checks that show the target system exists. Each is owned by the plan 
 | Snapshot create, then a query with that `snapshot_id`, returns the old assertion graph and resolves blob reads from the snapshot | [SNAPSHOT6](snapshots-implementation-plan.md) |
 | Two nodes converge on a shared assertion graph, each authoritative for its own writes, with no global snapshot coordination | [CLUSTER6](cluster-implementation-plan.md) |
 | A node answers a tag query for an object it did not write using only local metadata | [CLUSTER6](cluster-implementation-plan.md) |
-| The public API exposes no out-of-scope operation (POSIX path lookup, consensus, access control, full-text search, near-duplicate dedup) | manual review at each release |
+| The public API exposes no out-of-scope operation (POSIX path lookup, consensus, authentication, full-text search, near-duplicate dedup) | manual review at each release |
 
 ### Evidence kinds
 
