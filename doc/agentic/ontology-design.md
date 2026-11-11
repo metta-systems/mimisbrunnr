@@ -231,7 +231,7 @@ Source trees are a good test of the ontology: files have roles, dependencies, bu
 
 **Language and toolchain:** `lang` (attribute, text, set by import from the file extension), `toolchain` (attribute, text). A `ValueImplies { lang = rust → source }` rule makes every Rust file `source` without a per-file tag.
 
-**Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `debug-info`, `lto`, `stripped` (labels).
+**Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `lto` (attribute, text: `off`, `thin`, `fat`), `debug-info`, `stripped` (labels).
 
 **Lifecycle** (labels): `dirty`, `stale`, `current` (an `Exclusive` set), `released`, `pinned`.
 
@@ -267,7 +267,7 @@ bcm2711-rpi-4-b.dts     project=vesper component=hal                  device-tre
 bcm2711-rpi-4-b.dtb     project=vesper component=hal                  device-tree generated current  target=aarch64-unknown-none
                         derived-from→ bcm2711-rpi-4-b.dts
 main.o                  project=vesper component=kernel               object current  target=aarch64-unknown-none profile=release
-                        opt-level=2 lto toolchain=nightly-2024-01-15  derived-from→ main.rs, kernel_api.rs
+                        opt-level=2 lto=fat toolchain=nightly-2024-01-15  derived-from→ main.rs, kernel_api.rs
 libhal.rlib             project=vesper component=hal                  library current  target=… profile=release
 vesper                  project=vesper component=kernel               executable current debug-info  derived-from→ main.o  links→ libhal.rlib
 vesper.stripped         project=vesper component=kernel               executable current stripped  derived-from→ vesper
@@ -291,7 +291,7 @@ vesper-0.1.0-rpi4.img   project=vesper                                bundle cur
 | Stale-artifact footprint | `generated AND stale`, summing stored size |
 | Recent work | `source AND modified-week = <this week>` (a `Bucket` rule over the `modified` record field), distinct `project` |
 
-**Build integration.** After compiling, a build hook tags the output (`object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and on the previous `current` object of the same component removes `current` and asserts `stale` itself, so it does not rely on what the `Exclusive` set does on a conflicting write (ONTOLOGY-D9). Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
+**Build integration.** After compiling, a build hook tags the output (`object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and on the previous `current` build of the same output — same `component`, `target`, `profile` and output `unix-path` — removes `current` and asserts `stale` itself, so it does not rely on what the `Exclusive` set does on a conflicting write (ONTOLOGY-D9). Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
 
 **Placement.** The same tags drive `PlacementRule`s (SPECIFICATION-DESIGN§8.3): `Pin { source AND NOT vendored, Hot }` and `Replicate { source AND NOT vendored, 2 }`; `Pin { intermediate OR object, Hot }`; `Replicate { bundle AND released, 3 }` with `Prefer { bundle AND released, Warm }`; `Prefer { vendored, Cold }`.
 

@@ -233,7 +233,6 @@ Ontology says "playlist" is an ordered attribute key
 
 Ontology says "video" is-a media
   → Skip compression (already compressed)
-  → HCTR2 encryption (wide-block)
   → Prefer warm/cold tier placement
 
 Ontology says "vm-image" is-a mutable-large-file
@@ -252,9 +251,13 @@ value per axis from the candidates contributed by its tag set.
 struct StoragePolicy {
     chunking:    Option<ChunkParams>,        // §8.3 (chunking is a placement decision)
     compression: Option<CompressionAlgo>,    // §9.2
-    encryption:  Option<EncryptionMode>,     // §9.3
+    encryption:  Option<EncryptionPolicy>,   // §9.3: whether and under which key, never which cipher
 }
 ```
+
+The cipher is fixed by the structure being written (§9.3: HCTR2 for object data, XTS for tree
+nodes, AES-GCM for the journal); a storage policy only says whether an object's data is encrypted
+and under which key scope. The shape of `EncryptionPolicy` is ENCRYPTION-D6.
 
 **Static invariant (enforced at ontology install time).** For every storage axis A and
 every pair of tags `(T₁, T₂)` that both *directly* declare a value for A in their own
@@ -289,7 +292,7 @@ object carries both. **Allowed** — they declare different axes. Per-axis resol
 proceeds independently: `encrypted` wins on encryption, `vm-disk` wins on the others.
 
 **5. Multiple unrelated tags declaring the same axis with the same value.** `encrypted`
-and `sensitive` both declare `encryption: AES-GCM`, neither implies the other.
+and `sensitive` both declare the same `encryption` setting, neither implies the other.
 **Install fails** — the rule is structural, not value-based. Even though today's values
 agree, a future change to either tag silently creates a conflict the next time an object
 bearing both is written. Catching it at install time is the right ergonomic.
@@ -477,7 +480,7 @@ Object → the `TermId`s it asserts directly. Used for listing an object's tags 
 
 ### 5.6 Faceted Exploration
 
-"Given my current query, what tags exist on the matching set?" — intersect result bitmap with each candidate tag bitmap. At ~μs per AND, 5000 tags complete in <10ms. LRU cache avoids recomputation.
+"Given my current query, what tags exist on the matching set?" — intersect the result with each candidate term's postings, one container intersection per 65 536-id window of the result. The cost is the candidates times the result's windows, plus one device read for each container not already in the block cache; an LRU of recent refinements avoids recomputation.
 
 ---
 
@@ -761,7 +764,7 @@ precedence is ONTOLOGY-D5.
 
 **Disk removal:** Backpointer range scan over the disk's buckets, which yields exactly the objects with data on it. Each object migrated to a destination chosen by evaluating placement rules against it with the per-object evaluator (QUERY-DESIGN "Per-object evaluation"). Disk enters `Draining` state during removal — reads still served, no new writes.
 
-**Resilver:** Proportional to data on the failed disk, not pool size. Prioritized by surviving replica count. ~20× faster than ZFS resilver for typical configurations.
+**Resilver:** Proportional to data on the failed disk, not pool size. Prioritized by surviving replica count.
 
 **Automatic tiering:** Objects migrate between tiers based on tags and access patterns. Explicit placement rules take precedence, then access-time-based defaults.
 
@@ -799,11 +802,13 @@ Content hash is always computed on original plaintext — dedup and integrity ve
 ```rust
 enum CompressionAlgo { None, Zstd(i32 /* level 1-22 */), Lz4 }
 
+// The cipher each structure uses (§9.3). Chosen by what is being written, never by a storage
+// policy, which only says whether object data is encrypted and under which key (§3.5).
 enum EncryptionMode {
     None,
-    Hctr2 { object_id: u64 },   // wide-block, length-preserving (data buckets)
-    Xts,                        // narrow-block, length-preserving (node buckets)
-    AesGcm,                     // authenticated; nonce = 64-bit jset seq || 32-bit zero (journal)
+    Hctr2 { tweak_owner: u64 }, // wide-block, length-preserving: object data, chunks, packed blocks
+    Xts,                        // narrow-block, length-preserving: tree-node buckets
+    AesGcm,                     // authenticated; nonce = 64-bit jset seq || 32-bit zero: journal
     ChaCha20Poly1305,           // network/sync messages
 }
 
@@ -938,16 +943,19 @@ and a position-keyed structure can't dedup, so both are necessary.
 Every node replicates all metadata. Blob content lives only where placed or cached.
 
 ```
-           Node A (laptop)        Node B (NAS)         Node C (S3)
+           Node A (laptop)        Node B (NAS)         S3 (blob store)
          ┌────────────────┐    ┌────────────────┐    ┌─────────────┐
-Metadata │ ██████████████ │    │ ██████████████ │    │ ████████████│
-         │ ALL objects    │    │ ALL objects    │    │ ALL objects │
-         │ ~500 MB        │    │ ~500 MB        │    │ ~500 MB     │
+Metadata │ ██████████████ │    │ ██████████████ │    │             │
+         │ ALL objects    │    │ ALL objects    │    │ none        │
+         │ ~500 MB        │    │ ~500 MB        │    │             │
          ├────────────────┤    ├────────────────┤    ├─────────────┤
 Content  │ ░░░░ 30%       │    │ ████████ 80%   │    │ █████████95%│
          │ hot/active     │    │ most things    │    │ everything  │
          └────────────────┘    └────────────────┘    └─────────────┘
 ```
+
+Every *node* replicates all metadata; a blob store (§10.2) holds content only and is reached
+through a node.
 
 ### 10.2 Node Types
 
@@ -1016,9 +1024,6 @@ Ontology declarations merge by union of provenance, other fields last-writer-win
 ### 10.9 Remote Storage Backends
 
 S3, SFTP, IPFS slot in via a `BlobBackend` trait. The placement engine treats them as additional tiers. Placement rules work identically — `Prefer { query: HasTag { tag: tag("archive"), direct: false }, tier: Glacier }` sends archives to S3 Glacier.
-
-⁉️can provide a namespace layer on top of ipfs, the missing link!
-
 ---
 
 ## 11. Query Subscriptions (Watch System)
@@ -1307,10 +1312,14 @@ Build systems emit tagging operations as part of compilation — tagging outputs
 
 ## 14. Performance
 
+Figures assume the containers, leaves and pages touched are in the block cache. A cold read adds
+one device read per container, leaf or page: tens of μs on NVMe, around a millisecond on an SD
+card, several milliseconds on an HDD. Nothing is mirrored whole in memory (§15).
+
 ### 14.1 Tag Query
 
 ```
-Bitmap intersection (3-4 tags):          ~1 μs
+Bitmap intersection (3-4 tags):          ~1 μs per window (warm cache)
 ObjectRecord lookup (cached):            ~4 μs
 ObjectRecord lookup (disk):              ~50 μs
 1000 results with metadata:              ~1-5 ms
@@ -1549,7 +1558,7 @@ flowchart LR
 
 |Capability|ZFS|ext4/btrfs|Mímisbrunnr|
 |---|---|---|---|
-|File discovery|Path traversal|Path traversal|Tag query (~1 μs)|
+|File discovery|Path traversal|Path traversal|Tag query (posting intersection)|
 |Metadata query|None|Limited xattr|Full query algebra + ontology|
 |Change watching|Not built-in|inotify (path-based)|Query subscriptions with offline catch-up|
 |Placement control|Per-dataset|None|Per-object, tag-driven|
@@ -1622,13 +1631,11 @@ mimir watch list
 mimir watch catch-up build-watcher
 mimir watch stream "source" --format json
 
-# Path projections
-mimir project create-context rpi4-sdcard
-mimir project set-path obj:42 rpi4-sdcard "/boot/kernel8.img"
-mimir project export rpi4-sdcard --format tar.gz -o sdcard.tar.gz
-mimir project import ./checkout --context src --auto-tag
-mimir project tree rpi4-sdcard
-brunnr mount-unix --context project-vesper /mnt/vesper
+# Unix paths (UNIX-DESIGN "CLI"; further commands and flags are UNIX-D4)
+mimir project set-path obj:42 "/boot/kernel8.img"
+mimir project import ./checkout
+mimir project tree /boot
+brunnr mount-unix /mnt/vesper
 ```
 
 ---
@@ -1719,7 +1726,7 @@ The object-granularity content locator (§6.3) is the indirection that makes mov
 
 ### C.7 Chunking only where it pays
 
-Content-defined chunking turns one extent read into one lookup per chunk. It pays off for large files with small edits (VM images, databases, layered documents), partial overlap between objects, and resumable transfer over poor links. Music, photos, video and PDFs are write-once and gain nothing; whole-object dedup already comes from the content hash. Hence extent storage by default, CDC for large mutable objects, and fixed-size chunks when only resumability matters, all chosen by the ontology (§9.6). Chunking only about 1 % of objects keeps the chunk index near 100 K entries.
+Content-defined chunking turns one extent read into one lookup per chunk. It pays off for large files with small edits (VM images, databases, layered documents), partial overlap between objects, and resumable transfer over poor links. Music, photos, video and PDFs are write-once and gain nothing; finding an identical whole object needs a lookup by content hash, not chunking (METADATA-D6). Hence extent storage by default, CDC for large mutable objects, and fixed-size chunks when only resumability matters, all chosen by the ontology (§9.6). Chunking only about 1 % of objects keeps the chunk index near 100 K entries.
 
 ### C.8 Encryption
 

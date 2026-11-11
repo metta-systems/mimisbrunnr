@@ -188,7 +188,7 @@ A build system watching sources wants one batch after a save-all, not one event 
 - **Build system:** `project=vesper AND source`, interest `CONTENT_CHANGED | CREATED | DELETED | ENTERED`, 200 ms debounce. Changed, created or entered objects go to an incremental rebuild; deleted ones are dropped from the build graph.
 - **IDE:** `project=vesper` with all interest bits: source edits, new object files, test results and `stale` markers from one subscription.
 - **Backup agent:** `critical`, interest `CONTENT_CHANGED | CREATED | ENTERED`, 30 s debounce. A full backup of the initial result, then incremental backups per event; after a week offline, catch-up reports what changed without a rescan.
-- **Hydration trigger:** `active AND project AND _presence:remote`, interest `ENTERED`: objects that become active while their content is only remote are queued for hydration (SPECIFICATION-DESIGN§10.3).
+- **Hydration trigger:** `project = vesper AND _presence:remote`, interest `ENTERED`: objects of the project whose content becomes remote-only, or that join the project while remote-only, are queued for hydration (SPECIFICATION-DESIGN§10.3).
 
 ## CLI
 
