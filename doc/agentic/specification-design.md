@@ -947,6 +947,8 @@ dedup, so both are necessary.
 
 ## 10. Cluster Synchronization
 
+The filesystem does no networking. A separate **cluster manager** carries sync traffic in its own wire format and transport, chooses peers and schedules exchanges; it drives the filesystem through a privileged **cluster-support interface** (CLUSTER-DESIGN§5) that exports and applies changes, keeps each peer's cursor, and moves content piece by piece with durable progress. Everything that must survive a crash of either side lives in the filesystem, so a node can work alone for any time, rejoin without losing changes on either side, and resume interrupted transfers where they stopped.
+
 ### 10.1 Architecture
 
 Every node replicates all metadata. Blob content lives only where placed or cached.
@@ -973,22 +975,26 @@ through a node.
 |**Full**|Metadata + local blobs + syncs with peers|
 |**Thin**|Metadata + stubs only (phones, small SSDs)|
 |**BlobStore**|Blobs only (IPFS, S3, NAS without compute)|
-|**Hub**|Always-on relay for intermittently connected nodes|
+|**Hub**|Always-on relay for intermittently connected nodes; trusted hubs hold state, untrusted ones only relay (CLUSTER-D9)|
 
 ### 10.3 Content Presence (Hydration Model)
 
 Where an object's content is follows from its record's content locator (§6.3): any local kind
 (extent, pieces, packed, inline) means present; `Remote` means held by other
 nodes only, naming the origin, and the object carries the `_presence:remote` system label
-(§2.3). Content being fetched, and whether a partially fetched object is a distinct state
-(`Hydrating` with progress, `Partial` stubs), is CLUSTER-D3; a fetched copy that may be evicted
-is a cached replica, dropped lazily by generation (ALLOCATION-DESIGN§1.3).
+(§2.3). Content arrives piece by piece: the object's piece list is recorded with every piece
+absent, and each fetched piece is verified against its hash and stored at once, so a fetch
+interrupted by a crash or a dropped link resumes at the first absent piece (CLUSTER-DESIGN§3).
+Every fetch, and every piece served to a peer, is a durable transfer record with its state and
+progress (CLUSTER-DESIGN§4), which is what a UI shows. Reads of partially present objects, and
+whether `Hydrating` and `Partial` are distinct states, are CLUSTER-D3; a fetched copy that may be
+evicted is a cached replica, dropped lazily by generation (ALLOCATION-DESIGN§1.3).
 
 Hydration policy is ontology-driven — `Pin`, `StubOnly`, `Prefetch`, `AutoEvict` rules using the same query language as placement rules.
 
 ### 10.4 Sync Protocol — State Deltas
 
-Nodes exchange **state, not history**. Each exchange with a peer ships what changed in the sender's direct state — object records, forward entries, ontology records, collection order — since what the peer last acknowledged (how that is tracked is CLUSTER-D7), read from a snapshot diff (CLUSTER-DESIGN§1). No operation log is kept for sync, no postings or derived terms travel (each node derives its own), and tags travel by uid, values as values. The receiver journals the changes as local mutations, so its indexes, rules and subscriptions treat them as its own. Every change carries the hybrid timestamp of its origin, which orders changes without coordination:
+Nodes exchange **state, not history**. Exporting for a peer yields what changed in direct state — object records, forward entries, ontology records, collection order — since the peer's cursor (what a cursor holds is CLUSTER-D7), read from a snapshot diff (CLUSTER-DESIGN§1), in bounded batches the cluster manager ships and acknowledges. No operation log is kept for sync, no postings or derived terms travel (each node derives its own), and tags travel by uid, values as values. Applying a batch journals its changes as local mutations, so indexes, rules and subscriptions treat them as local writes; the merge is a function of the states merged, so applying a batch twice changes nothing. Every change carries the hybrid timestamp of its origin, which orders changes without coordination:
 
 ```rust
 /// Hybrid Logical Clock timestamp for total ordering without coordination
@@ -1000,7 +1006,7 @@ struct HybridTimestamp {            // 16 B
 }
 // Total order: physical_ns → logical → node_id
 
-struct ObjectDelta {               // one changed object in a SyncBundle (CLUSTER-DESIGN§1)
+struct ObjectChange {              // one changed object in an export batch (CLUSTER-DESIGN§1)
     oid: ObjectId,
     hlc: HybridTimestamp,
     record: Option<RecordFields>,  // state, length, content hash, timestamps; never the locator
@@ -1017,13 +1023,15 @@ reads only blocks whose snapshot range includes the changed snapshots (BTREE-DES
 
 ### 10.6 Sync Modes
 
-**Incremental** (normal): the changes since what the peer acknowledged. **Full** (a new node): the diff from the empty snapshot — the sender's whole direct state, ~400 MB for 10M objects. The receiver derives postings and the dictionary locally.
+**Incremental** (normal): the changes since the peer's cursor, however long ago it was acknowledged. **Full** (a new node): the export from the empty snapshot — the exporter's whole direct state, ~400 MB for 10M objects. The receiver derives postings and the dictionary locally. When and how often to exchange is the cluster manager's choice.
 
 ### 10.7 Conflict Resolution
 
 Ontology declarations merge by union of provenance, other fields last-writer-wins (ONTOLOGY-DESIGN "Cluster propagation"). How object state changed on both sides merges — a three-way merge of term sets against a per-peer base or an observed-remove set, last-writer-wins registers for single-valued fields, delete against edit — is CLUSTER-D2; collection order under concurrent inserts is CLUSTER-D6.
 
 ### 10.8 Bandwidth Budget
+
+Metadata the cluster manager carries, before its own framing and compression:
 
 |Scenario|Size|
 |---|---|

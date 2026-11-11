@@ -81,7 +81,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 | `Exclusive { tags }` | [ONTOLOGY-D9](ontology-decisions.md) |
 | `Requires { tag, needs }` | asserting `tag` on an object that does not carry `needs` (directly or derived) fails with a defined error |
 
-Constraints are checked against the object's derived closure after the mutation. They bind local writes only: changes applied from a sync bundle (CLUSTER-DESIGN) or by an import are accepted even when they violate a constraint — another node's change may arrive before the change that satisfies the constraint, and an import mirrors data that already exists — and the violation is reported, as for existing data at install (Install step 7).
+Constraints are checked against the object's derived closure after the mutation. They bind local writes only: changes applied from a peer's export (CLUSTER-DESIGN§1) or by an import are accepted even when they violate a constraint — another node's change may arrive before the change that satisfies the constraint, and an import mirrors data that already exists — and the violation is reported, as for existing data at install (Install step 7).
 
 ## Modules
 
@@ -186,7 +186,7 @@ Core principle: **data outlives apps.** Removing an app removes the schema, not 
 
 ### Cluster propagation
 
-Ontology records are snapshot-aware, so the records changed between two of a node's snapshots are a snapshot diff of the ontology tree. Sync ships them by uid inside a `SyncBundle`, ahead of the bundle's other changes ([cluster-design.md](cluster-design.md)), and the receiver journals them as `OntologyPut` / `OntologyDelete` entries (JOURNAL-DESIGN§1.3); a receiver resolves uids to its local `TagId`s, allocating ids for tags new to it, and reworks its postings in the same commit. Concurrent edits to the same declaration on different nodes merge by union of provenance, with scalar fields ordered last-writer-wins by HLC. A constraint arriving by sync is checked like a newly installed one: existing violators are reported, not changed (Install step 7).
+Ontology records are snapshot-aware, so the records changed between two of a node's snapshots are a snapshot diff of the ontology tree. An export lists them by uid ahead of its object changes ([cluster-design.md](cluster-design.md)), and the receiver journals them as `OntologyPut` / `OntologyDelete` entries (JOURNAL-DESIGN§1.3); a receiver resolves uids to its local `TagId`s, allocating ids for tags new to it, and reworks its postings in the same commit. Concurrent edits to the same declaration on different nodes merge by union of provenance, with scalar fields ordered last-writer-wins by HLC. A constraint arriving by sync is checked like a newly installed one: existing violators are reported, not changed (Install step 7).
 
 ### CLI
 
@@ -204,7 +204,7 @@ Commands: `mimir ontology list | install <file> | remove <module> | orphans | sh
 - **Install bookkeeping lists per module** (tags, implications, relations it added). Provenance sets per declaration replace them.
 - **Pairwise `mutex` relations without write semantics.** `Exclusive` groups have a defined write behaviour (ONTOLOGY-D9).
 - **Storing module source inside the pool** as the installed form. Sources compile on the host; the pool holds records.
-- **A per-op ontology update with tag changes buffered until it arrives.** Ontology records travel in the same bundle, ahead of the changes that use them.
+- **A per-op ontology update with tag changes buffered until it arrives.** Ontology records travel in the same export, ahead of the changes that use them.
 - **An `auto-evict` placement rule.** Placement has no eviction rule; ageing between tiers is `PlacementRule::AutoTier`.
 
 ## Example module: software development

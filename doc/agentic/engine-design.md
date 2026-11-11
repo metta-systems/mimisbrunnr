@@ -163,7 +163,8 @@ Throughout the documents, `RootPointer.<name>_root` names the root-list entry of
 | `ontology_root` | `Ontology` | ONTOLOGY-DESIGN§1 |
 | `subscriptions_root`, `subscription_members_root`, `subscription_events_root` | `Subscriptions`, `SubscriptionMembers`, `SubscriptionEvents` | SUBSCRIPTIONS-DESIGN§1 |
 | `snapshots_root` | `Snapshots` | SNAPSHOTS-DESIGN§1.1 |
-| `pool_state_root`, `disk_descriptors_root`, `placement_rules_root`, `cluster_peers_root` | `PoolState`, `DiskDescriptors`, `PlacementRules`, `ClusterPeers` | POOL-DESIGN§1 |
+| `pool_state_root`, `disk_descriptors_root`, `placement_rules_root` | `PoolState`, `DiskDescriptors`, `PlacementRules` | POOL-DESIGN§1 |
+| `cluster_peers_root`, `transfers_root` | `ClusterPeers`, `Transfers` | CLUSTER-DESIGN§2, §4 |
 | `reconcile_work_root`, `reconcile_pending_root`, `reconcile_scan_root` | `ReconcileWork`, `ReconcilePending`, `ReconcileScan` | RECONCILE-DESIGN§1.2 |
 
 Per-disk allocation trees are rooted in their disk descriptors (POOL-DESIGN§1), not in the list.

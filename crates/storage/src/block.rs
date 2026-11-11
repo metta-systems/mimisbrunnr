@@ -132,7 +132,7 @@ impl BlockKind {
 
 /// `BtreeKind` enumerates the large-region (256 KiB) types. FORMAT-DESIGN§1.3.
 ///
-/// TODO(BTREE11): take the spec's contiguous values 0–25; the kinds the spec
+/// TODO(BTREE11): take the spec's contiguous values 0–26; the kinds the spec
 /// no longer has go as their replacements land.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

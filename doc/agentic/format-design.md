@@ -118,11 +118,12 @@ enum BtreeKind {
     PoolState             = 19,  // POOL-DESIGN§1.2 single-entry pool state record
     DiskDescriptors       = 20,  // POOL-DESIGN§1.1 disk descriptors (disk_id → DiskDescriptor)
     PlacementRules        = 21,  // POOL-DESIGN§1 placement rules (heterogeneous, CBOR values)
-    ClusterPeers          = 22,  // POOL-DESIGN§1 cluster peers (NodeId → PeerRecord)
+    ClusterPeers          = 22,  // CLUSTER-DESIGN§2 peer records (NodeId → PeerRecord)
+    Transfers             = 23,  // CLUSTER-DESIGN§4 content transfers ((oid, direction, peer) → TransferRecord)
     // Reconcile
-    ReconcileWork         = 23,  // RECONCILE-DESIGN§1.2 queued work, by priority then physical position
-    ReconcilePending      = 24,  // RECONCILE-DESIGN§1.2 failed items awaiting device-config retry
-    ReconcileScan         = 25,  // RECONCILE-DESIGN§1.3 in-progress scan cursors
+    ReconcileWork         = 24,  // RECONCILE-DESIGN§1.2 queued work, by priority then physical position
+    ReconcilePending      = 25,  // RECONCILE-DESIGN§1.2 failed items awaiting device-config retry
+    ReconcileScan         = 26,  // RECONCILE-DESIGN§1.3 in-progress scan cursors
 }
 ```
 
@@ -228,9 +229,9 @@ Specified in [POOL-DESIGN§1](pool-design.md#1-pool-state).
 
 Specified in [SNAPSHOTS-DESIGN§1](snapshots-design.md#1-snapshots).
 
-### 11.7 Sync bundles from snapshot diffs
+### 11.7 Cluster support
 
-Specified in [CLUSTER-DESIGN§1](cluster-design.md#1-sync-bundles-from-snapshot-diffs).
+Change export in [CLUSTER-DESIGN§1](cluster-design.md#1-change-export-from-snapshot-diffs); peer records, absent pieces and transfer records in [CLUSTER-DESIGN§2–§4](cluster-design.md#2-peer-records).
 
 ## 12. Allocation Layer
 

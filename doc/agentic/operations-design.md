@@ -43,7 +43,7 @@ Mímisbrunnr is the associative filesystem of the Mettā operating system. Once 
 - Nanokernel integration.
 - POSIX path semantics: `open(path, …)`, `mkdir`, hard links, symlink-as-path resolution.
 - Strongly consistent cluster consensus and linearisable cross-node writes.
-- The network transport (Mettā provides peer reach).
+- Networking for cluster sync: transport, wire format, peer discovery and scheduling belong to a separate cluster manager, which drives the filesystem through the cluster-support interface ([cluster-design.md](cluster-design.md)).
 - Authentication and identity (provided by the Mettā security model). What a caller may discover and touch once it reaches the filesystem is in scope: [access-design.md](access-design.md).
 - Full-text search over blob contents, media transcoding, near-duplicate deduplication. Exact-content dedup by BLAKE3 hash is in scope.
 

@@ -61,7 +61,7 @@ The on-disk layout is encryption-aware but encryption-agnostic:
     in the journal is detected as a tag mismatch.
   - **Layout**: the 16-byte tag follows the ciphertext; the set's checksum covers ciphertext and
     tag, so readers without the key still validate I/O integrity.
-- **Sync bundles**: **ChaCha20-Poly1305** with random nonces.
+- **Sync traffic**: sealed by the cluster manager on its channel (CLUSTER-DESIGN), **ChaCha20-Poly1305** with random nonces where the filesystem seals export batches itself (CLUSTER-D9).
 
 Keys never leave the in-memory key hierarchy (`MasterKEK → DiskKey`). The superblock stores only
 key *identifiers*.

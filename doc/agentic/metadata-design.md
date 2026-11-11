@@ -324,6 +324,8 @@ struct PrivatePiece {                        // 88 bytes — the value of a priv
 }
 
 const PIECE_FLAG_SHARED: u8 = 1 << 0;        // located through ChunkIndex; no location in the entry
+const PIECE_FLAG_ABSENT: u8 = 1 << 1;        // hash and length known, bytes not local; head shape,
+                                             //   no location or reference (CLUSTER-DESIGN§3)
 ```
 
 - **Lookup.** The piece holding byte `x` is the first key `(oid, end_offset > x)` visible at the

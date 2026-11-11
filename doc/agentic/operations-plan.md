@@ -106,7 +106,7 @@ The term dictionary, postings and forward index replace every index structure, s
 
 ### 10. Cluster sync
 
-[CLUSTER1](cluster-implementation-plan.md) and [CLUSTER9](cluster-implementation-plan.md) (sync bundles; both after CLUSTER-D7), then [CLUSTER2](cluster-implementation-plan.md) (after CLUSTER-D2 and CLUSTER-D6), [CLUSTER4](cluster-implementation-plan.md), [CLUSTER5](cluster-implementation-plan.md), [CLUSTER7](cluster-implementation-plan.md), [CLUSTER8](cluster-implementation-plan.md), then [CLUSTER6](cluster-implementation-plan.md).
+[CLUSTER1](cluster-implementation-plan.md) and [CLUSTER9](cluster-implementation-plan.md) (peer records and change export; both after CLUSTER-D7), then [CLUSTER2](cluster-implementation-plan.md) (after CLUSTER-D2 and CLUSTER-D6), [CLUSTER7](cluster-implementation-plan.md), [CLUSTER8](cluster-implementation-plan.md); [CLUSTER10](cluster-implementation-plan.md) (piece transfer, after METADATA8, BLOB3 and CLUSTER-D10), then [CLUSTER11](cluster-implementation-plan.md) (transfer records) and [CLUSTER5](cluster-implementation-plan.md) (after CLUSTER-D3); then [CLUSTER6](cluster-implementation-plan.md).
 
 ### Parallel tracks
 
