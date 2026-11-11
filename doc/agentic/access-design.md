@@ -15,6 +15,15 @@ Three questions follow, for every operation the engine offers:
 2. **Query visibility** — which objects may appear in this caller's results, counts and events?
 3. **Tag visibility** — may this caller learn that a tag, or a value of it, exists at all?
 
+## Background
+
+Four earlier systems shape the problem:
+
+- **EROS / KeyKOS** have no filesystem at all: every object is reached through a capability, and persistence is orthogonal (a checkpoint captures all state, capabilities included). There the capability *is* the access control. Mímisbrunnr cannot stop there, because it must discover objects: no one can be handed a capability to "all photos from 2024" before those photos exist.
+- **Tahoe-LAFS** gives each stored object cryptographic capabilities derived one way — write → read → verify — so a holder weakens a capability without asking any authority. Diminishment as a first-class, local operation carries over.
+- **Attribute-based access control** (NIST SP 800-162) decides from attributes of subject, object, action and environment; in a tag-based filesystem tags already are the object's attributes. But ABAC is a policy framework without unforgeable tokens: it has to rest on capabilities.
+- **Capsicum** puts a process into capability mode, where it loses the global namespaces and keeps only the descriptors it holds. Its lesson: a global namespace is the enemy of capability discipline — and a query interface is a global namespace, so it must be scoped.
+
 ## Selected design
 
 - **Mettā provides identity, authentication and the capabilities that reach the filesystem.** A domain without a capability to the filesystem's endpoint issues no queries at all; Mímisbrunnr does not authenticate anyone.

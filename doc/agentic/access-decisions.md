@@ -24,7 +24,9 @@ Whether tags and values can be hidden, per realm. The candidate levels:
 - **NameOnly** — the key is visible; its values only through objects the caller can see.
 - **Hidden** — outside its realm the tag does not exist: a query naming it matches nothing (no error), and no enumeration lists it.
 
-Every enumeration surface must apply it: dictionary and prefix scans, n-gram `Contains` lookups over distinct values (INDEX-DESIGN§4.2), faceted refinement counts (SPECIFICATION-DESIGN§5.6), term cardinalities and other statistics, the `/tags/` view, and SQL `GROUP BY` over keys. Decide the levels, where a policy is declared (per realm, per key, in the ontology), and whether hidden values must also be encrypted at rest — query hiding does not protect a stolen disk (ACCESS-D7).
+Every enumeration surface must apply it: dictionary and prefix scans, n-gram `Contains` lookups over distinct values (INDEX-DESIGN§4.2), faceted refinement counts (SPECIFICATION-DESIGN§5.6), term cardinalities and other statistics, the `/tags/` view, and SQL `GROUP BY` over keys. Candidate policy shape: each realm declares a default visibility for its tags, plus overrides per key — `diagnosis` and `patient` hidden in realm `medical` while the realm's other keys stay open. A query naming a key resolves it against the policies of the realms that govern it: a hidden key is usable only by sessions holding one of those realms, and resolves to an empty set for everyone else.
+
+Decide the levels, where a policy is declared (per realm, per key, in the ontology), and whether hidden values must also be encrypted at rest — query hiding does not protect a stolen disk (ACCESS-D7).
 
 ## ACCESS-D4 — Sessions and rights
 
@@ -35,7 +37,17 @@ What a session is and what it may do. The candidate:
 - **Diminishment:** a holder can derive a weaker session or object capability (fewer realms or rights) without asking anyone.
 - **Opening an object** checks visibility, then rights, and returns an object capability for the data path; data access bypasses the query engine after that.
 
-Decide the rights set, how sessions and object capabilities map onto Mettā's capability types, whether capabilities can be time- or use-limited, and the error each refusal returns (ACCESS-D2).
+**Candidate mapping onto Mettā's capability types:**
+
+- **Reaching the filesystem:** a domain obtains an `EndpointKey` to the filesystem from KeyMaster. Without it, no queries.
+- **Opening a session:** the domain asks for a session with a realm set and rights. The filesystem checks that the domain holds a **RealmKey** for each realm and that the rights are within each realm's maximum for it, and returns a **SessionKey**: a badged `EndpointKey` whose badge encodes the realm set and rights. Queries carry the session in the badge.
+- **RealmKey:** a badged `EndpointKey` to the filesystem's realm manager, its badge encoding realm id and rights. A weaker RealmKey is derived by re-badging with fewer rights — admin → read-write → read-only — never the reverse.
+- **Opening an object:** the filesystem checks visibility (ACCESS-D2 on failure), then rights against the session's maximum, and mints a **`BufferKey`** with the granted rights; data access is then zero-copy through it, bypassing the query engine.
+- **Subscriptions:** signalled through an **`EventCountKey`** the filesystem advances when events are pending.
+- **The filesystem's own authority:** it runs as an ordinary domain holding only what it needs — its listening endpoint, buffers for its index and ontology data and its storage, the RealmKeys of the realms it manages, endpoints to the storage driver and to KeyMaster, and its notification keys — and nothing outside the realms it manages.
+- **Revocation chain:** KeyMaster revokes a RealmKey → the filesystem invalidates every session that includes the realm → the outstanding `BufferKey`s for objects of that realm fail on their next use. The window this leaves open is ACCESS-D8.
+
+Decide the rights set, whether this mapping holds, whether capabilities can be time- or use-limited, and the error each refusal returns (ACCESS-D2).
 
 ## ACCESS-D5 — Who may change the ontology
 
