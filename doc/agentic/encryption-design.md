@@ -11,7 +11,7 @@ Each kind of stored data — node blocks, data extents, journal sets — is encr
 
 ## Selected design
 
-- **Ciphers:** node-bucket blocks XTS-AES-256 (tweak = block address and bucket generation); data extents HCTR2 (tweak from the owner: `object_id` for private pieces, the piece hash for shared pieces, ENCRYPTION-DESIGN§1); journal sets AES-256-GCM (AAD the `JsetHeader` with its checksum zeroed, nonce `seq || 0`, 16 B tag after the ciphertext, ENCRYPTION-DESIGN§1); sync traffic ChaCha20-Poly1305; Adiantum as the fallback without AES instructions.
+- **Ciphers:** node-bucket blocks XTS-AES-256 (tweak = block address and bucket generation); data extents HCTR2 (tweak from the chunk hash when the chunk is deduplicated, from `object_id` when it is written without deduplication, ENCRYPTION-DESIGN§1); journal sets AES-256-GCM (AAD the `JsetHeader` with its checksum zeroed, nonce `seq || 0`, 16 B tag after the ciphertext, ENCRYPTION-DESIGN§1); sync traffic ChaCha20-Poly1305; Adiantum as the fallback without AES instructions.
 - **Key hierarchy:** `MasterKEK → DiskKey` (SPECIFICATION-DESIGN§9.4), with the journal key derived using the pool's `fs_uuid`; the superblock records `encryption_keyid`.
 - Sector padding for XTS/HCTR2 is already in the pipeline; journal entries compress before they encrypt.
 
@@ -33,14 +33,24 @@ The on-disk layout is encryption-aware but encryption-agnostic:
 - **Data and packed buckets**: encrypted with **HCTR2-AES-128**, length-preserving. The tweak
   depends on who owns the bytes, never on where they are, so moves (RECONCILE-DESIGN§1.5) copy
   ciphertext without re-encrypting:
-  - a private piece (METADATA-DESIGN§1.3): `(object_id || block_no_within_object)`, so equal
-    content in different objects encrypts differently;
-  - a shared piece (INDEX-DESIGN§4.3): `(piece_hash[0..8] || block_no_within_piece)`.
-    Deduplication happens at the chunk index before encryption, so each distinct shared piece is
-    stored and encrypted once and is shared by every object that references it. The price is
-    that equal shared pieces have equal ciphertext: anyone who can read the stored bytes learns
-    which objects share content there, though not the content itself. Pieces are private unless
-    an object's policy asks for sharing (SPECIFICATION-DESIGN§9.6);
+  - a chunk written with deduplication (METADATA-DESIGN§1.3, `CHUNK_FLAG_HASH_TWEAK` set): the
+    **hash tweak** `(hash[0..8] || block_no_within_chunk)`. Deduplication happens at
+    `ChunkIndex` (INDEX-DESIGN§4.3, hash → one live holder) before encryption, so each distinct
+    chunk under one key is stored and encrypted once and its replicas are named by every object
+    with an equal chunk. An object stored as one chunk carries the same choice in
+    `RECORD_FLAG_HASH_TWEAK` (METADATA-DESIGN§1.2);
+  - a chunk written without deduplication (a stream, a `deduplication: off` write,
+    SPECIFICATION-DESIGN§3.5; flag clear): the **owner tweak** `(object_id ||
+    block_no_within_object)`, so it can be encrypted as it streams before its hash is known.
+    Background deduplication (RECONCILE-DESIGN§1.10) later re-encrypts it under its hash tweak
+    or points it at an existing copy;
+  - **what equal ciphertext reveals:** equal deduplicated chunks under one key have equal
+    ciphertext and one location. The metadata naming them — content-map entries, hashes,
+    backpointers — is in node buckets encrypted under XTS above, so someone holding only the
+    disk cannot tell which objects share a location or what hash it has; they learn only that
+    the data area holds fewer distinct ciphertexts than the logical content. Anyone holding the
+    metadata key can see which objects share chunks. The deduplication domain is one key: a
+    chunk under one key never matches a chunk under another (ACCESS-D7, keys per realm);
   - a packed small-object block: `(block_id || block_no)`, with the block identifier BLOB-D4
     defines, stable across moves.
 - **Journal**: each journal set's entries are **AES-256-GCM** authenticated as one unit when

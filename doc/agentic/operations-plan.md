@@ -89,7 +89,7 @@ The term dictionary, postings and forward index replace every index structure, s
 
 1. [BLOB1](blob-implementation-plan.md), [BLOB2](blob-implementation-plan.md), [BLOB5](blob-implementation-plan.md); then [JOURNAL11](journal-implementation-plan.md) — one barrier per commit with extent verification.
 2. [ENGINE5](engine-implementation-plan.md) — backpointers in the engine; [METADATA8](metadata-implementation-plan.md) — content map; then [METADATA6](metadata-implementation-plan.md) — blob reclaim and tombstone expiry (after METADATA-D3).
-3. [BLOB3](blob-implementation-plan.md), [BLOB4](blob-implementation-plan.md) — piece writes and shared pieces, selective boundaries and sharing; then [BLOB8](blob-implementation-plan.md) — tiny objects (after BLOB-D4), [JOURNAL14](journal-implementation-plan.md) — object lifecycle ops, and [BLOB9](blob-implementation-plan.md) — streaming objects.
+3. [BLOB3](blob-implementation-plan.md), [BLOB4](blob-implementation-plan.md) — chunk writes with deduplication, chunk boundaries; then [BLOB8](blob-implementation-plan.md) — tiny objects (after BLOB-D4), [JOURNAL14](journal-implementation-plan.md) — object lifecycle ops, and [BLOB9](blob-implementation-plan.md) — streaming objects.
 4. [JOURNAL13](journal-implementation-plan.md) — optional retained history; then [BLOB6](blob-implementation-plan.md), [UNIX1](unix-implementation-plan.md), [ENGINE6](engine-implementation-plan.md), [ENGINE7](engine-implementation-plan.md), then [ENGINE8](engine-implementation-plan.md) — no legacy blob.
 
 ### 7. Device target
@@ -102,11 +102,11 @@ The term dictionary, postings and forward index replace every index structure, s
 
 ### 9. Reconcile and allocation completeness
 
-[RECONCILE1](reconcile-implementation-plan.md), [RECONCILE2](reconcile-implementation-plan.md), [RECONCILE9](reconcile-implementation-plan.md) (scans), then [RECONCILE3](reconcile-implementation-plan.md) through [RECONCILE8](reconcile-implementation-plan.md), [INDEX17](index-implementation-plan.md) (term reclamation), with [ALLOCATION7](allocation-implementation-plan.md), [ALLOCATION8](allocation-implementation-plan.md) and [POOL6](pool-implementation-plan.md) (disk evacuation); then [POOL2](pool-implementation-plan.md).
+[RECONCILE1](reconcile-implementation-plan.md), [RECONCILE2](reconcile-implementation-plan.md), [RECONCILE9](reconcile-implementation-plan.md) (scans), then [RECONCILE3](reconcile-implementation-plan.md) through [RECONCILE8](reconcile-implementation-plan.md), [RECONCILE10](reconcile-implementation-plan.md) (background deduplication), [INDEX17](index-implementation-plan.md) (term reclamation), with [ALLOCATION7](allocation-implementation-plan.md), [ALLOCATION8](allocation-implementation-plan.md) and [POOL6](pool-implementation-plan.md) (disk evacuation); then [POOL2](pool-implementation-plan.md).
 
 ### 10. Cluster sync
 
-[CLUSTER1](cluster-implementation-plan.md) and [CLUSTER9](cluster-implementation-plan.md) (peer records and change export; both after CLUSTER-D7), then [CLUSTER2](cluster-implementation-plan.md) (after CLUSTER-D2 and CLUSTER-D6), [CLUSTER7](cluster-implementation-plan.md), [CLUSTER8](cluster-implementation-plan.md); [CLUSTER10](cluster-implementation-plan.md) (piece transfer, after METADATA8, BLOB3 and CLUSTER-D10), then [CLUSTER11](cluster-implementation-plan.md) (transfer records) and [CLUSTER5](cluster-implementation-plan.md) (after CLUSTER-D3); then [CLUSTER6](cluster-implementation-plan.md).
+[CLUSTER1](cluster-implementation-plan.md) and [CLUSTER9](cluster-implementation-plan.md) (peer records and change export; both after CLUSTER-D7), then [CLUSTER2](cluster-implementation-plan.md) (after CLUSTER-D2 and CLUSTER-D6), [CLUSTER7](cluster-implementation-plan.md), [CLUSTER8](cluster-implementation-plan.md); [CLUSTER10](cluster-implementation-plan.md) (chunk transfer, after METADATA8, BLOB3 and CLUSTER-D10), then [CLUSTER11](cluster-implementation-plan.md) (transfer records) and [CLUSTER5](cluster-implementation-plan.md) (after CLUSTER-D3); then [CLUSTER6](cluster-implementation-plan.md).
 
 ### Parallel tracks
 

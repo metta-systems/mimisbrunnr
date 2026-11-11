@@ -108,9 +108,11 @@ enum BucketKind {
 **Live-sector accounting.** `live_sectors` changes only through entries that already exist for
 other reasons, so replay recomputes it without accounting entries of its own:
 
-- data: `WriteBlob`, `AppendPieces` and `ReplacePieces` (private pieces), `InsertSharedPieces`
-  and `PackObjects` add the sectors they reference; ending a piece's last reference
-  (SNAPSHOTS-DESIGN§1.6) subtracts them;
+- data: `WriteBlob`, `AppendChunks`, `ReplaceChunks` and `PackObjects` add the sectors of each
+  location they newly write; a chunk deduplicated onto existing replicas adds a backpointer but
+  no sectors, since sectors count once per location however many owners name it; a location
+  leaves when its last owner's backpointers go (SNAPSHOTS-DESIGN§1.6, the reference rule that
+  frees a location when no key or record version of any owner names it) and subtracts them;
   `ReconcileMove`, `ReconcileReplicate` and `ReconcileDropReplica` move, add or subtract them
   (JOURNAL-DESIGN§1.3);
 - tree nodes: a checkpoint adds the sectors of the regions its root newly reaches and
@@ -118,7 +120,8 @@ other reasons, so replay recomputes it without accounting entries of its own:
   checkpoint are not live: a crash leaves them unreferenced.
 
 Backpointers are derived by the same ops at the same points (METADATA-DESIGN§2.2 "Lifecycle"),
-so a bucket's `live_sectors` always equals the sectors its live backpointers cover.
+so a bucket's `live_sectors` always equals the sectors its live backpointers cover, each
+location counted once.
 
 The alloc table is housed in `Node` buckets like every other tree and committed by the same
 checkpoint (ENGINE-DESIGN§1.2).
@@ -195,13 +198,15 @@ most-fragmented closed buckets.
 Each bucket is processed via the standard move path (RECONCILE-DESIGN§1.5):
 
 1. **Range-scan the backpointers btree (METADATA-DESIGN§2.2) at prefix `(disk_id, bucket_no, *)`** to
-   enumerate live extents in the bucket. Entries with stale `bucket_gen` are skipped.
-2. Read each live extent from disk and verify it (block checksum; BLAKE3 at the object level if
-   the owner is `BlobExtent`).
+   enumerate live locations in the bucket, with every owner of each. Entries with stale
+   `bucket_gen` are skipped.
+2. Read each live location from disk once and verify it (block checksum; the chunk's BLAKE3
+   hash if the owner is a `Chunk`).
 3. Write to a fresh bucket via the move path.
 4. Emit a single `ReconcileMove { from_loc, to_loc, owner_key }` WAL op (JOURNAL-DESIGN§1.3, RECONCILE-DESIGN§1.5). Replay
-   projects this into removing the old backpointer, inserting the new one and updating the
-   owner, applied as a single LSN's worth of btree mutations.
+   projects this into replacing the backpointer of every owner at the old location with one at
+   the new location and updating every owner, applied as a single LSN's worth of btree
+   mutations.
 5. Once a checkpoint has committed every move out of the bucket, bump its generation
    (`BucketGenBump`) and mark it free with `BUCKET_FLAG_NEEDS_DISCARD`. The generation bump
    invalidates any backpointers missed during the scan.

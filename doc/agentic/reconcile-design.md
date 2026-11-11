@@ -42,7 +42,8 @@ because each extent is evaluated independently, at the time it is processed.
 | Object on wrong tier vs. `Pin` / `Prefer` rule    | Migrate via the move path                    |
 | Compression / encryption inconsistent with ontology | Rewrite with correct transform pipeline    |
 | `Inline` object whose resolved policy now sets an encryption mode (METADATA-DESIGN§1.2) | Move the content out of the record, encrypted as the policy says |
-| Pieces locator's `ChunkParamsRecord`, or the pieces' sharing, ≠ resolved policy (INDEX-DESIGN§4.3, SPECIFICATION-DESIGN§3.5) | Re-cut or re-share the pieces (a content rewrite) |
+| `Chunks` locator's `ChunkParamsRecord` ≠ resolved chunking policy (INDEX-DESIGN§4.3 chunk boundaries, SPECIFICATION-DESIGN§3.5 storage policy) | Re-cut the chunks (a content rewrite with `ReplaceChunks`) |
+| Chunks written without deduplication (streams, policy-marked writes) while deduplication is on for the object | Background deduplication at idle priority (RECONCILE-DESIGN§1.10) |
 | `AutoTier` access-time threshold crossed (how time triggers fire is POOL-D3; access time is METADATA-D7) | Migrate Hot → Warm → Cold → Glacier          |
 | Bucket fragmentation > copygc threshold           | Run copy GC (ALLOCATION-DESIGN§1.6)          |
 | Disk in `Draining` state                          | Evacuate via backpointer scan (METADATA-DESIGN§2.2) |
@@ -70,6 +71,7 @@ enum WorkKind {
     AutoTier         = 6,      // age-based migration
     EcEncode         = 7,      // promote to erasure-coding stripe
     NodeRepair       = 9,      // tree-node copy failed verification
+    Dedup            = 10,     // chunks written without deduplication (RECONCILE-DESIGN§1.10)
     // 4, 8 unassigned (evacuation and snapshot cleanup are scans, RECONCILE-DESIGN§1.3)
 }
 
@@ -92,8 +94,9 @@ struct WorkValue {                           // 24 bytes
     last_error: u16,                         //  [2..4]   0 = none
     _pad: u32,                               //  [4..8]
     enqueued_lsn: u64,                       //  [8..16]
-    owner_key: [u8; 8],                      // [16..24]  ObjectId or chunk-hash prefix; the
-                                             //           backpointer supplies the rest
+    owner_key: [u8; 8],                      // [16..24]  ObjectId or node-key prefix; the
+                                             //           backpointers at the location supply
+                                             //           the rest and every other owner
 }
 ```
 
@@ -159,9 +162,11 @@ queues them in `ReconcileWork`.
 | 2 | metadata option updates |
 | 3 | data tiering, option updates, copy GC |
 | 4 | optimisations |
+| 5 | background deduplication — idle only |
 
 Scans run between queue items, with their own share of each step's budget: evacuation and
-failure scans at priority 0–1, cleanup and rework scans at 4. Within a priority, entries are in
+failure scans at priority 0–1, cleanup and rework scans at 4. Priority 5 runs only while no
+foreground writes are in flight. Within a priority, entries are in
 physical order, so a worker sweeps each disk from low to high buckets. Snapshot cleanup reclaims
 space but never blocks correctness; under sustained pressure it yields to copy GC and tiering
 and resumes from its cursor.
@@ -170,8 +175,8 @@ and resumes from its cursor.
 
 Reconcile shares one **move path** with copy GC:
 
-1. Read the extent or node copy from `from_loc` and validate (block checksum; BLAKE3 at the
-   object level for `OwnerKind::BlobExtent`).
+1. Read the chunk or node copy from `from_loc` once and validate (block checksum; the chunk's
+   BLAKE3 hash for `OwnerKind::Chunk`).
 2. Write the bytes to a fresh `to_loc`.
 3. Emit one `ReconcileMove { from_loc, to_loc, owner_key }` journal entry (JOURNAL-DESIGN§1.3) —
    the atomicity boundary: one LSN, one commit.
@@ -182,15 +187,16 @@ equivalent primitive mutations:
 
 ```
 ReconcileMove { from_loc, to_loc, owner_key }
-  ⇒ remove the backpointer at from_loc
-   ∘ insert the backpointer at to_loc, same owner
-   ∘ owner-update on owner_key:
-        OwnerKind::BlobExtent      → start_offset 0 and an Extent locator: the locator's replica in
+  ⇒ for every owner whose backpointer is at from_loc (a deduplicated chunk has one per object):
+     remove that backpointer
+   ∘ insert one at to_loc, same owner
+   ∘ owner-update on that owner:
+        OwnerKind::Chunk           → start_offset 0 and an Extent locator: the locator's replica in
                                      the radix record and every ObjectHistory version of the oid
-                                     naming from_loc (SNAPSHOTS-DESIGN§1.6); otherwise the private
-                                     piece's content-map key of the oid starting at start_offset,
-                                     at any snapshot, that names from_loc (METADATA-DESIGN§1.3)
-        OwnerKind::Chunk           → the shared piece's ChunkIndex entry BlobRef (INDEX-DESIGN§4.3)
+                                     naming from_loc (SNAPSHOTS-DESIGN§1.6, which bounds this
+                                     search); otherwise the chunk's content-map key of the oid
+                                     ending at start_offset + length, at any snapshot, that names
+                                     from_loc (METADATA-DESIGN§1.3)
         OwnerKind::BtreeNode       → the moved copy's slot in the parent's NodePtr (BTREE-DESIGN§1);
                                      for a forward-overflow region after the first, the next
                                      region's predecessor pointer (a new copy of that region)
@@ -202,20 +208,22 @@ Changing the number of copies projects the same way, onto the same owners:
 
 ```
 ReconcileReplicate { existing, new_loc, owner_key }
-  ⇒ insert the backpointer at new_loc
+  ⇒ for every owner whose backpointer is at `existing`: insert one at new_loc
    ∘ owner-update: add new_loc as a replica beside `existing`, raising replica_count
-     (BlobExtent: in the locator or the private piece's keys found as for a move; PackedBlock: in
-     the Packed locator of every object the block names)
+     (Chunk: in the locator or the chunk's keys found as for a move; PackedBlock: in the Packed
+     locator of every object the block names)
 
 ReconcileDropReplica { loc, owner_key }
-  ⇒ remove the backpointer at loc
+  ⇒ for every owner whose backpointer is at loc: remove it
    ∘ owner-update: remove loc from the replicas, lowering replica_count; refused when it is
      the last replica
 ```
 
 A tree node always has exactly `metadata_replicas` copies, so its repair is a `ReconcileMove`
-of the lost copy's slot to a new location, never a change of count. A shared piece has one location in
-`ChunkIndex`, so neither op applies to `OwnerKind::Chunk` (BLOB-D7).
+of the lost copy's slot to a new location, never a change of count. A deduplicated chunk has
+one replica set for all its owners (METADATA-DESIGN§1.3, dedup as a relation between entries
+naming the same replicas), so its copies are counted, added and dropped once and every owner's
+entry follows. Its desired replica count is the highest any owner's resolved policy asks for.
 
 All projected mutations apply under the move's LSN, so a crash either replays all of them or
 none. Backpointers of fresh writes, node frees and dropped references are derived the same way
@@ -225,10 +233,8 @@ from their own ops (METADATA-DESIGN§2.2 "Lifecycle"); there are no backpointer 
 (`{disk_id, sector, bucket_no, generation}`, ENGINE-DESIGN§1.2); the on-disk owner fields use
 narrower shapes sharing its first 8 bytes. Replay demotes `to_loc: BlockRef` into the target's shape:
 
-- `ReplicaRef` (METADATA-DESIGN§2.1, `BlobExtent`): take the first 8 bytes; write the low 16 bits
-  of `generation` into the slot's generation tag.
-- `BlobRef` (INDEX-DESIGN§4.3, `Chunk`): take the first 8 bytes; copy `length` from the *previous*
-  owner record's `BlobRef.length` — moves preserve extent length, so the field is unchanged.
+- `ReplicaRef` (METADATA-DESIGN§2.1, `Chunk` and `PackedBlock`): take the first 8 bytes; write
+  the low 16 bits of `generation` into the slot's generation tag.
 - `BlockRef` (`BtreeNode`): copy verbatim into the moved copy's slot of the parent's `NodePtr`.
 
 Writers do the inverse promotion when emitting `ReconcileMove`: they read the destination
@@ -290,7 +296,37 @@ and the work it queued complete.
 Per-workload pause / resume via pool-state flags (e.g. `reconcile_on_ac_only` to pause on
 battery power for laptops).
 
-### 1.10 Footprint
+### 1.10 Background deduplication
+
+Deduplication is on by default (SPECIFICATION-DESIGN§3.5, the storage-policy `deduplication`
+axis). A write that skips it — a stream (JOURNAL-DESIGN§1.3.1, the chunk write sequence), or a
+write whose policy marks it `deduplication: off` for this write only — stores every chunk at
+its own new location, encrypted with the owner tweak, and leaves `CHUNK_FLAG_HASH_TWEAK` clear
+(METADATA-DESIGN§1.3, the 88-byte `ChunkEntry`). The commit that ends such a write
+(`FinalizeObject` for a stream, the write's last entry otherwise) enqueues one `Dedup` entry at
+the location of the object's first chunk; its backpointer gives the oid.
+
+The worker takes `Dedup` entries at priority 5, only while the pool is idle, and walks the
+object's content map in key order. For each chunk with `CHUNK_FLAG_HASH_TWEAK` clear:
+
+- **Hash already held.** `ChunkIndex` (INDEX-DESIGN§4.3, hash → one live holder) has an entry
+  for the chunk's hash, and the holder's replicas verify against it: one `ReplaceChunks` points
+  the object's key at the holder's replicas with `CHUNK_SPEC_EXISTING` set (JOURNAL-DESIGN§1.3,
+  reuse of existing replicas without new data). The object becomes another owner of those
+  replicas, and its own copy loses its last backpointer and is freed in the same entry.
+- **First copy of the hash.** The chunk is re-encrypted under its hash tweak into a new
+  location, one `ReplaceChunks` names it with `CHUNK_FLAG_HASH_TWEAK` set, the object becomes
+  the hash's holder in `ChunkIndex`, and the old copy is freed.
+
+Each `ReplaceChunks` carries at most about 510 chunks (JOURNAL-D2: one journal entry holds at
+most 64 KiB because `EntryHead.len` is a `u16`), so a large object takes several entries, each
+committing a consistent prefix; the work entry's resume point is the first chunk still clear.
+A foreground write to the same range wins: a key no longer naming the chunk the worker read is
+skipped. Policy that turns deduplication off for an object makes its pending `Dedup` entry a
+no-op. Encryption domains bound the search: a hash held by an object under another encryption
+key is not a match (ENCRYPTION-DESIGN, the deduplication domain is one key).
+
+### 1.11 Footprint
 
 Reconcile trees are transient and small: a scan is one record however much it covers, and
 queued entries are 36 bytes each before packing. Typical bounds:

@@ -93,7 +93,7 @@ enum BtreeKind {
     ObjectRoots           = 0,   // METADATA-DESIGN§1.4 NodeId → object radix root (snapshot-agnostic)
     ObjectTable           = 1,   // METADATA-DESIGN§1 per-node radix leaves & inners (current view)
     ObjectHistory         = 2,   // SNAPSHOTS-DESIGN§1.2 sidecar: (oid, snapshot) → ObjectRecord overrides
-    ContentMap            = 3,   // METADATA-DESIGN§1.3 shared piece B+ tree, (oid, end_offset, snapshot) → piece (snapshot-aware)
+    ContentMap            = 3,   // METADATA-DESIGN§1.3 one shared B+ tree, (oid, end_offset, snapshot) → ChunkEntry (snapshot-aware)
     // Term index
     Forward               = 4,   // INDEX-DESIGN§2 forward index B+ tree (snapshot-aware key)
     ForwardOverflow       = 5,   // INDEX-DESIGN§2.2 forward arrays of very large entries (positional, no sorted runs)
@@ -101,8 +101,8 @@ enum BtreeKind {
     TermTable             = 7,   // INDEX-DESIGN§4.1 term table: term_id → kind, key, full value (snapshot-agnostic)
     Postings              = 8,   // INDEX-DESIGN§3.1 postings B+ tree, one container per entry (snapshot-aware)
     Sequences             = 9,   // INDEX-DESIGN§3.3 ordered / ranked collection order (snapshot-aware)
-    // Shared pieces
-    ChunkIndex            = 10,  // INDEX-DESIGN§4.3 shared piece hash → extent, refcount (content-addressed; snapshot-agnostic)
+    // Deduplication
+    ChunkIndex            = 10,  // INDEX-DESIGN§4.3 chunk hash → one holder (oid, end_offset), write-time lookup (content-addressed; snapshot-agnostic)
     // Physical space
     Backpointer           = 11,  // METADATA-DESIGN§2.2 reverse-mapping B+ tree (snapshot-agnostic)
     BucketAlloc           = 12,  // ALLOCATION-DESIGN§1.2 per-disk bucket alloc B+ tree (physical)
@@ -231,7 +231,7 @@ Specified in [SNAPSHOTS-DESIGN§1](snapshots-design.md#1-snapshots).
 
 ### 11.7 Cluster support
 
-Change export in [CLUSTER-DESIGN§1](cluster-design.md#1-change-export-from-snapshot-diffs); peer records, absent pieces and transfer records in [CLUSTER-DESIGN§2–§4](cluster-design.md#2-peer-records).
+Change export in [CLUSTER-DESIGN§1](cluster-design.md#1-change-export-from-snapshot-diffs); peer records, absent chunks and transfer records in [CLUSTER-DESIGN§2–§4](cluster-design.md#2-peer-records).
 
 ## 12. Allocation Layer
 
@@ -371,7 +371,7 @@ about a third (~0.4 GiB at this scale). Tree sizes are for one copy of each node
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
 | Object table (records) | ~1.6 GiB  | Positional — 1.19 GiB of records in 6 511 leaves × 256 KiB (¾ of each region holds pages, the rest absorbs page runs); content locators included |
 | Object table (radix, roots) | < 1 MiB | One inner node per origin node at R = 1 (depth 1), a few at R = 2 (depth 2, METADATA-DESIGN§1); `ObjectRoots` one leaf |
-| Backpointers           | ~267 MiB  | METADATA-DESIGN§2.2 — 10 M extents × ~28 B packed                 |
+| Backpointers           | ~360 MiB  | METADATA-DESIGN§2.2 — one per owner of each location: 10 M chunks × ~38 B packed; a deduplicated chunk adds one per further owner |
 | Forward index          | ~0.6 GiB  | INDEX-DESIGN§2 — ~58 B per object at 8 direct assertions/object (32 B head + frame-of-reference term arrays); implied tags are not stored. Includes any `unix-path` and other path-projection attributes (UNIX-DESIGN§1) — those are ordinary `Attr` terms. |
 | Postings               | 200–400 MiB | INDEX-DESIGN§3 — roaring containers, one tree entry per (term, 65 536-id window); 5 000 tags |
 | Term dictionary + term table | 0.1–1 GiB | INDEX-DESIGN§4.1 — ~100 B per distinct attribute value; the upper end is one unique value per object |
@@ -409,7 +409,7 @@ disk space, surfaced via SNAPSHOTS-DESIGN§1.7's retention policy.
 
 | Structure              | Size       | Trigger                                           |
 | ---------------------- | ---------- | ------------------------------------------------- |
-| Reconcile trees        | < 1 MiB idle; a scan record per bulk event, plus the entries it could not act on at once | RECONCILE-DESIGN§1.10 |
+| Reconcile trees        | < 1 MiB idle; a scan record per bulk event, plus the entries it could not act on at once | RECONCILE-DESIGN§1.11 |
 | `ReconcileScan` cursors| < 1 MiB    | Per active scan; ~hundreds of bytes each          |
 | Snapshot cleanup scans | < 1 KiB    | One cursor per snapshot-aware btree while a pass runs, not per key or snapshot (SNAPSHOTS-DESIGN§1.5) |
 

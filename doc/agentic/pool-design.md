@@ -72,7 +72,7 @@ error naming it.
 ```text
 PoolStateRecord = [version,
                    cluster_node_count: uint,
-                   default_chunking_threshold: uint,      // objects ≤ this size are one piece, never cut
+                   default_chunking_threshold: uint,      // objects ≤ this size are one chunk, never cut
                    default_chunking: bytes(16),           // ChunkParamsRecord (INDEX-DESIGN§4.3)
                    encoded_extent_max: uint,              // plaintext bytes per compressed extent,
                                                           //   default 131072 (METADATA-DESIGN§1.3)

@@ -11,7 +11,7 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, answer
 
 1. **Resilient to delay and absence.** A node may work alone for any length of time, then rejoin and exchange everything that changed on either side, with no change lost on either.
 2. **Observable.** What is syncing, with which peer, and how far it has got can be shown to users.
-3. **Resumable.** A crash or a dropped link loses at most the work since the last durable step: a 20 GB transfer over a slow link resumes at the first piece it does not yet hold.
+3. **Resumable.** A crash or a dropped link loses at most the work since the last durable step: a 20 GB transfer over a slow link resumes at the first chunk it does not yet hold.
 4. **Driven from outside.** A separate cluster manager moves the traffic; the filesystem supplies the state and operations that make that possible, behind a privileged interface ordinary users do not see.
 
 ## Selected design
@@ -24,9 +24,9 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, answer
 - **Applying is idempotent and local.** Applied changes are journalled as ordinary local mutations, keeping each change's origin timestamp, so indexes, rules and subscriptions treat them exactly as local writes. The merge is a function of the states merged (CLUSTER-D2), so applying a batch twice — after a cluster-manager crash, or because two peers relayed it — changes nothing the second time. Constraints are not enforced on applied changes; violations are reported (ONTOLOGY-DESIGN "Rules and constraints").
 - **The ontology goes first.** An export lists changed ontology records ahead of object changes; declarations edited on two nodes merge by union of provenance, other fields last-writer-wins by hybrid timestamp (ONTOLOGY-DESIGN "Cluster propagation").
 - **Peer cursors are the filesystem's.** Each known peer has a record (CLUSTER-DESIGN§2) holding what the filesystem has exported to it and had acknowledged, what it has applied from it, and when. The cursors bound tombstone expiry (METADATA-DESIGN "Object deletion") and whatever the filesystem retains for diffing (CLUSTER-D7); a cluster manager that crashes or is replaced resumes from them.
-- **Content moves as pieces.** Every object's content is a list of hashed pieces (METADATA-DESIGN§1.3), so every transfer is "these pieces of this object": the receiver learns the object's piece list from the sender, records it with every piece absent (CLUSTER-DESIGN§3), fetches absent pieces in any order and from any peer that holds them, and verifies each against its hash before storing it. A stored piece is durable at once; after a crash the absent pieces are exactly what remains to fetch.
-- **Transfers are durable, visible records.** Every content transfer, in either direction, is a record (CLUSTER-DESIGN§4) with its state and progress. The filesystem creates inbound records itself when it wants content — an open of remote content, a hydration or pin rule, a resilver — and advances progress as pieces land; the cluster manager services them, creates records for what it serves to others, and pauses, resumes or cancels them. The records are what a UI shows; how they reach UI applications is [CLUSTER-D11](cluster-decisions.md).
-- **Bytes on the wire are ciphertext where keys allow.** Pieces are encrypted by owner (SPECIFICATION-DESIGN§9.3) and moves never re-encrypt, so between nodes holding the same keys a piece is read and written as stored; the cluster manager seals the channel. Who holds which keys is [ENCRYPTION-D4](encryption-decisions.md)/[ENCRYPTION-D5](encryption-decisions.md).
+- **Content moves as chunks.** Every object's content is a list of hashed chunks (METADATA-DESIGN§1.3, one 88-byte `ChunkEntry` per chunk), so every transfer is "these chunks of this object": the receiver learns the object's chunk list from the sender, records it with every chunk absent (CLUSTER-DESIGN§3), fetches absent chunks in any order and from any peer that holds them, and verifies each against its hash before storing it. A chunk whose hash the receiver already holds under the same key is deduplicated onto the local copy without being fetched. A stored chunk is durable at once; after a crash the absent chunks are exactly what remains to fetch.
+- **Transfers are durable, visible records.** Every content transfer, in either direction, is a record (CLUSTER-DESIGN§4) with its state and progress. The filesystem creates inbound records itself when it wants content — an open of remote content, a hydration or pin rule, a resilver — and advances progress as chunks land; the cluster manager services them, creates records for what it serves to others, and pauses, resumes or cancels them. The records are what a UI shows; how they reach UI applications is [CLUSTER-D11](cluster-decisions.md).
+- **Bytes on the wire are ciphertext where keys allow.** A chunk's tweak comes from its hash or its object id (SPECIFICATION-DESIGN§9.3), both the same on every node, and moves never re-encrypt, so between nodes holding the same keys a chunk is read and written as stored; the cluster manager seals the channel. Who holds which keys is [ENCRYPTION-D4](encryption-decisions.md)/[ENCRYPTION-D5](encryption-decisions.md).
 - **The interface is privileged.** The cluster-support operations (CLUSTER-DESIGN§5) are reachable only through their own capability, separate from user sessions ([ACCESS-D4](access-decisions.md), [CLUSTER-D12](cluster-decisions.md)).
 - **Open:** merge rules for object state ([CLUSTER-D2](cluster-decisions.md)); collection order under concurrent inserts ([CLUSTER-D6](cluster-decisions.md)); what a cursor holds ([CLUSTER-D7](cluster-decisions.md)); which nodes hold which content ([CLUSTER-D10](cluster-decisions.md)); reads of partially present objects ([CLUSTER-D3](cluster-decisions.md)).
 
@@ -34,7 +34,7 @@ Each node runs its own Mímisbrunnr, is authoritative for its own writes, answer
 
 - **The filesystem as a sync daemon** with its own wire format, transport binding and peer protocol. Transport and scheduling are policy that changes with deployment; keeping them in a separate manager leaves the filesystem a state store with a stable interface.
 - **An operation log replicated between nodes.** It must be kept until every peer has it, grows with absence, and lets derived state drift; state deltas need neither.
-- **Per-chunk presence lists** (`present_on` on every chunk-index entry). Every copy or eviction would change sync state per piece; see CLUSTER-D10 for the options kept open.
+- **Per-chunk presence lists** (`present_on` on every chunk-index entry). Every copy or eviction would change sync state per chunk; see CLUSTER-D10 for the options kept open.
 
 ## Format specification
 
@@ -79,7 +79,7 @@ Term = Tag(tag_uid) | Attr(key_uid, Value) | Relation(predicate_uid, target: Obj
 
 **Resilver.** A node returning with a disk missing repairs replicas through reconcile
 (RECONCILE-DESIGN§1): the disk-state change starts a scan over the disk's backpointers
-(METADATA-DESIGN§2.2). Pieces with no surviving local replica become wanted content — inbound
+(METADATA-DESIGN§2.2). Chunks with no surviving local replica become wanted content — inbound
 transfer records (CLUSTER-DESIGN§4) the cluster manager fills from peers.
 
 ## 2. Peer records
@@ -103,15 +103,17 @@ PeerRecord = [version,
 operations and commit like any mutation; adding and removing a peer commit by checkpoint as
 administrative changes (POOL-DESIGN§1.2).
 
-## 3. Absent pieces
+## 3. Absent chunks
 
-A piece whose hash and length are known but whose bytes are not local is a content-map key
-(METADATA-DESIGN§1.3) with `PIECE_FLAG_ABSENT` set and the shared-piece shape (hash, length,
-flags; no location). Recording an object's piece list writes every piece absent; storing a
-fetched piece, after its hash verifies, replaces the absent key with a private or shared piece
-in one `ReplacePieces` (JOURNAL-DESIGN§1.3). An absent piece holds no space and no reference.
-Which reads succeed on an object with absent pieces, and how the record's content kind marks it,
-is CLUSTER-D3.
+A chunk whose hash and length are known but whose bytes are not local is a content-map key
+(METADATA-DESIGN§1.3) whose `ChunkEntry` has `CHUNK_FLAG_ABSENT` set and `replica_count` 0 —
+the same 88-byte entry as any chunk, with no replicas. Recording an object's chunk list writes
+every chunk absent with `AppendChunks`. Storing a chunk replaces the absent entry with one
+naming replicas, in one `ReplaceChunks` (JOURNAL-DESIGN§1.3): either a fetched chunk, written
+after its hash verifies, or a local copy with the same hash found through `ChunkIndex`
+(INDEX-DESIGN§4.3, hash → one live holder), deduplicated without a fetch. An absent chunk holds
+no space and no backpointer. Which reads succeed on an object with absent chunks, and how the
+record's content kind marks it, is CLUSTER-D3.
 
 ## 4. Transfers
 
@@ -124,14 +126,14 @@ TransferRecord = [version,
                   state: uint,           // 0 wanted, 1 active, 2 paused, 3 done, 4 failed, 5 cancelled
                   cause: uint,           // 0 open, 1 hydration rule, 2 pin, 3 resilver, 4 peer request
                   priority: uint,
-                  pieces_total: uint, pieces_done: uint,
+                  chunks_total: uint, chunks_done: uint,
                   bytes_total: uint, bytes_done: uint,
                   created_ns: int, updated_ns: int,
                   last_error: text / null]
 ```
 
-- An **inbound** record's progress follows from the content map: `pieces_done` and `bytes_done`
-  are the object's present pieces, advanced in the commit that stores each piece and recomputed
+- An **inbound** record's progress follows from the content map: `chunks_done` and `bytes_done`
+  are the object's present chunks, advanced in the commit that stores each chunk and recomputed
   from the content map at mount, so they never run ahead of what is durable.
 - An **outbound** record's progress is what the cluster manager reports it has sent; it is
   advisory and survives a crash only to the last report.
@@ -147,7 +149,7 @@ The operations the cluster manager calls, through the cluster-support capability
 | Identity and time | the node's `NodeId` and uid; the current hybrid timestamp; observe a peer's timestamp |
 | Peers | put, get, list and remove peer records |
 | Changes | export the next batch for a peer from its cursor; acknowledge a batch; apply a batch of changes from a peer, returning what was applied and the constraint violations reported |
-| Content | an object's piece list; read a stored piece by hash or by `(oid, end_offset)`; record a piece list as absent; store a fetched piece (verified by hash); list the pieces an object still lacks |
+| Content | an object's chunk list; read a stored chunk by hash (through its `ChunkIndex` holder) or by `(oid, end_offset)`; record a chunk list as absent; store a fetched chunk (verified by hash); list the chunks an object still lacks |
 | Transfers | list transfers by state, priority, object or peer; create, pause, resume, cancel and remove; report outbound progress |
 | Retention | what each peer's cursor holds back (snapshots, tombstones) |
 

@@ -22,10 +22,10 @@ Ontology declarations already merge as ONTOLOGY-DESIGN "Cluster propagation" rec
 
 ## CLUSTER-D3 — Partially present content
 
-An object whose piece list is recorded but some pieces are absent (CLUSTER-DESIGN§3) — being fetched, or deliberately stubbed by a hydration rule — needs defined reads and a defined record. Decide:
+An object whose chunk list is recorded but some chunks are absent (CLUSTER-DESIGN§3, chunk entries with `CHUNK_FLAG_ABSENT` and no replicas) — being fetched, or deliberately stubbed by a hydration rule — needs defined reads and a defined record. Decide:
 
 - whether a read of a present range succeeds while other ranges are absent, and what a read of an absent range does (fail with a defined error, block while an inbound transfer is active, or trigger one);
-- how the record marks it: the `Pieces` content kind with absent keys, or `Remote` until the last piece lands;
+- how the record marks it: the `Chunks` content kind with absent keys, or `Remote` until the last chunk lands;
 - whether `Partial` (a stub kept on purpose, e.g. the first N bytes or a thumbnail) and `Hydrating` (a fetch in progress) are distinct states, or one state plus the transfer record.
 
 Blocks [CLUSTER5](cluster-implementation-plan.md).
@@ -62,11 +62,11 @@ Ties to [CLUSTER-D7](#cluster-d7--what-a-cursor-holds) and [ENCRYPTION-D4](encry
 
 ## CLUSTER-D10 — Who holds which content
 
-To fetch an object's pieces the cluster manager must know which peers have them. Options:
+To fetch an object's chunks the cluster manager must know which peers have them. Options:
 
 - (a) **Ask the origin, then peers:** the object's origin node first (`RemoteLocator.origin_node`), then any peer; no new state, but the origin may be offline while another node holds a copy.
 - (b) **Per-object presence in synced state:** the set of nodes holding a full copy, carried with the object's record in exports; a few node ids per object, changing only when copies are made or evicted.
-- (c) **Per-piece presence** in the chunk index: precise, but every copy or eviction changes sync state per piece (rejected in CLUSTER-DESIGN for that reason, kept here only for comparison).
+- (c) **Per-chunk presence** in the chunk index: precise, but every copy or eviction changes sync state per chunk (rejected in CLUSTER-DESIGN for that reason, kept here only for comparison).
 
 Leaning (b). Shapes [CLUSTER10](cluster-implementation-plan.md).
 

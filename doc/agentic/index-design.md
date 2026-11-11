@@ -1,6 +1,6 @@
 # Indices — design
 
-Scope: `crates/index` (term dictionary, term table, postings, forward index, sequences, chunk index and piece-boundary parameters), and the posting-container representation shared with `crates/query`, `crates/fuse`, `crates/watch`.
+Scope: `crates/index` (term dictionary, term table, postings, forward index, sequences, chunk index and chunk-boundary parameters), and the posting-container representation shared with `crates/query`, `crates/fuse`, `crates/watch`.
 Governing spec: INDEX-DESIGN§1 (values and terms), INDEX-DESIGN§2 (forward), INDEX-DESIGN§3 (postings and sequences), INDEX-DESIGN§4 (dictionary, range scans, chunks), SPECIFICATION-DESIGN§5.
 
 Plan: [index-implementation-plan.md](index-implementation-plan.md) · Open decisions: [index-decisions.md](index-decisions.md) · Completed: [index-completed.md](index-completed.md) · Order: [operations-plan.md](operations-plan.md)
@@ -21,7 +21,7 @@ Every assertion an object makes is a **term**; the index is an inverted index ov
   | Postings | `(term_id, id >> 16, snapshot)` → one roaring container | INDEX-DESIGN§3.1–3.2 |
   | Forward | `(oid, snapshot)` → the object's term ids | INDEX-DESIGN§2 |
   | Sequences | `(term_id, position, snapshot)` → oid | INDEX-DESIGN§3.3 |
-  | Chunk index | shared piece hash → extent, refcount; piece boundaries | INDEX-DESIGN§4.3 |
+  | Chunk index | chunk hash → one entry holding those bytes (dedup lookup); chunk boundaries | INDEX-DESIGN§4.3 |
 
 - **Equality, range and prefix** queries are all dictionary lookups or scans: one ordered structure replaces a hash index and a separate range tree.
 - **Posting lists** are roaring containers keyed by the high 48 bits of the object id, so ids carry full node and local identity, a small update rewrites one container, and local snapshot diffs work per container. Lists of up to four objects live inline in their dictionary entry.
@@ -516,63 +516,56 @@ postings.
 - Patterns shorter than `n`, and keys without n-grams, fall back to a scan of the key's dictionary
   entries.
 
-### 4.3 Chunk index and piece boundaries
+### 4.3 Chunk index and chunk boundaries
 
-An object's content is an ordered list of pieces in the content map (METADATA-DESIGN§1.3). A
-**shared** piece keeps only its hash there; its bytes are located through the chunk index, one
-entry per distinct shared piece in the pool:
+An object's content is an ordered list of chunks in the content map (METADATA-DESIGN§1.3); every
+entry names its chunk's replicas, so a read needs nothing else. The chunk index is the lookup a
+writer uses to find bytes that already exist:
 
 | Structure    | Keyed by             | Role                                                   | Snapshot? |
 | ------------ | -------------------- | ------------------------------------------------------ | --------- |
-| `ChunkIndex` | piece hash           | **Content-addressed dedup directory.** "Where does the shared piece with hash X live?" → `BlobRef` to its physical extent, plus a `ref_count`. | snapshot-agnostic |
-| `ContentMap` | `(oid, end_offset)`  | **Per-object recipe** (METADATA-DESIGN§1.3): the object's pieces in order; a shared piece's entry is a pointer *into* `ChunkIndex`, not the bytes. | snapshot-aware |
+| `ChunkIndex` | chunk hash           | **Dedup lookup.** "Is there already a chunk with hash X, and which entry names it?" → one live holder `(oid, end_offset)`. Never read on the read path. | snapshot-agnostic |
+| `ContentMap` | `(oid, end_offset)`  | **Per-object content** (METADATA-DESIGN§1.3): the object's chunks in order, each entry with its replicas. | snapshot-aware |
 
-The split is the same pattern as Git (object database vs. tree object) or ZFS dedup (DDT vs.
-file extent map):
+- **Write with deduplication** (the default, SPECIFICATION-DESIGN§3.5): cut the plaintext into
+  chunks (below) → for each, hash it and probe `ChunkIndex` → on a hit, read the holder's entry
+  and put a new entry naming the same replicas; on a miss, write the bytes, encrypted with the
+  hash tweak, and insert the hash with this entry as holder.
+- **Write without deduplication** (streams, and writes the policy marks): chunks are stored as
+  written, encrypted with the owner tweak; background deduplication (RECONCILE-DESIGN§1.10)
+  later folds them onto existing copies or makes them the copy others find.
+- **Reference tracking** is the backpointers' job: every owner of a location has its own
+  backpointer (METADATA-DESIGN§2.2), a location is freed when the last goes, and a move updates
+  every owner they list. `ChunkIndex` holds no count.
+- **Holder upkeep.** When the holder's key is physically removed, the entry moves to another
+  owner of the same location, found through its backpointers, or is deleted when none remain.
 
-- **Read** shared pieces: range-scan the object's content-map keys in order → for each shared
-  piece look up its hash in `ChunkIndex` → `BlobRef` → read the bytes from its data bucket.
-- **Write** shared pieces: cut the plaintext into pieces (below) → for each, hash it and probe
-  `ChunkIndex` → if hit, bump `ref_count`; if miss, write the bytes and insert. Either way, put
-  the piece as the object's next content-map key.
-- **Dedup** falls out: two objects whose plaintext has equal shared pieces share their storage
-  through one `ChunkIndex` entry — `ref_count` counts the keys naming it; physical reclaim
-  happens when it drops to zero.
+#### `ChunkIndex`
 
-A hash-keyed structure can't preserve order and a position-keyed one can't dedup, so both
-exist. Private pieces never enter `ChunkIndex`. The reverse direction (shared piece → which
-objects use it) is covered by the backpointers btree (METADATA-DESIGN§2.2) under
-`OwnerKind::Chunk`.
+A **B+ tree of large nodes** (BTREE-DESIGN§1) keyed by `chunk_hash: [u8; 32]`, snapshot-agnostic:
 
-#### `ChunkIndex` — content-addressed dedup directory
-
-A **B+ tree of large nodes** (BTREE-DESIGN§1) keyed by `chunk_hash: [u8; 32]`:
-
-```
-ChunkIndexLeafEntry {                        // 56 bytes
-    chunk_hash: [u8; 32],
-    ref_count: u32,
-    length: u32,
-    blob: BlobRef,                           // 16 B
+```rust
+#[repr(C)]
+struct ChunkHolder {                         // 16 bytes — the value
+    oid: u64,                                //  [0..8]    an object whose entry names the bytes
+    end_offset: u64,                         //  [8..16]   that entry's key in the content map
 }
 ```
 
-A 4 KiB data block (BTREE-DESIGN§1.2) holds 70 chunk entries — 8 B block head, then per entry a
-32 B key, 1 flag byte and 24 B of fixed-size value — so a 256 KiB leaf of 60 data blocks holds
-about **4 200**. Random-looking BLAKE3 hashes do not compress (each 32 B hash is four 8-byte
-`MSB_FIRST` fields with base 0, BTREE-DESIGN§1.6), so per-entry cost is the unpacked 57 B.
+A 4 KiB data block (BTREE-DESIGN§1.2) holds about 80 entries — a 32 B key, 1 flag byte and 16 B of
+value — so a 256 KiB leaf of 60 data blocks holds about **4 800**. Random-looking BLAKE3 hashes do
+not compress (each 32 B hash is four 8-byte `MSB_FIRST` fields with base 0, BTREE-DESIGN§1.6).
+Chunk hashes are BLAKE3 of plaintext (pre-compression), so dedup is content-defined.
 
-Piece hashes are BLAKE3 of plaintext (pre-compression), so dedup is content-defined.
+#### Chunk boundaries
 
-#### Piece boundaries
-
-How an object's content is cut into pieces is the chunking axis of its storage policy
-(SPECIFICATION-DESIGN§3.5, §9.6), recorded in a `Pieces` object's locator
+How an object's content is cut into chunks is the chunking axis of its storage policy
+(SPECIFICATION-DESIGN§3.5, §9.6), recorded in a `Chunks` object's locator
 (METADATA-DESIGN§1.2):
 
 ```rust
 #[repr(C)]
-struct ChunkParamsRecord {                   // 16 bytes — in the Pieces locator (METADATA-DESIGN§1.2)
+struct ChunkParamsRecord {                   // 16 bytes — in the Chunks locator (METADATA-DESIGN§1.2)
     algo: u8,                                //  [0..1]   ChunkingAlgo discriminant
     flags: u8,                               //  [1..2]   reserved
     _pad: [u8; 2],                           //  [2..4]
@@ -583,47 +576,45 @@ struct ChunkParamsRecord {                   // 16 bytes — in the Pieces locat
 
 #[repr(u8)]
 enum ChunkingAlgo {
-    None      = 0,                           // pieces as written, each at most one bucket (a stream
+    None      = 0,                           // chunks as written, each at most one bucket (a stream
                                              //   appends one per durable append); the pool default
-    FixedSize = 1,                           // fixed-size pieces: resumability and small rewrites
+    FixedSize = 1,                           // fixed-size chunks: resumability and small rewrites
     FastCDC   = 2,                           // content-defined: dedup across edits
     // 3+ reserved for future algorithms
 }
 ```
 
-With compression, a piece is decoded whole, so the cutter also ends a piece at
-`encoded_extent_max` plaintext bytes (POOL-DESIGN§1.2). At about 90 shared entries per 4 KiB
-block, a 256 KiB leaf of 60 data blocks holds about 5 400 pieces: ≈ 21 MiB of plaintext at 4 KiB
-pieces, ≈ 1.3 GiB at 256 KiB; private entries take about twice the space.
+With compression, a chunk is decoded whole, so the cutter also ends a chunk at
+`encoded_extent_max` plaintext bytes (POOL-DESIGN§1.2). At about 45 entries per 4 KiB block, a
+256 KiB leaf of 60 data blocks holds about 2 700 chunks: ≈ 10 MiB of plaintext at 4 KiB chunks,
+≈ 670 MiB at 256 KiB.
 
 **Re-cutting after policy change.** When the resolved storage policy (SPECIFICATION-DESIGN§3.5) for an
 object changes — typically because the operator updated a `PlacementRule::Chunk` or because
 an ontology install bumped a tag's `storage.chunking` — reconcile (RECONCILE-DESIGN§1.1) detects the
 mismatch by comparing the locator's `ChunkParamsRecord` to the resolved policy and
 queues a `WorkKind::OptionUpdate` entry, or, for a policy change affecting many objects, the policy change's scan handles them (RECONCILE-DESIGN§1.3). The pass is a
-content rewrite, not a move: it walks the object in windows that end on old piece boundaries,
-re-cuts each window with the new parameters and replaces its keys with one `ReplacePieces`
+content rewrite, not a move: it walks the object in windows that end on old chunk boundaries,
+re-cuts each window with the new parameters and replaces its keys with one `ReplaceChunks`
 (JOURNAL-DESIGN§1.3), so every intermediate recipe reads the same bytes; a final
-`FinalizeObject` records the new parameters in the locator. Old pieces are freed as their keys
-are physically removed — shared ones when their `ref_count` reaches zero; keys a snapshot still
-holds keep their pieces (SNAPSHOTS-DESIGN§1.6). Window size is BLOB-D6.
+`FinalizeObject` records the new parameters in the locator. A location is freed when the last
+owner naming it goes; keys a snapshot still holds keep theirs (SNAPSHOTS-DESIGN§1.6). Window size is
+BLOB-D6 (how large each re-cut window is: a pool-state value, a multiple of the new `max_size`, or
+left to the implementation).
 
-- **Concurrent writes.** Reading a window, writing its new pieces and emitting its
-  `ReplacePieces` are not one step, so an application may write into the window meanwhile.
+- **Concurrent writes.** Reading a window, writing its new chunks and emitting its
+  `ReplaceChunks` are not one step, so an application may write into the window meanwhile.
   Before journalling the replace, the engine checks that the object's keys in the window are
   the ones it read; under the engine's single writer the check and the entry are atomic. If they
   changed, the window is redone from the new keys.
-- **Deduplication turned on or off.** When the resolved policy makes an object's pieces shared,
-  or private again, the same window-by-window pass rewrites them: entering each piece into
-  `ChunkIndex` (or finding it there) and putting shared entries, or writing private copies and
-  putting private entries. An `Extent` object becoming `Pieces`, or back, ends with one
-  `FinalizeObject` that switches `content_kind` and range-deletes the old keys `(oid, *)` at the
-  current snapshot in the same commit. A snapshot keeps its own version.
+- **An `Extent` object becoming `Chunks`, or back,** ends with one `FinalizeObject` that switches
+  `content_kind` and range-deletes the old keys `(oid, *)` at the current snapshot in the same
+  commit. A snapshot keeps its own version.
 
 **Snapshots.** An edit after a snapshot puts the new keys and whiteouts at the current snapshot
 and leaves the snapshot's keys in place, so both versions read their own recipe. Unchanged
-ranges are the same keys, visible from both; shared pieces common to the two recipes are stored
-once through `ChunkIndex`.
+ranges are the same keys, visible from both; changed ranges that happen to hold content the
+other version has are deduplicated like any other chunk.
 
 ---
 

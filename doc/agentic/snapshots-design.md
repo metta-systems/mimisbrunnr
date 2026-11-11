@@ -106,9 +106,9 @@ entry that selects it carries the snapshot id.
 | `TermDictionary`   | yes             | per-term statistics and inline postings diverge |
 | `Postings`         | yes             | one container per `(term_id, high, snapshot)`; a change diverges one container |
 | `Sequences`        | yes             | collection order diverges                      |
-| `ContentMap`       | yes             | an object's pieces diverge per edited range    |
+| `ContentMap`       | yes             | an object's chunks diverge per edited range    |
 | `TermTable`        | no              | a term never changes once created              |
-| `ChunkIndex`       | no              | content-addressed; refcount handles divergence |
+| `ChunkIndex`       | no              | dedup lookup; any live holder serves every snapshot |
 | `Backpointer`      | no              | physical state, not logical                    |
 | `BucketAlloc`, `FreespaceLru` | no | physical state                              |
 | `Ontology`         | yes             | snapshot freezes the ontology version          |
@@ -223,8 +223,8 @@ The `SnapshotCreate` journal op (JOURNAL-DESIGN§1.3) records this as
 `parent_id ↔ N` (the previous current), and `current_replacement ↔ N₁` (the new writable head
 to which subsequent mutations are tagged).
 
-No backpointer is added for shared extents — the underlying blob is unchanged
-and its existing backpointer is valid for both snapshots. Backpointers are physical, not logical
+No backpointer is added for chunks a snapshot shares with its parent — the owner and the
+location are unchanged, and the owner's existing backpointer is valid for both snapshots. Backpointers are physical, not logical
 (METADATA-DESIGN§2.2 / SNAPSHOTS-DESIGN§1.2 table), so they're snapshot-agnostic.
 
 ### 1.5 Snapshot deletion
@@ -319,25 +319,32 @@ prevent generation bumps once *all* snapshots have moved on), retention is enfor
   *and* its owner's snapshot is still reachable through the snapshot tree.
 - Once a bucket has no live backpointers, its generation can be bumped.
 
-**References.** A reference to a piece is a key or locator that physically exists: a
+**References.** A reference to a chunk location is a key or locator that physically exists: a
 `ContentMap` key at any snapshot, or a record's `Extent` locator in the radix or in
 `ObjectHistory`. A whiteout is not a reference. A reference ends only when its key or version is
 physically removed — overwritten at the snapshot that wrote it, or dropped by snapshot cleanup
 (SNAPSHOTS-DESIGN§1.5) — never when a later snapshot whiteouts it.
 
-- **Shared pieces:** `ChunkIndex.ref_count` counts physical content-map keys naming the hash; a
-  put raises it, a physical removal lowers it, a whiteout leaves it; at zero the piece is freed.
-- **Private pieces:** there is no counter. A piece is immutable and never split, so it is named
-  by its own key — one physical key, visible from every snapshot that has not replaced it — and,
-  for an object stored as one piece, by the `Extent` locators of its record versions; converting
-  between `Extent` and `Pieces` can leave both names for a while. When a reference is physically
-  removed, the engine looks for the other: the oid's key at `start_offset + length` at every
-  snapshot, and the oid's record versions (METADATA-DESIGN§2.2). If none names the piece, its
-  backpointers are removed and its sectors leave `live_sectors`.
+- **Owners.** References come from owners: one object at one start offset is one owner, whatever
+  number of its snapshots or record versions name the location. Each owner has its own
+  backpointers (METADATA-DESIGN§2.2), so a location deduplicated across objects lists every
+  object that names it.
+- **One owner's references.** A chunk is immutable and never split, so within one owner it is
+  named by its own key — one physical key, visible from every snapshot that has not replaced it
+  — and, for an object stored as one chunk, by the `Extent` locators of its record versions;
+  converting between `Extent` and `Chunks` can leave both names for a while. When one of these
+  is physically removed, the engine looks for the others: the oid's key at `start_offset +
+  length` at every snapshot, and the oid's record versions. If none remains, that owner's
+  backpointers go.
+- **Freeing.** A location is freed — its sectors leave `live_sectors` — when its last owner's
+  backpointers go. `ChunkIndex` (INDEX-DESIGN§4.3) holds no count; when its holder for a hash
+  loses its key, the entry moves to another owner the backpointers list, or is deleted with the
+  last.
 
-The move path (RECONCILE-DESIGN§1.5) updates every reference the same search finds, under the
-move's single LSN. An object has at most as many versions as snapshots it changed in, so the
-search is bounded.
+The move path (RECONCILE-DESIGN§1.5) updates every owner the location's backpointers list, and
+within each owner every reference the search above finds, under the move's single LSN. An object
+has at most as many versions as snapshots it changed in, so the search is bounded; a location
+shared by many objects costs one update per owner.
 
 Snapshot retention scales with **logical changes**, not bucket counts.
 

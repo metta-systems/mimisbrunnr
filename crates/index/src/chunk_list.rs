@@ -2,15 +2,15 @@
 //!
 //! Two on-disk wire structs:
 //!
-//! - [`ChunkParamsRecord`] (16 B) — the piece-boundary parameters, held in a
-//!   `Pieces` object's content locator (METADATA-DESIGN§1.2).
+//! - [`ChunkParamsRecord`] (16 B) — the chunk-boundary parameters, held in a
+//!   `Chunks` object's content locator (METADATA-DESIGN§1.2).
 //! - [`ChunkListEntry`] (40 B) — a chunk-list entry of the prototype.
 //!
 //! TODO(BLOB3): `ChunkListEntry` gives way to the content map
 //! (METADATA-DESIGN§1.3): one shared `ContentMap` tree keyed
-//! `(oid, end_offset, snapshot)` whose `PieceEntry` values are either a
-//! 40-byte shared piece (hash, length, flags; located through `ChunkIndex`)
-//! or an 88-byte private piece (with its replicas and generation tags).
+//! `(oid, end_offset, snapshot)` whose values are 88-byte `ChunkEntry`s
+//! (hash, lengths, flags, replicas and generation tags), the same for every
+//! chunk; `ChunkIndex` becomes a dedup lookup from hash to one holder.
 //!
 //! Note: the storage crate currently exports a 16-byte
 //! `ChunkParamsRecord` *placeholder* that holds opaque bytes; the version in

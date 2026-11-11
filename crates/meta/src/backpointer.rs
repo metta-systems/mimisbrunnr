@@ -129,9 +129,10 @@ impl<'de> Deserialize<'de> for BackpointerKey {
 
 /// Discriminator for the kind of owner a backpointer points back to (METADATA-DESIGN§2.2).
 ///
-/// Discriminants are **pinned by the spec**; do not renumber. The format spec
-/// numbers these starting at 1 (see METADATA-DESIGN§2.2 enum block). The prompt's
-/// "BlobExtent = 0, …" form is not authoritative — the spec wins.
+/// TODO(METADATA3): the spec's `OwnerKind` is `Chunk = 0` (owner key = oid +
+/// start offset), `BtreeNode = 1`, `PackedBlock = 2`, and the owner moves from
+/// the value into `BackpointerKey`, so a deduplicated location has one
+/// backpointer per owner (METADATA-DESIGN§2.2).
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OwnerKind {

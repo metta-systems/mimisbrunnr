@@ -8,6 +8,12 @@
 //!
 //! In-memory mirror: [`ChunkIndex`] = `HashMap<[u8;32], ChunkIndexValue>`.
 //!
+//! TODO(BLOB3): the value becomes a 16-byte `ChunkHolder { oid, end_offset }`
+//! naming one content-map entry that holds the chunk (INDEX-DESIGN§4.3);
+//! `ref_count` and the `BlobRef` go. Writers copy the holder's replicas;
+//! readers never consult the index; who still uses a location is tracked by
+//! one backpointer per owner (METADATA-DESIGN§2.2).
+//!
 //! ## Persistence
 //!
 //! On disk the index occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
