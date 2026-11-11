@@ -81,7 +81,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 | `Exclusive { tags }` | [ONTOLOGY-D9](ontology-decisions.md) |
 | `Requires { tag, needs }` | asserting `tag` on an object that does not carry `needs` (directly or derived) fails with a defined error |
 
-Constraints are checked against the object's derived closure after the mutation.
+Constraints are checked against the object's derived closure after the mutation. They bind local writes only: changes applied from a sync bundle (CLUSTER-DESIGN) or by an import are accepted even when they violate a constraint — another node's change may arrive before the change that satisfies the constraint, and an import mirrors data that already exists — and the violation is reported, as for existing data at install (Install step 7).
 
 ## Modules
 
@@ -89,7 +89,9 @@ Module management is package management applied to schemas: one app needs some t
 
 - **Module identity.** A reverse-domain id (`systems.metta.music`) and a `module_uid` derived from it as for tags; a version; a name. The layering of core and application modules is SPECIFICATION-DESIGN§4.3.
 - **Compilation.** A module source file is compiled on the host into the ontology's record form (ONTOLOGY-DESIGN§1): tag, rule and constraint records with uids resolved, plus a module record carrying the compiled form's BLAKE3 digest. Installing a compiled module needs no source parser, so devices install modules prepared by the host.
-- **Module record.** `installers` (the applications that installed it; it stays while any remain) and `core` (a core module cannot be removed).
+- **Module record.** `installers` (the applications that installed it; it stays while any remain), `core` (a core module cannot be removed) and `requires` (below).
+- **Dependencies.** A module lists the modules it depends on with a semver requirement each (`"systems.metta.core" = ">=1.0, <4.0"`, Cargo's range syntax). Install fails when a dependency is missing or its installed version is outside the requirement; an upgrade of a dependency to a version some installed module's requirement excludes fails likewise; removing a module that another installed module requires fails, so removal follows reverse-dependency order. Resolving the names a module uses (Install step 2) is not enough on its own: a dependency can keep a name while changing what it means.
+- **Sharing a tag.** A module uses another module's tag by its qualified name. To share it — keep it alive when the other module is removed — the module re-declares it under that qualified name; the declaration must match the tag's kind, value type, collection flavour, hierarchy separator and n-gram length, or install fails, and it adds the module to the tag's provenance. The tag keeps its uid, which depends only on the declaring module and name.
 - **Distribution channels.** Built in (the core ontology), bundled with an app, user-created (`mimir ontology install ./my-tags.toml`).
 
 **Source syntax** (TOML; ONTOLOGY-D2 may replace the surface syntax):
@@ -99,6 +101,9 @@ Module management is package management applied to schemas: one app needs some t
 id = "systems.metta.music"
 version = "2.1.0"
 name = "Music Ontology"
+
+[requires]
+"systems.metta.core" = ">=1.0, <2.0"
 
 [[tags]]
 name = "artist"
@@ -138,7 +143,7 @@ needs = "systems.metta.core:audio"
 Install validates all-or-nothing and commits its records in one commit:
 
 1. **Duplicate module** — installing an installed `module_uid` adds the installer to its record and changes nothing else; a different version is an upgrade.
-2. **References** — every qualified name the module uses must resolve to an installed tag; an unresolved reference fails the install.
+2. **Dependencies and references** — every module in `requires` must be installed at a version inside its requirement, and every qualified name the module uses must resolve to an installed tag; either failure fails the install. A re-declared foreign tag must match its existing declaration ("Sharing a tag").
 3. **Cycles and order** — rules that would close an `Implies` / `ValueImplies` cycle fail the install, and so does a `Bucket` whose `key` is another `Bucket`'s `out_key`. A rule whose `to` is an attribute value interns that value's term in the same commit.
 4. **Storage-policy chain invariant** — SPECIFICATION-DESIGN§3.5.
 5. **Records** — tag, rule and constraint records are put with the module added to their provenance; new tags get `TagId`s.
@@ -343,7 +348,8 @@ RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)],
 Target = [0, tag: TagId] / [1, key: TagId, value: Value]   // what Implies / ValueImplies derive
 
 ModuleRecord = [version, uid: bytes(16), id: text, module_version: text, name: text,
-                installers: [text], core: bool, digest: bytes(32)]
+                installers: [text], core: bool, digest: bytes(32),
+                requires: [[module_id: text, version_req: text]]]
 ```
 
 `TagId`s and rule ids inside records are local; a record's uids are what leaves the node.

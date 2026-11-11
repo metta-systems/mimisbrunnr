@@ -336,10 +336,11 @@ struct ModuleRecord {
     installers: Vec<String>,     // applications that installed it; it stays while any remain
     core: bool,                  // a core module cannot be removed
     digest: [u8; 32],            // BLAKE3 of the compiled form
+    requires: Vec<(String, VersionReq)>, // modules it depends on, semver ranges
 }
 ```
 
-A module declares tags, rules and constraints; each declaration records the modules declaring it in its provenance (§3.1), so two modules may share a tag and removing one leaves it in place. Module source is compiled on the host into the ontology's record form with every name resolved to a uid; the engine installs compiled modules and never parses source, so a device installs what the host prepared (ONTOLOGY-DESIGN "Modules"). Ad-hoc tags belong to the built-in `local` module.
+A module declares tags, rules and constraints; each declaration records the modules declaring it in its provenance (§3.1). A module shares another module's tag by re-declaring it under its qualified name with a matching definition, so removing one leaves it in place; it depends on other modules through `requires`, checked at install, upgrade and removal (ONTOLOGY-DESIGN "Modules"). Module source is compiled on the host into the ontology's record form with every name resolved to a uid; the engine installs compiled modules and never parses source, so a device installs what the host prepared (ONTOLOGY-DESIGN "Modules"). Ad-hoc tags belong to the built-in `local` module.
 
 ### 4.2 Distribution Format
 

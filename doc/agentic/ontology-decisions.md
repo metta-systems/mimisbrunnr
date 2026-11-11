@@ -26,9 +26,7 @@ Whichever is chosen also decides what an implied tag does: whether a derived ter
 
 ## Future work
 
-- Module extensions listed in SPECIFICATION-DESIGN§4.1 / SPECIFICATION-DESIGN§4.2:
-  - `requires`: module dependencies with version requirements (`"systems.metta.core" = ">=1.0, <4.0"`); install fails on a missing dependency or a version outside the requirement, and removal follows reverse-dependency order.
-  - `extensible` tags: whether other modules may add rules under a tag.
+- `extensible` tags: whether other modules may add rules under a tag (SPECIFICATION-DESIGN§4.1).
 - General rule chaining: any rule reading any derived term, computed to a fixpoint, in place of the fixed single-pass order (ONTOLOGY-DESIGN "Rules and constraints"); needs a cycle check across all rule kinds and a general recompute on rule removal.
 - If maintaining `Bucket` rules on `changed` (INDEX-DESIGN§2.4) proves too costly under real loads: remove the `changed` record field and expose the forward entry's `modified_ns` as its own column (e.g. `retagged`), leaving "either changed" to SQL.
 - A module repository so `mimir ontology install <module-id>` fetches by id.
