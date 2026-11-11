@@ -16,7 +16,7 @@ The journal is the durability point for every mutation on any medium — SD card
 - **The root travels in the journal.** A checkpoint is a `Checkpoint` entry carrying the new root list (ENGINE-DESIGN§1.2); the superblock holds only a hint naming the jset of the newest checkpoint, rewritten on clean unmount and when the journal's bucket list changes.
 - **Adaptive group commit.** Idle commits seal and write at once; under load, commits join the next set and sets grow toward 256 KiB. Sets are pipelined and acknowledged in sequence. FUA where the device offers it, a cache flush otherwise; one flush per commit, with data extents verified by checksum on recovery instead of a second flush.
 - **Caller-chosen durability.** `Sync` returns once durable; `Buffered { max_delay }` becomes durable within a bound.
-- **Data beside the journal.** File data goes to blob extents; only tiny writes ride inside the journal, to be packed later. Streams are append-only objects made durable by periodic `ExtendObject` entries.
+- **Data beside the journal.** File data goes to blob extents; only tiny writes ride inside the journal, to be packed later. Streams are append-only objects made durable by periodic `AppendPieces` entries.
 - **Optional retained history.** Journal buckets may be kept past the trim point within a per-pool cap (default none); subscriptions do not depend on it — they keep their own pending events.
 - **Journal pins.** Each `LoadedNode` holds one `JournalPin { lsn_min, lsn_max, count }` over its pending journal; the trim point is the lowest live pin or the last checkpoint. `JournalPin` lives in `mimisbrunnr-storage`, beside `LoadedNode`.
 - **The engine starts no thread.** It exposes `commit`, `checkpoint` and a non-blocking query of what is due; the embedder drives them — a `std`-gated helper thread on the host, the filesystem server's own thread or event loop on Vesper.
@@ -201,33 +201,32 @@ subsystem; a reader rejects any other value.
 | 10 | `RenumberSequence` | collections |
 | 11 | `WriteBlob` | content |
 | 12 | `WriteInline` | content |
-| 13 | `ExtendObject` | content |
-| 14 | `PackObjects` | content |
-| 15 | `FinalizeObject` | content |
-| 16 | `ChunkInsertBatch` | chunked content |
-| 17 | `ChunkListAppend` | chunked content |
-| 18 | `ChunkListReplace` | chunked content |
-| 19 | `ChunkListShrink` | chunked content |
-| 20 | `ReclaimTerms` | terms |
-| 21 | `OntologyPut` | ontology |
-| 22 | `OntologyDelete` | ontology |
-| 23 | `SubscriptionPut` | subscriptions |
-| 24 | `SubscriptionDelete` | subscriptions |
-| 25 | `SubscriptionAck` | subscriptions |
-| 26 | `BucketAlloc` | buckets |
-| 27 | `BucketGenBump` | buckets |
-| 28 | `BucketDiscard` | buckets |
-| 29 | `SnapshotCreate` | snapshots |
-| 30 | `SnapshotSwitch` | snapshots |
-| 31 | `SnapshotDelete` | snapshots |
-| 32 | `SnapshotUnlink` | snapshots |
-| 33 | `SnapshotDepthUpdate` | snapshots |
-| 34 | `ReconcileEnqueue` | reconcile |
-| 35 | `ReconcileDequeue` | reconcile |
-| 36 | `ReconcileMove` | reconcile |
-| 37 | `ReconcileReplicate` | reconcile |
-| 38 | `ReconcileDropReplica` | reconcile |
-| 39 | `ReconcileScanStep` | reconcile |
+| 13 | `AppendPieces` | content |
+| 14 | `ReplacePieces` | content |
+| 15 | `TruncatePieces` | content |
+| 16 | `InsertSharedPieces` | content |
+| 17 | `PackObjects` | content |
+| 18 | `FinalizeObject` | content |
+| 19 | `ReclaimTerms` | terms |
+| 20 | `OntologyPut` | ontology |
+| 21 | `OntologyDelete` | ontology |
+| 22 | `SubscriptionPut` | subscriptions |
+| 23 | `SubscriptionDelete` | subscriptions |
+| 24 | `SubscriptionAck` | subscriptions |
+| 25 | `BucketAlloc` | buckets |
+| 26 | `BucketGenBump` | buckets |
+| 27 | `BucketDiscard` | buckets |
+| 28 | `SnapshotCreate` | snapshots |
+| 29 | `SnapshotSwitch` | snapshots |
+| 30 | `SnapshotDelete` | snapshots |
+| 31 | `SnapshotUnlink` | snapshots |
+| 32 | `SnapshotDepthUpdate` | snapshots |
+| 33 | `ReconcileEnqueue` | reconcile |
+| 34 | `ReconcileDequeue` | reconcile |
+| 35 | `ReconcileMove` | reconcile |
+| 36 | `ReconcileReplicate` | reconcile |
+| 37 | `ReconcileDropReplica` | reconcile |
+| 38 | `ReconcileScanStep` | reconcile |
 
 Changes to pool administration trees have no ops; they commit by checkpoint (POOL-DESIGN§1.2).
 Postings, pending subscription events, `live_sectors` and backpointers have none either: replay
@@ -246,46 +245,48 @@ AddRelation      : { oid: u64, predicate: u32, target: u64 }
 RemoveRelation   : { oid: u64, predicate: u32, target: u64 }
 WriteBlob        : { oid: u64, content_hash: [u8;32], size: u64, extent_sum: u64,
                      replicas: ReplicaSet }
-                   // One-extent objects only: sets the record's Extent locator with every
-                   //   replica written (METADATA-DESIGN§1.2); a backpointer per replica follows
-                   //   (METADATA-DESIGN§1.2). Larger non-chunked objects are written
-                   //   through ExtendObject into an extent list (METADATA-DESIGN§1.3).
-                   //   Chunked objects (INDEX-DESIGN§4.3) use the
-                   // ChunkInsertBatch / ChunkListAppend / FinalizeObject flow
-                   // described in JOURNAL-DESIGN§1.3.1.
+                   // One-piece objects: sets the record's Extent locator with every replica
+                   //   written (METADATA-DESIGN§1.2); content_hash is the piece's hash. Every
+                   //   other object is written as pieces (AppendPieces, JOURNAL-DESIGN§1.3.1).
 
-// FastCDC chunked objects (INDEX-DESIGN§4.3, JOURNAL-DESIGN§1.3.1)
-ChunkInsertBatch    : { chunks: [(chunk_hash: [u8;32], extent: BlockRef, length: u32, extent_sum: u64); N] }
-                   // N ≤ 1 000, chosen by the producer; one entry fits a jset (JOURNAL-DESIGN§1.2);
-                   //   replay inserts each (hash → extent) into ChunkIndex (or bumps
-                   //   ref_count if the hash already exists). Idempotent under LSN.
-ChunkListAppend     : { oid: u64, start_offset: u64, chunks: [(chunk_hash: [u8;32], length: u32); N] }
-                   // Puts N ChunkList keys (INDEX-DESIGN§4.3) for oid, the first covering
-                   //   [start_offset, start_offset + length₀), each next one following.
-                   //   N ≤ 1 000; replay adds one ChunkIndex reference per chunk.
-ChunkListReplace    : { oid: u64, start_offset: u64, end_offset: u64,
-                        chunks: [(chunk_hash: [u8;32], length: u32); N] }
-                   // In-place patch: the keys covering [start_offset, end_offset) — chunk
-                   //   boundaries, as FastCDC re-chunks whole chunks — are replaced by N
-                   //   keys whose lengths sum to the new range. Replay removes the old keys
-                   //   written at the current snapshot and whiteouts those of an ancestor
-                   //   snapshot; ref_count rises for each new key and falls only for each
-                   //   key physically removed (SNAPSHOTS-DESIGN§1.6).
-ChunkListShrink     : { oid: u64, new_length: u64 }
-                   // Truncate oid's chunks to the first new_length plaintext bytes, which
-                   //   fall on a chunk boundary. Replay removes or whiteouts the later keys
-                   //   as ChunkListReplace does, with the same ref_count rule.
+// Pieces (METADATA-DESIGN§1.3, INDEX-DESIGN§4.3, JOURNAL-DESIGN§1.3.1)
+// PieceSpec — one piece, variable-size:
+//   head (40 B): hash: [u8;32], length: u32, flags: u8 (PIECE_FLAG_SHARED), 3 B pad
+//   private piece adds (80 B): extent_sum: u64, replicas: ReplicaSet
+//   shared piece adds nothing: its bytes are recorded by InsertSharedPieces
+// An op's `pieces` is a byte string of consecutive PieceSpecs, each sized by its flag.
+AppendPieces        : { oid: u64, start_offset: u64, new_length: u64, pieces: bytes }
+                   // Puts one content-map key per piece for oid, the first covering
+                   //   [start_offset, start_offset + length₀), each next one following;
+                   //   adds one ChunkIndex reference per shared piece. For an object in the
+                   //   Writing state it makes the first new_length bytes durable, and the
+                   //   object's first append sets content_kind = Pieces (JOURNAL-DESIGN§1.8).
+ReplacePieces       : { oid: u64, start_offset: u64, end_offset: u64, pieces: bytes }
+                   // The keys covering [start_offset, end_offset) — piece boundaries — are
+                   //   replaced by the given pieces, whose lengths sum to the new range.
+                   //   Replay removes the old keys written at the current snapshot and
+                   //   whiteouts those of an ancestor snapshot; a shared piece's ref_count
+                   //   rises for each new key and falls only for each key physically
+                   //   removed (SNAPSHOTS-DESIGN§1.6).
+TruncatePieces      : { oid: u64, new_length: u64 }
+                   // Truncate oid's content to its first new_length plaintext bytes, which
+                   //   fall on a piece boundary. Replay removes or whiteouts the later keys
+                   //   as ReplacePieces does.
+InsertSharedPieces  : { pieces: [(hash: [u8;32], length: u32, _pad: u32, extent_sum: u64,
+                        extent: BlockRef); N] }
+                   // N ≤ 1 000, chosen by the producer; one entry fits a jset
+                   //   (JOURNAL-DESIGN§1.2). Replay inserts each (hash → extent) into
+                   //   ChunkIndex, or bumps ref_count if the hash is already there.
+                   //   Idempotent under LSN.
 FinalizeObject      : { oid: u64, content_hash: [u8;32], total_length: u64,
                         chunk_params: ChunkParamsRecord }
                    // Closes a write: sets content_hash and length = total_length; for a
-                   //   stream, moves Writing → Active. chunk_params is all zero for an
-                   //   object that is not chunked; otherwise it sets content_kind = ChunkList
-                   //   and the locator's params (METADATA-DESIGN§1.2). A re-chunk ends with
-                   //   one to record the new params (INDEX-DESIGN§4.3). An Active object
-                   //   written through the chunked flow shows its content only after this op.
-                   //   Converting between chunked and not chunked ends with one that
-                   //   switches content_kind and range-deletes the old representation's keys
-                   //   (oid, *) at the current snapshot (INDEX-DESIGN§4.3).
+                   //   stream, moves Writing → Active. For a Pieces object it sets the
+                   //   locator's params (METADATA-DESIGN§1.2); a re-cut ends with one to
+                   //   record the new params (INDEX-DESIGN§4.3). An Active object written as
+                   //   pieces shows its content only after this op. Converting between
+                   //   Extent and Pieces ends with one that switches content_kind and
+                   //   range-deletes the old keys (oid, *) at the current snapshot.
 
 // Bucket lifecycle (ALLOCATION-DESIGN§1)
 BucketAlloc      : { disk_id: u16, bucket_no: u32, kind: u8, generation: u32 }  // bucket opened
@@ -360,12 +361,6 @@ PackObjects      : { block: ReplicaSet, slots: [(oid: u64, slot: [u8; 8]); N] }
                    //   object's Packed locator to its slot (slot address layout per BLOB-D4)
                    //   and inserts the block's PackedBlock backpointer per replica; the
                    //   WriteInline entries it packs no longer pin the journal.
-ExtendObject     : { oid: u64, new_length: u64, extents: [(length: u32, _pad: u32,
-                     extent_sum: u64, replicas: ReplicaSet); N] }
-                   // Appends extents to an object in the Writing state and makes its first
-                   //   new_length bytes durable. The first extent sets an Extent locator;
-                   //   from the second on, replay puts one extent-tree key per extent
-                   //   (METADATA-DESIGN§1.3), the Extent locator's extent becoming the first key.
 
 // Term maintenance (INDEX-DESIGN§1.2)
 ReclaimTerms     : { term_ids: [u64; N] }
@@ -406,72 +401,74 @@ RenumberSequence : { term_id: u64 }
 Replay applies entries strictly in LSN order. Each in-memory mutation is idempotent under
 `(lsn ≤ structure.lsn)` shortcutting, so replay is safe across crashes mid-replay.
 
-#### 1.3.1 Chunked-object write sequence
+#### 1.3.1 Piece write sequence
 
-Chunked objects (SPECIFICATION-DESIGN§9.6, INDEX-DESIGN§4.3) are the only logical mutation that splits
-into a multi-op flow. The `WriteBlob` op covers atomic non-chunked writes; chunked workloads
-need finer granularity because a single object can be gigabytes and per-fsync durability
-during long transfers matters.
+An object of more than one piece is written as a multi-op flow; `WriteBlob` covers an atomic
+one-piece write. A single object can be gigabytes, and per-fsync durability during long
+transfers matters.
 
-**Bulk write (e.g. a 32 GiB VM image, no dedup).** Before chunking begins, the producer
-resolves the per-object chunking parameters per SPECIFICATION-DESIGN§3.5 (ontology effective policy →
-matching `PlacementRule::Chunk` → superblock default). Then:
+**Bulk write (e.g. a 32 GiB VM image).** Before cutting begins, the producer resolves the
+object's boundary parameters and whether its pieces are shared, per SPECIFICATION-DESIGN§3.5
+(ontology effective policy → matching placement rule → pool default). Then:
 
-1. Splits plaintext using the resolved algorithm/params (e.g. FastCDC at the resolved
-   `avg_size`). For each chunk: probes `ChunkIndex`; on a miss writes the chunk extent to a
-   fresh blob bucket and adds `(hash, extent, length)` to a pending `ChunkInsertBatch`; either
-   way adds `(hash, length)` to a pending `ChunkListAppend`.
-2. When the pending entries reach the producer's chosen size cap (at most 1 000 chunks per
-   entry), or on fsync, emits the `ChunkInsertBatch` and then the `ChunkListAppend`
-   `{ oid, start_offset, chunks }`; the ChunkList keys are ordinary tree puts, flushed with
-   every other tree at checkpoint.
+1. Cuts plaintext with the resolved algorithm and parameters (e.g. FastCDC at the resolved
+   `avg_size`). For each piece:
+   - **private:** writes it to a fresh data extent and adds its `PieceSpec` with its replica set
+     to a pending `AppendPieces`;
+   - **shared:** probes `ChunkIndex`; on a miss writes it to a fresh data extent and adds
+     `(hash, length, extent_sum, extent)` to a pending `InsertSharedPieces`; either way adds
+     its 40-byte `PieceSpec` to the pending `AppendPieces`.
+2. When the pending entries reach the producer's chosen size cap (at most 1 000 pieces per
+   entry), or on fsync, emits the `InsertSharedPieces` and then the `AppendPieces`
+   `{ oid, start_offset, new_length, pieces }`; content-map keys are ordinary tree puts, flushed
+   with every other tree at checkpoint.
 3. At end-of-write, emits `FinalizeObject { oid, content_hash, total_length, chunk_params }`;
    the locator's `ChunkParamsRecord` is the durable record of the parameters this object was
-   written with.
+   cut with.
 
-**Chunked streams** (an object created `Writing`) follow the same steps, except that the first
-`ChunkListAppend` sets `content_kind = ChunkList` and each one advances the durable `length` to
-its end, so the prefix is readable before `FinalizeObject` and survives a crash (JOURNAL-DESIGN§1.8).
+**Streams** (an object created `Writing`) follow the same steps, except that the first
+`AppendPieces` sets `content_kind = Pieces` and each one advances the durable `length` to its end,
+so the prefix is readable before `FinalizeObject` and survives a crash (JOURNAL-DESIGN§1.8).
 
-**Small in-place edit** (e.g. 4 KiB write at offset 1 GiB into a VM disk → FastCDC re-chunks
-the affected window, replacing 1–3 chunks):
+**Small in-place edit** (e.g. 4 KiB write at offset 1 GiB into a VM disk → the cutter re-cuts
+the affected window, replacing 1–3 pieces):
 
-1. New chunks → `ChunkInsertBatch { chunks: [1..3] }`.
-2. `ChunkListReplace { oid, start_offset, end_offset, chunks: [1..3] }` over the replaced
-   chunks' range.
+1. New shared pieces, if any → `InsertSharedPieces { pieces: [1..3] }`.
+2. `ReplacePieces { oid, start_offset, end_offset, pieces }` over the replaced pieces' range.
 
 No `FinalizeObject` is needed for in-place edits — the object is already published; the
-replace op modifies its existing ChunkList, and a length change follows from the replaced
-range. Any edit also changes the object's `content_hash`; how that hash is maintained without
-re-reading the whole object — likely a Merkle-style hash over the chunk hashes — is BLOB-D5.
+replace op modifies its existing pieces, and a length change follows from the replaced range.
+Any edit also changes the object's `content_hash`; how that hash is maintained without
+re-reading the whole object — likely a Merkle-style hash over the piece hashes — is BLOB-D5.
 
-**Sync receive / resumable transfer.** Identical to bulk-write but driven by stream arrival
-order. After crash, the receiver reads the object's last ChunkList key and resumes from its
-`end_offset` — the replayed `ChunkListAppend` entries *are* the durable progress record.
+**Sync receive / resumable transfer.** Identical to bulk-write but driven by arrival order.
+After a crash, the receiver reads the object's last content-map key and resumes from its
+`end_offset` — the replayed `AppendPieces` entries *are* the durable progress record.
 
-**Truncate / delete.** `ChunkListShrink { oid, new_length: 0 }` drops every key;
-`DeleteObject` then removes the object record. ChunkIndex `ref_count` decrements happen during
-shrink-replay; chunks reaching `ref_count = 0` are freed.
+**Truncate / delete.** `TruncatePieces { oid, new_length: 0 }` drops every key; `DeleteObject`
+then removes the object record. Shared pieces' `ref_count` decrements happen during replay of
+the truncate; pieces reaching zero are freed, as are private pieces no key names.
 
-**Crash semantics.** Each step is independently durable: chunks written to fresh buckets but
-not yet referenced from any `ChunkInsertBatch` get reclaimed by bucket-gen GC. An `Active`
-object written through the chunked flow that crashed before `FinalizeObject` shows no content —
-its locator was never set — so no partial state is observable; a chunked stream keeps its
-durable prefix.
+**Crash semantics.** Each step is independently durable: pieces written to fresh buckets but
+not yet named by any `InsertSharedPieces` or `AppendPieces` get reclaimed by bucket-gen GC. An
+`Active` object written as pieces that crashed before `FinalizeObject` shows no content — its
+locator was never set — so no partial state is observable; a stream keeps its durable prefix.
 
-**Throughput model — 32 GiB bulk write, no dedup, across the FastCDC parameter space.**
+**Throughput model — 32 GiB bulk write of shared pieces, no dedup hits, across the FastCDC
+parameter space.** Private pieces cost one 120-byte `PieceSpec` each in `AppendPieces` and no
+`InsertSharedPieces` entry.
 
 FastCDC's avg-chunk-size knob spans ~3 orders of magnitude in real deployments (SPECIFICATION-DESIGN§9.6):
 4 KiB for fine-grained edits at the small end, up to 8 MiB for resumability-only large
 transfers at the other. The five-regime table below shows how the design scales:
 
-| Avg chunk | Typical workload                   | Chunks      | `ChunkInsertBatch` and `ChunkListAppend` entries (≤ 1 000 chunks each, one of each per batch) | Journal bytes (~100 B per chunk: 64 in the batch, 36 in the append) | Journal append rate at 530 MiB/s plaintext |
+| Avg piece | Typical workload                   | Pieces      | `InsertSharedPieces` and `AppendPieces` entries (≤ 1 000 pieces each, one of each per batch) | Journal bytes (~104 B per piece: 64 in the insert, 40 in the append) | Journal append rate at 530 MiB/s plaintext |
 | --------- | ---------------------------------- | ----------- | --------------------------------------------------------------------- | ------------------------------- | ------------------------------------------ |
-| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 8 389 of each                                                         | ~800 MiB (2.4 % of plaintext)   | ~12.9 MiB/s                                |
-| 16 KiB    | VM disks, databases                | 2 097 152   | 2 098 of each                                                         | ~200 MiB (0.61 %)               | ~3.2 MiB/s                                 |
-| 256 KiB   | generic FastCDC default            | 131 072     | 132 of each                                                           | ~12.5 MiB (0.038 %)             | ~207 KiB/s                                 |
-| 1 MiB     | backup-tool default (restic-class) | 32 768      | 33 of each                                                            | ~3.1 MiB (0.0095 %)             | ~52 KiB/s                                  |
-| **8 MiB** | large extreme — pure resumability  | 4 096       | 5 of each                                                             | ~400 KiB (0.0012 %)             | ~6.5 KiB/s                                 |
+| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 8 389 of each                                                         | ~832 MiB (2.5 % of plaintext)   | ~13.5 MiB/s                                |
+| 16 KiB    | VM disks, databases                | 2 097 152   | 2 098 of each                                                         | ~208 MiB (0.63 %)               | ~3.4 MiB/s                                 |
+| 256 KiB   | generic FastCDC default            | 131 072     | 132 of each                                                           | ~13 MiB (0.040 %)               | ~215 KiB/s                                 |
+| 1 MiB     | backup-tool default (restic-class) | 32 768      | 33 of each                                                            | ~3.3 MiB (0.0099 %)             | ~54 KiB/s                                  |
+| **8 MiB** | large extreme — pure resumability  | 4 096       | 5 of each                                                             | ~416 KiB (0.0013 %)             | ~6.7 KiB/s                                 |
 
 The spread is roughly **2 000×** across regimes on every axis — the same op set covers all
 of it, only the constants change.
@@ -479,14 +476,14 @@ of it, only the constants change.
 **Cumulative ≠ simultaneous.** Steady-state journal fill is bounded by *reclaim latency*, not
 by total traffic over the operation: buckets are freed as soon as the trim point passes them
 (JOURNAL-DESIGN§1.4). Reclaim's job is flushing ChunkIndex leaves (256 KiB nodes holding about
-4 200 chunks each) and ChunkList leaves (about 5 400 chunks each, INDEX-DESIGN§4.3); the
-leaf-fill rate it must sustain is `chunks_per_second × (1/4 200 + 1/5 400)` ≈
-`chunks_per_second / 2 360` leaves/s. At 530 MiB/s plaintext:
+4 200 pieces each) and content-map leaves (about 5 400 shared pieces each, INDEX-DESIGN§4.3);
+the leaf-fill rate it must sustain is `pieces_per_second × (1/4 200 + 1/5 400)` ≈
+`pieces_per_second / 2 360` leaves/s. At 530 MiB/s plaintext:
 
-- **4 KiB regime:** ~135 K chunks/s ÷ 2 360 = ~57 leaves/s = ~14.4 MiB/s of leaf writes.
+- **4 KiB regime:** ~135 K pieces/s ÷ 2 360 = ~57 leaves/s = ~14.4 MiB/s of leaf writes.
   Comfortably within NVMe write bandwidth (~1–3 GiB/s typical) but no longer trivial; this
   is where reclaim genuinely has to keep up. Cumulative journal traffic exceeds a 64 MiB
-  journal by ~12×, so its buckets cycle continuously.
+  journal by ~13×, so its buckets cycle continuously.
 - **16 KiB regime (canonical VM / DB workload):** ~14 leaves/s ≈ 3.6 MiB/s of leaf writes.
   A 64 MiB journal cycles ~3× over the 60-second write. JOURNAL-DESIGN§1.4's *idle* /
   *background-flush* bands cover the producer comfortably.
@@ -495,23 +492,23 @@ leaf-fill rate it must sustain is `chunks_per_second × (1/4 200 + 1/5 400)` ≈
 
 The design therefore scales from "fine-grained dedup workload that genuinely stresses
 reclaim" to "barely-noticed bookkeeping" without changing op shapes. The producer's choice
-of FastCDC parameters trades dedup granularity (small chunks → more shared chunks across
-edits) against per-chunk overhead (small chunks → more journal bytes, more ChunkIndex and
-ChunkList leaves).
+of FastCDC parameters trades dedup granularity (small pieces → more shared pieces across
+edits) against per-piece overhead (small pieces → more journal bytes, more ChunkIndex and
+content-map leaves).
 
 **HDD-only pools.** A pool whose only writable disk is rotational clamps the producer to
 whatever reclaim sustains there. At the 4 KiB extreme this would be a real bottleneck (HDD
 write throughput is far below the ~14 MiB/s leaf-write demand); at 1 MiB or above it is
-unnoticeable. Chunked workloads typically imply hot-tier (NVMe/SSD) presence anyway, so
-this is a corner case.
+unnoticeable. Fine-grained piece workloads typically imply hot-tier (NVMe/SSD) presence anyway,
+so this is a corner case.
 
 **Per-object footprint** (orthogonal to WAL but worth noting at the small extreme): a 32 GiB
-object's `ChunkList` keys cost about 45 B per chunk. At 4 KiB chunks that's ~360 MiB per
-object (1.1 % of plaintext); at 8 MiB chunks it's ~180 KiB, sharing leaves with other objects.
-ChunkIndex footprint scales similarly. The very-small-chunk regime is therefore
-viable but pays for itself in dedup hit-rate, not in raw efficiency — fine for VM-disk
-workloads with high common-chunk ratios across snapshots, less so for one-shot writes of
-unique data.
+object's shared content-map keys cost about 45 B per piece. At 4 KiB pieces that's ~360 MiB per
+object (1.1 % of plaintext); at 8 MiB pieces it's ~180 KiB, sharing leaves with other objects;
+private keys cost about twice as much, with no ChunkIndex entry. ChunkIndex footprint scales
+with shared pieces. The very-small-piece regime is therefore viable but pays for itself in
+dedup hit-rate, not in raw efficiency — fine for VM-disk workloads with high common-piece ratios
+across snapshots, less so for one-shot writes of unique data.
 
 ### 1.4 Journal pins and deferred btree flushes
 
@@ -672,8 +669,8 @@ Object bytes do not go through the journal, with one exception:
 | Write | Path |
 |---|---|
 | Tiny: whole object ≤ `INLINE_WRITE_MAX` (2 KiB by default, set per pool) | `WriteInline` carries the bytes; one jset write makes the object durable. An object of at most 40 bytes is stored in its record's `Inline` locator; larger ones are later packed into small-object blocks, many per block (`PackObjects`), so a 200-byte file does not occupy a 4 KiB blob sector ([BLOB-DESIGN](blob-design.md)). |
-| Small to large | Bytes go to blob extents at the stream's write point (ALLOCATION-DESIGN§1.5); `WriteBlob` or the chunked flow (JOURNAL-DESIGN§1.3.1) records them, with `extent_sum`s. |
-| Streaming (camera recording, logs, downloads) | The object is created in the `Writing` state (METADATA-DESIGN§1.1); bytes are appended to extents taken whole bucket by bucket from a per-stream write point, so the stream is physically sequential; `ExtendObject` (or `ChunkListAppend` for chunked streams) makes each prefix durable, typically under `Buffered` durability once per second or on request. Closing the object (`FinalizeObject`) sets its final length and content hash, computed incrementally while streaming, and moves it to `Active`. |
+| Small to large | Bytes go to blob extents at the stream's write point (ALLOCATION-DESIGN§1.5); `WriteBlob` (one piece) or the piece flow (JOURNAL-DESIGN§1.3.1) records them, with `extent_sum`s. |
+| Streaming (camera recording, logs, downloads) | The object is created in the `Writing` state (METADATA-DESIGN§1.1); bytes are appended as pieces taken from buckets of a per-stream write point, so the stream is physically sequential; each `AppendPieces` makes a prefix durable, typically under `Buffered` durability once per second or on request. Closing the object (`FinalizeObject`) sets its final length and content hash, computed incrementally while streaming, and moves it to `Active`. |
 
 **A stream survives an interrupted write.** Power loss, a crash or a writer that never closes
 leaves the object `Writing` at its last journaled length, with every byte up to it intact and

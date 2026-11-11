@@ -1,6 +1,6 @@
 # Metadata tables — design
 
-Scope: `crates/meta` (`ObjectTable`, `ObjectRoots`, extent lists, `BackpointerTable`, radix helpers, leaf layouts).
+Scope: `crates/meta` (`ObjectTable`, `ObjectRoots`, the content map, `BackpointerTable`, radix helpers, leaf layouts).
 Governing spec: METADATA-DESIGN§1 (object table), METADATA-DESIGN§2 (replicas and backpointers), SPECIFICATION-DESIGN§6.2, SPECIFICATION-DESIGN§6.3, SPECIFICATION-DESIGN§7.
 
 Plan: [metadata-implementation-plan.md](metadata-implementation-plan.md) · Open decisions: [metadata-decisions.md](metadata-decisions.md) · Completed: [metadata-completed.md](metadata-completed.md) · Order: [operations-plan.md](operations-plan.md)
@@ -11,7 +11,7 @@ One fixed-size record per object says what the object is and where its content l
 
 ## Selected design
 
-- **One record per object, content location included.** `ObjectRecord` (128 B) holds state, lengths, content hash, timestamps, the transform applied and a 40-byte **content locator** whose shape depends on how the content is stored: one extent with its replicas, an extent list, a chunk list, a packed small-object slot, the content itself when it is at most 40 bytes, or a remote origin (METADATA-DESIGN§1.2). There is no separate location table: a read is one record lookup, a flush rewrites one tree, and a snapshot has one sidecar.
+- **One record per object, content location included.** `ObjectRecord` (128 B) holds state, lengths, content hash, timestamps, the transform applied and a 40-byte **content locator** whose shape depends on how the content is stored: one private piece with its replicas, a list of pieces in the content map, a packed small-object slot, the content itself when it is at most 40 bytes, or a remote origin (METADATA-DESIGN§1.2). There is no separate location table: a read is one record lookup, a flush rewrites one tree, and a snapshot has one sidecar.
 - **No assertions in the record.** An object's tags, attributes and relations live only in its forward entry (INDEX-DESIGN§2); the record carries no tag ids, counts or overflow chains.
 - **One radix per origin node.** `ObjectId`s carry the creating node in their top 16 bits and every node holds every object's metadata, so records are kept in one radix tree per origin node, indexed by the id's local part. The `ObjectRoots` tree maps a `NodeId` to that radix's root, depth and id high-water (METADATA-DESIGN§1.4). Each node's ids are sequential, so each radix stays dense.
 - **Radix shape.** Nodes are positional page regions (BTREE-DESIGN§1.7). Leaf: 1 536 × 128 B records (32 per page); a zero record was never allocated. Inner node: 12 288 / R `NodePtr` slots; an empty child is zero. `slot = local % 1536`, `child[level] = (local / 1536) % (12 288 / R)`.
@@ -24,7 +24,7 @@ One fixed-size record per object says what the object is and where its content l
 
 - ObjectIds are never recycled (SPECIFICATION-DESIGN§7.3); each node's id high-water in `ObjectRoots` only grows.
 - A record read returns exactly the committed 128 B image.
-- Every physical extent an object's content uses is reachable from its content locator or its keys in the extent or chunk-list tree, and each has exactly one backpointer per replica (METADATA-DESIGN§2).
+- Every physical extent an object's content uses is reachable from its content locator, its content-map keys, or the `ChunkIndex` entry of a shared piece, and each has exactly one backpointer per replica (METADATA-DESIGN§2).
 
 ## Object deletion
 
@@ -38,7 +38,7 @@ Deletion walks `ObjectRecord.state` (`ObjectState`, discriminants pinned: `Activ
 
 1. **Tombstone.** `state = Tombstoned`, `state_ns` = deletion time, and the object leaves the `_object` system label's postings (SPECIFICATION-DESIGN§2.3); the `DeleteObject` journal entry is written and subscribers get `Deleted`. The object is invisible to queries from here on. O(1).
 2. **Index cleanup.** The forward entry and the ontology's closure tables give exactly what to undo, so cost is O(terms on the object), not O(terms in the pool): the object leaves the postings of every term in its forward entry and of every term those derive (one container each, INDEX-DESIGN§2.4, INDEX-DESIGN§3.1) and, for ordered or ranked collections, their sequences (INDEX-DESIGN§3.3); each term's dictionary statistics are updated; then the forward entry goes. Twenty terms are about 2 µs, so the work is not parallelised.
-3. **Blob reclaim**, once every peer has seen the deletion (step 4's watermark condition): `state = BlobReclaim`; the extents, extent-list regions or packed slot the locator names are freed through the allocator (ALLOCATION-DESIGN§1), a chunked blob's chunk references are decremented and chunks reaching zero are freed (INDEX-DESIGN§4.3), and the locator is cleared. Waiting protects a peer still hydrating the blob, and freeing in the same commit that clears the locator keeps a crash from leaving a committed locator that points at freed space.
+3. **Blob reclaim**, once every peer has seen the deletion (step 4's watermark condition): `state = BlobReclaim`; the object's private pieces, its content-map keys or packed slot are freed through the allocator (ALLOCATION-DESIGN§1), its shared pieces' references are decremented and pieces reaching zero are freed (INDEX-DESIGN§4.3), and the locator is cleared. Waiting protects a peer still hydrating the blob, and freeing in the same commit that clears the locator keeps a crash from leaving a committed locator that points at freed space.
 4. **Tombstone expiry**, when every peer has acknowledged state past the deletion (CLUSTER-DESIGN "Selected design", CLUSTER-D7) and the minimum grace period has elapsed (SPECIFICATION-DESIGN§7.2): `state = Cleared` and the rest of the record is zeroed. The id is not reused; a leaf left holding only cleared records is dropped (METADATA-DESIGN§1).
 
 When phase 2 runs is [METADATA-D3](metadata-decisions.md); phases 3 and 4 are [METADATA6](metadata-implementation-plan.md).
@@ -218,27 +218,25 @@ most 40 bytes and alignment ≤ 8, read in place from the record (the locator st
 ```rust
 #[repr(u8)]
 enum ContentKind {
-    None       = 0,   // no content yet (new object, or a stream before its first extent)
-    Extent     = 1,   // one extent
-    ExtentList = 2,   // several extents, keyed by offset in the extent tree (METADATA-DESIGN§1.3)
-    ChunkList  = 3,   // FastCDC chunks, keyed by offset in the chunk-list tree (INDEX-DESIGN§4.3)
-    Packed     = 4,   // a slot in a small-object bucket (BLOB-D4)
-    Inline     = 5,   // the content itself, at most 40 bytes, in the locator
-    Remote     = 6,   // content held by other nodes only (CLUSTER-D3)
+    None    = 0,      // no content yet (new object, or a stream before its first piece)
+    Extent  = 1,      // one private piece, located in the record
+    Pieces  = 2,      // ordered pieces, keyed by offset in the content map (METADATA-DESIGN§1.3)
+    Packed  = 3,      // a slot in a small-object bucket (BLOB-D4)
+    Inline  = 4,      // the content itself, at most 40 bytes, in the locator
+    Remote  = 5,      // content held by other nodes only (CLUSTER-D3)
 }
 
 #[repr(C)]
 struct ExtentLocator {                       // content_kind = Extent
-    replicas: [ReplicaRef; 4],               //  [0..32]   copies of the extent, [replica_count..4] zero
+    replicas: [ReplicaRef; 4],               //  [0..32]   copies of the piece, [replica_count..4] zero
     generations: [u16; 4],                   // [32..40]   generation tag of each replica's bucket
 }
 
 #[repr(C)]
-struct ChunkLocator {                        // content_kind = ChunkList
-    params: ChunkParamsRecord,               //  [0..16]   chunking the object was written with (INDEX-DESIGN§4.3)
+struct PiecesLocator {                       // content_kind = Pieces
+    params: ChunkParamsRecord,               //  [0..16]   piece boundaries the object was cut with (INDEX-DESIGN§4.3)
     _reserved: [u8; 24],                     // [16..40]
 }
-// content_kind = ExtentList: the locator is all zero; the extents are found by oid
 
 #[repr(C)]
 struct RemoteLocator {                       // content_kind = Remote
@@ -247,14 +245,13 @@ struct RemoteLocator {                       // content_kind = Remote
 }
 ```
 
-- **Extent** — `stored_length` bytes from the first sector of each replica, covering `[0, length)`.
-  An object whose stored form fits one extent (METADATA-DESIGN§1.3, size limits) uses this.
-- **ExtentList** — larger non-chunked objects, streams, and objects partly overwritten: their
-  extents are keys of the shared extent tree under the object's id (METADATA-DESIGN§1.3).
-- **ChunkList** — the chunks are keys of the shared chunk-list tree under the object's id
-  (INDEX-DESIGN§4.3); the locator holds the chunking parameters. Chunks are content-addressed and
-  shared, so the record's `replica_count` does not apply to them; a chunk has the one location
-  its `ChunkIndex` entry names (BLOB-D7).
+- **Extent** — the fast path for an object that is one private piece: `stored_length` bytes from
+  the first sector of each replica, covering `[0, length)`; the piece's hash is the object's
+  `content_hash`. An object whose stored form fits one piece (METADATA-DESIGN§1.3, size limits)
+  uses this.
+- **Pieces** — every other object with local content: its pieces are keys of the content map
+  under the object's id (METADATA-DESIGN§1.3); the locator holds the boundary parameters it was
+  cut with.
 - **Packed** — the object's bytes are one slot of a small-object block; the locator's layout is
   set by BLOB-D4 and names up to 40 bytes of slot address across its replicas.
 - **Inline** — objects of at most 40 bytes: the locator holds the bytes themselves,
@@ -288,51 +285,75 @@ its own encryption has to carry that policy from its first write.
 
 A completed write of at most 40 bytes in total (`WriteInline`, JOURNAL-DESIGN§1.3) stores `Inline` unless its policy sets an encryption mode; a rewrite that grows past 40 bytes moves the
 object to `Packed` or `Extent`, and one that shrinks to 40 bytes or less moves it back,
-freeing what the old locator named. A stream (`state = Writing`) starts as `None`, becomes `Extent` with its first extent and
-`ExtentList` with its second; `length` is the durable prefix (JOURNAL-DESIGN§1.8).
+freeing what the old locator named. A stream (`state = Writing`) starts as `None` and becomes
+`Pieces` with its first durable append; `length` is the durable prefix (JOURNAL-DESIGN§1.8).
 
-### 1.3 Extent tree
+### 1.3 Content map
 
-The extents of every `ExtentList` object live in one shared BTREE-DESIGN§1 tree of
-`BtreeKind::ExtentList`, snapshot-aware, keyed by `(oid: u64, end_offset: u64, snapshot: u32)`
-through the packed-key codec, where `end_offset` is the plaintext offset one past the last byte
-the key covers. Values are fixed-size:
+Every object's content is an ordered list of **pieces**: immutable runs of plaintext, each with
+its BLAKE3 hash. The pieces of every `Pieces` object live in one shared BTREE-DESIGN§1 tree of
+`BtreeKind::ContentMap`, snapshot-aware, keyed by `(oid: u64, end_offset: u64, snapshot: u32)`
+through the packed-key codec, where `end_offset` is the plaintext offset one past the piece's last
+byte. A piece is one of two kinds:
+
+- **Private** (the default) — its location is in the entry; it belongs to this object alone and
+  is encrypted with the object's owner tweak (SPECIFICATION-DESIGN§9.3).
+- **Shared** — its location is `ChunkIndex[hash]` (INDEX-DESIGN§4.3), refcounted, stored once for
+  every object whose pieces have that hash. Whether an object's pieces are shared is the
+  deduplication axis of its storage policy (SPECIFICATION-DESIGN§3.5).
+
+The value is a `PieceEntry`, variable-size, its shape chosen by `PIECE_FLAG_SHARED`:
 
 ```rust
 #[repr(C)]
-struct ExtentEntry {                         // 56 bytes
-    logical_length: u32,                     //  [0..4]    plaintext bytes covered: [end_offset − logical_length, end_offset)
-    skip: u32,                               //  [4..8]    plaintext bytes of the extent before the covered range
-    stored_length: u32,                      //  [8..12]   bytes of the whole extent on disk
-    replica_count: u8,                       // [12..13]
-    _pad: [u8; 3],                           // [13..16]
-    replicas: [ReplicaRef; 4],               // [16..48]
-    generations: [u16; 4],                   // [48..56]   generation tag of each replica's bucket
+struct PieceHead {                           // 40 bytes — the whole value of a shared piece
+    hash: [u8; 32],                          //  [0..32]   BLAKE3 of the piece's plaintext
+    length: u32,                             // [32..36]   plaintext bytes: [end_offset − length, end_offset)
+    flags: u8,                               // [36..37]   PIECE_FLAG_*
+    _pad: [u8; 3],                           // [37..40]
 }
+
+#[repr(C)]
+struct PrivatePiece {                        // 88 bytes — the value of a private piece
+    head: PieceHead,                         //  [0..40]
+    stored_length: u32,                      // [40..44]   bytes of the piece on disk, one replica
+    replica_count: u8,                       // [44..45]
+    _pad: [u8; 3],                           // [45..48]
+    replicas: [ReplicaRef; 4],               // [48..80]
+    generations: [u16; 4],                   // [80..88]   generation tag of each replica's bucket
+}
+
+const PIECE_FLAG_SHARED: u8 = 1 << 0;        // located through ChunkIndex; no location in the entry
 ```
 
-- **Lookup.** The extent holding byte `x` is the first key `(oid, end_offset > x)` visible at the
+- **Lookup.** The piece holding byte `x` is the first key `(oid, end_offset > x)` visible at the
   reading snapshot (SNAPSHOTS-DESIGN§1.3); a range read is one range scan. A range no key covers
   is a hole and reads as zeros.
-- **Appends** (`ExtendObject`, JOURNAL-DESIGN§1.3) put one key per new extent.
-- **Overwrites.** A write over `[a, b)` puts the new extents' keys and trims every key it
-  overlaps: a key extending past either end is replaced by its remainder, which names the same
-  physical extent with a smaller `logical_length` and, on the left, the same `skip`, on the
-  right a larger `skip`. Keys of one object at one snapshot never overlap. When the overlapped
-  key was written at an ancestor snapshot, the write also puts a whiteout at that key's position
-  in the current snapshot, so the ancestor's version stays visible only where it still applies.
-  An extent no key or record version names any more is freed; one a snapshot's key still names
-  stays (SNAPSHOTS-DESIGN§1.6, "References").
-- **Encoded extents** — compressed ones — are decoded whole, then `skip` and `logical_length`
-  select the covered bytes; plain extents are read from `skip` directly, sector-aligned.
-- **Size limits.** A plain extent is at most one bucket of its disk. An encoded extent holds at
-  most `encoded_extent_max` plaintext bytes (POOL-DESIGN§1.2, default 128 KiB), so a random read
-  decodes at most that much.
-- A 4 KiB data block holds about 70 entries (56 B value, a few bytes of packed key); one object's
-  keys are contiguous in key order, so its extent map reads as a run of whole blocks.
+- **Pieces are immutable.** An append (`AppendPieces`, JOURNAL-DESIGN§1.3) puts one key per new
+  piece. A write over `[a, b)` rewrites every piece it touches, copy-on-write, and replaces their
+  keys with the new pieces' (`ReplacePieces`); keys of one object at one snapshot never overlap.
+  When a replaced key was written at an ancestor snapshot, the write puts a whiteout at its
+  position in the current snapshot, so the ancestor's version stays visible to the ancestor. A
+  piece no key or record version names any more is freed; one a snapshot's key still names stays
+  (SNAPSHOTS-DESIGN§1.6, "References"). Because a piece is rewritten whole, an object that takes
+  small random writes is cut into small pieces; that is what its boundary policy is for.
+- **Boundaries** are the chunking axis of the storage policy (`ChunkParamsRecord`,
+  SPECIFICATION-DESIGN§3.5, §9.6): `None` — pieces as written, each at most one bucket of its
+  disk, a stream appending one piece per durable append; `FixedSize`; `FastCDC`. The locator of a
+  `Pieces` object records the parameters it was cut with.
+- **Size limits.** A plain piece is at most one bucket of its disk. A compressed piece is decoded
+  whole, so it holds at most `encoded_extent_max` plaintext bytes (POOL-DESIGN§1.2, default
+  128 KiB), and a random read decodes at most that much.
+- **Every piece has a hash,** so every object's content verifies piece by piece, can be fetched
+  and resumed by hash, and has a hash over its piece hashes available (BLOB-D5).
+- A 4 KiB data block holds about 45 private entries or about 90 shared ones (a few bytes of
+  packed key each); one object's keys are contiguous in key order, so its content map reads as a
+  run of whole blocks.
 
-Moving an extent (copy GC, evacuation) rewrites the keys that name it, in whichever leaves hold
-them, like any key update: nothing else points at the entries.
+Moving a private piece (copy GC, evacuation) rewrites the keys that name it, in whichever leaves
+hold them; moving a shared piece rewrites its `ChunkIndex` entry. Switching an object's pieces
+between private and shared is a content rewrite that moves them into or out of `ChunkIndex`
+(INDEX-DESIGN§4.3).
 
 ### 1.4 Object roots
 
@@ -361,8 +382,8 @@ whole tree in one leaf.
 
 Two complementary structures translate between objects and physical space:
 
-- **Replica references** (METADATA-DESIGN§2.1) — forward: the content locator and extent-tree
-  entries name each copy of each extent.
+- **Replica references** (METADATA-DESIGN§2.1) — forward: the content locator and private
+  content-map entries name each copy of each piece.
 - **Backpointers** (METADATA-DESIGN§2.2) — reverse mapping `(disk_id, bucket_no, sector_offset) → owning key`.
   Used by copygc, device evacuation, scrub, resilver, and cluster reconcile. Without
   backpointers these operations cost O(pool size); with them, O(data-on-affected-bucket).
@@ -380,7 +401,7 @@ struct ReplicaRef {                          // 8 bytes
 
 **Generation tags.** A content extent's `ReplicaRef` is paired with a `u16` **generation tag**:
 the low 16 bits of its bucket's generation when the extent was written (ALLOCATION-DESIGN§1.3).
-`ExtentLocator`, `ExtentEntry` and the packed locator carry one per replica. A read compares the
+`ExtentLocator`, `PrivatePiece` and the packed locator carry one per replica. A read compares the
 tag with the low 16 bits of the resident generation; a mismatch is `StaleBlockRef`, as for a
 `BlockRef`. A reused bucket goes undetected only when it has been freed a multiple of 2¹⁶ times
 since the write.
@@ -435,11 +456,10 @@ struct BackpointerValue {                    // 24 bytes
 
 #[repr(u8)]
 enum OwnerKind {
-    BlobExtent       = 1,                    // owner_key = ObjectId (u64) + start_offset (u64): the
-                                             //   plaintext offset the extent was written at, 0 for an
-                                             //   Extent locator; every key naming the extent lies in
-                                             //   [start_offset, start_offset + its plaintext length)
-    Chunk            = 2,                    // owner_key = first 16 B of chunk_hash (BLAKE3 prefix)
+    BlobExtent       = 1,                    // a private piece: owner_key = ObjectId (u64) +
+                                             //   start_offset (u64), the plaintext offset the piece
+                                             //   starts at, 0 for an Extent locator
+    Chunk            = 2,                    // a shared piece: owner_key = first 16 B of its hash
     BtreeNode        = 3,                    // owner_key = (BtreeKind, level, min_key prefix);
                                              //   covers every tree node and radix node
     // 4, 5 unassigned
@@ -482,11 +502,11 @@ applied under those ops' LSNs, so the mutation path and replay produce the same 
 | Op | Backpointer change |
 |---|---|
 | `WriteBlob` | insert one per replica: `BlobExtent`, owner `(oid, 0)` |
-| `ExtendObject` | insert one per replica of each extent: `BlobExtent`, owner `(oid, start_offset)`, where `start_offset` is the object's durable length before that extent |
-| `ChunkInsertBatch` | insert one per new chunk: `Chunk`, owner = hash prefix |
+| `AppendPieces`, `ReplacePieces` | insert one per replica of each new private piece: `BlobExtent`, owner `(oid, start_offset)`, where `start_offset` is the offset the piece starts at |
+| `InsertSharedPieces` | insert one per replica of each new shared piece: `Chunk`, owner = hash prefix |
 | `PackObjects` | insert one per replica of the block: `PackedBlock`, owner = block id |
 | `Checkpoint` | insert one per copy of every region the new root reaches and the old did not: `BtreeNode`; remove those of every region it no longer reaches. Regions written after the last checkpoint have none — a crash leaves them unreferenced |
-| an op that ends an extent's or chunk's last reference (an overwrite, `ChunkListReplace`/`Shrink`, snapshot cleanup, deletion reclaim; SNAPSHOTS-DESIGN§1.6) | remove its backpointers |
+| an op that ends a piece's last reference (`ReplacePieces`, `TruncatePieces`, snapshot cleanup, deletion reclaim; SNAPSHOTS-DESIGN§1.6) | remove its backpointers |
 | `ReconcileMove`, `ReconcileReplicate`, `ReconcileDropReplica` | move, add or remove one, with the owner update (RECONCILE-DESIGN§1.5) |
 
 Every field of a `BackpointerValue` comes from the op: the owner kind and key as above, the

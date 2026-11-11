@@ -42,7 +42,7 @@ because each extent is evaluated independently, at the time it is processed.
 | Object on wrong tier vs. `Pin` / `Prefer` rule    | Migrate via the move path                    |
 | Compression / encryption inconsistent with ontology | Rewrite with correct transform pipeline    |
 | `Inline` object whose resolved policy now sets an encryption mode (METADATA-DESIGN§1.2) | Move the content out of the record, encrypted as the policy says |
-| ChunkList locator's `ChunkParamsRecord` ≠ resolved policy (INDEX-DESIGN§4.3, SPECIFICATION-DESIGN§3.5) | Re-chunk with new params (a content rewrite) |
+| Pieces locator's `ChunkParamsRecord`, or the pieces' sharing, ≠ resolved policy (INDEX-DESIGN§4.3, SPECIFICATION-DESIGN§3.5) | Re-cut or re-share the pieces (a content rewrite) |
 | `AutoTier` access-time threshold crossed (how time triggers fire is POOL-D3; access time is METADATA-D7) | Migrate Hot → Warm → Cold → Glacier          |
 | Bucket fragmentation > copygc threshold           | Run copy GC (ALLOCATION-DESIGN§1.6)          |
 | Disk in `Draining` state                          | Evacuate via backpointer scan (METADATA-DESIGN§2.2) |
@@ -187,10 +187,10 @@ ReconcileMove { from_loc, to_loc, owner_key }
    ∘ owner-update on owner_key:
         OwnerKind::BlobExtent      → start_offset 0 and an Extent locator: the locator's replica in
                                      the radix record and every ObjectHistory version of the oid
-                                     naming from_loc (SNAPSHOTS-DESIGN§1.6); otherwise every
-                                     extent-tree key of the oid, at any snapshot, in the range
-                                     the owner key bounds, that names from_loc (METADATA-DESIGN§1.3)
-        OwnerKind::Chunk           → ChunkIndex entry's BlobRef (INDEX-DESIGN§4.3)
+                                     naming from_loc (SNAPSHOTS-DESIGN§1.6); otherwise the private
+                                     piece's content-map key of the oid starting at start_offset,
+                                     at any snapshot, that names from_loc (METADATA-DESIGN§1.3)
+        OwnerKind::Chunk           → the shared piece's ChunkIndex entry BlobRef (INDEX-DESIGN§4.3)
         OwnerKind::BtreeNode       → the moved copy's slot in the parent's NodePtr (BTREE-DESIGN§1);
                                      for a forward-overflow region after the first, the next
                                      region's predecessor pointer (a new copy of that region)
@@ -204,7 +204,7 @@ Changing the number of copies projects the same way, onto the same owners:
 ReconcileReplicate { existing, new_loc, owner_key }
   ⇒ insert the backpointer at new_loc
    ∘ owner-update: add new_loc as a replica beside `existing`, raising replica_count
-     (BlobExtent: in the locator or the extent-tree keys found as for a move; PackedBlock: in
+     (BlobExtent: in the locator or the private piece's keys found as for a move; PackedBlock: in
      the Packed locator of every object the block names)
 
 ReconcileDropReplica { loc, owner_key }
@@ -214,8 +214,8 @@ ReconcileDropReplica { loc, owner_key }
 ```
 
 A tree node always has exactly `metadata_replicas` copies, so its repair is a `ReconcileMove`
-of the lost copy's slot to a new location, never a change of count. A chunk has one location in
-`ChunkIndex`, so neither op applies to `OwnerKind::Chunk`.
+of the lost copy's slot to a new location, never a change of count. A shared piece has one location in
+`ChunkIndex`, so neither op applies to `OwnerKind::Chunk` (BLOB-D7).
 
 All projected mutations apply under the move's LSN, so a crash either replays all of them or
 none. Backpointers of fresh writes, node frees and dropped references are derived the same way

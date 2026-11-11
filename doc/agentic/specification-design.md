@@ -498,7 +498,7 @@ The filesystem operates directly on raw block devices. Each disk is divided into
   …                   │  Buckets, each of one kind:       │
                       │   Journal — journal sets          │
                       │   Node    — tree nodes, regions   │
-                      │   Data    — object extents, chunks│
+                      │   Data    — pieces, private/shared│
                       │   Packed  — small-object blocks   │
                       │   Free                            │
                       └───────────────────────────────────┘
@@ -562,9 +562,8 @@ The record's 40-byte **content locator** says where the content is; `content_kin
 
 | `content_kind` | Locator | Used for |
 |---|---|---|
-| `Extent` | up to 4 `ReplicaRef`s of one extent | objects that fit one bucket |
-| `ExtentList` | nothing: the extents are keys `(oid, end_offset, snapshot)` of the shared extent tree (METADATA-DESIGN§1.3) | large non-chunked objects, streams, partly overwritten objects |
-| `ChunkList` | the chunking parameters; the chunks are keys of the shared chunk-list tree (§9.6) | chunked objects; each chunk is stored once, shared by every object using it (BLOB-D7) |
+| `Extent` | up to 4 `ReplicaRef`s of one private piece | objects that are one piece |
+| `Pieces` | the piece-boundary parameters; the pieces are keys `(oid, end_offset, snapshot)` of the content map (METADATA-DESIGN§1.3), each private (located in its entry) or shared (located through the chunk index, stored once for every object with an equal piece) | larger objects, streams, partly overwritten objects, deduplicated objects |
 | `Packed` | a slot in a small-object block | tiny objects (JOURNAL-DESIGN§1.8) |
 | `Inline` | the content itself | objects of at most 40 bytes whose storage policy sets no encryption mode of its own; one that gains such a policy moves out, but earlier copies of its bytes persist until reclaimed (METADATA-DESIGN§1.2 "Residual copies") |
 | `Remote` | the origin node | content held by other nodes only (§10.3) |
@@ -596,8 +595,8 @@ The journal is the **redo log** of every mutation, kept in an ordered list of al
 
 **Data paths.** File data goes to blob extents beside the journal; tiny objects ride inside it until packed; streams are append-only objects made durable step by step (JOURNAL-DESIGN§1.8).
 
-**Ops.** Each entry is one op: object and term changes, content writes (whole, chunked, inline,
-packed, streamed), bucket and backpointer bookkeeping, snapshots, reconcile moves and replica
+**Ops.** Each entry is one op: object and term changes, content writes (one piece, pieces, shared
+pieces, inline, packed, streamed), bucket and backpointer bookkeeping, snapshots, reconcile moves and replica
 changes, ontology records, subscriptions, collection order and the checkpoint. The numbered list
 and every payload are in JOURNAL-DESIGN§1.3. Pool administration has no ops; it commits by
 checkpoint (POOL-DESIGN§1.2).
@@ -627,7 +626,7 @@ Delete request
        │ after grace period (all nodes caught up)
        ▼
 ┌────────────────┐
-│ 3. BLOB        │  Free disk extents (or decrement chunk refs).
+│ 3. BLOB        │  Free private pieces (decrement shared refs).
 │    RECLAIM     │  Clear the record's content locator.
 └──────┬─────────┘
        │ after tombstone expiry
@@ -718,9 +717,9 @@ tree node; whether the journal is mirrored is JOURNAL-D1, and the number of tree
 ### 8.3 Semantic Placement Rules
 
 Placement rules bind semantic properties to physical topology — and to the *granularity*
-at which objects are stored. Chunking is a placement decision: it determines how an
-object's bytes are subdivided across the bucket layer (single contiguous extent vs.
-content-defined chunks):
+at which objects are stored. Piece boundaries are a placement decision: they determine how an
+object's bytes are subdivided across the bucket layer (pieces as written, fixed-size, or
+content-defined, §9.6):
 
 ```rust
 enum PlacementRule {
@@ -740,9 +739,9 @@ struct ChunkParams {
 }
 
 enum ChunkingAlgo {
-    None      = 0,                       // do not chunk; store as a single extent
-    FixedSize = 1,                       // resumability without CDC overhead
-    FastCDC   = 2,                       // content-defined; default for the chunked path
+    None      = 0,                       // pieces as written, each at most one bucket
+    FixedSize = 1,                       // fixed-size pieces: resumability and small rewrites
+    FastCDC   = 2,                       // content-defined pieces: dedup across edits
     // 3+ reserved for future algorithms
 }
 ```
@@ -753,9 +752,9 @@ ontology (e.g. "all objects matching `tag=database AND size>1GiB` use FastCDC at
 average regardless of what the ontology says"). For ontology-driven defaults, declare the
 policy on the relevant `TagRecord.storage` instead (§3.5).
 
-`ChunkingAlgo::None` is the explicit "do not chunk" form — used both as the
-format-time default (the pool state record's default chunking, POOL-DESIGN§1.2) and as an
-admin override ("force this matching set of objects to be unchunked"). The sources are the
+`ChunkingAlgo::None` cuts pieces as they are written — used both as the format-time default
+(the pool state record's default chunking, POOL-DESIGN§1.2) and as an admin override ("force
+this matching set of objects back to pieces as written"). The sources are the
 ontology's effective policy, matching `PlacementRule::Chunk` rules and the pool default; their
 precedence is ONTOLOGY-D5.
 
@@ -807,7 +806,7 @@ enum CompressionAlgo { None, Zstd(i32 /* level 1-22 */), Lz4 }
 // policy, which only says whether object data is encrypted and under which key (§3.5).
 enum EncryptionMode {
     None,
-    Hctr2 { tweak_owner: u64 }, // wide-block, length-preserving: object data, chunks, packed blocks
+    Hctr2 { tweak_owner: u64 }, // wide-block, length-preserving: private and shared pieces, packed blocks
     Xts,                        // narrow-block, length-preserving: tree-node buckets
     AesGcm,                     // authenticated; nonce = 64-bit jset seq || 32-bit zero: journal
     ChaCha20Poly1305,           // network/sync messages
@@ -854,7 +853,7 @@ Two fundamentally different regimes using the correct cryptographic mode for eac
 
 AES-GCM is **not** used for disk encryption — it expands data, catastrophically fails on nonce reuse (power loss), and requires per-sector stored nonces. XTS and HCTR2 derive all state from a tweak and the key.
 
-**Tweak construction:** HCTR2 tweaks come from the owner of the bytes, never their location, so moves copy ciphertext unchanged: `(object_id || block_no_within_object)` for an object's own extents, so identical content in different objects encrypts differently; `(chunk_hash[0..8] || block_no_within_chunk)` for chunks, which are deduplicated at the chunk index before encryption and stored once for every object sharing them; the block identifier for packed small-object blocks. XTS tweaks on node blocks are the block's address and its bucket's generation `(disk_id, bucket_no, generation, sector)`, so a reused bucket never repeats a tweak (ENCRYPTION-DESIGN§1). Which objects are encrypted, and at what granularity, is ENCRYPTION-D6.
+**Tweak construction:** HCTR2 tweaks come from the owner of the bytes, never their location, so moves copy ciphertext unchanged: `(object_id || block_no_within_object)` for private pieces, so identical content in different objects encrypts differently; `(piece_hash[0..8] || block_no_within_piece)` for shared pieces, which are deduplicated at the chunk index before encryption and stored once for every object sharing them — and so reveal which objects hold equal content to anyone who can read the stored bytes; the block identifier for packed small-object blocks. XTS tweaks on node blocks are the block's address and its bucket's generation `(disk_id, bucket_no, generation, sector)`, so a reused bucket never repeats a tweak (ENCRYPTION-DESIGN§1). Which objects are encrypted, and at what granularity, is ENCRYPTION-D6.
 
 **Integrity:** BLAKE3 checksums on plaintext stored in the object records (node buckets, different key) detect tampering that XTS/HCTR2 cannot.
 
@@ -891,19 +890,30 @@ enum NodeTrust {
 }
 ```
 
-### 9.6 Selective Chunking
+### 9.6 Pieces, boundaries and sharing
 
-Content-defined chunking (FastCDC) is only applied where the ontology indicates benefit:
+Every object's content is an ordered list of hashed **pieces** (METADATA-DESIGN§1.3), so every
+object verifies, transfers and resumes piece by piece. Two policy axes shape them:
 
-|Workload|Chunk?|Why|
-|---|---|---|
-|Music/photo/video|No|Immutable, pure overhead|
-|VM images, databases|Yes (CDC)|Large, small edits, massive sync savings|
-|Large immutable transfers|Maybe|Fixed-chunk for resumability|
+- **Boundaries** — how content is cut: as written (each piece at most one bucket), fixed-size,
+  or content-defined (FastCDC). A piece is rewritten whole, so objects taking small random writes
+  are cut small.
+- **Sharing** — whether pieces are **private** (default: located in the object's own entry,
+  encrypted under the object's owner tweak) or **shared** (located through the chunk index,
+  stored once for every object with an equal piece, encrypted under the piece's hash). Sharing
+  saves space and transfer across objects but reveals which objects have equal content to anyone
+  who can see the stored bytes.
 
-Only ~1% of objects are typically chunked, keeping the chunk index small (~5 MB vs 4 GB if everything were chunked). When active: chunk plaintext, hash each chunk, compress per-chunk, encrypt.
+|Workload|Boundaries|Sharing|Why|
+|---|---|---|---|
+|Music/photo/video|as written|private|Immutable, read whole|
+|VM images, databases|FastCDC|shared|Large, small edits, massive sync and dedup savings|
+|Large immutable transfers|fixed-size|private|Resumability|
 
-**Where chunk parameters come from.** Per-object chunking parameters
+Only objects whose policy says so share pieces, keeping the chunk index small. When cutting:
+cut plaintext, hash each piece, compress per piece, encrypt.
+
+**Where boundary parameters come from.** Per-object chunking parameters
 (`algo`, `min_size`, `avg_size`, `max_size`) are resolved at write time per §3.5 from:
 
 - the ontology-effective policy on the object's tag set (the deepest tag whose
@@ -916,24 +926,22 @@ Only ~1% of objects are typically chunked, keeping the chunk index small (~5 MB 
 Their precedence is ONTOLOGY-D5. The resolved `ChunkParams` are then **persisted in the
 object's content locator** so readers know exactly what was used and reconcile
 (RECONCILE-DESIGN§1) can detect mismatches and
-re-chunk when the policy changes. See INDEX-DESIGN§4.3 for the on-disk layout.
+re-cut when the policy changes. See INDEX-DESIGN§4.3 for the on-disk layout.
 
-**Two complementary structures, not one.** A chunked object is stored across two structures
-with deliberately opposing key shapes (full layout in INDEX-DESIGN§4.3):
+**Two complementary structures for shared pieces** (full layout in METADATA-DESIGN§1.3 and
+INDEX-DESIGN§4.3):
 
-- **Chunk index** — content-addressed, keyed by `chunk_hash`. One entry per **unique chunk
-  in the entire pool**, refcounted. This is the dedup directory: "where does the chunk with
-  hash X live?". Two unrelated objects that share chunks share these entries at the byte
-  level.
-- **Chunk list** — keyed by `(object, end offset)` in one shared tree, so a byte offset finds
-  its chunk with one seek. This is the per-object recipe: "to reconstruct object O, fetch chunks
-  `[hash₀, hash₁, hash₂, …]` in this order". The hashes are pointers *into* the chunk index,
-  not the chunk bytes.
+- **Content map** — keyed by `(object, end offset)` in one shared tree, so a byte offset finds
+  its piece with one seek. This is the per-object recipe: "to reconstruct object O, read pieces
+  `[p₀, p₁, p₂, …]` in this order". A private piece's entry holds its location; a shared piece's
+  holds only its hash, a pointer *into* the chunk index.
+- **Chunk index** — content-addressed, keyed by piece hash. One entry per **distinct shared
+  piece in the pool**, refcounted: "where does the shared piece with hash X live?". Two
+  unrelated objects with equal shared pieces share these entries at the byte level.
 
-Reading range-scans the object's keys and looks up each hash; writing probes the index by
-hash (dedup) and puts the hash as the object's next key. The pattern is the same as Git (object database vs. tree
-object) or ZFS dedup (DDT vs. file extent map): a hash-keyed structure can't preserve order,
-and a position-keyed structure can't dedup, so both are necessary.
+The pattern is the same as Git (object database vs. tree object) or ZFS dedup (DDT vs. file
+extent map): a hash-keyed structure can't preserve order, and a position-keyed structure can't
+dedup, so both are necessary.
 
 ---
 
@@ -970,7 +978,7 @@ through a node.
 ### 10.3 Content Presence (Hydration Model)
 
 Where an object's content is follows from its record's content locator (§6.3): any local kind
-(extent, extent list, chunk list, packed, inline) means present; `Remote` means held by other
+(extent, pieces, packed, inline) means present; `Remote` means held by other
 nodes only, naming the origin, and the object carries the `_presence:remote` system label
 (§2.3). Content being fetched, and whether a partially fetched object is a distinct state
 (`Hydrating` with progress, `Partial` stubs), is CLUSTER-D3; a fetched copy that may be evicted
@@ -1412,7 +1420,7 @@ All engine state persists in the trees of the root list — B+ trees and positio
 │ Module system │ │             │ │               │
 │ Rules and     │ │ Term dict   │ │ Object roots  │
 │ constraints   │ │ Postings    │ │ Object table  │
-│ Closures      │ │ Sequences   │ │ Extent tree   │
+│ Closures      │ │ Sequences   │ │ Content map   │
 │               │ │ Forward Idx │ │ Backpointers  │
 └───────┬───────┘ └─────┬───────┘ └────┬──────────┘
         │               │              │
@@ -1459,7 +1467,7 @@ flowchart TB
     end
 
     subgraph Journal["Journal (Journal buckets, JOURNAL-DESIGN)"]
-        JSET["Journal sets<br/><i>Preamble JRNL · seq · last_seq · hlc_base<br/>entries: op kinds 0–39 · checksum u64</i>"]
+        JSET["Journal sets<br/><i>Preamble JRNL · seq · last_seq · hlc_base<br/>entries: op kinds 0–38 · checksum u64</i>"]
         CKPT["Checkpoint entry<br/><i>RootListHead: seq · lsn · R<br/>id_counters[IdKind] (Term, Tag, Rule, Subscription,<br/>Snapshot, PlacementRule, Disk, Scan)<br/>+ RootEntry × N (BtreeKind → NodePtr)</i>"]
         JSET --> CKPT
     end
@@ -1493,22 +1501,22 @@ flowchart LR
         OR["ObjectRoots<br/><i>NodeId → radix root (NodePtr), next_local</i>"]
         OT["ObjectTable radix<br/><i>positional pages · 128 B ObjectRecord<br/>state · length · content_hash · times · snapshot<br/>40 B locator</i>"]
         OH["ObjectHistory<br/><i>(oid, snapshot) → older record</i>"]
-        ET["ExtentList tree<br/><i>(oid, end_offset, snapshot) → ExtentEntry<br/>replicas + 16-bit generation tags · skip</i>"]
+        ET["ContentMap<br/><i>(oid, end_offset, snapshot) → piece: hash, length;<br/>private: replicas + 16-bit generation tags</i>"]
         OR --> OT
         OT -.->|"pushed-down versions"| OH
     end
 
     subgraph Content["Content (BLOB-DESIGN, INDEX-DESIGN§4.3)"]
-        DATA["Data buckets<br/><i>extents ≤ 1 bucket; compressed ≤ 128 KiB</i>"]
+        DATA["Data buckets<br/><i>pieces ≤ 1 bucket; compressed ≤ 128 KiB</i>"]
         PACK["Packed buckets<br/><i>small-object blocks</i>"]
-        CL["ChunkList tree<br/><i>(oid, end_offset, snapshot) → chunk hash</i>"]
-        CI["ChunkIndex<br/><i>hash → BlobRef, ref_count (one copy: BLOB-D7)</i>"]
+        CI["ChunkIndex<br/><i>shared piece hash → BlobRef, ref_count (one copy: BLOB-D7)</i>"]
     end
 
     OT -->|"Inline (≤ 40 B)"| OT
-    OT -->|"Extent locator"| DATA
-    OT -->|"ExtentList"| ET --> DATA
-    OT -->|"ChunkList (+ ChunkParams)"| CL --> CI --> DATA
+    OT -->|"Extent locator (one private piece)"| DATA
+    OT -->|"Pieces (+ ChunkParams)"| ET
+    ET -->|"private piece"| DATA
+    ET -->|"shared piece"| CI --> DATA
     OT -->|"Packed"| PACK
 
     subgraph Index["Term index (INDEX-DESIGN)"]
@@ -1725,9 +1733,9 @@ The object-granularity content locator (§6.3) is the indirection that makes mov
 - **Node roles considered:** full, thin (metadata and stubs), blob-store only, hub.
 - **Bandwidth.** A moderately active user generates under 1 MB of metadata sync per day; a full join of 10 M objects is about 400 MB compressed. Blobs move only when opened.
 
-### C.7 Chunking only where it pays
+### C.7 One piece model, sharing only where it pays
 
-Content-defined chunking turns one extent read into one lookup per chunk. It pays off for large files with small edits (VM images, databases, layered documents), partial overlap between objects, and resumable transfer over poor links. Music, photos, video and PDFs are write-once and gain nothing; finding an identical whole object needs a lookup by content hash, not chunking (METADATA-D6). Hence extent storage by default, CDC for large mutable objects, and fixed-size chunks when only resumability matters, all chosen by the ontology (§9.6). Chunking only about 1 % of objects keeps the chunk index near 100 K entries.
+Every object is a list of hashed pieces, so verification, transfer by hash and resumption work the same for all content. Routing every piece through a global content-addressed index was weighed and rejected: it adds a random-keyed lookup to every read, an index entry and reference count to every write (hundreds of MB at 10 M objects), and — because shared pieces are encrypted under their hash — reveals which objects hold equal content to anyone who can see the stored bytes. Pieces are therefore private by default and shared only where the ontology says deduplication pays (VM images, databases, layered documents, partial overlap between objects); content-defined boundaries likewise apply only where small edits are expected. Music, photos, video and PDFs stay as written; finding an identical whole object needs a lookup by content hash (METADATA-D6), not sharing (§9.6).
 
 ### C.8 Encryption
 

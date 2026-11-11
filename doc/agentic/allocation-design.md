@@ -108,8 +108,9 @@ enum BucketKind {
 **Live-sector accounting.** `live_sectors` changes only through entries that already exist for
 other reasons, so replay recomputes it without accounting entries of its own:
 
-- data: `WriteBlob`, `ExtendObject`, `PackObjects` and `ChunkInsertBatch` add the sectors they
-  reference; ending an extent's or chunk's last reference (SNAPSHOTS-DESIGN§1.6) subtracts them;
+- data: `WriteBlob`, `AppendPieces` and `ReplacePieces` (private pieces), `InsertSharedPieces`
+  and `PackObjects` add the sectors they reference; ending a piece's last reference
+  (SNAPSHOTS-DESIGN§1.6) subtracts them;
   `ReconcileMove`, `ReconcileReplicate` and `ReconcileDropReplica` move, add or subtract them
   (JOURNAL-DESIGN§1.3);
 - tree nodes: a checkpoint adds the sectors of the regions its root newly reaches and

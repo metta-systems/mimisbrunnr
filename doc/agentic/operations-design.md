@@ -123,7 +123,7 @@ Logical types live in `mimisbrunnr-types`; each on-disk wire struct lives in the
 | IDs (`ObjectId`, `TagId`, `NodeId`, `DiskId`, `SubscriptionId`, `ModuleId`), `Assertion`, `Value`, `Query`, tag definitions and storage policy types, disk and tier types, watch event types, `HybridTimestamp`, `ContentPresence`, object state enums, value CBOR codec | types |
 | Block headers and kinds, `BtreeNodeHeader`, run and page-run headers, key formats, superblock, root list, `BlockRef`, `BlobRef`, `NodePtr`, bucket allocation, `LoadedNode`, `JournalPin` | storage |
 | Journal set header, entry header and flags, ops | wal |
-| `ObjectRecord`, content locator, object table and `ObjectRoots`, extent tree, replica and backpointer types | meta |
+| `ObjectRecord`, content locator, object table and `ObjectRoots`, content map and piece entries, replica and backpointer types | meta |
 | Term dictionary, term table, postings, forward index, sequences, chunk index | index |
 | `OntologyState` (records, name and uid maps, closure tables), module records | ontology |
 | `QueryExecutor`, `FacetedExplorer`, `QueryParser`, `ObjectView` and the per-object `matches` | query |

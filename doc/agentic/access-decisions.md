@@ -59,7 +59,7 @@ A subscription delivers events only for objects visible to its session; decide w
 
 ## ACCESS-D7 — Realms and encryption keys
 
-Whether visibility is backed by encryption: a key per realm (`PerRealm`, objects of a realm share a key derived from the realm's root) or per object, held by the realm's key manager, so that holding a realm's capability is what lets a domain obtain the key. Candidate answer to [ENCRYPTION-D5](encryption-decisions.md) (per-tag keys) and part of [ENCRYPTION-D6](encryption-decisions.md). Earlier work claimed sharing an object into another realm needs no re-encryption; that holds only if the other realm's members are given the first realm's key, which defeats per-realm keys — decide whether sharing re-encrypts.
+Whether visibility is backed by encryption: a key per realm (`PerRealm`, objects of a realm share a key derived from the realm's root) or per object, held by the realm's key manager, so that holding a realm's capability is what lets a domain obtain the key. Candidate answer to [ENCRYPTION-D5](encryption-decisions.md) (per-tag keys) and part of [ENCRYPTION-D6](encryption-decisions.md). Earlier work claimed sharing an object into another realm needs no re-encryption; that holds only if the other realm's members are given the first realm's key, which defeats per-realm keys — decide whether sharing re-encrypts. Deduplicated content is a further leak: shared pieces are encrypted under their hash (ENCRYPTION-DESIGN§1), so pieces shared across realms reveal to anyone who can read the stored bytes that objects in different realms hold equal content; decide whether shared pieces are confined to one realm (a dedup domain per realm or key).
 
 ## ACCESS-D8 — Visibility across nodes
 

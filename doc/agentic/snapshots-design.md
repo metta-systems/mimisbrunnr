@@ -106,7 +106,7 @@ entry that selects it carries the snapshot id.
 | `TermDictionary`   | yes             | per-term statistics and inline postings diverge |
 | `Postings`         | yes             | one container per `(term_id, high, snapshot)`; a change diverges one container |
 | `Sequences`        | yes             | collection order diverges                      |
-| `ExtentList`, `ChunkList` | yes      | an object's extent map or chunk recipe diverges per edited range |
+| `ContentMap`       | yes             | an object's pieces diverge per edited range    |
 | `TermTable`        | no              | a term never changes once created              |
 | `ChunkIndex`       | no              | content-addressed; refcount handles divergence |
 | `Backpointer`      | no              | physical state, not logical                    |
@@ -149,7 +149,7 @@ so the whiteout encoding is **per leaf shape**:
 | `Postings` (INDEX-DESIGN§3.2) | a `ContainerHead` with `kind = 0xFF` (`CONTAINER_WHITEOUT`) and no payload. |
 | `TermDictionary` (INDEX-DESIGN§4.1) | a `DictEntry` with bit 7 of `flags` set (`DICT_FLAG_WHITEOUT`) and every other field zero. |
 | `Sequences` (INDEX-DESIGN§3.3) | ordered: the value `oid = u64::MAX`, never a valid id; ranked: the 1-byte value `0xFF` in place of `0x00`. |
-| `ExtentList` (METADATA-DESIGN§1.3), `ChunkList` (INDEX-DESIGN§4.3) | the run entry's `RUN_ENTRY_FLAG_WHITEOUT` (BTREE-DESIGN§1.2), no value bytes. |
+| `ContentMap` (METADATA-DESIGN§1.3) | the run entry's `RUN_ENTRY_FLAG_WHITEOUT` (BTREE-DESIGN§1.2), no value bytes. |
 | `Ontology` (ONTOLOGY-DESIGN§1) | a CBOR null (`0xF6`) at the value position, in place of the usual record. |
 | `ObjectHistory` (SNAPSHOTS-DESIGN§1.2) | a 1-byte discriminator precedes the shadowed record; `0xFF` (`KEY_TYPE_whiteout`) means whiteout, otherwise the record follows. |
 
@@ -232,8 +232,8 @@ and its existing backpointer is valid for both snapshots. Backpointers are physi
 Deleting a snapshot is **two operations**: a small synchronous step that takes the snapshot
 out of visibility, and a background cleanup that physically reclaims its keys. Deletions are
 **batched**: every snapshot marked deleted joins one pending set, and one cleanup pass over the
-snapshot-aware btrees — `Forward`, `TermDictionary`, `Postings`, `Sequences`, `ExtentList`,
-`ChunkList`, `Ontology`, `ObjectHistory`, the yes-rows of SNAPSHOTS-DESIGN§1.2's table — serves every
+snapshot-aware btrees — `Forward`, `TermDictionary`, `Postings`, `Sequences`, `ContentMap`,
+`Ontology`, `ObjectHistory`, the yes-rows of SNAPSHOTS-DESIGN§1.2's table — serves every
 snapshot in the set. A burst of sync-snapshot expiries costs one pass, not one per snapshot.
 
 **Synchronous step (`SnapshotDelete` journal op).**
@@ -319,24 +319,25 @@ prevent generation bumps once *all* snapshots have moved on), retention is enfor
   *and* its owner's snapshot is still reachable through the snapshot tree.
 - Once a bucket has no live backpointers, its generation can be bumped.
 
-**References.** A reference to an extent or chunk is a key or locator that physically exists: an
-`ExtentList` or `ChunkList` key at any snapshot, or a record's locator in the radix or in
+**References.** A reference to a piece is a key or locator that physically exists: a
+`ContentMap` key at any snapshot, or a record's `Extent` locator in the radix or in
 `ObjectHistory`. A whiteout is not a reference. A reference ends only when its key or version is
 physically removed — overwritten at the snapshot that wrote it, or dropped by snapshot cleanup
 (SNAPSHOTS-DESIGN§1.5) — never when a later snapshot whiteouts it.
 
-- **Chunks:** `ChunkIndex.ref_count` counts physical `ChunkList` keys; a put raises it, a
-  physical removal lowers it, a whiteout leaves it; at zero the chunk is freed.
-- **Extents:** there is no counter. One physical extent may be named by several keys — split
-  pieces after an overwrite, and keys of several snapshots — and by several record versions,
-  under one backpointer per replica. When a reference is physically removed, the engine looks for
-  any other: the oid's keys at every snapshot within the backpointer's owner range
-  `[start_offset, start_offset + length)` (METADATA-DESIGN§2.2) and the oid's record versions. If
-  none names the extent, its backpointers are removed and its sectors leave `live_sectors`.
+- **Shared pieces:** `ChunkIndex.ref_count` counts physical content-map keys naming the hash; a
+  put raises it, a physical removal lowers it, a whiteout leaves it; at zero the piece is freed.
+- **Private pieces:** there is no counter. A piece is immutable and never split, so it is named
+  by its own key — one physical key, visible from every snapshot that has not replaced it — and,
+  for an object stored as one piece, by the `Extent` locators of its record versions; converting
+  between `Extent` and `Pieces` can leave both names for a while. When a reference is physically
+  removed, the engine looks for the other: the oid's key at `start_offset + length` at every
+  snapshot, and the oid's record versions (METADATA-DESIGN§2.2). If none names the piece, its
+  backpointers are removed and its sectors leave `live_sectors`.
 
 The move path (RECONCILE-DESIGN§1.5) updates every reference the same search finds, under the
-move's single LSN. An object has at most as many versions as snapshots it changed in, and an
-extent's keys lie within its owner range, so both are bounded.
+move's single LSN. An object has at most as many versions as snapshots it changed in, so the
+search is bounded.
 
 Snapshot retention scales with **logical changes**, not bucket counts.
 

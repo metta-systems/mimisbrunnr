@@ -26,8 +26,8 @@ To decide: the representation, its granularity, whether reads by sync or reconci
 ## Future work
 
 - **A larger `ObjectRecord` for a future format.** A 64-byte locator makes the record 160 bytes (152 used, 8 reserved).
-  - Solves without further work: full 32-bit generations on content extents (four `ReplicaRef` + `u32` pairs in 48 bytes) and on list heads (a full `NodePtr` up to R = 3 with the entry count kept in the record, or R = 4 without it), replacing the 16-bit tags (METADATA-DESIGN§2.1); inline objects up to 64 bytes; room to spare for the packed locator (BLOB-D4).
+  - Solves without further work: full 32-bit generations on the `Extent` locator's piece (four `ReplicaRef` + `u32` pairs in 48 bytes), replacing its 16-bit tags (METADATA-DESIGN§2.1); inline objects up to 64 bytes; room to spare for the packed locator (BLOB-D4).
   - Costs: 25 records per 4 KiB page instead of 32 (96 bytes lost per page) and 1 200 per leaf instead of 1 536, changing the radix arithmetic (METADATA-DESIGN§1.4); about +0.3 GiB of object table at 10 M objects, held by every node and R times on each; 22 % fewer records per cached page for scans and per-object evaluation. Every object pays, while the gains go mostly to large objects and to closing the 16-bit tag compromise.
   - A 192-byte record (three cache lines) is the other round size: about +0.6 GiB at 10 M objects, with 32 bytes reserved that nothing uses yet.
 
-- Full 32-bit generations on content extents in place of the 16-bit tags (METADATA-DESIGN§2.1): a 12-byte `ReplicaRef`, so `ExtentLocator` holds three replicas in 40 bytes and `ExtentEntry` grows to 56 bytes. Worth it if the extent layouts change for another reason and free bytes appear, or if size evaluations show the wider records are affordable.
+- Full 32-bit generations on content extents in place of the 16-bit tags (METADATA-DESIGN§2.1): a 12-byte `ReplicaRef`, so `ExtentLocator` holds three replicas in 40 bytes and `PrivatePiece` grows from 88 to 96 bytes. Worth it if the piece layouts change for another reason and free bytes appear, or if size evaluations show the wider records are affordable.

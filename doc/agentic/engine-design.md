@@ -155,10 +155,10 @@ Throughout the documents, `RootPointer.<name>_root` names the root-list entry of
 |---|---|---|
 | `object_roots_root` | `ObjectRoots` | METADATA-DESIGN§1.4 |
 | `object_history_root` | `ObjectHistory` | SNAPSHOTS-DESIGN§1.2 |
-| `extent_list_root` | `ExtentList` | METADATA-DESIGN§1.3 |
+| `content_map_root` | `ContentMap` | METADATA-DESIGN§1.3 |
 | `forward_index_root` | `Forward` | INDEX-DESIGN§2 |
 | `term_dictionary_root`, `term_table_root`, `postings_root`, `sequences_root` | `TermDictionary`, `TermTable`, `Postings`, `Sequences` | INDEX-DESIGN§3–§4 |
-| `chunk_index_root`, `chunk_list_root` | `ChunkIndex`, `ChunkList` | INDEX-DESIGN§4.3 |
+| `chunk_index_root` | `ChunkIndex` | INDEX-DESIGN§4.3 |
 | `backpointer_root` | `Backpointer` | METADATA-DESIGN§2.2 |
 | `ontology_root` | `Ontology` | ONTOLOGY-DESIGN§1 |
 | `subscriptions_root`, `subscription_members_root`, `subscription_events_root` | `Subscriptions`, `SubscriptionMembers`, `SubscriptionEvents` | SUBSCRIPTIONS-DESIGN§1 |

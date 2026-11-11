@@ -93,7 +93,7 @@ enum BtreeKind {
     ObjectRoots           = 0,   // METADATA-DESIGN§1.4 NodeId → object radix root (snapshot-agnostic)
     ObjectTable           = 1,   // METADATA-DESIGN§1 per-node radix leaves & inners (current view)
     ObjectHistory         = 2,   // SNAPSHOTS-DESIGN§1.2 sidecar: (oid, snapshot) → ObjectRecord overrides
-    ExtentList            = 3,   // METADATA-DESIGN§1.3 shared extent B+ tree, (oid, end_offset, snapshot) → extent (snapshot-aware)
+    ContentMap            = 3,   // METADATA-DESIGN§1.3 shared piece B+ tree, (oid, end_offset, snapshot) → piece (snapshot-aware)
     // Term index
     Forward               = 4,   // INDEX-DESIGN§2 forward index B+ tree (snapshot-aware key)
     ForwardOverflow       = 5,   // INDEX-DESIGN§2.2 forward arrays of very large entries (positional, no sorted runs)
@@ -101,29 +101,28 @@ enum BtreeKind {
     TermTable             = 7,   // INDEX-DESIGN§4.1 term table: term_id → kind, key, full value (snapshot-agnostic)
     Postings              = 8,   // INDEX-DESIGN§3.1 postings B+ tree, one container per entry (snapshot-aware)
     Sequences             = 9,   // INDEX-DESIGN§3.3 ordered / ranked collection order (snapshot-aware)
-    // Chunk content-addressing
-    ChunkIndex            = 10,  // INDEX-DESIGN§4.3 chunk index B+ tree (content-addressed; snapshot-agnostic)
-    ChunkList             = 11,  // INDEX-DESIGN§4.3 shared chunk-list B+ tree, (oid, end_offset, snapshot) → chunk (snapshot-aware)
+    // Shared pieces
+    ChunkIndex            = 10,  // INDEX-DESIGN§4.3 shared piece hash → extent, refcount (content-addressed; snapshot-agnostic)
     // Physical space
-    Backpointer           = 12,  // METADATA-DESIGN§2.2 reverse-mapping B+ tree (snapshot-agnostic)
-    BucketAlloc           = 13,  // ALLOCATION-DESIGN§1.2 per-disk bucket alloc B+ tree (physical)
-    FreespaceLru          = 14,  // ALLOCATION-DESIGN§1.4 per-disk freespace LRU B+ tree (physical)
+    Backpointer           = 11,  // METADATA-DESIGN§2.2 reverse-mapping B+ tree (snapshot-agnostic)
+    BucketAlloc           = 12,  // ALLOCATION-DESIGN§1.2 per-disk bucket alloc B+ tree (physical)
+    FreespaceLru          = 13,  // ALLOCATION-DESIGN§1.4 per-disk freespace LRU B+ tree (physical)
     // Ontology and snapshots
-    Ontology              = 15,  // ONTOLOGY-DESIGN§1 ontology records: tags, rules, modules (snapshot-aware)
-    Snapshots             = 16,  // SNAPSHOTS-DESIGN§1.1 snapshot tree (SnapshotId → SnapshotNode)
+    Ontology              = 14,  // ONTOLOGY-DESIGN§1 ontology records: tags, rules, modules (snapshot-aware)
+    Snapshots             = 15,  // SNAPSHOTS-DESIGN§1.1 snapshot tree (SnapshotId → SnapshotNode)
     // Subscriptions
-    Subscriptions         = 17,  // SUBSCRIPTIONS-DESIGN§1 subscription records (snapshot-agnostic)
-    SubscriptionMembers   = 18,  // SUBSCRIPTIONS-DESIGN§1 (id, window) → membership container (snapshot-agnostic)
-    SubscriptionEvents    = 19,  // SUBSCRIPTIONS-DESIGN§1 (id, lsn, index) → pending event (snapshot-agnostic)
+    Subscriptions         = 16,  // SUBSCRIPTIONS-DESIGN§1 subscription records (snapshot-agnostic)
+    SubscriptionMembers   = 17,  // SUBSCRIPTIONS-DESIGN§1 (id, window) → membership container (snapshot-agnostic)
+    SubscriptionEvents    = 18,  // SUBSCRIPTIONS-DESIGN§1 (id, lsn, index) → pending event (snapshot-agnostic)
     // Pool and cluster
-    PoolState             = 20,  // POOL-DESIGN§1.2 single-entry pool state record
-    DiskDescriptors       = 21,  // POOL-DESIGN§1.1 disk descriptors (disk_id → DiskDescriptor)
-    PlacementRules        = 22,  // POOL-DESIGN§1 placement rules (heterogeneous, CBOR values)
-    ClusterPeers          = 23,  // POOL-DESIGN§1 cluster peers (NodeId → PeerRecord)
+    PoolState             = 19,  // POOL-DESIGN§1.2 single-entry pool state record
+    DiskDescriptors       = 20,  // POOL-DESIGN§1.1 disk descriptors (disk_id → DiskDescriptor)
+    PlacementRules        = 21,  // POOL-DESIGN§1 placement rules (heterogeneous, CBOR values)
+    ClusterPeers          = 22,  // POOL-DESIGN§1 cluster peers (NodeId → PeerRecord)
     // Reconcile
-    ReconcileWork         = 24,  // RECONCILE-DESIGN§1.2 queued work, by priority then physical position
-    ReconcilePending      = 25,  // RECONCILE-DESIGN§1.2 failed items awaiting device-config retry
-    ReconcileScan         = 26,  // RECONCILE-DESIGN§1.3 in-progress scan cursors
+    ReconcileWork         = 23,  // RECONCILE-DESIGN§1.2 queued work, by priority then physical position
+    ReconcilePending      = 24,  // RECONCILE-DESIGN§1.2 failed items awaiting device-config retry
+    ReconcileScan         = 25,  // RECONCILE-DESIGN§1.3 in-progress scan cursors
 }
 ```
 

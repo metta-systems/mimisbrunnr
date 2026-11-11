@@ -1,14 +1,16 @@
-//! `ChunkList` per-object recipe structures (INDEX-DESIGN§4.3).
+//! Per-object chunk recipe structures (INDEX-DESIGN§4.3).
 //!
 //! Two on-disk wire structs:
 //!
-//! - [`ChunkParamsRecord`] (16 B) — held in the object's `ChunkList`
-//!   content locator (METADATA-DESIGN§1.2).
-//! - [`ChunkListEntry`] (40 B) — the value of one `(oid, end_offset, snapshot)`
-//!   key of the shared chunk-list tree, one per FastCDC chunk.
+//! - [`ChunkParamsRecord`] (16 B) — the piece-boundary parameters, held in a
+//!   `Pieces` object's content locator (METADATA-DESIGN§1.2).
+//! - [`ChunkListEntry`] (40 B) — a chunk-list entry of the prototype.
 //!
-//! TODO(BLOB3): persist these through the shared chunk-list tree; no
-//! per-object chain regions.
+//! TODO(BLOB3): `ChunkListEntry` gives way to the content map
+//! (METADATA-DESIGN§1.3): one shared `ContentMap` tree keyed
+//! `(oid, end_offset, snapshot)` whose `PieceEntry` values are either a
+//! 40-byte shared piece (hash, length, flags; located through `ChunkIndex`)
+//! or an 88-byte private piece (with its replicas and generation tags).
 //!
 //! Note: the storage crate currently exports a 16-byte
 //! `ChunkParamsRecord` *placeholder* that holds opaque bytes; the version in
