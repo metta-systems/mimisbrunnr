@@ -15,7 +15,7 @@ SPECIFICATION-DESIGN§10.7 names conflict resolution without specifying it. Bund
   - (b) **observed-remove set** (add wins): each added term carries a dot (origin node, counter) and each node a version vector, so concurrent add and remove resolve the same way on every node whatever the path. Costs about 8–10 bytes per direct term in forward entries plus version vectors per peer;
   - investigate whether Mettā's topology (peers and hubs) makes (a) safe, or needs (b).
 - **Single-valued fields** (content hash and length, `state`, a ranked collection's score): last-writer-wins by hybrid timestamp, or for content, keeping the losing version as a conflict copy.
-- **Delete against a concurrent edit:** delete wins when it is causally after the edit (METADATA-DESIGN "Deletion and cluster sync"); define "causally after" under the chosen set model.
+- **Delete against a concurrent edit:** delete wins when it is causally after the edit (METADATA-DESIGN "Deletion and cluster sync"); define "causally after" under the chosen set model. Hybrid timestamps alone cannot tell an edit made after seeing the deletion from one made concurrently — a node that tags an object it has not yet learned is deleted produces a timestamp later than the deletion — so the rule needs causal information (version vectors or dots) or must treat every later edit as concurrent. Decide also whether a dropped concurrent edit is surfaced (an event, a conflict record) or silent.
 - **Constraints:** an `Exclusive` removal on one node racing an assertion of the other tag on another.
 
 Ontology declarations already merge as ONTOLOGY-DESIGN "Cluster propagation" records (union of provenance, other fields last-writer-wins). Blocks [CLUSTER2](cluster-implementation-plan.md).
@@ -47,6 +47,16 @@ Ordered collections keep sparse `u64` positions and renumber when a gap runs out
 - (c) **RGA or Fugue:** no interleaving anomalies (Fugue is the strongest), but tombstones and a tree per sequence, heavier than sparse positions.
 
 Moves are a delete and an insert, or Kleppmann's move operation where an element must never be duplicated. The choice changes the forward entry's order slots (INDEX-DESIGN§2.1) and the `Sequences` key (INDEX-DESIGN§3.3) and removes renumbering on a single node too. Blocks the sequence part of [CLUSTER2](cluster-implementation-plan.md); shapes [INDEX15](index-implementation-plan.md).
+
+## CLUSTER-D9 — Untrusted hubs
+
+State-based sync (CLUSTER-DESIGN§1) has a sender diff its own snapshots and a receiver merge direct state, which needs the state in plaintext. A hub that is always on but not trusted (SPECIFICATION-DESIGN§9.5, `Untrusted`: stores and relays ciphertext only) cannot do either. The earlier operation-log design relayed sealed, encrypted operations through such a hub without the hub reading them. Options:
+
+- (a) **Store and forward sealed bundles:** a hub keeps each `SyncBundle` encrypted for its recipients and hands it on; it computes nothing, and a node returning after a long absence receives the bundles it missed in order rather than one delta — so the hub's storage grows with the changes it holds for the slowest peer, and bundles need an expiry or a compaction step done by a trusted node.
+- (b) **Trusted hubs only:** an untrusted node may relay transport traffic but not hold state; nodes never online together need a trusted hub.
+- (c) **Encrypted state the hub can merge blindly:** only for state whose merge needs no plaintext (e.g. append-only sets of sealed items); does not cover diffing.
+
+Ties to [CLUSTER-D7](#cluster-d7--what-a-sender-knows-of-each-peer) (what a sender knows of each peer decides what a bundle relayed by a hub must contain) and [ENCRYPTION-D4](encryption-decisions.md) (trust tier semantics).
 
 ## Future work
 

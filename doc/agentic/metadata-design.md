@@ -57,7 +57,7 @@ Ops are applied in HLC order, so a deletion and a concurrent mutation resolve de
 | 5 | A receives B's tag op |
 
 - A mutation op for a tombstoned object whose timestamp is **earlier** than the deletion was valid when issued: it is dropped as stale. Applied in HLC order it would have been undone by the deletion anyway.
-- A mutation op **later** than the deletion (step 3 above) should not occur under correct HLC propagation; it is dropped and logged as a conflict naming the origin node.
+- A mutation op **later** than the deletion but made without knowledge of it (step 3 above) is ordinary concurrency: a hybrid timestamp orders events, it does not record what the issuing node had seen. It is dropped — the deletion wins — until CLUSTER-D2 settles how a delete merges with a concurrent edit; how it is surfaced is part of that decision.
 - An op earlier than the deletion that is applied before the deletion arrives is simply undone by it: the tag existed briefly, then went with the object.
 
 The full per-assertion conflict rules are [CLUSTER-D2](cluster-decisions.md).

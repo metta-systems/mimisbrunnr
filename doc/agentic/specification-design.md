@@ -76,7 +76,7 @@ struct ObjectId {
 struct TagId(u32);
 ```
 
-The node-prefix scheme allows independent creation across nodes with no coordination. Each node can create 281 trillion objects (48-bit local sequence) — at 1000 objects per second, that's ~8,900 years before exhaustion.
+The node prefix lets every node create objects without coordinating with others once it holds a cluster-unique `NodeId`; how a node obtains one, which does take coordination, is CLUSTER-D1. Each node can create 281 trillion objects (48-bit local sequence) — at 1000 objects per second, that's ~8,900 years before exhaustion.
 
 Additional type aliases used throughout:
 
@@ -1721,7 +1721,7 @@ The object-granularity content locator (§6.3) is the indirection that makes mov
 ### C.6 Cluster sync
 
 - **Conflicts.** Tag adds from two nodes commute; add-versus-remove needs a policy. Options weighed: add-wins (no accidental loss), last-writer-wins (intuitive), mark-conflict (user resolves) ([CLUSTER-D2](cluster-decisions.md)). Ordered collections need a sequence CRDT such as RGA, or last-writer-wins per collection ([CLUSTER-D6](cluster-decisions.md)).
-- **Hubs.** Nodes that are never online together relay through an always-on hub that holds their direct state; a node offline for any time catches up by one state delta of what it has not seen (CLUSTER-D7).
+- **Hubs.** Nodes that are never online together relay through an always-on hub; a node offline for any time catches up by one state delta of what it has not seen (CLUSTER-D7). A trusted hub can hold the direct state and compute deltas; an untrusted one (§9.5) can only store and forward bundles it cannot read (CLUSTER-D9).
 - **Node roles considered:** full, thin (metadata and stubs), blob-store only, hub.
 - **Bandwidth.** A moderately active user generates under 1 MB of metadata sync per day; a full join of 10 M objects is about 400 MB compressed. Blobs move only when opened.
 
