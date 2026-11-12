@@ -65,7 +65,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 | Rule | Derives | Example |
 |---|---|---|
 | `Implies { from, to }` | `to` — a tag, or an attribute value `Attr(key, value)` — for every object carrying tag `from` | `flac → audio → media`; `test → kind = test` |
-| `ValueImplies { key, value, to }` | `to` — a tag or an attribute value — for every object with `Attr(key, value)` | `mime = audio/flac → flac`; `lang = rust → kind = source` |
+| `ValueImplies { key, value, to }` | `to` — a tag or an attribute value — for every object with `Attr(key, value)` | `mime = audio/flac → flac`; `extension = rs → language = rust` |
 | `Bucket { key, out_key, granularity }` | `Attr(out_key, bucket(value))`, where `key` is an attribute key or a record field | `created → created-year = 2026`, `created-month = 2026-11`; `size → size-class = 1-10MiB` |
 
 - Rules form a DAG over tags (an install that would close a cycle through `Implies` and `ValueImplies` fails).
@@ -219,22 +219,21 @@ Source trees are a good test of the ontology: files have roles, dependencies, bu
 | `component` | attribute (text, grouping) | Crate or package within the project: `component = kernel` |
 | `workspace` | attribute (text, grouping) | Multi-project workspace: `workspace = metta-systems` |
 
-**File role** (labels)
+**Origin:** `origin` (attribute, text, one value per file) says where a file comes from: `source` (human-authored), `generated` (machine-produced output) or `vendored` (third-party code copied into the project).
 
-| Tag | Implies | Meaning |
+**Role:** `role` (attribute, text, repeatable) says what a file is for, independently of its origin: `boot.S` is `role = implementation` and `role = interface`; a device tree is `role = device-tree` whether it is the `.dts` source or the compiled `.dtb`.
+
+| `role` value | Implies | Meaning |
 |---|---|---|
-| `source` | — | Human-authored material |
-| `generated` | — | Machine-produced output |
-| `vendored` | — | Third-party code copied into the project |
-| `implementation`, `interface`, `test`, `bench` | `source` | Core code; public API or headers; tests; benchmarks |
-| `build-script`, `config` | `source` | `Cargo.toml`, `build.rs`, `Makefile`; `rustfmt.toml`, `.cargo/config.toml` |
-| `documentation`, `spec` | `source` | Documentation sources; design documents |
-| `resource` | `source` | Non-code assets the build or runtime consumes |
-| `icon`, `font`, `texture`, `shader`, `locale`, `schema`, `linker-script`, `device-tree` | `resource` | Asset kinds; `schema` covers database, protobuf and JSON schemas |
-| `object`, `library`, `executable`, `bundle` | `generated` | `.o`/`.rlib`; linked library; final binary; tarball/`.img`/`.deb` |
-| `codegen`, `doc-output`, `test-result`, `intermediate` | `generated` | Generated sources; rendered docs; test logs and coverage; dep-info, incremental caches, stamps |
+| `implementation`, `interface`, `test`, `bench` | `origin = source` | Core code; public API or headers; tests; benchmarks |
+| `build-script`, `config` | `origin = source` | `Cargo.toml`, `build.rs`, `Makefile`; `rustfmt.toml`, `.cargo/config.toml` |
+| `documentation`, `spec` | `origin = source` | Documentation sources; design documents |
+| `resource` | `origin = source` | Non-code assets the build or runtime consumes |
+| `icon`, `font`, `texture`, `shader`, `locale`, `schema`, `linker-script`, `device-tree` | `role = resource` | Asset kinds; `schema` covers database, protobuf and JSON schemas |
+| `object`, `library`, `executable`, `bundle` | `origin = generated` | `.o`/`.rlib`; linked library; final binary; tarball/`.img`/`.deb` |
+| `codegen`, `doc-output`, `test-result`, `intermediate` | `origin = generated` | Generated sources; rendered docs; test logs and coverage; dep-info, incremental caches, stamps |
 
-**Language and toolchain:** `lang` (attribute, text, set by import from the file extension), `toolchain` (attribute, text). A `ValueImplies { lang = rust → source }` rule makes every Rust file `source` without a per-file tag.
+**Language and toolchain:** `language` (attribute, text, set by import from the file extension), `toolchain` (attribute, text). Language, origin and role are independent assertions: no rule derives one from another, so `main.rs` carries `language = rust`, `origin = source` and `role = implementation` as three assertions.
 
 **Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `lto` (attribute, text: `off`, `thin`, `fat`), `debug-info`, `stripped` (labels).
 
@@ -264,19 +263,19 @@ needs = "generated"
 **A tagged build** (Vesper kernel for Raspberry Pi 4):
 
 ```text
-boot.S                  project=vesper component=bootloader lang=asm  implementation interface
-main.rs                 project=vesper component=kernel lang=rust     implementation
-Cargo.toml              project=vesper component=kernel lang=toml     build-script
-vesper.ld               project=vesper component=kernel               linker-script
-bcm2711-rpi-4-b.dts     project=vesper component=hal                  device-tree source  target=aarch64-unknown-none
-bcm2711-rpi-4-b.dtb     project=vesper component=hal                  device-tree generated current  target=aarch64-unknown-none
+boot.S                  project=vesper component=bootloader language=asm  origin=source role=implementation role=interface
+main.rs                 project=vesper component=kernel language=rust     origin=source role=implementation
+Cargo.toml              project=vesper component=kernel language=toml     origin=source role=build-script
+vesper.ld               project=vesper component=kernel                   origin=source role=linker-script
+bcm2711-rpi-4-b.dts     project=vesper component=hal                      origin=source role=device-tree  target=aarch64-unknown-none
+bcm2711-rpi-4-b.dtb     project=vesper component=hal                      origin=generated role=device-tree current  target=aarch64-unknown-none
                         derived-from→ bcm2711-rpi-4-b.dts
-main.o                  project=vesper component=kernel               object current  target=aarch64-unknown-none profile=release
+main.o                  project=vesper component=kernel                   origin=generated role=object current  target=aarch64-unknown-none profile=release
                         opt-level=2 lto=fat toolchain=nightly-2024-01-15  derived-from→ main.rs, kernel_api.rs
-libhal.rlib             project=vesper component=hal                  library current  target=… profile=release
-vesper                  project=vesper component=kernel               executable current debug-info  derived-from→ main.o  links→ libhal.rlib
-vesper.stripped         project=vesper component=kernel               executable current stripped  derived-from→ vesper
-vesper-0.1.0-rpi4.img   project=vesper                                bundle current released
+libhal.rlib             project=vesper component=hal                      origin=generated role=library current  target=… profile=release
+vesper                  project=vesper component=kernel                   origin=generated role=executable current debug-info  derived-from→ main.o  links→ libhal.rlib
+vesper.stripped         project=vesper component=kernel                   origin=generated role=executable current stripped  derived-from→ vesper
+vesper-0.1.0-rpi4.img   project=vesper                                    origin=generated role=bundle current released
                         bundles→ vesper.stripped, bcm2711-rpi-4-b.dtb, config.txt
 ```
 
@@ -284,21 +283,21 @@ vesper-0.1.0-rpi4.img   project=vesper                                bundle cur
 
 | Question | Query |
 |---|---|
-| Kernel sources | `project=vesper AND component=kernel AND source` |
-| aarch64 release artifacts | `project=vesper AND generated AND target=aarch64-unknown-none AND profile=release` |
+| Kernel sources | `project=vesper AND component=kernel AND origin=source` |
+| aarch64 release artifacts | `project=vesper AND origin=generated AND target=aarch64-unknown-none AND profile=release` |
 | Contents of the image | transitive closure of `bundles` and `derived-from` from the image |
 | Provenance of the binary | `vesper.stripped` → `vesper` → `main.o` → `main.rs`, `kernel_api.rs`; `links` → `libhal.rlib` → its sources |
-| Cleanable artifacts | `project=vesper AND (stale OR dirty) AND generated AND NOT pinned` |
-| Objects from an old toolchain | `project=vesper AND object AND toolchain=nightly-2024-01-10` |
+| Cleanable artifacts | `project=vesper AND (stale OR dirty) AND origin=generated AND NOT pinned` |
+| Objects from an old toolchain | `project=vesper AND role=object AND toolchain=nightly-2024-01-10` |
 | Everything of one component | `project=vesper AND component=hal` |
 | Users of a library | `links` relation reversed from `libhal.rlib` |
-| All Rust libraries anywhere | `lang=rust AND library` |
-| Stale-artifact footprint | `generated AND stale`, summing stored size |
-| Recent work | `source AND modified-week = <this week>` (a `Bucket` rule over the `modified` record field), distinct `project` |
+| All Rust libraries anywhere | `language=rust AND role=library` |
+| Stale-artifact footprint | `origin=generated AND stale`, summing stored size |
+| Recent work | `origin=source AND modified-week = <this week>` (a `Bucket` rule over the `modified` record field), distinct `project` |
 
-**Build integration.** After compiling, a build hook tags the output (`object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and on the previous `current` build of the same output — same `component`, `target`, `profile` and output `unix-path` — removes `current` and asserts `stale` itself, so it does not rely on what the `Exclusive` set does on a conflicting write (ONTOLOGY-D9). Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
+**Build integration.** After compiling, a build hook tags the output (`origin = generated`, `role = object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and on the previous `current` build of the same output — same `component`, `target`, `profile` and output `unix-path` — removes `current` and asserts `stale` itself, so it does not rely on what the `Exclusive` set does on a conflicting write (ONTOLOGY-D9). Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND role=intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
 
-**Placement.** The same tags drive `PlacementRule`s (SPECIFICATION-DESIGN§8.3): `Pin { source AND NOT vendored, Hot }` and `Replicate { source AND NOT vendored, 2 }`; `Pin { intermediate OR object, Hot }`; `Replicate { bundle AND released, 3 }` with `Prefer { bundle AND released, Warm }`; `Prefer { vendored, Cold }`.
+**Placement.** The same tags drive `PlacementRule`s (SPECIFICATION-DESIGN§8.3): `Pin { origin=source, Hot }` and `Replicate { origin=source, 2 }`; `Pin { role=intermediate OR role=object, Hot }`; `Replicate { role=bundle AND released, 3 }` with `Prefer { role=bundle AND released, Warm }`; `Prefer { origin=vendored, Cold }`.
 
 ## Format specification
 

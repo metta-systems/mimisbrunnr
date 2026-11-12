@@ -82,11 +82,11 @@ SQL text ─▶ SqlParser ─▶ SqlPlanner ────────────
 
 ```sql
 SELECT name FROM objects
-WHERE tag = 'source' AND lang = 'rust' AND year > 2023 AND component LIKE 'k%nel';
+WHERE tag = 'released' AND language = 'rust' AND year > 2023 AND component LIKE 'k%nel';
 ```
 
 ```text
-HasTag(source) ∧ HasAttr(lang = rust) ∧ HasAttr(year > 2023)   postings; dictionary lookup; dictionary scan
+HasTag(released) ∧ HasAttr(language = rust) ∧ HasAttr(year > 2023)   postings; dictionary lookup; dictionary scan
   → filter component LIKE 'k%nel'                              over the ~200 survivors, not the pool
   → project name                                               forward index
 ```

@@ -58,7 +58,7 @@ Commands: `mimir project set-path <oid> <path> | tree [<path>] | import <dir>`, 
 - **Archive export in the filesystem** (`mimir project export --format tar.gz | deb`). Archive and image formats are applications' concerns.
 - **Symlink targets as metadata** (a `symlink-target` attribute or symlink kind). An object at several paths carries several `unix-path` values (UNIX-DESIGN§1). How imported host symlinks map onto this is [UNIX-D3](unix-decisions.md).
 - **An in-memory path manager** rebuilt at boot from every object's `unix-path` assertions. The hierarchical `unix-path` key answers path, directory and name lookups from the index (INDEX-DESIGN§4.2); a resident copy would cost memory proportional to the pool and a scan at every mount.
-- **File extensions as the basis of classification.** Import asserts categories (`lang`, `type`) from path conventions; an ontology may still declare an `extension` key with rules over it, but the core does not.
+- **File extensions as the basis of classification.** Import asserts categories (`language`, `type`) from path conventions; an ontology may still declare an `extension` key with rules over it, but the core does not.
 
 ## Format specification
 

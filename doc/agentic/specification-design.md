@@ -1340,45 +1340,34 @@ The `systems.metta.dev` ontology demonstrates how rich domain structure maps to 
 |Dimension|Examples|
 |---|---|
 |**Project identity**|`workspace=metta-systems`, `project=vesper`, `component=kernel`|
-|**File role**|`source`, `generated`, `implementation`, `test`, `object`, `executable`, `bundle`|
-|**Language**|`lang=rust`, `lang=c`, `lang=asm`|
+|**Origin**|`origin=source`, `origin=generated`, `origin=vendored`|
+|**Role**|`role=implementation`, `role=test`, `role=device-tree`, `role=object`, `role=executable`, `role=bundle`|
+|**Language**|`language=rust`, `language=c`, `language=asm`|
 |**Build configuration**|`profile=release`, `target=aarch64-unknown-none`, `opt-level=2`, `lto=fat`|
 |**Lifecycle**|`current`, `stale`, `dirty`, `released`, `pinned`|
 |**Derivation**|`derived-from→`, `links→`, `bundles→`|
 
-### 13.2 Implication Hierarchy
+### 13.2 Intersecting Dimensions
 
-```
-                              file
-                            ╱      ╲
-                     source          generated
-                   ╱  │  ╲         ╱   │    ╲
-         implementation│ resource  object library executable bundle
-                    test│  ╱ ╲     codegen  doc-output
-                   bench  icon shader      test-result
-                build-script  font         intermediate
-                   config  texture
-                documentation
-                     spec
-```
+Each dimension is asserted on its own; none is a branch of another. A file has one `origin` (where it comes from) and any number of `role` values (what it is for), so a device-tree source and its compiled blob share `role=device-tree` and differ in `origin`. Language is asserted separately again: `language=rust` says nothing about origin or role. Rules between role and origin values are listed with the module (ONTOLOGY-DESIGN "Example module: software development").
 
 ### 13.3 Queries That Become Trivial
 
 ```
 "All source in the vesper kernel"
-  project=vesper AND component=kernel AND source
+  project=vesper AND component=kernel AND origin=source
 
 "All aarch64 release artifacts"
-  generated AND target=aarch64-unknown-none AND profile=release
+  origin=generated AND target=aarch64-unknown-none AND profile=release
 
 "Full provenance of the distribution image"
   Transitive closure over derived-from and bundles relations
 
 "Stale artifacts safe to clean"
-  generated AND stale AND NOT pinned
+  origin=generated AND stale AND NOT pinned
 
 "What have I been working on this week?"
-  source AND modified AFTER 7-days-ago → distinct(project)
+  origin=source AND modified AFTER 7-days-ago → distinct(project)
 ```
 
 ### 13.4 Build Integration
@@ -1692,7 +1681,7 @@ mimir info obj:42                          # show all assertions
 
 # Queries
 mimir query "electronic AND year:2024"
-mimir query "project=vesper AND source AND lang=rust"
+mimir query "project=vesper AND origin=source AND language=rust"
 mimir explore electronic                    # faceted exploration
 
 # Ontology management
