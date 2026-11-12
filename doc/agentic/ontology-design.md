@@ -73,8 +73,8 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 - **Attribute values a rule produces are terminal.** An `Implies` or `ValueImplies` whose `to` is an attribute value derives that value and nothing further: no rule reads a derived attribute value as its input, so derivation never loops. A rule on that value matches objects that assert it directly.
 - An object's **derived terms** are the closure of its direct terms under the rules (INDEX-DESIGN§2.4); they appear in postings and never in forward entries.
 - **Modelling rule for formats and categories.** Format facts come from rules over attributes (`mime`, `extension` → `flac` → `audio`); categories (`music`, `work`, `favorite`) are asserted directly by users and applications, or implied from other categories. `mp3` files are all `audio`; whether one is `music` is an assertion, not a derivation.
-- **Intersecting categories over hierarchies.** The model is associative: an object carries every category that applies, side by side, and queries intersect them. Categories with no real order between them are values of a repeatable attribute (`kind = source`, `kind = test`), not an implication tree in which one ranks above another; `Implies` is for genuine "every X is a Y" facts (`flac → audio`). Hierarchical keys are for values that are paths by nature (`unix-path`), not for classification. Which keys, labels and values a domain uses is its module's vocabulary; the core fixes only the model.
-- Import's path conventions (UNIX-DESIGN "Import") belong to the `systems.metta.unix-interop` module, not the core ontology. An ontology may declare an `extension` key with rules over it (`extension = rs → lang-rust`); the core does not, and categories such as `lang = rust` and `type = source` are asserted directly.
+- **Intersecting categories over hierarchies.** The model is associative: an object carries every category that applies, side by side, and queries intersect them. Categories with no real order between them are values of a repeatable attribute (`role = implementation`, `role = test`), not an implication tree in which one ranks above another; `Implies` is for genuine "every X is a Y" facts (`flac → audio`). Hierarchical keys are for values that are paths by nature (`unix-path`), not for classification. Which keys, labels and values a domain uses is its module's vocabulary; the core fixes only the model.
+- Import's path conventions (UNIX-DESIGN "Import") belong to the `systems.metta.unix-interop` module, not the core ontology. An ontology may declare an `extension` key with rules over it (`extension = rs → language = rust`); the core does not, and categories such as `language = rust` and `origin = source` are asserted directly.
 
 | Constraint | On a write that would violate it |
 |---|---|
@@ -231,10 +231,10 @@ Source trees are a good test of the ontology: files have roles, dependencies, bu
 | `resource` | Assets the build or runtime consumes |
 | `icon`, `font`, `texture`, `shader`, `locale`, `schema`, `linker-script`, `device-tree` | Asset kinds; `schema` covers database, protobuf and JSON schemas |
 | `object`, `library`, `executable`, `bundle` | `.o`/`.rlib`; linked library; final binary; tarball/`.img`/`.deb` |
-| `doc-output`, `intermediate` | Rendered docs; dep-info, incremental caches, stamps |
+| `intermediate` | Dep-info, incremental caches, stamps |
 | `test-result` | Test logs, coverage and benchmark reports: `origin = generated`, `derived-from` the test, coverage or benchmark run's inputs; its `created` record field says when the run happened |
 
-Generated source code has no role of its own: bindgen output is `origin = generated` with `role = implementation` or `role = interface`, like any other code.
+Generated code and rendered documentation have no role of their own: bindgen output is `origin = generated` with `role = implementation` or `role = interface`, like any other code, and rendered docs are `origin = generated` with `role = documentation`, `derived-from` their sources.
 
 **Language and toolchain:** `language` (attribute, text, set by import from the file extension), `toolchain` (attribute, text).
 
