@@ -221,19 +221,21 @@ Source trees are a good test of the ontology: files have roles, dependencies, bu
 
 **Origin:** `origin` (attribute, text, one value per file) says where a file comes from: `source` (human-authored), `generated` (machine-produced output) or `vendored` (third-party code copied into the project).
 
-**Role:** `role` (attribute, text, repeatable) says what a file is for, independently of its origin: `boot.S` is `role = implementation` and `role = interface`; a device tree is `role = device-tree` whether it is the `.dts` source or the compiled `.dtb`.
+**Role:** `role` (attribute, text, repeatable) says what a file is for, independently of its origin: `boot.S` is `role = implementation` and `role = interface`; a device tree is `role = device-tree` whether it is the `.dts` source or the compiled `.dtb`; a shader's source is `role = shader` and its compiled form `role = shader` and `role = resource`.
 
-| `role` value | Implies | Meaning |
-|---|---|---|
-| `implementation`, `interface`, `test`, `bench` | `origin = source` | Core code; public API or headers; tests; benchmarks |
-| `build-script`, `config` | `origin = source` | `Cargo.toml`, `build.rs`, `Makefile`; `rustfmt.toml`, `.cargo/config.toml` |
-| `documentation`, `spec` | `origin = source` | Documentation sources; design documents |
-| `resource` | `origin = source` | Non-code assets the build or runtime consumes |
-| `icon`, `font`, `texture`, `shader`, `locale`, `schema`, `linker-script`, `device-tree` | `role = resource` | Asset kinds; `schema` covers database, protobuf and JSON schemas |
-| `object`, `library`, `executable`, `bundle` | `origin = generated` | `.o`/`.rlib`; linked library; final binary; tarball/`.img`/`.deb` |
-| `codegen`, `doc-output`, `test-result`, `intermediate` | `origin = generated` | Generated sources; rendered docs; test logs and coverage; dep-info, incremental caches, stamps |
+| `role` value | Meaning |
+|---|---|
+| `implementation`, `interface`, `test`, `bench` | Core code; public API or headers; tests; benchmarks |
+| `build-script`, `config` | `Cargo.toml`, `build.rs`, `Makefile`; `rustfmt.toml`, `.cargo/config.toml` |
+| `documentation`, `spec` | Documentation; design documents |
+| `resource` | Assets the build or runtime consumes |
+| `icon`, `font`, `texture`, `shader`, `locale`, `schema`, `linker-script`, `device-tree` | Asset kinds; `schema` covers database, protobuf and JSON schemas |
+| `object`, `library`, `executable`, `bundle` | `.o`/`.rlib`; linked library; final binary; tarball/`.img`/`.deb` |
+| `codegen`, `doc-output`, `test-result`, `intermediate` | Generated sources; rendered docs; test logs and coverage; dep-info, incremental caches, stamps |
 
-**Language and toolchain:** `language` (attribute, text, set by import from the file extension), `toolchain` (attribute, text). Language, origin and role are independent assertions: no rule derives one from another, so `main.rs` carries `language = rust`, `origin = source` and `role = implementation` as three assertions.
+**Language and toolchain:** `language` (attribute, text, set by import from the file extension), `toolchain` (attribute, text).
+
+Language, origin and role are independent assertions, and the module has no rule between them or between role values: a library may be built or vendored, implementation code may be written or generated, and whether an icon is also a `resource` depends on how the project uses it. The application that creates or manages the file — import, the IDE, the build hook, a source-management tool — asserts each one, so `main.rs` carries `language = rust`, `origin = source` and `role = implementation` as three assertions.
 
 **Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `lto` (attribute, text: `off`, `thin`, `fat`), `debug-info`, `stripped` (labels).
 

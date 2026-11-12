@@ -1349,7 +1349,7 @@ The `systems.metta.dev` ontology demonstrates how rich domain structure maps to 
 
 ### 13.2 Intersecting Dimensions
 
-Each dimension is asserted on its own; none is a branch of another. A file has one `origin` (where it comes from) and any number of `role` values (what it is for), so a device-tree source and its compiled blob share `role=device-tree` and differ in `origin`. Language is asserted separately again: `language=rust` says nothing about origin or role. Rules between role and origin values are listed with the module (ONTOLOGY-DESIGN "Example module: software development").
+Each dimension is asserted on its own; none is a branch of another. A file has one `origin` (where it comes from) and any number of `role` values (what it is for), so a device-tree source and its compiled blob share `role=device-tree` and differ in `origin`. Language is asserted separately again: `language=rust` says nothing about origin or role. No rule derives one dimension from another; the application that creates or manages a file asserts each.
 
 ### 13.3 Queries That Become Trivial
 
