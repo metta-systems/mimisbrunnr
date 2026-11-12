@@ -32,6 +32,16 @@ Tiny objects are packed into small-object buckets at checkpoint (JOURNAL-DESIGN�
 
 Re-cutting walks an object in windows ending on old chunk boundaries (INDEX-DESIGN§4.3, chunk boundaries), so the last new chunk of each window is cut at the window edge instead of where the cutter would cut it, losing a little deduplication per window; a window is also what the concurrent-write check redoes. Larger windows mean fewer forced cuts and longer redos. Options: a pool-state value (e.g. 64 MiB default), a fixed multiple of the new `max_size`, or left to the implementation and not pinned. Shapes [BLOB3](blob-implementation-plan.md).
 
+## BLOB-D8 — Chunks shared by very many objects
+
+A deduplicated chunk has one backpointer per owner (METADATA-DESIGN§2.2, backpointers keyed by location and owner), so a chunk shared by N objects has N owners. Moving it (copy GC, evacuation, tiering) or changing its replica count updates every owner's content-map entry under one LSN (RECONCILE-DESIGN§1.5, the move path), and replaying that one small journal entry fans out into N tree mutations. For a chunk common to most of a pool — a licence text, a shared library, a block common to many VM images — N can be in the millions, so one move becomes an unbounded commit and an unbounded replay step. Holes already read as zeros and store nothing, which removes the all-zero chunk. Options:
+
+- (a) **An owner cap per stored copy:** when a chunk's `ChunkIndex` holder (INDEX-DESIGN§4.3, the hash → one live holder lookup used when writing) already has K owners, a new write stores a fresh copy and becomes the holder for later writes, so no copy ever has more than K owners. Bounds every move at K updates; costs one extra copy per K owners of very common content.
+- (b) **Indirection for hot chunks:** past K owners, entries point at a shared location record (a small tree keyed by chunk id) instead of naming replicas directly, so a move rewrites one record; reads of such chunks take one extra lookup.
+- (c) **Batched moves:** a move of a chunk with many owners runs as a resumable reconcile scan over its backpointers (RECONCILE-DESIGN§1.3, scans with persisted cursors), both locations valid until the scan completes and the old one freed only then. No format change; a move is no longer one commit, and the old copy's space is held until it finishes.
+
+Decide the option and K (or its policy). Shapes [RECONCILE10](reconcile-implementation-plan.md) (background deduplication) and the move path.
+
 ## Future work
 
 - None recorded.
