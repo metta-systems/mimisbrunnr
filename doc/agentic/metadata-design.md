@@ -466,6 +466,9 @@ enum OwnerKind {
     PackedBlock      = 2,                    // owner_key = small-object block id (BLOB-D4: the layout
                                              //   of small-object blocks); the block names the
                                              //   ObjectId of each of its slots
+    Staging          = 3,                    // owner_key = (oid, end_offset) of a chunk being
+                                             //   fetched in verified groups (CLUSTER-DESIGN§3.1);
+                                             //   becomes a Chunk owner when the chunk completes
 }
 ```
 
@@ -508,6 +511,9 @@ applied under those ops' LSNs, so the mutation path and replay produce the same 
 | `WriteBlob` | insert one per replica: `Chunk`, owner `(oid, 0)` |
 | `AppendChunks`, `ReplaceChunks` | insert one per replica of each chunk the op names, for this owner: `Chunk`, owner `(oid, start_offset)`, where `start_offset` is the offset the chunk starts at in this object — whether the replicas are newly written or already named by other owners (a deduplicated chunk) |
 | `PackObjects` | insert one per replica of the block: `PackedBlock`, owner = block id |
+| `TransferPut` creating a staged chunk | insert one for its staging extent: `Staging`, owner = `(oid, end_offset)` (CLUSTER-DESIGN§3.1, chunks fetched in verified groups) |
+| `ReplaceChunks` completing a staged chunk | the `Staging` backpointer becomes the chunk's `Chunk` backpointer |
+| `TransferDelete` with chunks still staged | remove their `Staging` backpointers, freeing the staging extents |
 | `Checkpoint` | insert one per copy of every region the new root reaches and the old did not: `BtreeNode`; remove those of every region it no longer reaches. Regions written after the last checkpoint have none — a crash leaves them unreferenced |
 | an op that physically removes an owner's last name for a location (`ReplaceChunks`, `TruncateChunks`, snapshot cleanup, deletion reclaim; SNAPSHOTS-DESIGN§1.6) | remove that owner's backpointers |
 | `ReconcileMove`, `ReconcileReplicate`, `ReconcileDropReplica` | move, add or remove the location's backpointers for every owner, with the owner updates (RECONCILE-DESIGN§1.5) |

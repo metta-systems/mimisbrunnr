@@ -84,6 +84,10 @@ Still being considered. Shapes [CLUSTER11](cluster-implementation-plan.md).
 
 The operations of CLUSTER-DESIGN§5 are privileged. Decide how the capability is granted (one cluster manager per node, or several), whether it is diminishable (e.g. a read-only cluster capability for monitoring, which would answer CLUSTER-D11 (b)), how it maps onto Mettā capability types (ACCESS-D4's candidate mapping), and whether applying changes runs with the origin's identity or the manager's for access control ([ACCESS-D8](access-decisions.md)).
 
+## CLUSTER-D13 — Implementing verified streaming
+
+Transfers within a chunk use BLAKE3's tree in the Bao verified-streaming form with a group size chosen per request and subtrees condensed into their parent hash (CLUSTER-DESIGN§3.1). The workspace already depends on `blake3` for content hashes. Options: (a) the `bao` crate (the reference implementation by BLAKE3's authors; fixed 1 KiB granularity, encoder and decoder for combined and outboard streams); (b) `bao-tree` (iroh's; configurable chunk groups and range requests, closer to the per-request group size); (c) build the outboard and verification on `blake3`'s lower-level tree API (`blake3::hazmat`), with no new dependency and the frontier logic our own. Criteria: `no_std` + `alloc` support for the device build (operations-design "Deployment targets"), group sizes from 1 KiB to the whole chunk, verifying out-of-order groups, and the dependency itself (a new workspace dependency is a maintainer decision). Blocks [CLUSTER10](cluster-implementation-plan.md).
+
 ## Future work
 
 - Remote storage backends (SPECIFICATION-DESIGN§10.9), including an IPFS-style frontend developed outside Mettā and a namespace layer over IPFS.

@@ -1488,7 +1488,7 @@ flowchart TB
     end
 
     subgraph Journal["Journal (Journal buckets, JOURNAL-DESIGN)"]
-        JSET["Journal sets<br/><i>Preamble JRNL · seq · last_seq · hlc_base<br/>entries: op kinds 0–37 · checksum u64</i>"]
+        JSET["Journal sets<br/><i>Preamble JRNL · seq · last_seq · hlc_base<br/>entries: op kinds 0–42 · checksum u64</i>"]
         CKPT["Checkpoint entry<br/><i>RootListHead: seq · lsn · R<br/>id_counters[IdKind] (Term, Tag, Rule, Subscription,<br/>Snapshot, PlacementRule, Disk, Scan)<br/>+ RootEntry × N (BtreeKind → NodePtr)</i>"]
         JSET --> CKPT
     end

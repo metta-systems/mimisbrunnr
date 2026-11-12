@@ -212,20 +212,25 @@ subsystem; a reader rejects any other value.
 | 21 | `SubscriptionPut` | subscriptions |
 | 22 | `SubscriptionDelete` | subscriptions |
 | 23 | `SubscriptionAck` | subscriptions |
-| 24 | `BucketAlloc` | buckets |
-| 25 | `BucketGenBump` | buckets |
-| 26 | `BucketDiscard` | buckets |
-| 27 | `SnapshotCreate` | snapshots |
-| 28 | `SnapshotSwitch` | snapshots |
-| 29 | `SnapshotDelete` | snapshots |
-| 30 | `SnapshotUnlink` | snapshots |
-| 31 | `SnapshotDepthUpdate` | snapshots |
-| 32 | `ReconcileEnqueue` | reconcile |
-| 33 | `ReconcileDequeue` | reconcile |
-| 34 | `ReconcileMove` | reconcile |
-| 35 | `ReconcileReplicate` | reconcile |
-| 36 | `ReconcileDropReplica` | reconcile |
-| 37 | `ReconcileScanStep` | reconcile |
+| 24 | `PeerPut` | cluster support |
+| 25 | `PeerDelete` | cluster support |
+| 26 | `TransferPut` | cluster support |
+| 27 | `TransferDelete` | cluster support |
+| 28 | `StageVerified` | cluster support |
+| 29 | `BucketAlloc` | buckets |
+| 30 | `BucketGenBump` | buckets |
+| 31 | `BucketDiscard` | buckets |
+| 32 | `SnapshotCreate` | snapshots |
+| 33 | `SnapshotSwitch` | snapshots |
+| 34 | `SnapshotDelete` | snapshots |
+| 35 | `SnapshotUnlink` | snapshots |
+| 36 | `SnapshotDepthUpdate` | snapshots |
+| 37 | `ReconcileEnqueue` | reconcile |
+| 38 | `ReconcileDequeue` | reconcile |
+| 39 | `ReconcileMove` | reconcile |
+| 40 | `ReconcileReplicate` | reconcile |
+| 41 | `ReconcileDropReplica` | reconcile |
+| 42 | `ReconcileScanStep` | reconcile |
 
 Changes to pool administration trees have no ops; they commit by checkpoint (POOL-DESIGN§1.2).
 Postings, pending subscription events, `live_sectors` and backpointers have none either: replay
@@ -399,6 +404,25 @@ SetOrder         : { oid: u64, term_id: u64, order: u64 }
 RenumberSequence : { term_id: u64 }
                    // Respaces the term's positions; deterministic, so replay recomputes every
                    //   member's new position and order slot from the tree alone.
+
+// Cluster support (CLUSTER-DESIGN§2–§4: peer records, staged chunks, transfer records)
+PeerPut          : { node_id: u16, record: bytes }
+                   // Inserts or replaces one PeerRecord (positional CBOR); cursor advances on
+                   //   acknowledgement and apply are PeerPuts.
+PeerDelete       : { node_id: u16 }
+TransferPut      : { oid: u64, direction: u8, peer: u16, record: bytes }
+                   // Inserts or replaces one TransferRecord. Creating an inbound record with
+                   //   staged chunks allocates their staging extents (BucketAlloc first) and
+                   //   inserts their Staging backpointers.
+TransferDelete   : { oid: u64, direction: u8, peer: u16 }
+                   // Removes the record; any staging extents it still names are freed.
+StageVerified    : { oid: u64, peer: u16, chunk_end: u64, level: u8, index: u64,
+                     hash: [u8; 32], extent_sum: u64 }
+                   // A subtree of a staged chunk's BLAKE3 tree (CLUSTER-DESIGN§3.1) has been
+                   //   written to its staging extent and verified: replay records the subtree
+                   //   in the staged chunk's frontier, condensing it with verified siblings into
+                   //   their parent. extent_sum lets recovery check the staged bytes written in
+                   //   the same commit (JOURNAL-DESIGN§1.5, extents verified by checksum).
 ```
 
 Replay applies entries strictly in LSN order. Each in-memory mutation is idempotent under

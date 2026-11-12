@@ -149,7 +149,7 @@ impl WalEntryHeader {
 ///
 /// The numeric value is the on-disk `op_kind` byte in [`WalEntryHeader`].
 ///
-/// TODO(JOURNAL8): take the contiguous values 0–37 of the JOURNAL-DESIGN§1.3 op-kind
+/// TODO(JOURNAL8): take the contiguous values 0–42 of the JOURNAL-DESIGN§1.3 op-kind
 /// table; `BucketWrite`, `TagBitmapGrow`, `TagBitmapShrink`, `FormatPromote`,
 /// `BackpointerInsert` and `BackpointerRemove` go, and the chunk-list ops and
 /// `ExtendObject` become the chunk ops (`AppendChunks`, `ReplaceChunks`,
