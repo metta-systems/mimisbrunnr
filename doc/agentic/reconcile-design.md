@@ -318,8 +318,8 @@ object's content map in key order. For each chunk with `CHUNK_FLAG_HASH_TWEAK` c
   location, one `ReplaceChunks` names it with `CHUNK_FLAG_HASH_TWEAK` set, the object becomes
   the hash's holder in `ChunkIndex`, and the old copy is freed.
 
-Each `ReplaceChunks` carries at most about 510 chunks (JOURNAL-D2: one journal entry holds at
-most 64 KiB because `EntryHead.len` is a `u16`), so a large object takes several entries, each
+Each `ReplaceChunks` carries at most 2 000 chunks (one journal entry holds at most a jset's
+256 KiB, JOURNAL-DESIGN§1.2), so a large object takes several entries, each
 committing a consistent prefix; the work entry's resume point is the first chunk still clear.
 A foreground write to the same range wins: a key no longer naming the chunk the worker read is
 skipped. Policy that turns deduplication off for an object makes its pending `Dedup` entry a

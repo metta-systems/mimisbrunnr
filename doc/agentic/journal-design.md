@@ -108,7 +108,8 @@ const JSET_FLAG_COMPRESSED: u16 = 1 << 1;    // entries are compressed before en
 struct EntryHead {                           // 8 bytes, 8-aligned within the plaintext entries
     op_kind:   u8,                           // [0..1]  WalOpKind
     flags:     u8,                           // [1..2]  ENTRY_FLAG_*
-    len:       u16,                          // [2..4]  payload bytes that follow (excluding padding)
+    len:       u16,                          // [2..4]  payload length in 8-byte words, padding included
+                                             //         (up to 512 KiB; one entry never exceeds its jset)
     hlc_delta: u32,                          // [4..8]  nanoseconds after hlc_base.physical_ns
 }
 // followed by the op's payload record (JOURNAL-DESIGN§1.3), zero-padded to a multiple of 8.
@@ -175,8 +176,11 @@ record rules:
   `String` a `u16` length and its UTF-8 (FORMAT-DESIGN§1.1), either zero-padded to a multiple of
   8; `Value` is a `u32` length and its CBOR encoding. `Option<String>` uses length `u16::MAX`
   for `None`.
-- `EntryHead.len` covers the head and the variable part (not the trailing padding); a reader
-  rejects a payload whose length disagrees with its head.
+- `EntryHead.len` counts the payload in 8-byte words, trailing zero padding included; the exact
+  byte length follows from the payload itself — its fixed head and the count or length of its
+  variable part. A reader rejects a payload whose own lengths run past `len × 8` bytes or whose
+  remaining padding is not zero. Counting words lets one entry be as large as its jset
+  (256 KiB), so no op is split across entries for size.
 - An extent checksum (`extent_sum`) is the OPERATIONS-D4 checksum of the extent's bytes as
   written; recovery uses it to verify data written in the same commit (JOURNAL-DESIGN§1.5).
 - A `ReplicaSet` (72 bytes) is `replica_count: u8`, 7 bytes of padding and
@@ -445,9 +449,9 @@ object's boundary parameters and whether it deduplicates, per SPECIFICATION-DESI
    - **miss** (or deduplication off): writes the chunk to fresh data extents on every replica's
      disk and adds its `ChunkSpec` with its replica set and `extent_sum`.
 2. When the pending entry reaches the producer's chosen size, or on fsync, emits the
-   `AppendChunks { oid, start_offset, new_length, chunks }`. One entry holds at most about 510
-   chunks while one journal entry is capped at 64 KiB — JOURNAL-D2 (`EntryHead.len` is a `u16`,
-   so one entry's payload is at most 64 KiB; widen it or split ops across entries). Content-map
+   `AppendChunks { oid, start_offset, new_length, chunks }`. One entry holds up to about 2 000
+   chunks, bounded by the 256 KiB a jset may hold (`EntryHead.len` counts 8-byte words,
+   JOURNAL-DESIGN§1.2); producers cap a batch at 2 000. Content-map
    keys, backpointers and `ChunkIndex` holders are ordinary tree puts, flushed with every other
    tree at checkpoint.
 3. At end-of-write, emits `FinalizeObject { oid, content_hash, total_length, chunk_params }`;
@@ -491,13 +495,13 @@ FastCDC's avg-chunk-size knob spans ~3 orders of magnitude in real deployments (
 4 KiB for fine-grained edits at the small end, up to 8 MiB for resumability-only large
 transfers at the other. The five-regime table below shows how the design scales:
 
-| Avg chunk | Typical workload                   | Chunks      | `AppendChunks` entries (≤ ~510 chunks each) | Journal bytes (128 B per chunk) | Journal append rate at 530 MiB/s plaintext |
-| --------- | ---------------------------------- | ----------- | ------------------------------------------- | ------------------------------- | ------------------------------------------ |
-| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 16 449                                      | ~1 GiB (3.1 % of plaintext)     | ~16.6 MiB/s                                |
-| 16 KiB    | VM disks, databases                | 2 097 152   | 4 113                                       | ~256 MiB (0.78 %)               | ~4.1 MiB/s                                 |
-| 256 KiB   | generic FastCDC default            | 131 072     | 258                                         | ~16 MiB (0.049 %)               | ~265 KiB/s                                 |
-| 1 MiB     | backup-tool default (restic-class) | 32 768      | 65                                          | ~4 MiB (0.012 %)                | ~66 KiB/s                                  |
-| **8 MiB** | large extreme — pure resumability  | 4 096       | 9                                           | ~512 KiB (0.0016 %)             | ~8.3 KiB/s                                 |
+| Avg chunk | Typical workload                   | Chunks      | `AppendChunks` entries (≤ 2 000 chunks each) | Journal bytes (128 B per chunk) | Journal append rate at 530 MiB/s plaintext |
+| --------- | ---------------------------------- | ----------- | -------------------------------------------- | ------------------------------- | ------------------------------------------ |
+| **4 KiB** | small extreme — fine-grained edits | 8 388 608   | 4 195                                        | ~1 GiB (3.1 % of plaintext)     | ~16.6 MiB/s                                |
+| 16 KiB    | VM disks, databases                | 2 097 152   | 1 049                                        | ~256 MiB (0.78 %)               | ~4.1 MiB/s                                 |
+| 256 KiB   | generic FastCDC default            | 131 072     | 66                                           | ~16 MiB (0.049 %)               | ~265 KiB/s                                 |
+| 1 MiB     | backup-tool default (restic-class) | 32 768      | 17                                           | ~4 MiB (0.012 %)                | ~66 KiB/s                                  |
+| **8 MiB** | large extreme — pure resumability  | 4 096       | 3                                            | ~512 KiB (0.0016 %)             | ~8.3 KiB/s                                 |
 
 The spread is roughly **2 000×** across regimes on every axis — the same op set covers all
 of it, only the constants change.

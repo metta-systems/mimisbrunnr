@@ -22,7 +22,7 @@ Estimated checkpoint entry size under (c), with 64 errors of 64-byte detail and 
 | Scan records | ~300 B | ≤ 1.2 KiB | 4.8 KiB |
 | **Total** | | **~8 KiB** | **~36 KiB** |
 
-(c) depends on bounds the format does not yet have: [JOURNAL-D2](journal-decisions.md) (an entry's payload is at most 64 KiB), [POOL-D4](pool-decisions.md) (how many nodes and disks), [RECONCILE-D1](reconcile-decisions.md) (scan parameters and error detail) and the peer record's layout ([CLUSTER-D7](cluster-decisions.md)). Decide once those are settled.
+(c) must fit one journal entry, which holds at most a jset's 256 KiB (JOURNAL-DESIGN§1.2, `EntryHead.len` counts 8-byte words) — about seven times the 64-node estimate — and depends on bounds the format does not yet have: [POOL-D4](pool-decisions.md) (how many nodes and disks), [RECONCILE-D1](reconcile-decisions.md) (scan parameters and error detail) and the peer record's layout ([CLUSTER-D7](cluster-decisions.md)). Decide once those are settled.
 
 ## ENGINE-D3 — Superblock layout version and pool format version
 
