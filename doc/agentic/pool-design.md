@@ -16,6 +16,7 @@ A pool spans any number of disks across tiers; placement and tiering follow plac
 - **Pool state is one versioned record** — tunables, throttles, default chunking, the error log — in its own single-entry tree.
 - **Tree nodes are replicated** `metadata_replicas` times across disks, fastest tier first (ENGINE-DESIGN§1.2); the replica count is [POOL-D1](pool-decisions.md).
 - Placement rules persist one entry per rule (`placement_rules_root`); `cluster_peers_root` belongs to [cluster-design.md](cluster-design.md).
+- **Presence rules** (`KeepLocal`, `Stub`, `Prefetch`, `Evict`; SPECIFICATION-DESIGN§8.3) decide which content this node holds at all. They are placement rules of this node: kept in the same tree, committed by checkpoint, never synced, and watchers in the same match index. Their fetches are inbound transfers (CLUSTER-DESIGN§4, transfer records) and their evictions mark chunks absent (CLUSTER-DESIGN§3).
 - Placement changes are carried out by reconcile ([RECONCILE5](reconcile-implementation-plan.md)).
 
 ## Format specification

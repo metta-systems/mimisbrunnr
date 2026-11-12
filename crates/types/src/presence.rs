@@ -9,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{DiskId, NodeId};
 
 /// Where the payload bytes for an object currently live.
+///
+/// TODO(POOL9): presence is derived from present and absent chunks, transfer
+/// records and presence rules (SPECIFICATION-DESIGN§10.3); this becomes a
+/// computed view, never stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentPresence {
     /// Fully resident on the named disk.

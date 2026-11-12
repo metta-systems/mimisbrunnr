@@ -22,11 +22,10 @@ Ontology declarations already merge as ONTOLOGY-DESIGN "Cluster propagation" rec
 
 ## CLUSTER-D3 — Partially present content
 
-An object whose chunk list is recorded but some chunks are absent (CLUSTER-DESIGN§3, chunk entries with `CHUNK_FLAG_ABSENT` and no replicas) — being fetched, or deliberately stubbed by a hydration rule — needs defined reads and a defined record. Decide:
+An object whose chunk list is recorded but some chunks are absent (CLUSTER-DESIGN§3, chunk entries with `CHUNK_FLAG_ABSENT` and no replicas) — being fetched, kept as a stub by a `Stub` presence rule, or left metadata-only — needs defined reads and a defined record. Presence itself is derived from chunks, transfer records and presence rules (SPECIFICATION-DESIGN§10.3), so no `Partial` or `Hydrating` state is stored. Decide:
 
-- whether a read of a present range succeeds while other ranges are absent, and what a read of an absent range does (fail with a defined error, block while an inbound transfer is active, or trigger one);
-- how the record marks it: the `Chunks` content kind with absent keys, or `Remote` until the last chunk lands;
-- whether `Partial` (a stub kept on purpose, e.g. the first N bytes or a thumbnail) and `Hydrating` (a fetch in progress) are distinct states, or one state plus the transfer record.
+- whether a read of a present range succeeds while other ranges are absent, and what a read of an absent range does (fail with a defined error, block while an inbound transfer is active, or create one with cause `open`);
+- how the record marks it: the `Chunks` content kind with absent keys, or `Remote` until the last chunk lands.
 
 Blocks [CLUSTER5](cluster-implementation-plan.md).
 

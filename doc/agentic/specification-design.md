@@ -757,6 +757,42 @@ enum ChunkingAlgo {
 }
 ```
 
+**Presence rules** decide which content this node holds at all, beside placement's "on which
+local disks and tier". They are node-local — a laptop and a NAS want different content — kept in
+the same placement-rules tree, committed by checkpoint and never synced, and they follow
+mutations through the same match index as subscriptions (§11.3):
+
+```rust
+enum PresenceRule {
+    KeepLocal { query: Query },                 // content fully present; never evicted
+    Stub      { query: Query, prefix_bytes: u64 },  // keep the chunks covering [0, prefix_bytes)
+    Prefetch  { trigger: Query, group_key: TagUid, threshold: u32, target: Query },
+    Evict     { query: Query, unused_ns: u64, keep_prefix: u64 },
+}
+```
+
+- **Default.** An object created on this node holds its content; an object learned from a peer
+  arrives as metadata only — its chunks absent (CLUSTER-DESIGN§3) — unless a rule asks for more.
+- **`KeepLocal`** fetches a matching object's absent chunks (an inbound transfer, cause `pin`,
+  CLUSTER-DESIGN§4) and exempts it from eviction.
+- **`Stub`** keeps the chunks covering the first `prefix_bytes` present and the rest absent —
+  enough to identify a file or preview its start.
+- **`Prefetch`**: when `threshold` objects matching `trigger` and sharing one value of
+  `group_key` are opened, every object with that value matching `target` is fetched — "after
+  three tracks of an album, fetch the rest of the album" is `group_key = album`. Open counts are
+  kept in memory; losing them on reboot only delays a prefetch.
+- **`Evict`** drops a matching object's local chunks — marks them absent and frees their
+  replicas — once it has gone `unused_ns` without access, keeping the chunks covering
+  `keep_prefix` bytes. It fires on time passing (POOL-D3, time-triggered rules with bucket terms
+  and time wheels), needs a recorded access time (METADATA-D7, how access time is represented),
+  and never drops the last copy in the cluster, which needs knowing which nodes hold the content
+  (CLUSTER-D10).
+- **Precedence** on one object: `KeepLocal` over `Stub` over `Evict`; a stub bounds what eviction
+  may drop. `Prefetch` only adds transfers.
+- **Previews and thumbnails** are objects of their own, produced by applications and linked by a
+  relation (`thumbnail-of`); keeping them local is `KeepLocal { Related(thumbnail-of, …) }`,
+  not a stub kind.
+
 `PlacementRule::Chunk` is the **admin-time override** for chunking — used when the
 operator wants to force a chunking decision that's not captured in the installed
 ontology (e.g. "all objects matching `tag=database AND size>1GiB` use FastCDC at 64 KiB
@@ -1003,7 +1039,18 @@ progress (CLUSTER-DESIGN§4), which is what a UI shows. Reads of partially prese
 whether `Hydrating` and `Partial` are distinct states, are CLUSTER-D3; a fetched copy that may be
 evicted is a cached replica, dropped lazily by generation (ALLOCATION-DESIGN§1.3).
 
-Hydration policy is ontology-driven — `Pin`, `StubOnly`, `Prefetch`, `AutoEvict` rules using the same query language as placement rules.
+Presence is derived, not stored as a state of its own:
+
+| Presence | What makes it so |
+|---|---|
+| Local | every chunk present |
+| Remote | every chunk absent, or the `Remote` locator |
+| Hydrating | absent chunks and an active inbound transfer record |
+| Partial | some chunks absent because a `Stub` rule keeps them so |
+| Cached | present, and no `KeepLocal` or `Stub` rule requires it, so `Evict` may drop it |
+
+Which content a node holds is set by its presence rules (§8.3): `KeepLocal`, `Stub`,
+`Prefetch` and `Evict`, using the same query language as placement rules.
 
 ### 10.4 Sync Protocol — State Deltas
 
