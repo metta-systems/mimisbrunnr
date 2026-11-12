@@ -231,7 +231,10 @@ Source trees are a good test of the ontology: files have roles, dependencies, bu
 | `resource` | Assets the build or runtime consumes |
 | `icon`, `font`, `texture`, `shader`, `locale`, `schema`, `linker-script`, `device-tree` | Asset kinds; `schema` covers database, protobuf and JSON schemas |
 | `object`, `library`, `executable`, `bundle` | `.o`/`.rlib`; linked library; final binary; tarball/`.img`/`.deb` |
-| `codegen`, `doc-output`, `test-result`, `intermediate` | Generated sources; rendered docs; test logs and coverage; dep-info, incremental caches, stamps |
+| `doc-output`, `intermediate` | Rendered docs; dep-info, incremental caches, stamps |
+| `test-result` | Test logs, coverage and benchmark reports: `origin = generated`, `derived-from` the test, coverage or benchmark run's inputs; its `created` record field says when the run happened |
+
+Generated source code has no role of its own: bindgen output is `origin = generated` with `role = implementation` or `role = interface`, like any other code.
 
 **Language and toolchain:** `language` (attribute, text, set by import from the file extension), `toolchain` (attribute, text).
 
@@ -277,6 +280,8 @@ main.o                  project=vesper component=kernel                   origin
 libhal.rlib             project=vesper component=hal                      origin=generated role=library current  target=… profile=release
 vesper                  project=vesper component=kernel                   origin=generated role=executable current debug-info  derived-from→ main.o  links→ libhal.rlib
 vesper.stripped         project=vesper component=kernel                   origin=generated role=executable current stripped  derived-from→ vesper
+kernel-tests.log        project=vesper component=kernel                   origin=generated role=test-result current  target=aarch64-unknown-none
+                        derived-from→ kernel-tests, main.rs, kernel_tests.rs
 vesper-0.1.0-rpi4.img   project=vesper                                    origin=generated role=bundle current released
                         bundles→ vesper.stripped, bcm2711-rpi-4-b.dtb, config.txt
 ```
@@ -292,6 +297,8 @@ vesper-0.1.0-rpi4.img   project=vesper                                    origin
 | Cleanable artifacts | `project=vesper AND (stale OR dirty) AND origin=generated AND NOT pinned` |
 | Objects from an old toolchain | `project=vesper AND role=object AND toolchain=nightly-2024-01-10` |
 | Everything of one component | `project=vesper AND component=hal` |
+| Latest kernel test results | `project=vesper AND component=kernel AND role=test-result AND current`, newest `created` first |
+| Tests touching a source file | `derived-from` relation reversed from `main.rs`, intersected with `role=test-result` |
 | Users of a library | `links` relation reversed from `libhal.rlib` |
 | All Rust libraries anywhere | `language=rust AND role=library` |
 | Stale-artifact footprint | `origin=generated AND stale`, summing stored size |
