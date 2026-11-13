@@ -208,12 +208,18 @@ The on-disk record is ONTOLOGY-DESIGN§1's `TagRecord`; this is its logical shap
 
 ```rust
 enum Rule {
-    Implies { from: TagId, to: TagId },                     // "flac" → "audio"
-    ValueImplies { key: TagId, value: Value, to: TagId },   // mime = audio/flac → "flac"
+    Implies { from: TagId, to: Target },                    // "flac" → "audio"
+    ValueImplies { key: TagId, value: Value, to: Target },  // mime = audio/flac → "flac"
     Bucket { key: TagId, out_key: TagId, granularity: Granularity },
                                                             // created → created-month = 2026-11
     Exclusive { tags: Vec<TagId> },          // at most one per object: current / stale
-    Requires { tag: TagId, needs: TagId },   // asserting "lossless" without "audio" fails
+    Requires { tag: Target, needs: Target }, // asserting "lossless" without "audio" fails;
+                                             //   "profile" without origin = generated fails
+}
+
+enum Target {
+    Tag(TagId),                              // a label; in Requires, an attribute key matches any value
+    Value { key: TagId, value: Value },      // one attribute value; derived values are terminal
 }
 ```
 

@@ -14,7 +14,7 @@ The ontology is the single authority over tag identity, attribute keys, derivati
 - **Two identities per tag.** `TagUid` (128 bits) is stable everywhere — sync, modules and exports name tags by it. `TagId` (`u32`) is the dense local id, used as the tag's `TermId` (INDEX-DESIGN§1.2) and never reused.
 - **Two kinds of concept.** *Labels* (plain tags) and *attribute keys* with a value type. Any label or attribute value can be a *collection* — grouping, ordered or ranked — by its declaration's collection flavour. Prefix-named tag families (`playlist:workout`) are attribute values (`playlist = workout`).
 - **Derivation rules produce every derived term:** `Implies` (tag → tag), `ValueImplies` (attribute value → tag), `Bucket` (attribute value → coarse value). Attribute keys may also be declared *hierarchical* (values are trie paths with adaptive roll-up postings, INDEX-DESIGN§4.2) and *n-grammed* (substring search over distinct values, INDEX-DESIGN§4.2). Derived terms are never stored per object.
-- **Constraints with defined write semantics.** `Exclusive { tags }` allows at most one of its tags on an object; what a write asserting a second one does is [ONTOLOGY-D9](ontology-decisions.md). `Requires(a, b)` rejects asserting `a` on an object lacking `b`. Aliases map extra names to one tag.
+- **Constraints with defined write semantics.** `Exclusive { tags }` allows at most one of its tags on an object; what a write asserting a second one does is [ONTOLOGY-D9](ontology-decisions.md). `Requires(a, b)` rejects asserting `a` on an object lacking `b`, each a tag or an attribute value. Aliases map extra names to one tag.
 - **Provenance per declaration.** Every tag, rule and constraint records the set of modules that declare it. Install adds a module to those sets, removal takes it out, and a declaration with an empty set is removed under the scrub policy. Ad-hoc tags are declared by the pool's `local` module.
 - **Per-record persistence.** Tags, rules and modules are records in one snapshot-aware `BtreeKind::Ontology` tree (ONTOLOGY-DESIGN§1). Creating a tag writes one record; all records are loaded at mount, with name maps and closure tables built in memory. Closure tables are rebuilt only when rules change.
 - **Changes are journaled record operations** (`OntologyPut`, `OntologyDelete`), applied with their posting rework in one commit and shipped to peers by uid.
@@ -79,7 +79,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 | Constraint | On a write that would violate it |
 |---|---|
 | `Exclusive { tags }` | [ONTOLOGY-D9](ontology-decisions.md) |
-| `Requires { tag, needs }` | asserting `tag` on an object that does not carry `needs` (directly or derived) fails with a defined error |
+| `Requires { tag, needs }` | asserting `tag` on an object that does not carry `needs` (directly or derived) fails with a defined error. Each side is a label, an attribute key (any value of it: `profile` matches `profile = release`) or one attribute value (`origin = generated`) |
 
 Constraints are checked against the object's derived closure after the mutation. They bind local writes only: changes applied from a peer's export (CLUSTER-DESIGN§1) or by an import are accepted even when they violate a constraint — another node's change may arrive before the change that satisfies the constraint, and an import mirrors data that already exists — and the violation is reported, as for existing data at install (Install step 7).
 
@@ -94,7 +94,7 @@ Module management is package management applied to schemas: one app needs some t
 - **Sharing a tag.** A module uses another module's tag by its qualified name. To share it — keep it alive when the other module is removed — the module re-declares it under that qualified name; the declaration must match the tag's kind, value type, collection flavour, hierarchy separator and n-gram length, or install fails, and it adds the module to the tag's provenance. The tag keeps its uid, which depends only on the declaring module and name.
 - **Distribution channels.** Built in (the core ontology), bundled with an app, user-created (`mimir ontology install ./my-tags.toml`).
 
-**Source syntax** (TOML; ONTOLOGY-D2 may replace the surface syntax):
+**Source syntax** (TOML; ONTOLOGY-D2 may replace the surface syntax). A rule's `to` and a constraint's `tag` and `needs` are a tag name, or an attribute value written `{ key = "origin", value = "generated" }`:
 
 ```toml
 [module]
@@ -257,12 +257,11 @@ tags = ["dirty", "current", "stale"]
 kind = "exclusive"
 tags = ["debug-info", "stripped"]
 
-# profile, target, opt-level, lto, derived-from, links, dirty, stale and current
-# each require "generated":
+# compiler settings belong to build outputs; opt-level and lto are declared the same way
 [[constraints]]
 kind = "requires"
 tag = "profile"
-needs = "generated"
+needs = { key = "origin", value = "generated" }
 ```
 
 **A tagged build** (Vesper kernel for Raspberry Pi 4):
@@ -351,9 +350,11 @@ RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)],
     kind 2 Bucket        params = [key: TagId, out_key: TagId, granularity: uint]
                                   // key: an attribute key or a record field (TagRecord kind 2)
     kind 3 Exclusive     params = [tags: [TagId]]
-    kind 4 Requires      params = [tag: TagId, needs: TagId]
+    kind 4 Requires      params = [tag: Target, needs: Target]
 
-Target = [0, tag: TagId] / [1, key: TagId, value: Value]   // what Implies / ValueImplies derive
+Target = [0, tag: TagId] / [1, key: TagId, value: Value]
+    // what Implies / ValueImplies derive, and both sides of Requires;
+    // in Requires, [0, tag] naming an attribute key matches any value of that key
 
 ModuleRecord = [version, uid: bytes(16), id: text, module_version: text, name: text,
                 installers: [text], core: bool, digest: bytes(32),
