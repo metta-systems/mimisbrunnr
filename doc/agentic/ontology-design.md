@@ -242,7 +242,7 @@ Language, origin and role are independent assertions, and the module has no rule
 
 **Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `lto` (attribute, text: `off`, `thin`, `fat`), `debug-info`, `stripped` (labels). A real module would be more nuanced here (debug-info levels, split debug files, symbol and debug stripping as separate settings); two labels keep the example short.
 
-**Lifecycle** (labels): `dirty` (a source modified since its last VCS commit), `current`, `stale` (an `Exclusive` pair on build outputs), `released`, `pinned`.
+**Lifecycle** (labels): `dirty` (a source modified since its last VCS commit), `current`, `stale` (an `Exclusive` pair on build outputs), `released`, `exempt-from-cleaning`.
 
 **Derivation** (relation predicates, label tags): `derived-from` (artifact → its inputs), `links` (artifact → library), `depends-on` (source → source), `bundles` (package → contents).
 
@@ -293,7 +293,7 @@ vesper-0.1.0-rpi4.img   project=vesper                                    origin
 | aarch64 release artifacts | `project=vesper AND origin=generated AND target=aarch64-unknown-none AND profile=release` |
 | Contents of the image | transitive closure of `bundles` and `derived-from` from the image |
 | Provenance of the binary | `vesper.stripped` → `vesper` → `main.o` → `main.rs`, `kernel_api.rs`; `links` → `libhal.rlib` → its sources |
-| Cleanable artifacts | `project=vesper AND stale AND origin=generated AND NOT pinned` |
+| Cleanable artifacts | `project=vesper AND stale AND origin=generated AND NOT exempt-from-cleaning` |
 | Uncommitted work | `project=vesper AND dirty` |
 | Objects from an old toolchain | `project=vesper AND role=object AND toolchain=nightly-2024-01-10` |
 | Everything of one component | `project=vesper AND component=hal` |
@@ -304,9 +304,11 @@ vesper-0.1.0-rpi4.img   project=vesper                                    origin
 | Stale-artifact footprint | `origin=generated AND stale`, summing stored size |
 | Recent work | `origin=source AND modified-week = <this week>` (a `Bucket` rule over the `modified` record field), distinct `project` |
 
-**Build integration.** After compiling, a build hook tags the output (`origin = generated`, `role = object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and on the previous `current` build of the same output — same `component`, `target`, `profile` and output `unix-path` — removes `current` and asserts `stale` itself, so it does not rely on what the `Exclusive` set does on a conflicting write (ONTOLOGY-D9). Cleaning is a query (`project=vesper AND stale AND NOT pinned`, `project=vesper AND role=intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
+**Build integration.** After compiling, a build hook tags the output (`origin = generated`, `role = object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and on the previous `current` build of the same output — same `component`, `target`, `profile` and output `unix-path` — removes `current` and asserts `stale` itself, so it does not rely on what the `Exclusive` set does on a conflicting write (ONTOLOGY-D9). Cleaning is a query (`project=vesper AND stale AND NOT exempt-from-cleaning`, `project=vesper AND role=intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
 
 **Placement.** The same tags drive `PlacementRule`s (SPECIFICATION-DESIGN§8.3): `Pin { origin=source, Hot }` and `Replicate { origin=source, 2 }`; `Pin { role=intermediate OR role=object, Hot }`; `Replicate { role=bundle AND released, 3 }` with `Prefer { role=bundle AND released, Warm }`; `Prefer { origin=vendored, Cold }`.
+
+**Presence.** Presence rules (SPECIFICATION-DESIGN§8.3) are node-local and use the same tags. A laptop keeps the sources, only the start of each released image and drops stale build outputs after a week: `KeepLocal { project=vesper AND origin=source }`, `Stub { role=bundle AND released, 64 KiB }`, `Evict { origin=generated AND stale, 7 days, keep_prefix 0 }`. Eviction drops this node's copy of the content and leaves the object, its tags and the other nodes' copies in place; cleaning deletes the objects from the pool.
 
 ## Format specification
 

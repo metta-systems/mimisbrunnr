@@ -1350,7 +1350,7 @@ The `systems.metta.dev` ontology demonstrates how rich domain structure maps to 
 |**Role**|`role=implementation`, `role=test`, `role=device-tree`, `role=object`, `role=executable`, `role=bundle`|
 |**Language**|`language=rust`, `language=c`, `language=asm`|
 |**Build configuration**|`profile=release`, `target=aarch64-unknown-none`, `opt-level=2`, `lto=fat`|
-|**Lifecycle**|`current`, `stale`, `dirty`, `released`, `pinned`|
+|**Lifecycle**|`current`, `stale`, `dirty`, `released`, `exempt-from-cleaning`|
 |**Derivation**|`derived-from→`, `links→`, `bundles→`|
 
 ### 13.2 Intersecting Dimensions
@@ -1370,7 +1370,7 @@ Each dimension is asserted on its own; none is a branch of another. A file has o
   Transitive closure over derived-from and bundles relations
 
 "Stale artifacts safe to clean"
-  origin=generated AND stale AND NOT pinned
+  origin=generated AND stale AND NOT exempt-from-cleaning
 
 "What have I been working on this week?"
   origin=source AND modified AFTER 7-days-ago → distinct(project)
