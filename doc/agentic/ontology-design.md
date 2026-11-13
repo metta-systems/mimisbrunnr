@@ -240,7 +240,7 @@ Generated code and rendered documentation have no role of their own: bindgen out
 
 Language, origin and role are independent assertions, and the module has no rule between them or between role values: a library may be built or vendored, implementation code may be written or generated, and whether an icon is also a `resource` depends on how the project uses it. The application that creates or manages the file — import, the IDE, the build hook, a source-management tool — asserts each one, so `main.rs` carries `language = rust`, `origin = source` and `role = implementation` as three assertions.
 
-**Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `lto` (attribute, text: `off`, `thin`, `fat`), `debug-info`, `stripped` (labels).
+**Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `lto` (attribute, text: `off`, `thin`, `fat`), `debug-info`, `stripped` (labels). A real module would be more nuanced here (debug-info levels, split debug files, symbol and debug stripping as separate settings); two labels keep the example short.
 
 **Lifecycle** (labels): `dirty`, `stale`, `current` (an `Exclusive` set), `released`, `pinned`.
 
