@@ -242,7 +242,7 @@ Language, origin and role are independent assertions, and the module has no rule
 
 **Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `lto` (attribute, text: `off`, `thin`, `fat`), `debug-info`, `stripped` (labels). A real module would be more nuanced here (debug-info levels, split debug files, symbol and debug stripping as separate settings); two labels keep the example short.
 
-**Lifecycle** (labels): `dirty`, `stale`, `current` (an `Exclusive` set), `released`, `pinned`.
+**Lifecycle** (labels): `dirty` (a source modified since its last VCS commit), `current`, `stale` (an `Exclusive` pair on build outputs), `released`, `pinned`.
 
 **Derivation** (relation predicates, label tags): `derived-from` (artifact → its inputs), `links` (artifact → library), `depends-on` (source → source), `bundles` (package → contents).
 
@@ -251,7 +251,7 @@ Constraints, in module syntax:
 ```toml
 [[constraints]]
 kind = "exclusive"
-tags = ["dirty", "current", "stale"]
+tags = ["current", "stale"]
 
 [[constraints]]
 kind = "exclusive"
@@ -293,7 +293,8 @@ vesper-0.1.0-rpi4.img   project=vesper                                    origin
 | aarch64 release artifacts | `project=vesper AND origin=generated AND target=aarch64-unknown-none AND profile=release` |
 | Contents of the image | transitive closure of `bundles` and `derived-from` from the image |
 | Provenance of the binary | `vesper.stripped` → `vesper` → `main.o` → `main.rs`, `kernel_api.rs`; `links` → `libhal.rlib` → its sources |
-| Cleanable artifacts | `project=vesper AND (stale OR dirty) AND origin=generated AND NOT pinned` |
+| Cleanable artifacts | `project=vesper AND stale AND origin=generated AND NOT pinned` |
+| Uncommitted work | `project=vesper AND dirty` |
 | Objects from an old toolchain | `project=vesper AND role=object AND toolchain=nightly-2024-01-10` |
 | Everything of one component | `project=vesper AND component=hal` |
 | Latest kernel test results | `project=vesper AND component=kernel AND role=test-result AND current`, newest `created` first |
