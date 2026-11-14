@@ -87,10 +87,12 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 | Constraint | On a write that would violate it |
 |---|---|
 | `Exclusive { tags }` | [ONTOLOGY-D9](ontology-decisions.md) |
-| `Requires { tag, needs }` | asserting `tag` on an object that does not carry `needs` (directly or derived) fails with a defined error. Each side is a label, an attribute key (any value of it: `profile` matches `profile = release`) or one attribute value (`origin = generated`) |
+| `Requires { tag, needs }` | asserting `tag` on an object that does not carry `needs` (directly or derived) fails with a defined error. Each side is a label, an attribute key (any value of it: `profile` matches `profile = release`) or one attribute value (`origin = generated`). A collection key on the left constrains its members: `Requires { playlist, audio }` admits only audio objects to any playlist |
 | `RelationTarget { predicate, needs }` | adding an edge `predicate` whose target does not carry `needs` (directly or derived) fails with a defined error; `needs` as in `Requires`. `links` needs `role = library` |
 
-Constraints are checked against the object's derived closure after the mutation (for `RelationTarget`, the target's); a later change to the target's terms does not recheck its incoming edges. They bind local writes only: changes applied from a peer's export (CLUSTER-DESIGN§1) or by an import are accepted even when they violate a constraint — another node's change may arrive before the change that satisfies the constraint, and an import mirrors data that already exists — and the violation is reported, as for existing data at install (Install step 7).
+Constraints are checked against the object's derived closure after the mutation (for `RelationTarget`, the target's); a later change to the target's terms does not recheck its incoming edges.
+
+Consistency across a group — an album's tracks sharing one `artist` — is a query, not a constraint: `GROUP BY album` keeping the groups with more than one distinct `artist` lists the albums that disagree, and compilations show why it can only be reported. They bind local writes only: changes applied from a peer's export (CLUSTER-DESIGN§1) or by an import are accepted even when they violate a constraint — another node's change may arrive before the change that satisfies the constraint, and an import mirrors data that already exists — and the violation is reported, as for existing data at install (Install step 7).
 
 ## Modules
 
@@ -212,6 +214,9 @@ Commands: `mimir ontology list | install <file> | remove <module> | orphans | sh
 - **Per-object n-gram postings.** N-grams index distinct values (INDEX-DESIGN§4.2).
 - **Install bookkeeping lists per module** (tags, implications, relations it added). Provenance sets per declaration replace them.
 - **Pairwise `mutex` relations without write semantics.** `Exclusive` groups have a defined write behaviour (ONTOLOGY-D9).
+- **Member constraints on collection declarations** (`element_constraint`, `MembersMustHave`). `Requires` with the collection key on its left says the same.
+- **`MembersMustNotHave`** ("a playlist cannot contain playlists"). Collections are attribute values, not objects, so they do not nest; no other negative constraint is needed.
+- **A shared-attribute constraint on collection members** (`MembersShouldShareAttr`). It does not hold in general, checking it reads the group's other members on every write, and peers' changes can break it anyway; group consistency is a report query.
 - **Storing module source inside the pool** as the installed form. Sources compile on the host; the pool holds records.
 - **A per-op ontology update with tag changes buffered until it arrives.** Ontology records travel in the same export, ahead of the changes that use them.
 - **An `auto-evict` placement rule.** Placement has no eviction rule; ageing between tiers is `PlacementRule::AutoTier`.
