@@ -201,40 +201,41 @@ subsystem; a reader rejects any other value.
 | 6 | `RemoveAttr` | objects and terms |
 | 7 | `AddRelation` | objects and terms |
 | 8 | `RemoveRelation` | objects and terms |
-| 9 | `SetOrder` | collections |
-| 10 | `RenumberSequence` | collections |
-| 11 | `WriteBlob` | content |
-| 12 | `WriteInline` | content |
-| 13 | `AppendChunks` | content |
-| 14 | `ReplaceChunks` | content |
-| 15 | `TruncateChunks` | content |
-| 16 | `PackObjects` | content |
-| 17 | `FinalizeObject` | content |
-| 18 | `ReclaimTerms` | terms |
-| 19 | `OntologyPut` | ontology |
-| 20 | `OntologyDelete` | ontology |
-| 21 | `SubscriptionPut` | subscriptions |
-| 22 | `SubscriptionDelete` | subscriptions |
-| 23 | `SubscriptionAck` | subscriptions |
-| 24 | `PeerPut` | cluster support |
-| 25 | `PeerDelete` | cluster support |
-| 26 | `TransferPut` | cluster support |
-| 27 | `TransferDelete` | cluster support |
-| 28 | `StageVerified` | cluster support |
-| 29 | `BucketAlloc` | buckets |
-| 30 | `BucketGenBump` | buckets |
-| 31 | `BucketDiscard` | buckets |
-| 32 | `SnapshotCreate` | snapshots |
-| 33 | `SnapshotSwitch` | snapshots |
-| 34 | `SnapshotDelete` | snapshots |
-| 35 | `SnapshotUnlink` | snapshots |
-| 36 | `SnapshotDepthUpdate` | snapshots |
-| 37 | `ReconcileEnqueue` | reconcile |
-| 38 | `ReconcileDequeue` | reconcile |
-| 39 | `ReconcileMove` | reconcile |
-| 40 | `ReconcileReplicate` | reconcile |
-| 41 | `ReconcileDropReplica` | reconcile |
-| 42 | `ReconcileScanStep` | reconcile |
+| 9 | `SetRelationAnnotation` | objects and terms |
+| 10 | `SetOrder` | collections |
+| 11 | `RenumberSequence` | collections |
+| 12 | `WriteBlob` | content |
+| 13 | `WriteInline` | content |
+| 14 | `AppendChunks` | content |
+| 15 | `ReplaceChunks` | content |
+| 16 | `TruncateChunks` | content |
+| 17 | `PackObjects` | content |
+| 18 | `FinalizeObject` | content |
+| 19 | `ReclaimTerms` | terms |
+| 20 | `OntologyPut` | ontology |
+| 21 | `OntologyDelete` | ontology |
+| 22 | `SubscriptionPut` | subscriptions |
+| 23 | `SubscriptionDelete` | subscriptions |
+| 24 | `SubscriptionAck` | subscriptions |
+| 25 | `PeerPut` | cluster support |
+| 26 | `PeerDelete` | cluster support |
+| 27 | `TransferPut` | cluster support |
+| 28 | `TransferDelete` | cluster support |
+| 29 | `StageVerified` | cluster support |
+| 30 | `BucketAlloc` | buckets |
+| 31 | `BucketGenBump` | buckets |
+| 32 | `BucketDiscard` | buckets |
+| 33 | `SnapshotCreate` | snapshots |
+| 34 | `SnapshotSwitch` | snapshots |
+| 35 | `SnapshotDelete` | snapshots |
+| 36 | `SnapshotUnlink` | snapshots |
+| 37 | `SnapshotDepthUpdate` | snapshots |
+| 38 | `ReconcileEnqueue` | reconcile |
+| 39 | `ReconcileDequeue` | reconcile |
+| 40 | `ReconcileMove` | reconcile |
+| 41 | `ReconcileReplicate` | reconcile |
+| 42 | `ReconcileDropReplica` | reconcile |
+| 43 | `ReconcileScanStep` | reconcile |
 
 Changes to pool administration trees have no ops; they commit by checkpoint (POOL-DESIGN§1.2).
 Postings, pending subscription events, `live_sectors` and backpointers have none either: replay
@@ -250,7 +251,12 @@ RemoveTag        : { oid: u64, tag: u32 }
 SetAttr          : { oid: u64, key: u32, value: Value }       // Value tagged-union (INDEX-DESIGN§1)
 RemoveAttr       : { oid: u64, term_id: u64 }                   // the attribute term (INDEX-DESIGN§1.2)
 AddRelation      : { oid: u64, predicate: u32, target: u64 }
-RemoveRelation   : { oid: u64, predicate: u32, target: u64 }
+RemoveRelation   : { oid: u64, predicate: u32, target: u64 }   // also drops the edge's annotation
+SetRelationAnnotation : { oid: u64, predicate: u32, target: u64, value: Value? }
+                   // Sets the annotation of an existing edge (INDEX-DESIGN§2.1 annotation
+                   //   slots), of the predicate's declared value type; without a value tail
+                   //   it clears the annotation. Setting it on an edge that does not exist
+                   //   fails.
 WriteBlob        : { oid: u64, content_hash: [u8;32], size: u64, extent_sum: u64,
                      replicas: ReplicaSet }
                    // One-chunk objects: sets the record's Extent locator with every replica

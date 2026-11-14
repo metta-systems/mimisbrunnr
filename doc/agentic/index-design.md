@@ -139,7 +139,7 @@ struct ForwardHead {                         // 32 bytes
     _pad0:       u8,                         //  [7..8]
     tag_base:    u32,                        //  [8..12]  smallest tag TermId
     order_count: u16,                        // [12..14]  collection terms with an order slot
-    _pad1:       u16,                        // [14..16]
+    annotation_count: u16,                   // [14..16]  relation terms with an annotation slot
     other_base:  u64,                        // [16..24]  smallest other TermId
     modified_ns: i64,                        // [24..32]  last change to the object's direct terms
 }
@@ -147,6 +147,19 @@ struct ForwardHead {                         // 32 bytes
 //   tag_offsets:   [u{8·tag_width};   tag_count]     TermId = tag_base + offset
 //   other_offsets: [u{8·other_width}; other_count]   TermId = other_base + offset
 //   order_slots:   [(term_id: u64, order: u64); order_count]   ascending term_id
+//   annotation_slots: annotation_count × AnnotationSlot, ascending term_id
+
+#[repr(C)]
+struct AnnotationSlot {                      // 16-byte head
+    term_id: u64,                            //  [0..8]   the relation term
+    len:     u32,                            //  [8..12]  bytes of the value encoding that follow
+    flags:   u8,                             // [12..13]  ANNOTATION_FLAG_OUT_OF_LINE
+    _pad:    [u8; 3],                        // [13..16]
+}
+// followed by the value's INDEX-DESIGN§1.1 encoding (≤ 96 bytes), zero-padded to 8, or with
+// ANNOTATION_FLAG_OUT_OF_LINE a BlobRef (16 B) to a data-bucket extent holding it (len = 16)
+
+const ANNOTATION_FLAG_OUT_OF_LINE: u8 = 1 << 0;
 
 const FORWARD_FLAG_OVERFLOW:  u8 = 1 << 0;   // arrays live in a ForwardOverflow chain
 const FORWARD_FLAG_WHITEOUT:  u8 = 1 << 7;   // snapshot whiteout (SNAPSHOTS-DESIGN§1.3)
@@ -157,6 +170,13 @@ holds the object's place in that collection: its position for an ordered term, i
 (zero-extended) for a ranked one (INDEX-DESIGN§3.3). The place is stated by the user, so it is
 direct state and lives with the term; an object in no collection has `order_count = 0` and no
 array.
+
+**Annotation slots.** A relation edge may carry one annotation, a value of the type its
+predicate declares (ONTOLOGY-DESIGN "Relation predicates") — an input's content hash, a label, a
+range of the target the application encodes. It is direct state stated by the writer, so it lives
+with the edge in the subject's entry; it is not indexed and has no postings. Forward traversal
+reads it in place; reverse traversal reads it from each subject's entry. Slots vary in size, so
+finding one is a scan of the slots; removing the edge removes its slot.
 
 Each width is the smallest of the allowed widths that holds `max − base` for its run. A typical
 object with 12 tags (ids within a few thousand of each other) and 3 attributes costs

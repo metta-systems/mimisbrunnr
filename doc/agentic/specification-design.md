@@ -97,7 +97,9 @@ Each object carries a bag of assertions — statements about what it is:
 enum Assertion {
     Tag(TagId),                                      // "this is electronic music"
     Attr { key: TagId, value: Value },               // "artist = Aphex Twin"
-    Relation { predicate: TagId, target: ObjectId }, // "member_of playlist:900"
+    Relation { predicate: TagId, target: ObjectId,   // "main.o derived-from main.rs"
+               annotation: Option<Value> },          // per-edge value of the predicate's
+                                                     //   annotation type: the input's hash
 }
 
 enum Value {
@@ -180,6 +182,12 @@ enum TagKind {
     AttributeKey { value_type: ValueType },
     RecordField { field: RecordField },   // size, created, modified, changed: read from the
                                           //   object record, never asserted (core ontology)
+    Predicate {                           // names relation edges; never asserted as a label
+        inverse: Option<String>,          // "derived-from" read backwards: "produces"
+        symmetric: bool,                  // duplicate-of: one edge, read both ways
+        transitive: bool,                 // depends-on: Related follows the closure
+        annotation: Option<ValueType>,    // one value per edge, set or changed later
+    },
 }
 enum ValueType { Text, Int, Float, Timestamp, Blob }
 enum Collection { Plain, Grouping, Ordered, Ranked }   // attribute keys
@@ -215,6 +223,8 @@ enum Rule {
     Exclusive { tags: Vec<TagId> },          // at most one per object: current / stale
     Requires { tag: Target, needs: Target }, // asserting "lossless" without "audio" fails;
                                              //   "profile" without origin = generated fails
+    RelationTarget { predicate: TagId, needs: Target },
+                                             // "links" to an object without role = library fails
 }
 
 enum Target {
@@ -1530,7 +1540,7 @@ flowchart TB
     end
 
     subgraph Journal["Journal (Journal buckets, JOURNAL-DESIGN)"]
-        JSET["Journal sets<br/><i>Preamble JRNL · seq · last_seq · hlc_base<br/>entries: op kinds 0–42 · checksum u64</i>"]
+        JSET["Journal sets<br/><i>Preamble JRNL · seq · last_seq · hlc_base<br/>entries: op kinds 0–43 · checksum u64</i>"]
         CKPT["Checkpoint entry<br/><i>RootListHead: seq · lsn · R<br/>id_counters[IdKind] (Term, Tag, Rule, Subscription,<br/>Snapshot, PlacementRule, Disk, Scan)<br/>+ RootEntry × N (BtreeKind → NodePtr)</i>"]
         JSET --> CKPT
     end

@@ -49,7 +49,10 @@ the set executor runs:
 - `HasAttr`, ranges, prefixes and `Contains` compare the object's values of the key through the
   term table, with full values at non-exact boundaries as in a dictionary scan;
 - `Under` walks the object's hierarchy node's parents (INDEX-DESIGN§4.2);
-- `Related` tests the object's relation terms;
+- `Related` tests the object's relation terms, and for a symmetric predicate also the edges
+  pointing at the object (the relation term's postings); for a transitive predicate it tests
+  reachability through the closure, and a predicate's inverse name tests the edges pointing at
+  the object (ONTOLOGY-DESIGN "Relation predicates");
 - record-field predicates (`size`, `created`, `modified`, `changed`) read the record;
 - `And`, `Or` combine; `Not(q)` is `_object ∧ ¬q`.
 
@@ -119,7 +122,7 @@ Each operates on the result bitmap from the executor.
 - **`ORDER BY` an attribute:** walk the attribute's dictionary entries in key order (reversed for `DESC`), emitting each entry's postings intersected with the result; when the result is much smaller than the attribute's value count, fetch each result object's value instead (forward entry, then term table) and sort, O(n log n) over the result. With `LIMIT k` the sort is a bounded heap, O(n log k) ([QUERY9](query-implementation-plan.md)). Collection order is [QUERY5](query-implementation-plan.md).
 - **`LIMIT` / `OFFSET`:** truncate the ordered result.
 - **`GROUP BY` / aggregates:** for each dictionary entry of the group key (one per distinct value), intersect its postings with the result; empty intersections drop out. `COUNT` is the intersection's cardinality; `SUM` / `AVG` read the attribute through each member's forward entry; `MIN` / `MAX` are the first and last dictionary entries whose postings meet the result. 500 groups cost about 500 bitmap ANDs, ~0.5 ms ([QUERY6](query-implementation-plan.md)).
-- **Relation traversal:** following a predicate from the current set yields the targets' bitmap (forward direction from forward entries; reverse direction from the postings of the relation term `(predicate, target)`, [QUERY4](query-implementation-plan.md)), which further predicates intersect. The relation indices do the work of a join; no hash or merge join exists. "Sources of the release executable": find the executable, follow `derived-from`, intersect with `source`, project `name, lang`.
+- **Relation traversal:** following a predicate from the current set yields the targets' bitmap (forward direction from forward entries; reverse direction from the postings of the relation term `(predicate, target)`, [QUERY4](query-implementation-plan.md)), which further predicates intersect. A predicate's inverse name traverses in reverse, a symmetric predicate in both directions, and a transitive one through its closure unless one step is asked for (ONTOLOGY-DESIGN "Relation predicates"); edge annotations are read from the subjects' forward entries. The relation indices do the work of a join; no hash or merge join exists. "Sources of the release executable": find the executable, follow `derived-from`, intersect with `origin = source`, project `name, language`.
 - **Transitive closure:** iterative frontier expansion — `next = ⋃ targets(frontier, predicates) − visited`, until empty — for full provenance or dependency trees ([QUERY10](query-implementation-plan.md)).
 
 How relation traversal, closure, collection order and faceting are spelled in SQL is [QUERY-D2](query-decisions.md).

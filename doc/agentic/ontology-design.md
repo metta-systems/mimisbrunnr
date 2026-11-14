@@ -12,9 +12,9 @@ The ontology is the single authority over tag identity, attribute keys, derivati
 ## Selected design
 
 - **Two identities per tag.** `TagUid` (128 bits) is stable everywhere — sync, modules and exports name tags by it. `TagId` (`u32`) is the dense local id, used as the tag's `TermId` (INDEX-DESIGN§1.2) and never reused.
-- **Two kinds of concept.** *Labels* (plain tags) and *attribute keys* with a value type. Any label or attribute value can be a *collection* — grouping, ordered or ranked — by its declaration's collection flavour. Prefix-named tag families (`playlist:workout`) are attribute values (`playlist = workout`).
+- **Three kinds of concept.** *Labels* (plain tags), *attribute keys* with a value type, and *relation predicates*, which name edges between objects and may declare an inverse name, symmetry, transitivity and an annotation type. Any label or attribute value can be a *collection* — grouping, ordered or ranked — by its declaration's collection flavour. Prefix-named tag families (`playlist:workout`) are attribute values (`playlist = workout`).
 - **Derivation rules produce every derived term:** `Implies` (tag → tag), `ValueImplies` (attribute value → tag), `Bucket` (attribute value → coarse value). Attribute keys may also be declared *hierarchical* (values are trie paths with adaptive roll-up postings, INDEX-DESIGN§4.2) and *n-grammed* (substring search over distinct values, INDEX-DESIGN§4.2). Derived terms are never stored per object.
-- **Constraints with defined write semantics.** `Exclusive { tags }` allows at most one of its tags on an object; what a write asserting a second one does is [ONTOLOGY-D9](ontology-decisions.md). `Requires(a, b)` rejects asserting `a` on an object lacking `b`, each a tag or an attribute value. Aliases map extra names to one tag.
+- **Constraints with defined write semantics.** `Exclusive { tags }` allows at most one of its tags on an object; what a write asserting a second one does is [ONTOLOGY-D9](ontology-decisions.md). `Requires(a, b)` rejects asserting `a` on an object lacking `b`, each a tag or an attribute value; `RelationTarget(p, b)` rejects an edge `p` to a target lacking `b`. Aliases map extra names to one tag.
 - **Provenance per declaration.** Every tag, rule and constraint records the set of modules that declare it. Install adds a module to those sets, removal takes it out, and a declaration with an empty set is removed under the scrub policy. Ad-hoc tags are declared by the pool's `local` module.
 - **Per-record persistence.** Tags, rules and modules are records in one snapshot-aware `BtreeKind::Ontology` tree (ONTOLOGY-DESIGN§1). Creating a tag writes one record; all records are loaded at mount, with name maps and closure tables built in memory. Closure tables are rebuilt only when rules change.
 - **Changes are journaled record operations** (`OntologyPut`, `OntologyDelete`), applied with their posting rework in one commit and shipped to peers by uid.
@@ -39,6 +39,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 | Label | a plain tag | `favorite`, `source`, `flac` |
 | Attribute key | a tag used as the key of `Attr(key, value)`, with a value type (`text`, `int`, `float`, `timestamp`, `blob`) | `artist`, `year`, `unix-path` |
 | Record field | a name for a field of the object record (METADATA-DESIGN§1.1), declared by the core ontology; never asserted, readable as a SQL column and usable as a `Bucket` input | `size`, `created`, `modified`, `changed` |
+| Relation predicate | a tag naming edges from an object to other objects (`Relation(predicate, target)`); never asserted as a plain tag | `derived-from`, `links`, `thumbnail-of` |
 
 **System labels.** The core ontology declares labels the engine derives from the object record (INDEX-DESIGN§2.4), and that users and applications cannot assert or remove (an attempt is a defined error): `_object` (the object is live; the universe of `Not`, SPECIFICATION-DESIGN§2.3), `_presence:remote` (its content is held by other nodes only, METADATA-DESIGN§1.2), `_writing` (a stream not yet closed). Their records carry the system flag.
 
@@ -57,6 +58,13 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 
 - `hierarchy = "/"` — values are paths, stored as a trie of components with adaptive roll-up postings (INDEX-DESIGN§1.2, INDEX-DESIGN§4.2). `location`, `unix-path`.
 - `ngram = 3` — `Contains` over the key's values uses n-gram postings over distinct values (INDEX-DESIGN§4.2). Opt-in per key, meant for name-like keys.
+
+**Relation predicates.** A predicate's declaration may give it:
+
+- an **inverse name** — `derived-from` with inverse `produces`. The inverse resolves like any other name and reads the same edges backwards (reverse traversal through the relation term's postings); nothing extra is stored.
+- **symmetric** — `duplicate-of`, `see-also`. One stored edge; `Related` and traversal read forward and reverse together. A symmetric predicate has no inverse name.
+- **transitive** — `depends-on`, `derived-from`, `bundles`. `Related` and traversal follow the closure by default, by frontier expansion at query time (QUERY-DESIGN "Post-operations"); one-step traversal stays available. Closures are never materialised, so adding or removing an edge touches only that edge.
+- an **annotation type** — one of the value types. Each edge may then carry one annotation of that type, set, changed or cleared after the edge exists: an input's content hash on `derived-from`, a label on a link, a part or range of the target that the application encodes. Annotations live with the edge in the subject's forward entry (INDEX-DESIGN§2.1) and are not indexed. One edge — one subject, predicate and target — holds one annotation; several ranges of one target are encoded in one value.
 
 **Storage policy** attaches to a tag and resolves per object over its derived closure (SPECIFICATION-DESIGN§3.5).
 
@@ -80,8 +88,9 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 |---|---|
 | `Exclusive { tags }` | [ONTOLOGY-D9](ontology-decisions.md) |
 | `Requires { tag, needs }` | asserting `tag` on an object that does not carry `needs` (directly or derived) fails with a defined error. Each side is a label, an attribute key (any value of it: `profile` matches `profile = release`) or one attribute value (`origin = generated`) |
+| `RelationTarget { predicate, needs }` | adding an edge `predicate` whose target does not carry `needs` (directly or derived) fails with a defined error; `needs` as in `Requires`. `links` needs `role = library` |
 
-Constraints are checked against the object's derived closure after the mutation. They bind local writes only: changes applied from a peer's export (CLUSTER-DESIGN§1) or by an import are accepted even when they violate a constraint — another node's change may arrive before the change that satisfies the constraint, and an import mirrors data that already exists — and the violation is reported, as for existing data at install (Install step 7).
+Constraints are checked against the object's derived closure after the mutation (for `RelationTarget`, the target's); a later change to the target's terms does not recheck its incoming edges. They bind local writes only: changes applied from a peer's export (CLUSTER-DESIGN§1) or by an import are accepted even when they violate a constraint — another node's change may arrive before the change that satisfies the constraint, and an import mirrors data that already exists — and the violation is reported, as for existing data at install (Install step 7).
 
 ## Modules
 
@@ -244,11 +253,35 @@ Language, origin and role are independent assertions, and the module has no rule
 
 **Lifecycle** (labels): `dirty` (a source modified since its last VCS commit), `current`, `stale` (an `Exclusive` pair on build outputs), `released`, `exempt-from-cleaning`.
 
-**Derivation** (relation predicates, label tags): `derived-from` (artifact → its inputs), `links` (artifact → library), `depends-on` (source → source), `bundles` (package → contents).
+**Derivation** (relation predicates):
 
-Constraints, in module syntax:
+| Predicate | Edge | Declared as |
+|---|---|---|
+| `derived-from` | artifact → each input | transitive, inverse `produces`, annotation `blob`: the input's content hash at build time |
+| `links` | artifact → library | inverse `linked-by`; target must be `role = library` |
+| `depends-on` | source → source | transitive |
+| `bundles` | package → contents | transitive, inverse `bundled-in` |
+
+Predicates and constraints, in module syntax:
 
 ```toml
+[[tags]]
+name = "derived-from"
+kind = "predicate"
+inverse = "produces"
+transitive = true
+annotation = "blob"
+
+[[tags]]
+name = "links"
+kind = "predicate"
+inverse = "linked-by"
+
+[[constraints]]
+kind = "relation-target"
+predicate = "links"
+needs = { key = "role", value = "library" }
+
 [[constraints]]
 kind = "exclusive"
 tags = ["current", "stale"]
@@ -298,13 +331,13 @@ vesper-0.1.0-rpi4.img   project=vesper                                    origin
 | Objects from an old toolchain | `project=vesper AND role=object AND toolchain=nightly-2024-01-10` |
 | Everything of one component | `project=vesper AND component=hal` |
 | Latest kernel test results | `project=vesper AND component=kernel AND role=test-result AND current`, newest `created` first |
-| Tests touching a source file | `derived-from` relation reversed from `main.rs`, intersected with `role=test-result` |
-| Users of a library | `links` relation reversed from `libhal.rlib` |
+| Tests touching a source file | `produces` from `main.rs` (the closure of `derived-from` reversed), intersected with `role=test-result` |
+| Users of a library | `linked-by` from `libhal.rlib` |
 | All Rust libraries anywhere | `language=rust AND role=library` |
 | Stale-artifact footprint | `origin=generated AND stale`, summing stored size |
 | Recent work | `origin=source AND modified-week = <this week>` (a `Bucket` rule over the `modified` record field), distinct `project` |
 
-**Build integration.** After compiling, a build hook tags the output (`origin = generated`, `role = object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input, and on the previous `current` build of the same output — same `component`, `target`, `profile` and output `unix-path` — removes `current` and asserts `stale` itself, so it does not rely on what the `Exclusive` set does on a conflicting write (ONTOLOGY-D9). Cleaning is a query (`project=vesper AND stale AND NOT exempt-from-cleaning`, `project=vesper AND role=intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's content hash with the hashes recorded on the artifact at build time, so it does not depend on clock skew or mtimes.
+**Build integration.** After compiling, a build hook tags the output (`origin = generated`, `role = object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input with the input's content hash as the edge's annotation, and on the previous `current` build of the same output — same `component`, `target`, `profile` and output `unix-path` — removes `current` and asserts `stale` itself, so it does not rely on what the `Exclusive` set does on a conflicting write (ONTOLOGY-D9). Cleaning is a query (`project=vesper AND stale AND NOT exempt-from-cleaning`, `project=vesper AND role=intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's current content hash with the hash annotated on its edge at build time, so it does not depend on clock skew or mtimes.
 
 **Placement.** The same tags drive `PlacementRule`s (SPECIFICATION-DESIGN§8.3): `Pin { origin=source, Hot }` and `Replicate { origin=source, 2 }`; `Pin { role=intermediate OR role=object, Hot }`; `Replicate { role=bundle AND released, 3 }` with `Prefer { role=bundle AND released, Warm }`; `Prefer { origin=vendored, Cold }`.
 
@@ -333,9 +366,11 @@ Values are positional, versioned CBOR (FORMAT-DESIGN§1.6), schema version 1:
 
 ```text
 TagRecord    = [version, uid: bytes(16), name: text, aliases: [text],
-                kind: uint,              // 0 label, 1 attribute key, 2 record field
+                kind: uint,              // 0 label, 1 attribute key, 2 record field,
+                                         //   3 relation predicate
                 value_type: uint,        // attribute keys and record fields: 0 text, 1 int,
-                                         //   2 float, 3 timestamp, 4 blob
+                                         //   2 float, 3 timestamp, 4 blob; predicates: the
+                                         //   annotation type, 255 = no annotation
                 collection: uint,        // 0 plain, 1 grouping, 2 ordered, 3 ranked
                 hierarchy_sep: uint,     // attribute keys: separator code point, 0 = not hierarchical
                 ngram: uint,             // attribute keys: n-gram length, 0 = none
@@ -344,7 +379,9 @@ TagRecord    = [version, uid: bytes(16), name: text, aliases: [text],
                 record_field: uint,      // kind 2: 1 length, 2 created_ns, 3 modified_ns,
                                          //   4 changed (latest of modified_ns, the forward
                                          //   entry's modified_ns and state_ns); 0 otherwise
-                flags: uint]             // bit 0: system label, derived by the engine
+                inverse: text / null,    // kind 3: the inverse name
+                flags: uint]             // bit 0: system label, derived by the engine;
+                                         //   kind 3: bit 1 symmetric, bit 2 transitive
 
 RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)],
                 state: uint]             // 0 active, 1 installing, 2 removing (INDEX-DESIGN§2.4)
@@ -354,9 +391,10 @@ RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)],
                                   // key: an attribute key or a record field (TagRecord kind 2)
     kind 3 Exclusive     params = [tags: [TagId]]
     kind 4 Requires      params = [tag: Target, needs: Target]
+    kind 5 RelationTarget params = [predicate: TagId, needs: Target]
 
 Target = [0, tag: TagId] / [1, key: TagId, value: Value]
-    // what Implies / ValueImplies derive, and both sides of Requires;
+    // what Implies / ValueImplies derive, both sides of Requires, RelationTarget's needs;
     // in Requires, [0, tag] naming an attribute key matches any value of that key
 
 ModuleRecord = [version, uid: bytes(16), id: text, module_version: text, name: text,
