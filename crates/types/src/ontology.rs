@@ -54,6 +54,9 @@ pub enum TagRelation {
     /// `child` "is-a" `parent`. (`car` ⇒ `vehicle`.)
     ImpliedBy,
     /// Cannot coexist on the same object. (`active` vs `discontinued`.)
+    ///
+    /// TODO(ONTOLOGY16): goes; mutually exclusive states are values of one
+    /// single-valued attribute key (ONTOLOGY-DESIGN "Tags and attribute keys").
     MutuallyExclusive,
     /// Presence demands the other tag be present too. (`usb-c` requires
     /// `electronics`.)

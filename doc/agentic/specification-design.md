@@ -111,7 +111,7 @@ enum Value {
 }
 ```
 
-Multi-valued attributes are natural — an object can have multiple assertions with the same key. A music track in two playlists simply has two `playlist` attributes.
+Multi-valued attributes are natural — an object can have multiple assertions with the same key. A music track in two playlists simply has two `playlist` attributes. A key declared single-valued holds one value, and setting it replaces the old one (`build-state = stale` replaces `current`).
 
 An object's **direct** assertions are the ones a user or application set; its **derived** terms are the ones the ontology's rules add. The forward index stores direct assertions only; derived terms are the closure of the direct ones under the rules, recomputed when needed, and appear in postings so queries never expand rules (§3.3, INDEX-DESIGN§2.4).
 
@@ -179,7 +179,7 @@ Every tag has two identities: a 128-bit `TagUid`, derived from its module id and
 ```rust
 enum TagKind {
     Label,
-    AttributeKey { value_type: ValueType },
+    AttributeKey { value_type: ValueType, single: bool },   // single: one value, set replaces
     RecordField { field: RecordField },   // size, created, modified, changed: read from the
                                           //   object record, never asserted (core ontology)
     Predicate {                           // names relation edges; never asserted as a label
@@ -220,7 +220,6 @@ enum Rule {
     ValueImplies { key: TagId, value: Value, to: Target },  // mime = audio/flac → "flac"
     Bucket { key: TagId, out_key: TagId, granularity: Granularity },
                                                             // created → created-month = 2026-11
-    Exclusive { tags: Vec<TagId> },          // at most one per object: current / stale
     Requires { tag: Target, needs: Target }, // asserting "lossless" without "audio" fails;
                                              //   "profile" without origin = generated fails
     RelationTarget { predicate: TagId, needs: Target },
@@ -304,9 +303,8 @@ deepest tag → wins. No ambiguity, no install error.
 
 **2. Sibling tags.** `archive` declares `chunking: avg=1 MiB`, `log` declares
 `chunking: avg=64 KiB`, neither implies the other. **Install fails.** The fix is one of:
-declare an implication between them; move the policy to a common ancestor and remove from
-the conflicting tag; put them in one `Exclusive` set (§3.2) so they cannot coexist on an
-object.
+declare an implication between them, or move the policy to a common ancestor and remove it
+from the conflicting tag.
 
 **3. Diamond.** `large-file` (1 MiB chunks) and `mutable-file` (16 KiB chunks) are siblings.
 `vm-disk implies BOTH` but does not declare chunking itself. **Install of `vm-disk`
@@ -1360,7 +1358,7 @@ The `systems.metta.dev` ontology demonstrates how rich domain structure maps to 
 |**Role**|`role=implementation`, `role=test`, `role=device-tree`, `role=object`, `role=executable`, `role=bundle`|
 |**Language**|`language=rust`, `language=c`, `language=asm`|
 |**Build configuration**|`profile=release`, `target=aarch64-unknown-none`, `opt-level=2`, `lto=fat`|
-|**Lifecycle**|`current`, `stale`, `dirty`, `released`, `exempt-from-cleaning`|
+|**Lifecycle**|`build-state=current`, `build-state=stale`, `dirty`, `released`, `exempt-from-cleaning`|
 |**Derivation**|`derived-from→`, `links→`, `bundles→`|
 
 ### 13.2 Intersecting Dimensions
@@ -1380,7 +1378,7 @@ Each dimension is asserted on its own; none is a branch of another. A file has o
   Transitive closure over derived-from and bundles relations
 
 "Stale artifacts safe to clean"
-  origin=generated AND stale AND NOT exempt-from-cleaning
+  build-state=stale AND NOT exempt-from-cleaning
 
 "What have I been working on this week?"
   origin=source AND modified AFTER 7-days-ago → distinct(project)

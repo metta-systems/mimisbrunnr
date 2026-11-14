@@ -248,7 +248,8 @@ CreateObject     : { oid: u64, created_ns: i64, state: u8 }    // raises the ori
 DeleteObject     : { oid: u64, lsn: u64 }
 AddTag           : { oid: u64, tag: u32 }                     // a direct tag (INDEX-DESIGN§2.4)
 RemoveTag        : { oid: u64, tag: u32 }
-SetAttr          : { oid: u64, key: u32, value: Value }       // Value tagged-union (INDEX-DESIGN§1)
+SetAttr          : { oid: u64, key: u32, value: Value }       // Value tagged-union (INDEX-DESIGN§1);
+                   //   adds a value, or for a single-valued key replaces the object's value
 RemoveAttr       : { oid: u64, term_id: u64 }                   // the attribute term (INDEX-DESIGN§1.2)
 AddRelation      : { oid: u64, predicate: u32, target: u64 }
 RemoveRelation   : { oid: u64, predicate: u32, target: u64 }   // also drops the edge's annotation

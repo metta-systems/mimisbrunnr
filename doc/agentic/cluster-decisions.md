@@ -10,13 +10,12 @@ ObjectIds embed a 16-bit `NodeId` (SPECIFICATION-DESIGN§2.1). Decide how a node
 
 Applying a peer's changes (CLUSTER-DESIGN§1) must merge an object changed on both sides, deterministically, so that every node converges and re-applying a batch changes nothing. The merge runs in the filesystem; what it needs stored (dots, version vectors, a base) is part of the format. Candidates, by kind of state:
 
-- **Term sets** (tags, attribute values, relations — attribute keys are multi-valued, so every value is a set element):
+- **Term sets** (tags, attribute values, relations — every value of a multi-valued key is a set element; single-valued keys resolve last-writer-wins by `HybridTimestamp`, ONTOLOGY-DESIGN "Tags and attribute keys"):
   - (a) **three-way merge** against a per-peer base snapshot: base + (local adds ∪ remote adds) − (removes neither side re-added). No per-term metadata; correct when every pair of nodes merges directly or through one hub, but changes reaching a node by two paths (a removal through a hub, a re-add directly) can diverge, and it needs one base snapshot per peer. The maintainer expects it not to scale to multi-node sync;
   - (b) **observed-remove set** (add wins): each added term carries a dot (origin node, counter) and each node a version vector, so concurrent add and remove resolve the same way on every node whatever the path. Costs about 8–10 bytes per direct term in forward entries plus version vectors per peer;
   - investigate whether the topologies the cluster manager builds (peers and hubs) make (a) safe, or need (b).
 - **Single-valued fields** (content hash and length, `state`, a ranked collection's score): last-writer-wins by hybrid timestamp, or for content, keeping the losing version as a conflict copy.
 - **Delete against a concurrent edit:** delete wins when it is causally after the edit (METADATA-DESIGN "Deletion and cluster sync"); define "causally after" under the chosen set model. Hybrid timestamps alone cannot tell an edit made after seeing the deletion from one made concurrently — a node that tags an object it has not yet learned is deleted produces a timestamp later than the deletion — so the rule needs causal information (version vectors or dots) or must treat every later edit as concurrent. Decide also whether a dropped concurrent edit is surfaced (an event, a conflict record) or silent.
-- **Constraints:** an `Exclusive` removal on one node racing an assertion of the other tag on another.
 
 Ontology declarations already merge as ONTOLOGY-DESIGN "Cluster propagation" records (union of provenance, other fields last-writer-wins). Blocks [CLUSTER2](cluster-implementation-plan.md).
 

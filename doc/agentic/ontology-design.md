@@ -14,7 +14,7 @@ The ontology is the single authority over tag identity, attribute keys, derivati
 - **Two identities per tag.** `TagUid` (128 bits) is stable everywhere — sync, modules and exports name tags by it. `TagId` (`u32`) is the dense local id, used as the tag's `TermId` (INDEX-DESIGN§1.2) and never reused.
 - **Three kinds of concept.** *Labels* (plain tags), *attribute keys* with a value type, and *relation predicates*, which name edges between objects and may declare an inverse name, symmetry, transitivity and an annotation type. Any label or attribute value can be a *collection* — grouping, ordered or ranked — by its declaration's collection flavour. Prefix-named tag families (`playlist:workout`) are attribute values (`playlist = workout`).
 - **Derivation rules produce every derived term:** `Implies` (tag → tag), `ValueImplies` (attribute value → tag), `Bucket` (attribute value → coarse value). Attribute keys may also be declared *hierarchical* (values are trie paths with adaptive roll-up postings, INDEX-DESIGN§4.2) and *n-grammed* (substring search over distinct values, INDEX-DESIGN§4.2). Derived terms are never stored per object.
-- **Constraints with defined write semantics.** `Exclusive { tags }` allows at most one of its tags on an object; what a write asserting a second one does is [ONTOLOGY-D9](ontology-decisions.md). `Requires(a, b)` rejects asserting `a` on an object lacking `b`, each a tag or an attribute value; `RelationTarget(p, b)` rejects an edge `p` to a target lacking `b`. Aliases map extra names to one tag.
+- **Single-valued keys and constraints with defined write semantics.** A key declared `single` holds at most one value per object, and setting it replaces the value. `Requires(a, b)` rejects asserting `a` on an object lacking `b`, each a tag or an attribute value; `RelationTarget(p, b)` rejects an edge `p` to a target lacking `b`. Aliases map extra names to one tag.
 - **Provenance per declaration.** Every tag, rule and constraint records the set of modules that declare it. Install adds a module to those sets, removal takes it out, and a declaration with an empty set is removed under the scrub policy. Ad-hoc tags are declared by the pool's `local` module.
 - **Per-record persistence.** Tags, rules and modules are records in one snapshot-aware `BtreeKind::Ontology` tree (ONTOLOGY-DESIGN§1). Creating a tag writes one record; all records are loaded at mount, with name maps and closure tables built in memory. Closure tables are rebuilt only when rules change.
 - **Changes are journaled record operations** (`OntologyPut`, `OntologyDelete`), applied with their posting rework in one commit and shipped to peers by uid.
@@ -58,6 +58,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 
 - `hierarchy = "/"` — values are paths, stored as a trie of components with adaptive roll-up postings (INDEX-DESIGN§1.2, INDEX-DESIGN§4.2). `location`, `unix-path`.
 - `ngram = 3` — `Contains` over the key's values uses n-gram postings over distinct values (INDEX-DESIGN§4.2). Opt-in per key, meant for name-like keys.
+- `single = true` — the key holds at most one value per object; keys are multi-valued otherwise. `SetAttr` replaces the object's value in the same mutation, and replay does the same; two nodes setting it concurrently resolve last-writer-wins by the ops' `HybridTimestamp`s (SPECIFICATION-DESIGN§10.4). A set of mutually exclusive states is one single-valued key: `build-state = current | stale`, `status = draft | published`.
 
 **Relation predicates.** A predicate's declaration may give it:
 
@@ -78,7 +79,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 
 - Rules form a DAG over tags (an install that would close a cycle through `Implies` and `ValueImplies` fails).
 - **Derivation runs in one fixed order, in a single pass:** direct attributes and record fields → `Bucket` → `ValueImplies` → `Implies` (transitive). A `ValueImplies` may match a bucket's output (`size-class = huge → large-file`); a `Bucket` takes only a direct attribute key or a record field, so a bucket of a bucket is written from the source key (`created → created-quarter`, not `created-month → created-quarter`). The single pass keeps the cost of one write bounded and rule removal local.
-- **Attribute values a rule produces are terminal.** An `Implies` or `ValueImplies` whose `to` is an attribute value derives that value and nothing further: no rule reads a derived attribute value as its input, so derivation never loops. A rule on that value matches objects that assert it directly.
+- **Attribute values a rule produces are terminal.** An `Implies` or `ValueImplies` whose `to` is an attribute value derives that value and nothing further: no rule reads a derived attribute value as its input, so derivation never loops. A rule on that value matches objects that assert it directly. A rule may not derive a value of a single-valued key: it could contradict the value set directly, and installing one fails.
 - An object's **derived terms** are the closure of its direct terms under the rules (INDEX-DESIGN§2.4); they appear in postings and never in forward entries.
 - **Modelling rule for formats and categories.** Format facts come from rules over attributes (`mime`, `extension` → `flac` → `audio`); categories (`music`, `work`, `favorite`) are asserted directly by users and applications, or implied from other categories. `mp3` files are all `audio`; whether one is `music` is an assertion, not a derivation.
 - **Intersecting categories over hierarchies.** The model is associative: an object carries every category that applies, side by side, and queries intersect them. Categories with no real order between them are values of a repeatable attribute (`role = implementation`, `role = test`), not an implication tree in which one ranks above another; `Implies` is for genuine "every X is a Y" facts (`flac → audio`). Hierarchical keys are for values that are paths by nature (`unix-path`), not for classification. Which keys, labels and values a domain uses is its module's vocabulary; the core fixes only the model.
@@ -86,7 +87,6 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 
 | Constraint | On a write that would violate it |
 |---|---|
-| `Exclusive { tags }` | [ONTOLOGY-D9](ontology-decisions.md) |
 | `Requires { tag, needs }` | asserting `tag` on an object that does not carry `needs` (directly or derived) fails with a defined error. Each side is a label, an attribute key (any value of it: `profile` matches `profile = release`) or one attribute value (`origin = generated`). A collection key on the left constrains its members: `Requires { playlist, audio }` admits only audio objects to any playlist |
 | `RelationTarget { predicate, needs }` | adding an edge `predicate` whose target does not carry `needs` (directly or derived) fails with a defined error; `needs` as in `Requires`. `links` needs `role = library` |
 
@@ -159,7 +159,7 @@ Install validates all-or-nothing and commits its records in one commit:
 4. **Storage-policy chain invariant** — SPECIFICATION-DESIGN§3.5.
 5. **Records** — tag, rule and constraint records are put with the module added to their provenance; new tags get `TagId`s.
 6. **Derived postings** — every new rule's derived terms are posted (INDEX-DESIGN§2.4): in the same commit when the work is small, otherwise by a resumable rework during which the rule is `installing` (INDEX-DESIGN§2.4, "When the rework runs").
-7. **Constraints on existing data** — objects already violating a new `Exclusive` or `Requires` are reported, not changed; with a resumable rework, when it completes.
+7. **Constraints on existing data** — objects already violating a new `Requires` or `RelationTarget`, or holding several values of a key newly declared single, are reported, not changed; with a resumable rework, when it completes.
 
 ### Upgrade
 
@@ -213,7 +213,7 @@ Commands: `mimir ontology list | install <file> | remove <module> | orphans | sh
 - **A `Hierarchical` tag kind materialising every path prefix.** Hierarchy is a key option with trie storage and adaptive roll-ups (INDEX-DESIGN§4.2).
 - **Per-object n-gram postings.** N-grams index distinct values (INDEX-DESIGN§4.2).
 - **Install bookkeeping lists per module** (tags, implications, relations it added). Provenance sets per declaration replace them.
-- **Pairwise `mutex` relations without write semantics.** `Exclusive` groups have a defined write behaviour (ONTOLOGY-D9).
+- **Mutually exclusive label sets** (pairwise `mutex` relations, `Exclusive` groups). A single-valued key says the same with ordinary setter semantics, and leaves no choice between replacing and rejecting a conflicting label.
 - **Member constraints on collection declarations** (`element_constraint`, `MembersMustHave`). `Requires` with the collection key on its left says the same.
 - **`MembersMustNotHave`** ("a playlist cannot contain playlists"). Collections are attribute values, not objects, so they do not nest; no other negative constraint is needed.
 - **A shared-attribute constraint on collection members** (`MembersShouldShareAttr`). It does not hold in general, checking it reads the group's other members on every write, and peers' changes can break it anyway; group consistency is a report query.
@@ -233,7 +233,7 @@ Source trees are a good test of the ontology: files have roles, dependencies, bu
 | `component` | attribute (text, grouping) | Crate or package within the project: `component = kernel` |
 | `workspace` | attribute (text, grouping) | Multi-project workspace: `workspace = metta-systems` |
 
-**Origin:** `origin` (attribute, text, one value per file) says where a file comes from: `source` (human-authored), `generated` (machine-produced output) or `vendored` (third-party code copied into the project).
+**Origin:** `origin` (attribute, text, single) says where a file comes from: `source` (human-authored), `generated` (machine-produced output) or `vendored` (third-party code copied into the project).
 
 **Role:** `role` (attribute, text, repeatable) says what a file is for, independently of its origin: `boot.S` is `role = implementation` and `role = interface`; a device tree is `role = device-tree` whether it is the `.dts` source or the compiled `.dtb`; a shader's source is `role = shader` and its compiled form `role = shader` and `role = resource`.
 
@@ -254,9 +254,9 @@ Generated code and rendered documentation have no role of their own: bindgen out
 
 Language, origin and role are independent assertions, and the module has no rule between them or between role values: a library may be built or vendored, implementation code may be written or generated, and whether an icon is also a `resource` depends on how the project uses it. The application that creates or manages the file — import, the IDE, the build hook, a source-management tool — asserts each one, so `main.rs` carries `language = rust`, `origin = source` and `role = implementation` as three assertions.
 
-**Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `lto` (attribute, text: `off`, `thin`, `fat`), `debug-info`, `stripped` (labels). A real module would be more nuanced here (debug-info levels, split debug files, symbol and debug stripping as separate settings); two labels keep the example short.
+**Build configuration:** `profile`, `target`, `features` (attributes, text), `opt-level` (attribute, int), `lto` (attribute, text: `off`, `thin`, `fat`), `symbols` (attribute, text, single: `debug-info`, `stripped`). A real module would be more nuanced here (debug-info levels, split debug files, symbol and debug stripping as separate settings); one key with two values keeps the example short.
 
-**Lifecycle** (labels): `dirty` (a source modified since its last VCS commit), `current`, `stale` (an `Exclusive` pair on build outputs), `released`, `exempt-from-cleaning`.
+**Lifecycle:** `build-state` (attribute, text, single: `current`, `stale`) on build outputs; `dirty` (label: a source modified since its last VCS commit), `released`, `exempt-from-cleaning` (labels).
 
 **Derivation** (relation predicates):
 
@@ -267,9 +267,15 @@ Language, origin and role are independent assertions, and the module has no rule
 | `depends-on` | source → source | transitive |
 | `bundles` | package → contents | transitive, inverse `bundled-in` |
 
-Predicates and constraints, in module syntax:
+Keys, predicates and constraints, in module syntax:
 
 ```toml
+[[tags]]
+name = "build-state"
+kind = "attribute"
+value_type = "text"
+single = true                # origin and symbols are declared the same way
+
 [[tags]]
 name = "derived-from"
 kind = "predicate"
@@ -287,14 +293,6 @@ kind = "relation-target"
 predicate = "links"
 needs = { key = "role", value = "library" }
 
-[[constraints]]
-kind = "exclusive"
-tags = ["current", "stale"]
-
-[[constraints]]
-kind = "exclusive"
-tags = ["debug-info", "stripped"]
-
 # compiler settings belong to build outputs; opt-level and lto are declared the same way
 [[constraints]]
 kind = "requires"
@@ -310,16 +308,18 @@ main.rs                 project=vesper component=kernel language=rust     origin
 Cargo.toml              project=vesper component=kernel language=toml     origin=source role=build-script
 vesper.ld               project=vesper component=kernel                   origin=source role=linker-script
 bcm2711-rpi-4-b.dts     project=vesper component=hal                      origin=source role=device-tree  target=aarch64-unknown-none
-bcm2711-rpi-4-b.dtb     project=vesper component=hal                      origin=generated role=device-tree current  target=aarch64-unknown-none
+bcm2711-rpi-4-b.dtb     project=vesper component=hal                      origin=generated role=device-tree build-state=current  target=aarch64-unknown-none
                         derived-from→ bcm2711-rpi-4-b.dts
-main.o                  project=vesper component=kernel                   origin=generated role=object current  target=aarch64-unknown-none profile=release
+main.o                  project=vesper component=kernel                   origin=generated role=object build-state=current  target=aarch64-unknown-none profile=release
                         opt-level=2 lto=fat toolchain=nightly-2024-01-15  derived-from→ main.rs, kernel_api.rs
-libhal.rlib             project=vesper component=hal                      origin=generated role=library current  target=… profile=release
-vesper                  project=vesper component=kernel                   origin=generated role=executable current debug-info  derived-from→ main.o  links→ libhal.rlib
-vesper.stripped         project=vesper component=kernel                   origin=generated role=executable current stripped  derived-from→ vesper
-kernel-tests.log        project=vesper component=kernel                   origin=generated role=test-result current  target=aarch64-unknown-none
+libhal.rlib             project=vesper component=hal                      origin=generated role=library build-state=current  target=… profile=release
+vesper                  project=vesper component=kernel                   origin=generated role=executable build-state=current symbols=debug-info
+                        derived-from→ main.o  links→ libhal.rlib
+vesper.stripped         project=vesper component=kernel                   origin=generated role=executable build-state=current symbols=stripped
+                        derived-from→ vesper
+kernel-tests.log        project=vesper component=kernel                   origin=generated role=test-result build-state=current  target=aarch64-unknown-none
                         derived-from→ kernel-tests, main.rs, kernel_tests.rs
-vesper-0.1.0-rpi4.img   project=vesper                                    origin=generated role=bundle current released
+vesper-0.1.0-rpi4.img   project=vesper                                    origin=generated role=bundle build-state=current released
                         bundles→ vesper.stripped, bcm2711-rpi-4-b.dtb, config.txt
 ```
 
@@ -331,22 +331,22 @@ vesper-0.1.0-rpi4.img   project=vesper                                    origin
 | aarch64 release artifacts | `project=vesper AND origin=generated AND target=aarch64-unknown-none AND profile=release` |
 | Contents of the image | transitive closure of `bundles` and `derived-from` from the image |
 | Provenance of the binary | `vesper.stripped` → `vesper` → `main.o` → `main.rs`, `kernel_api.rs`; `links` → `libhal.rlib` → its sources |
-| Cleanable artifacts | `project=vesper AND stale AND origin=generated AND NOT exempt-from-cleaning` |
+| Cleanable artifacts | `project=vesper AND build-state=stale AND NOT exempt-from-cleaning` |
 | Uncommitted work | `project=vesper AND dirty` |
 | Objects from an old toolchain | `project=vesper AND role=object AND toolchain=nightly-2024-01-10` |
 | Everything of one component | `project=vesper AND component=hal` |
-| Latest kernel test results | `project=vesper AND component=kernel AND role=test-result AND current`, newest `created` first |
+| Latest kernel test results | `project=vesper AND component=kernel AND role=test-result AND build-state=current`, newest `created` first |
 | Tests touching a source file | `produces` from `main.rs` (the closure of `derived-from` reversed), intersected with `role=test-result` |
 | Users of a library | `linked-by` from `libhal.rlib` |
 | All Rust libraries anywhere | `language=rust AND role=library` |
-| Stale-artifact footprint | `origin=generated AND stale`, summing stored size |
+| Stale-artifact footprint | `build-state=stale`, summing stored size |
 | Recent work | `origin=source AND modified-week = <this week>` (a `Bucket` rule over the `modified` record field), distinct `project` |
 
-**Build integration.** After compiling, a build hook tags the output (`origin = generated`, `role = object`, `current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `debug-info`), records `derived-from` to each input with the input's content hash as the edge's annotation, and on the previous `current` build of the same output — same `component`, `target`, `profile` and output `unix-path` — removes `current` and asserts `stale` itself, so it does not rely on what the `Exclusive` set does on a conflicting write (ONTOLOGY-D9). Cleaning is a query (`project=vesper AND stale AND NOT exempt-from-cleaning`, `project=vesper AND role=intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's current content hash with the hash annotated on its edge at build time, so it does not depend on clock skew or mtimes.
+**Build integration.** After compiling, a build hook tags the output (`origin = generated`, `role = object`, `build-state = current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `symbols`), records `derived-from` to each input with the input's content hash as the edge's annotation, and sets `build-state = stale` on the previous current build of the same output — same `component`, `target`, `profile` and output `unix-path`; setting the single-valued key replaces `current`. Cleaning is a query (`project=vesper AND build-state=stale AND NOT exempt-from-cleaning`, `project=vesper AND role=intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's current content hash with the hash annotated on its edge at build time, so it does not depend on clock skew or mtimes.
 
 **Placement.** The same tags drive `PlacementRule`s (SPECIFICATION-DESIGN§8.3): `Pin { origin=source, Hot }` and `Replicate { origin=source, 2 }`; `Pin { role=intermediate OR role=object, Hot }`; `Replicate { role=bundle AND released, 3 }` with `Prefer { role=bundle AND released, Warm }`; `Prefer { origin=vendored, Cold }`.
 
-**Presence.** Presence rules (SPECIFICATION-DESIGN§8.3) are node-local and use the same tags. A laptop keeps the sources, only the start of each released image and drops stale build outputs after a week: `KeepLocal { project=vesper AND origin=source }`, `Stub { role=bundle AND released, 64 KiB }`, `Evict { origin=generated AND stale, 7 days, keep_prefix 0 }`. Eviction drops this node's copy of the content and leaves the object, its tags and the other nodes' copies in place; cleaning deletes the objects from the pool.
+**Presence.** Presence rules (SPECIFICATION-DESIGN§8.3) are node-local and use the same tags. A laptop keeps the sources, only the start of each released image and drops stale build outputs after a week: `KeepLocal { project=vesper AND origin=source }`, `Stub { role=bundle AND released, 64 KiB }`, `Evict { build-state=stale, 7 days, keep_prefix 0 }`. Eviction drops this node's copy of the content and leaves the object, its tags and the other nodes' copies in place; cleaning deletes the objects from the pool.
 
 ## Format specification
 
@@ -386,7 +386,8 @@ TagRecord    = [version, uid: bytes(16), name: text, aliases: [text],
                                          //   entry's modified_ns and state_ns); 0 otherwise
                 inverse: text / null,    // kind 3: the inverse name
                 flags: uint]             // bit 0: system label, derived by the engine;
-                                         //   kind 3: bit 1 symmetric, bit 2 transitive
+                                         //   kind 3: bit 1 symmetric, bit 2 transitive;
+                                         //   kind 1: bit 3 single-valued
 
 RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)],
                 state: uint]             // 0 active, 1 installing, 2 removing (INDEX-DESIGN§2.4)
@@ -394,9 +395,8 @@ RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)],
     kind 1 ValueImplies  params = [key: TagId, value: Value, to: Target]
     kind 2 Bucket        params = [key: TagId, out_key: TagId, granularity: uint]
                                   // key: an attribute key or a record field (TagRecord kind 2)
-    kind 3 Exclusive     params = [tags: [TagId]]
-    kind 4 Requires      params = [tag: Target, needs: Target]
-    kind 5 RelationTarget params = [predicate: TagId, needs: Target]
+    kind 3 Requires      params = [tag: Target, needs: Target]
+    kind 4 RelationTarget params = [predicate: TagId, needs: Target]
 
 Target = [0, tag: TagId] / [1, key: TagId, value: Value]
     // what Implies / ValueImplies derive, both sides of Requires, RelationTarget's needs;
