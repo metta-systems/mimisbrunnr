@@ -103,7 +103,7 @@ struct RunHeader {                           // 40 bytes, start of the index blo
     flags: u16,                              // [14..16]  RUN_FLAG_*
     journal_seq: u64,                        // [16..24]  newest journal LSN merged into this run
     entry_count: u32,                        // [24..28]
-    _reserved: u32,                          // [28..32]
+    region_tag: u32,                         // [28..32]  low 32 bits of block 0's checksum
     checksum: u64,                           // [32..40]  of the index block, this field zeroed
 }
 // followed in the index block by:
@@ -128,9 +128,14 @@ const RUN_BLOCK_FLAG_VALUE:      u16 = 1 << 0;  // raw bytes of large values, no
 ```
 
 A run holds as many data blocks as its index block can describe. At load, a reader walks the
-runs from block 1: each run's index block must carry the magic, the next `seq` and a valid
-checksum; the first block that does not ends the node. A torn append therefore loses only the
-run being written, whose entries the journal still holds.
+runs from block 1: each run's index block must carry the magic, the next `seq`, the region's
+tag and a valid checksum; the first block that does not ends the node. A torn append therefore
+loses only the run being written, whose entries the journal still holds.
+
+**Region tag.** A run's `region_tag` binds it to the region it was appended to: block 0 differs
+between any two regions — its `node_seq` and `created_lsn` change with every new region — so a
+run left in reused space by an earlier region, whose sequence and checksum are otherwise
+valid, carries another tag and ends the walk.
 
 **Data blocks.** Each entry block is self-contained:
 

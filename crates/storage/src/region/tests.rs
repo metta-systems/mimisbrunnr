@@ -124,8 +124,12 @@ fn index_and_data_block_fixed_bytes() {
         1, 0, 0, 0, // seq
         1, 0, 0, 0, // block_count, flags
         7, 0, 0, 0, 0, 0, 0, 0, // journal_seq
-        3, 0, 0, 0, 0, 0, 0, 0, // entry_count, reserved
+        3, 0, 0, 0, // entry_count
     ];
+    // region_tag: the low 32 bits of block 0's checksum.
+    let block_zero = device.bytes_at(0, BLOCK_SIZE);
+    expected_index.extend_from_slice(&block_zero[56..60]);
+    assert_eq!(region.region_tag().to_le_bytes(), block_zero[56..60]);
     let header_checksum = &index[32..40];
     expected_index.extend_from_slice(header_checksum);
     expected_index.extend_from_slice(&[1, 1, VALUE_KIND_FIXED, 0, 8, 0, 0, 0]); // key format head
@@ -289,6 +293,29 @@ fn rewriting_in_place_never_reads_the_previous_runs() {
     rewritten.append_run(&device, 3, &values(&[(9u32, vec![9; 8])])).unwrap();
     let reopened = Region::open(&device, 0, BtreeKind::BucketAlloc).unwrap();
     assert_eq!(reopened.run_count(), 1);
+    assert_eq!(reopened.entries::<_, u32>(&device).unwrap(), vec![(9, vec![9; 8])]);
+}
+
+#[test]
+fn a_run_left_by_an_earlier_region_is_not_read_as_this_regions() {
+    // Reused space, nothing zeroed: an earlier region's second run sits
+    // exactly where the new region's second run would start.
+    let device = CountingDevice::new(REGION_BYTES);
+    let mut earlier = Region::create(&device, 0, params(BtreeKind::Forward), &[]).unwrap();
+    earlier.append_run(&device, 1, &values(&[(1u32, vec![1; 8])])).unwrap();
+    earlier.append_run(&device, 2, &values(&[(2u32, vec![2; 8])])).unwrap();
+
+    let later_params = RegionParams {
+        node_seq: 2,
+        created_lsn: 9,
+        ..params(BtreeKind::Forward)
+    };
+    let mut later = Region::create(&device, 0, later_params, &[]).unwrap();
+    assert_ne!(later.region_tag(), earlier.region_tag());
+    later.append_run(&device, 3, &values(&[(9u32, vec![9; 8])])).unwrap();
+
+    let reopened = Region::open(&device, 0, BtreeKind::Forward).unwrap();
+    assert_eq!(reopened.run_count(), 1, "the earlier region's run 2 has another tag");
     assert_eq!(reopened.entries::<_, u32>(&device).unwrap(), vec![(9, vec![9; 8])]);
 }
 

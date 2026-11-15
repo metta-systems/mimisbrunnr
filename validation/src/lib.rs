@@ -256,7 +256,7 @@ pub struct RunHeader {
     pub flags: u16,                   // [14..16]
     pub journal_seq: u64,             // [16..24]
     pub entry_count: u32,             // [24..28]
-    pub _reserved: u32,               // [28..32]
+    pub region_tag: u32,              // [28..32] low 32 bits of block 0's checksum
     pub checksum: u64,                // [32..40]
 }
 const _: () = assert!(size_of::<RunHeader>() == 40);

@@ -86,8 +86,9 @@ pub struct RunHeader {
     pub journal_seq: u64,
     /// `[24..28]` entries in the run.
     pub entry_count: u32,
-    /// `[28..32]` zero.
-    pub _reserved: u32,
+    /// `[28..32]` low 32 bits of block 0's checksum: the region this run
+    /// belongs to.
+    pub region_tag: u32,
     /// `[32..40]` of the index block, this field zeroed.
     pub checksum: u64,
 }
@@ -582,8 +583,10 @@ impl Region {
     ///
     /// shortcut: a region is written once and replaced by a fresh one
     /// (BTREE-DESIGN§1.1); trees kept at fixed offsets rewrite in place until
-    /// ENGINE3 places them in allocated regions (TODO(ENGINE3)). Zeroing first
-    /// keeps runs of the previous contents from being read as this region's.
+    /// ENGINE3 places them in allocated regions (TODO(ENGINE3)). Rewritten in
+    /// place with the same `node_seq` and `created_lsn`, block 0 — and so the
+    /// region tag — would repeat; zeroing first keeps runs of the previous
+    /// contents from being read as this region's.
     pub fn create_in_place<D: BlockDevice>(
         device: &D,
         offset: u64,
@@ -672,6 +675,7 @@ impl Region {
             || header.pre.version != LAYOUT_VERSION
             || header.pre.kind != 0
             || header.seq != expected_seq
+            || header.region_tag != self.region_tag()
             || header.checksum != checksum_with_zeroed_slot(bytes, RUN_HEADER_CHECKSUM)
         {
             return Ok(None);
@@ -708,6 +712,12 @@ impl Region {
             fences: bytes[entries_end..fences_end].to_vec(),
             first_data_block: block_no + 1,
         }))
+    }
+
+    /// The tag every run of this region carries: the low 32 bits of block 0's
+    /// checksum (BTREE-DESIGN§1.2).
+    pub fn region_tag(&self) -> u32 {
+        self.header.checksum as u32
     }
 
     /// The region's header.
@@ -941,7 +951,7 @@ impl Region {
             flags: 0,
             journal_seq,
             entry_count: entries.len() as u32,
-            _reserved: 0,
+            region_tag: self.region_tag(),
             checksum: 0,
         };
         let mut index_block = vec![0u8; BLOCK_SIZE];
