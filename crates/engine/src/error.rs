@@ -12,7 +12,7 @@ use mimisbrunnr_storage::StorageError;
 use mimisbrunnr_transform::TransformError;
 use mimisbrunnr_types::ObjectId;
 use mimisbrunnr_unix::UnixError;
-use mimisbrunnr_wal::WalError;
+use mimisbrunnr_journal::WalError;
 use mimisbrunnr_watch::WatchError;
 use thiserror::Error;
 

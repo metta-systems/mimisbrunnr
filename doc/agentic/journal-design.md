@@ -1,6 +1,6 @@
 # Journal (WAL) — design
 
-Scope: `crates/wal`, the WAL projection in `crates/engine/src/wal_proj.rs`, checkpoint cadence in `crates/engine`.
+Scope: `crates/journal`, the WAL projection in `crates/engine/src/wal_proj.rs`, checkpoint cadence in `crates/engine`.
 Governing spec: JOURNAL-DESIGN§1 (§1.1 journal location, §1.2 journal sets, §1.3 ops, §1.4 pins and reclaim, §1.5 commits and checkpoints, §1.6 retention, §1.7 mirroring, §1.8 data paths), SPECIFICATION-DESIGN§6.4.
 
 Plan: [journal-implementation-plan.md](journal-implementation-plan.md) · Open decisions: [journal-decisions.md](journal-decisions.md) · Completed: [journal-completed.md](journal-completed.md) · Order: [operations-plan.md](operations-plan.md)

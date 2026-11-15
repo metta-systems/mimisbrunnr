@@ -97,7 +97,7 @@ These apply to every slice and are never plan checkboxes.
 ## Pick one incremental slice
 
 1. Read the user's request, the scope's four documents and the linked spec sections.
-2. Follow the real call chain: CLI (`bin/`) → `crates/engine` (`Engine`, `DiskEngine`) → owning crate (`index`, `meta`, `ontology`, `watch`, `pool`, `unix`…) → `crates/storage` (B+ tree regions, allocator, superblock) and `crates/wal`. Use Pathfinder tools when available (see `AGENTS.md`).
+2. Follow the real call chain: CLI (`bin/`) → `crates/engine` (`Engine`, `DiskEngine`) → owning crate (`index`, `meta`, `ontology`, `watch`, `pool`, `unix`…) → `crates/storage` (B+ tree regions, allocator, superblock) and `crates/journal`. Use Pathfinder tools when available (see `AGENTS.md`).
 3. Distinguish code that is wired into production paths from code exercised only by tests. Presence of a function does not mean the engine calls it.
 4. Select **one plan item** consistent with the request. Identify its prerequisites, decisions, acceptance criteria and affected crates. Do not execute the backlog unprompted; respect the plan's dependency order.
 5. If the workspace does not build or its tests fail before you start, report it. Restoring a green workspace is the first slice unless the user directs otherwise.
@@ -122,7 +122,7 @@ These apply to every slice and are never plan checkboxes.
 
 - **`types`:** pure logical types and small pure codecs (`Value`, `value_hash`, IDs). No I/O.
 - **`storage`:** block device, superblock, zones, bucket allocation, B+ tree region envelopes and the packed-key codec. Mechanism only; it knows no index semantics.
-- **`wal`:** log format, append, checkpoint, replay, journal pins.
+- **`journal`:** log format, append, checkpoint, replay, journal pins.
 - **Owning crates (`meta`, `index`, `ontology`, `watch`, `pool`, `unix`, `transform`):** their wire structs, key/value types and invariant-preserving operations, persisted through `storage` regions.
 - **`query`, `sql`:** evaluation over indices; no persistence.
 - **`engine`:** orchestration: WAL-first mutation, commit, flush, boot-time load and rebuild of derived views. It does not hide another crate's invariants.

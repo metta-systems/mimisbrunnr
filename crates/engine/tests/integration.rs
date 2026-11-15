@@ -14,7 +14,7 @@ use mimisbrunnr_types::{
     Assertion, ChangeInterest, MediaType, ObjectId, Query, StorageTier, TagId, TagOrigin, Value,
     WatchEvent,
 };
-use mimisbrunnr_wal::{WalOp, WalOpKind};
+use mimisbrunnr_journal::{WalOp, WalOpKind};
 use mimisbrunnr_watch::Retention;
 use tempfile::TempDir;
 

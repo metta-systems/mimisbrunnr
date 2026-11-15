@@ -1,7 +1,7 @@
 //! Engine `OpKind` ↔ WAL `WalOp` projection.
 //!
 //! The engine keeps an in-memory [`crate::OpKind`] log; each entry is also
-//! projected to a [`mimisbrunnr_wal::WalOp`] at append time so the WAL ring
+//! projected to a [`mimisbrunnr_journal::WalOp`] at append time so the WAL ring
 //! gets a durable record. Replay reverses the projection.
 //!
 //! ## Mapping table
@@ -26,7 +26,7 @@
 
 use mimisbrunnr_storage::BlockRef;
 use mimisbrunnr_types::{ObjectId, TagId, value_hash};
-use mimisbrunnr_wal::{
+use mimisbrunnr_journal::{
     AddRelation as WalAddRelation, AddTag as WalAddTag, CreateObject as WalCreateObject,
     DeleteObject as WalDeleteObject, RemoveAttr as WalRemoveAttr,
     RemoveRelation as WalRemoveRelation, RemoveTag as WalRemoveTag, SetAttr as WalSetAttr,

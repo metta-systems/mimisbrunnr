@@ -944,7 +944,7 @@ pub fn check_fit<K: PackableKey>(
 /// Emitted by the storage layer when a flush widens a sorted run's format;
 /// the engine layer is responsible for journalling this as a WAL op so
 /// recovery can reconstruct the in-memory sorted run state. The WAL op
-/// itself lives in `mimisbrunnr-wal` — this is the shape the storage
+/// itself lives in `mimisbrunnr-journal` — this is the shape the storage
 /// crate produces for the engine to consume.
 #[derive(Clone, Debug)]
 pub struct FormatPromoteEvent {

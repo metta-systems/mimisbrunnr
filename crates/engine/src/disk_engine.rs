@@ -188,7 +188,7 @@ use mimisbrunnr_types::{
     ChangeInterest, DiskId, ObjectId, Query, SubscriptionId, TagId, Value,
 };
 use mimisbrunnr_unix::PathContextManager;
-use mimisbrunnr_wal::{Checkpoint, Wal, WalOpKind};
+use mimisbrunnr_journal::{Checkpoint, Wal, WalOpKind};
 use mimisbrunnr_watch::{Retention, SubscriptionEngine};
 use serde::{Deserialize, Serialize};
 

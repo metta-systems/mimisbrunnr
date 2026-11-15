@@ -1,6 +1,6 @@
 # Encryption — design
 
-Scope: `crates/transform` (`Encryptor`), encrypted journal sets in `crates/wal`, encrypted blocks in `crates/storage`, key material in the superblock and pool state.
+Scope: `crates/transform` (`Encryptor`), encrypted journal sets in `crates/journal`, encrypted blocks in `crates/storage`, key material in the superblock and pool state.
 Governing spec: SPECIFICATION-DESIGN§9.3 (ciphers per bucket kind), SPECIFICATION-DESIGN§9.4 (key hierarchy), SPECIFICATION-DESIGN§9.5 (trust tiers), ENCRYPTION-DESIGN§1.
 
 Plan: [encryption-implementation-plan.md](encryption-implementation-plan.md) · Open decisions: [encryption-decisions.md](encryption-decisions.md) · Completed: [encryption-completed.md](encryption-completed.md) · Order: [operations-plan.md](operations-plan.md)

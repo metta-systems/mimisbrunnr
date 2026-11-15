@@ -1,4 +1,4 @@
-//! `mimisbrunnr-wal` — Write-Ahead Log: on-disk header, entry framing, the
+//! `mimisbrunnr-journal` — the journal (JOURNAL-DESIGN), Mímisbrunnr's write-ahead log: on-disk header, entry framing, the
 //! per-op CBOR payload schemas, and a sector-aligned circular ring.
 //!
 //! Implements:

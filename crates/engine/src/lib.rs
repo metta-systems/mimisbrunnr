@@ -10,7 +10,7 @@
 //!   superblock + WAL; thin mutation methods that project to `WalOp` and
 //!   append.
 //! - [`OpLog`] / [`OpKind`] / [`OpLogEntry`] — engine-level operation log
-//!   (SPECIFICATION-DESIGN§15). Distinct from `mimisbrunnr_wal::WalOpKind`; mapping is in
+//!   (SPECIFICATION-DESIGN§15). Distinct from `mimisbrunnr_journal::WalOpKind`; mapping is in
 //!   [`wal_proj`].
 //! - [`HybridClock`] — HLC clock source.
 //! - [`EngineError`] — public error type.

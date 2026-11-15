@@ -2,7 +2,7 @@
 members = [
     "crates/types",
     "crates/storage",
-    "crates/wal",
+    "crates/journal",
     "crates/meta",
     "crates/index",
     "crates/ontology",
@@ -30,7 +30,7 @@ license = "MIT"
 [workspace.dependencies]
 mimisbrunnr-types = { path = "crates/types" }
 mimisbrunnr-storage = { path = "crates/storage" }
-mimisbrunnr-wal = { path = "crates/wal" }
+mimisbrunnr-journal = { path = "crates/journal" }
 mimisbrunnr-meta = { path = "crates/meta" }
 mimisbrunnr-index = { path = "crates/index" }
 mimisbrunnr-ontology = { path = "crates/ontology" }

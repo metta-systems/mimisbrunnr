@@ -29,7 +29,7 @@ use mimisbrunnr::{
         Assertion, CompressionState, DiskId, MediaType, ObjectId, ObjectState, StorageTier, TagId,
         Value,
     },
-    wal::{Wal, WalEntry, WalOp, WalOpKind},
+    journal::{Wal, WalEntry, WalOp, WalOpKind},
 };
 
 // -----------------------------------------------------------------------

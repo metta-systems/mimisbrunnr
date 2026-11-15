@@ -1,7 +1,7 @@
 //! In-memory operation log + engine-level [`OpKind`] enum (SPECIFICATION-DESIGN§15).
 //!
 //! `OpKind` is the **engine-level** mutation set. It is distinct from
-//! [`mimisbrunnr_wal::WalOpKind`] (JOURNAL-DESIGN§1.3), which has the full universe of
+//! [`mimisbrunnr_journal::WalOpKind`] (JOURNAL-DESIGN§1.3), which has the full universe of
 //! 32 byte-pinned WAL discriminants (object lifecycle, chunked-flow, bucket
 //! lifecycle, backpointers, snapshots, reconcile, …). Each engine op projects
 //! to one or more WAL ops; the mapping lives in
