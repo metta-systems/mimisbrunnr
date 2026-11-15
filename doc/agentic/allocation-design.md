@@ -229,9 +229,12 @@ can never block on GC because at least one fully-empty bucket is always availabl
 
 ### 1.7 Discard / TRIM
 
-Freed buckets carry `BUCKET_FLAG_NEEDS_DISCARD` until TRIM is issued (mount option
-`discard=true|async|off`); a flagged bucket is allocatable, and allocating it clears the flag
-without a TRIM. On rotational media no flag is set.
+Freed buckets carry `BUCKET_FLAG_NEEDS_DISCARD` until TRIM is issued; a flagged bucket is
+allocatable, and allocating it clears the flag without a TRIM. The mount option
+`discard = true | async | off` (default `async`) says when: on free, by a background pass over
+flagged free buckets, or never. A device discards through `BlockDevice::discard(offset, length)`;
+one that cannot returns an "unsupported" error, and on it — rotational media among them — no
+flag is set.
 
 ### 1.8 Crash recovery
 

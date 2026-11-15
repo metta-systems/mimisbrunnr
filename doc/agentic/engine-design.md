@@ -199,8 +199,12 @@ length instead of a generation, and its freshness follows from the owning record
 a list head — is a `NodePtr`: `RootListHead.metadata_replicas` (R, 1..=4)
 `BlockRef`s naming the R copies of the node, each on a different disk, the fastest tier first.
 A node is written to all R places before any pointer to it is committed; a read takes the
-first copy that verifies and repairs the others through reconcile. On a single-disk pool R = 1.
-The default R and whether it may change after format are [POOL-D1](pool-decisions.md).
+first copy that verifies and repairs the others through reconcile. Format sets R to 2 when the
+pool has at least two disks and to 1 otherwise. R may change later: a reconcile scan rewrites
+every node pointer and radix slot to the new width (16 × R bytes) and writes or drops the extra
+copies, and the root list's `metadata_replicas` changes with the checkpoint that commits the
+last of them. R guards against losing one of this node's disks and is independent of cluster
+replication: every node holds all metadata, and R still protects each node's own copy.
 
 **Commit protocol** (invoked per the cadence in JOURNAL-DESIGN§1.5, *not* per mutation):
 

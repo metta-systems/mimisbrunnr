@@ -103,7 +103,7 @@ Workspace-level evidence (`just test`, `just clippy`) backs every claim: a regre
 | JSON | Never on disk; allowed in CLI output, logs and test fixtures. |
 | TOML | Human-edited sources only (ontology module sources, compiled on the host). Never on disk. |
 | Content hash | BLAKE3. |
-| Block and run checksums | One algorithm for every checksum slot; which is [OPERATIONS-D4](operations-decisions.md). |
+| Block and run checksums | XXH3-64 in every 64-bit checksum slot, journal included (FORMAT-DESIGN§1.4), through the `no_std` `xxhash-rust` crate: fast in software on cores without SIMD, and the full 64 bits are used. |
 | Fixed-size on-disk structs | `bytemuck::{Pod, Zeroable}`, `#[repr(C)]`, naturally aligned. |
 | Bitfields | `bitbybit` + `arbitrary-int`. |
 | Endianness | Little-endian on disk; big-endian hosts are out of scope. |
@@ -150,7 +150,7 @@ Records with a variable part (journal payloads) are a fixed head plus one array 
 
 ## CRC and magic
 
-- Checksums: 64-bit slots holding the OPERATIONS-D4 algorithm over each structure with its checksum slot zeroed — superblock, node header block, run index and data blocks, page runs (BTREE-DESIGN§1.1–1.2, BTREE-DESIGN§1.7), journal sets (JOURNAL-DESIGN§1.2) (FORMAT-DESIGN§1.4).
+- Checksums: 64-bit slots holding XXH3-64 over each structure with its checksum slot zeroed — superblock, node header block, run index and data blocks, page runs (BTREE-DESIGN§1.1–1.2, BTREE-DESIGN§1.7), journal sets (JOURNAL-DESIGN§1.2) (FORMAT-DESIGN§1.4).
 - Magic: every header starts with the 8-byte `Preamble` (FORMAT-DESIGN§1.3) — `b"MIMR"` superblock (which also carries `b"MIMISBRUNNR\0\0\0\0\0"` for device probing), `b"BREG"` region, `b"BIDX"` run index block, `b"BPGS"` page-run index block, `b"JRNL"` journal set.
 - `BtreeKind` discriminants are pinned by the spec.
 

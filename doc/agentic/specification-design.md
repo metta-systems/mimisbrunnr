@@ -738,8 +738,8 @@ from the devices themselves; host paths are never stored.
 ```
 
 The diagram shows a pool that mirrors its journal on two hot disks and keeps two copies of each
-tree node; whether the journal is mirrored is JOURNAL-D1, and the number of tree-node copies
-(`metadata_replicas`) is POOL-D1.
+tree node; whether the journal is mirrored is JOURNAL-D1; the number of tree-node copies
+(`metadata_replicas`) is 2 on a pool of two or more disks (ENGINE-DESIGN§1.2).
 
 ### 8.3 Semantic Placement Rules
 

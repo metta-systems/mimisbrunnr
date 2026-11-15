@@ -34,8 +34,6 @@ Steps 1–7 replace the prototype's shortcuts with the specified binary formats 
 
 Each fixes a layout that later steps write; decide them first.
 
-- [OPERATIONS-D4](operations-decisions.md) — checksum algorithm.
-- [POOL-D1](pool-decisions.md) — metadata replica count (sets node-pointer width).
 - [BLOB-D4](blob-decisions.md) — small-object bucket layout.
 
 ### 2. Binary formats that need no new allocation
@@ -44,14 +42,13 @@ Independent of each other unless an order is given.
 
 - **Encodings** (FORMAT-DESIGN§1.6): [SPEC25](specification-implementation-plan.md) and [INDEX9](index-implementation-plan.md) first; then [JOURNAL8](journal-implementation-plan.md) (binary payloads, then [JOURNAL9](journal-implementation-plan.md): journal buckets and journal sets, after JOURNAL7), [QUERY11](query-implementation-plan.md) and [ONTOLOGY10](ontology-implementation-plan.md); after QUERY11, [SUBSCRIPTION7](subscriptions-implementation-plan.md) and [POOL5](pool-implementation-plan.md) (native placement-rules tree).
 - [SPEC24](specification-implementation-plan.md) — no packed on-disk structs.
-- [JOURNAL7](journal-implementation-plan.md) — one checksum algorithm (after OPERATIONS-D4).
+- [JOURNAL7](journal-implementation-plan.md) — one checksum algorithm, XXH3-64; before BTREE9, whose new headers it checksums.
 - [POOL1](pool-implementation-plan.md) — one disk-descriptor tree (after ALLOCATION9).
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
-- [BTREE9](btree-implementation-plan.md) — write-once regions with block-addressable runs; then [BTREE10](btree-implementation-plan.md) — positional page regions, and [BTREE8](btree-implementation-plan.md) — one run format for every tree.
+- [BTREE11](btree-implementation-plan.md) — one preamble; then [BTREE9](btree-implementation-plan.md) — write-once regions, block-addressable runs and one run format for every tree (after JOURNAL7); then [BTREE10](btree-implementation-plan.md) — positional page regions.
 - [ONTOLOGY2](ontology-implementation-plan.md) — storage errors.
 - [ONTOLOGY10](ontology-implementation-plan.md) (per-record ontology tree, in the encodings group above), then [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator with ad-hoc tags in `local` — and [ONTOLOGY15](ontology-implementation-plan.md) — tag uids and name resolution; [ONTOLOGY11](ontology-implementation-plan.md) — ontology journal ops, after JOURNAL8.
-- [ALLOCATION9](allocation-implementation-plan.md) — bucket-relative pointers and node pointers (after POOL-D1).
-- [ALLOCATION2](allocation-implementation-plan.md) — freelist seeding at format time.
+- [ALLOCATION9](allocation-implementation-plan.md) — bucket-relative pointers and node pointers.
 
 ### 3. Term index
 
@@ -80,7 +77,7 @@ The term dictionary, postings and forward index replace every index structure, s
 4. [METADATA1](metadata-implementation-plan.md) — multi-level radix per origin node.
 5. [ENGINE4](engine-implementation-plan.md) — retire zones and fixed areas.
 6. [SUBSCRIPTION1](subscriptions-implementation-plan.md) — membership containers (after INDEX13).
-7. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md), [ALLOCATION6](allocation-implementation-plan.md) — per-disk allocation trees.
+7. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md), [ALLOCATION6](allocation-implementation-plan.md) — per-disk allocation trees (after BTREE9 and POOL1); then [ALLOCATION2](allocation-implementation-plan.md) — freelist seeding at format time.
 8. [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup.
 9. [INDEX6](index-implementation-plan.md) — footprint benchmark.
 
@@ -116,7 +113,7 @@ These touch disjoint code and can run whenever their prerequisites hold:
 - **Query and SQL:** [QUERY13](query-implementation-plan.md) (after INDEX14, ONTOLOGY16 and ONTOLOGY17), then [QUERY14](query-implementation-plan.md) (after INDEX16), then [QUERY16](query-implementation-plan.md) — the per-object evaluator, before SUBSCRIPTION3 and POOL4; [QUERY15](query-implementation-plan.md) after METADATA7; [QUERY1](query-implementation-plan.md)–[QUERY10](query-implementation-plan.md), [QUERY12](query-implementation-plan.md) (QUERY1–QUERY3 after INDEX12, QUERY1's n-gram path after INDEX19; QUERY12 after INDEX18 and QUERY1; QUERY4 after INDEX13; QUERY5 after INDEX15; QUERY6 and QUERY9 after QUERY7; QUERY10 after QUERY4 and QUERY-D2); [QUERY17](query-implementation-plan.md) — predicate properties in `Related` and traversal, after QUERY4, ONTOLOGY21 and INDEX20.
 - **Subscriptions:** [SUBSCRIPTION3](subscriptions-implementation-plan.md) (after QUERY14), then [SUBSCRIPTION8](subscriptions-implementation-plan.md) (after SUBSCRIPTION1), then [SUBSCRIPTION4](subscriptions-implementation-plan.md)–[SUBSCRIPTION6](subscriptions-implementation-plan.md).
 - **Ontology:** [ONTOLOGY6](ontology-implementation-plan.md) (after INDEX14), then [ONTOLOGY18](ontology-implementation-plan.md) — rework cost measurements, [ONTOLOGY7](ontology-implementation-plan.md), [ONTOLOGY17](ontology-implementation-plan.md) (after METADATA7) and [ONTOLOGY12](ontology-implementation-plan.md), then [ONTOLOGY21](ontology-implementation-plan.md) — relation predicates — and [INDEX20](index-implementation-plan.md) — edge annotations (after JOURNAL8); [ONTOLOGY14](ontology-implementation-plan.md) (after ONTOLOGY11 and ONTOLOGY15), then [ONTOLOGY5](ontology-implementation-plan.md), [ONTOLOGY8](ontology-implementation-plan.md), [ONTOLOGY9](ontology-implementation-plan.md), [ONTOLOGY3](ontology-implementation-plan.md); [ONTOLOGY4](ontology-implementation-plan.md) after ONTOLOGY-D2; [ONTOLOGY20](ontology-implementation-plan.md) — module dependencies and shared tags, after ONTOLOGY14 and ONTOLOGY15; [ONTOLOGY19](ontology-implementation-plan.md) — example modules reworked to intersecting categories, a documentation item with no prerequisite.
-- **Pool:** [POOL4](pool-implementation-plan.md); [POOL10](pool-implementation-plan.md) — disk health, after POOL1 and POOL8; then [POOL9](pool-implementation-plan.md) — presence rules, after CLUSTER11 (its `Evict` rule also after POOL-D3, METADATA-D7 and CLUSTER-D10).
+- **Pool:** [POOL4](pool-implementation-plan.md); [POOL10](pool-implementation-plan.md) — disk health, after POOL1 and POOL8; [POOL11](pool-implementation-plan.md) — changing the metadata replica count, after ALLOCATION9; then [POOL9](pool-implementation-plan.md) — presence rules, after CLUSTER11 (its `Evict` rule also after POOL-D3, METADATA-D7 and CLUSTER-D10).
 - **Access control:** [ACCESS1](access-implementation-plan.md) after ACCESS-D1 and QUERY14, then [ACCESS2](access-implementation-plan.md)–[ACCESS4](access-implementation-plan.md) as their decisions resolve; [ACCESS5](access-implementation-plan.md) after SUBSCRIPTION8.
 - **Unix and FUSE:** [UNIX11](unix-implementation-plan.md) (remove path contexts and export) first; [UNIX2](unix-implementation-plan.md)–[UNIX5](unix-implementation-plan.md); [UNIX10](unix-implementation-plan.md) after BLOB1, UNIX-D4 and METADATA-D6.
 - **Tooling:** [TOOLING3](tooling-implementation-plan.md)–[TOOLING8](tooling-implementation-plan.md); TOOLING3 early, since later end-to-end acceptance criteria use it.

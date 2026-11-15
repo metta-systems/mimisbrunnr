@@ -19,7 +19,7 @@
 //! ## Not yet implemented
 //!
 //! * Codec-transparent region read (BTREE-DESIGN§1.6): the generic
-//!   [`BtreeRegion::read`] rejects packed runs — `TODO(BTREE8)`. Packed regions
+//!   [`BtreeRegion::read`] rejects packed runs — `TODO(BTREE9)`. Packed regions
 //!   go through [`BtreeRegion::read_packed`].
 //! * COW / fresh-region allocation. The actual *allocator* call lives at the
 //!   index / pool layer (ENGINE3); this module only knows how to read and write a
@@ -597,7 +597,7 @@ impl BtreeRegion {
             let payload_length = { run_header.payload_length } as usize;
             let flags = { run_header.flags };
             if flags & SORTED_RUN_FLAG_PACKED_KEYS != 0 {
-                // Packed runs need `read_packed`. TODO(BTREE8).
+                // Packed runs need `read_packed`. TODO(BTREE9).
                 return Err(StorageError::UnsupportedFormatVersion(0));
             }
             // Read payload.

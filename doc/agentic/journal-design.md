@@ -127,8 +127,8 @@ base, and `logical` equal to `hlc_base.logical` plus the number of earlier entri
 with the same physical time; `ENTRY_FLAG_HLC_EXPLICIT` entries carry their own. A batch spanning
 more than 2³² ns (≈ 4.3 s) is sealed before the delta would overflow.
 
-**Checksum, compression and encryption are per jset.** The checksum (algorithm per
-OPERATIONS-D4) covers the header with `checksum` zeroed, the stored entries, the AEAD tag if
+**Checksum, compression and encryption are per jset.** The checksum (XXH3-64,
+FORMAT-DESIGN§1.4) covers the header with `checksum` zeroed, the stored entries, the AEAD tag if
 any, and the padding. With `JSET_FLAG_COMPRESSED` the entries are compressed as one unit
 (algorithm per BLOB-D3). With `JSET_FLAG_ENCRYPTED` they are then encrypted with the key
 hierarchy's journal key (ENCRYPTION-DESIGN§1): nonce = 64-bit `seq` ‖ 32 zero bits, AAD = the
@@ -181,7 +181,7 @@ record rules:
   variable part. A reader rejects a payload whose own lengths run past `len × 8` bytes or whose
   remaining padding is not zero. Counting words lets one entry be as large as its jset
   (256 KiB), so no op is split across entries for size.
-- An extent checksum (`extent_sum`) is the OPERATIONS-D4 checksum of the extent's bytes as
+- An extent checksum (`extent_sum`) is the block checksum (FORMAT-DESIGN§1.4) of the extent's bytes as
   written; recovery uses it to verify data written in the same commit (JOURNAL-DESIGN§1.5).
 - A `ReplicaSet` (72 bytes) is `replica_count: u8`, 7 bytes of padding and
   `replicas: [BlockRef; 4]`, slots `[replica_count..4)` zero: the copies of one extent or block

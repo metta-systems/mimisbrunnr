@@ -134,9 +134,9 @@ independently. A reader that encounters an unknown `(magic, kind, version)` abor
 ### 1.4 Checksums
 
 Every header, run data block, page and journal-set checksum is a 64-bit slot (`u64`) holding
-the pool-wide block checksum, whose algorithm is [OPERATIONS-D4](operations-decisions.md); an
-algorithm with a 32-bit result is stored zero-extended, so the choice changes no layout. BLAKE3
-is used for *content* integrity (per-object), not for block checksums.
+the pool-wide block checksum: XXH3-64 with seed 0 over the structure's bytes with its checksum
+slot zeroed. One algorithm serves every slot, the journal's included. BLAKE3 is used for
+*content* integrity (per-object), not for block checksums.
 
 ### 1.5 Large node format
 
@@ -430,6 +430,6 @@ Specified in [RECONCILE-DESIGN§1](reconcile-design.md#1-reconcile).
 - BLAKE3: <https://github.com/BLAKE3-team/BLAKE3-specs>
 - HCTR2: <https://eprint.iacr.org/2021/1441>
 - CBOR: RFC 8949
-- CRC32C: RFC 3720 §12.1
+- XXH3: <https://github.com/Cyan4973/xxHash/blob/dev/doc/xxhash_spec.md>
 - HKDF: RFC 5869
 - Argon2id: RFC 9106
