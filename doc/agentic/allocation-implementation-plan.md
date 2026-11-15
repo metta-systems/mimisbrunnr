@@ -16,7 +16,6 @@ Design: [allocation-design.md](allocation-design.md) · Decisions: [allocation-d
 
 - [ ] **ALLOCATION4 — Per-disk bucket-alloc table.** Rooted in the disk descriptor, key `bucket_no: u32`, packed-key codec; engine keeps one table per disk; `BucketAllocator::for_disk(disk_id)`. Written once, in the final region format. Prerequisites: [BTREE9](btree-implementation-plan.md), [POOL1](pool-implementation-plan.md) (descriptor roots). Acceptance: in a two-disk pool each disk's tree holds only its own buckets.
 - [ ] **ALLOCATION5 — Per-disk freespace LRU.** Rooted in the disk descriptor, key `(fragmentation_band: u8, bucket_no: u32)`, closed buckets only; allocator fast path takes band 0 (ALLOCATION-DESIGN§1.4). Prerequisite: ALLOCATION4.
-- [ ] **ALLOCATION6 — Drop CBOR-wrapped POD values in allocation trees.** `BucketAllocEntry` and freespace keys lose their manual byte-image `Serialize` impls once ALLOCATION4 / ALLOCATION5 use the packed codec; `BucketAllocKey` and `FreespaceLruKey` proxies go away.
 
 ## Completeness
 

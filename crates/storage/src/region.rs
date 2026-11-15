@@ -577,6 +577,26 @@ impl Region {
         })
     }
 
+    /// Rewrite the region at `offset` in place: zero all of it, then
+    /// [`Self::create`].
+    ///
+    /// shortcut: a region is written once and replaced by a fresh one
+    /// (BTREE-DESIGN§1.1); trees kept at fixed offsets rewrite in place until
+    /// ENGINE3 places them in allocated regions (TODO(ENGINE3)). Zeroing first
+    /// keeps runs of the previous contents from being read as this region's.
+    pub fn create_in_place<D: BlockDevice>(
+        device: &D,
+        offset: u64,
+        params: RegionParams,
+        kind_header: &[u8],
+    ) -> Result<Self, StorageError> {
+        if !(12..=19).contains(&params.region_size_log2) {
+            return Err(StorageError::RegionCorrupt("region size out of range"));
+        }
+        device.write_at(offset, &vec![0u8; 1 << params.region_size_log2])?;
+        Self::create(device, offset, params, kind_header)
+    }
+
     /// Load the region at `offset`, which must belong to `kind`: block 0 and
     /// each run's index block. Loading stops at the first block that is not
     /// the next valid run, and the newest run is dropped if any of its data

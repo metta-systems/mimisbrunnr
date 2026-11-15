@@ -76,7 +76,7 @@ The term dictionary, postings and forward index replace every index structure, s
 4. [METADATA1](metadata-implementation-plan.md) — multi-level radix per origin node.
 5. [ENGINE4](engine-implementation-plan.md) — retire zones and fixed areas.
 6. [SUBSCRIPTION1](subscriptions-implementation-plan.md) — membership containers (after INDEX13).
-7. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md), [ALLOCATION6](allocation-implementation-plan.md) — per-disk allocation trees (after BTREE9 and POOL1); then [ALLOCATION2](allocation-implementation-plan.md) — freelist seeding at format time.
+7. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md) — per-disk allocation trees (after BTREE9 and POOL1); then [ALLOCATION2](allocation-implementation-plan.md) — freelist seeding at format time.
 8. [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup.
 9. [INDEX6](index-implementation-plan.md) — footprint benchmark.
 

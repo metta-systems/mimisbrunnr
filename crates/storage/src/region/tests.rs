@@ -279,6 +279,20 @@ fn many_entries_split_into_runs_and_a_full_region_is_reported() {
 }
 
 #[test]
+fn rewriting_in_place_never_reads_the_previous_runs() {
+    let (device, mut region) = fresh(BtreeKind::BucketAlloc);
+    // Two runs: the second's index block sits right after the first run.
+    region.append_run(&device, 1, &values(&[(1u32, vec![1; 8])])).unwrap();
+    region.append_run(&device, 2, &values(&[(2u32, vec![2; 8])])).unwrap();
+    // Rewrite with one run of the same shape: its end is where run 2 began.
+    let mut rewritten = Region::create_in_place(&device, 0, params(BtreeKind::BucketAlloc), &[]).unwrap();
+    rewritten.append_run(&device, 3, &values(&[(9u32, vec![9; 8])])).unwrap();
+    let reopened = Region::open(&device, 0, BtreeKind::BucketAlloc).unwrap();
+    assert_eq!(reopened.run_count(), 1);
+    assert_eq!(reopened.entries::<_, u32>(&device).unwrap(), vec![(9, vec![9; 8])]);
+}
+
+#[test]
 fn unsorted_entries_are_refused() {
     let (device, mut region) = fresh(BtreeKind::Forward);
     let result = region.append_run(&device, 1, &[(2u32, RunEntry::Whiteout), (1, RunEntry::Whiteout)]);

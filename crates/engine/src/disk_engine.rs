@@ -566,16 +566,11 @@ impl DiskEngine {
             .backpointer_table
             .flush_to_region(dev, block_ref_offset(&active.backpointer_root))
             .map_err(EngineError::from)?;
-        // Bucket alloc + freespace LRU. Pool-scoped for now; wire
-        // `disk_id = 0` until ALLOCATION4 / ALLOCATION5 split them per disk
-        // (ALLOCATION-DESIGN§1.2).
+        // Bucket alloc + freespace LRU. Pool-scoped until ALLOCATION4 /
+        // ALLOCATION5 split them per disk (ALLOCATION-DESIGN§1.2).
         self.engine
             .bucket_alloc
-            .flush_to_region(
-                self.primary_device.as_ref(),
-                zone_offset + BUCKET_ALLOC_REGION_OFFSET,
-                0,
-            )
+            .flush_to_region(self.primary_device.as_ref(), zone_offset + BUCKET_ALLOC_REGION_OFFSET)
             .map_err(EngineError::from)?;
         self.engine
             .freespace_lru

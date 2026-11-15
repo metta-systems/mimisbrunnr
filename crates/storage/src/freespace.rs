@@ -8,38 +8,26 @@
 //!
 //! ## Persistence
 //!
-//! On disk the table occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
-//! [`BtreeKind::FreespaceLru`]. The mirror is materialised into a single
-//! CBOR-encoded sorted run via [`BtreeRegion::write_full`] keyed by
-//! [`FreespaceLruKey`] ascending. Values are [`Empty`] — ALLOCATION-DESIGN§1.4
-//! describes a key-only B+ tree (the "value" is implicit in the key).
+//! On disk the table occupies one 256 KiB [`Region`] of
+//! [`BtreeKind::FreespaceLru`], keyed by [`FreespaceLruKey`] with empty values:
+//! ALLOCATION-DESIGN§1.4 describes a key-only tree.
 //!
-//! For now this is one pool-scoped tree. The wire key already
-//! carries `disk_id: u16` so the per-disk split (ALLOCATION5) is a layout-only
-//! change with no on-disk format break.
-//!
-//! TODO(ALLOCATION5): split into per-disk metadata zones per
-//! ALLOCATION-DESIGN§1.4 — one freespace LRU per disk, rooted at
-//! `DiskDescriptorOnDisk.freespace_root`.
+//! TODO(ALLOCATION5): one LRU per disk, rooted in its disk descriptor, keyed
+//! `(band, bucket_no)` (ALLOCATION-DESIGN§1.4); for now one pool-scoped tree
+//! whose key carries `disk_id`.
 //!
 //! TODO(ALLOCATION5): live-allocator integration. The table
 //! ships only the persistence skeleton — the foreground allocator's
 //! "scan band 0" fast path, the lazy-reband-on-8-sector-boundary
 //! producer, and the copygc consumer come with ALLOCATION5 and RECONCILE3.
 
-use std::{collections::BTreeMap, ops::Bound};
-
-use {
-    bytemuck::{Pod, Zeroable},
-    serde::{Deserialize, Serialize},
-    static_assertions::const_assert_eq,
-};
+use std::{collections::BTreeSet, ops::Bound};
 
 use crate::{
     block::BtreeKind,
     block_device::BlockDevice,
-    btree::{BtreeRegion, LoadedNode, SortedRun},
     error::StorageError,
+    region::{FieldKind, Region, RegionKey, RegionParams, RunEntry},
 };
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
@@ -48,76 +36,17 @@ use crate::{
 pub const FREESPACE_LRU_REGION_SIZE: u64 = 256 * 1024;
 const FREESPACE_LRU_REGION_SIZE_LOG2: u8 = 18;
 
-/// Wire key for the freespace LRU B+ tree.
-///
-/// Per ALLOCATION-DESIGN§1.4 the per-disk tree is keyed by
-/// `(fragmentation_band: u8, bucket_no: u32)`. For now this is one
-/// pool-scoped tree; `disk_id: u16` is added between the two for
-/// forward compat with ALLOCATION5. Lexicographic ordering of the byte image
-/// matches `(band, disk_id, bucket_no)` — band first so the allocator
-/// fast path (`band == 0`) is a contiguous prefix scan.
-///
-/// Layout:
-/// ```text
-///  [0..1]  fragmentation_band  u8
-///  [1..3]  disk_id             u16
-///  [3..7]  bucket_no           u32
-/// ```
-#[repr(C, packed)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
+/// Key of the freespace LRU, ordered band first so the allocator fast path
+/// (`band == 0`) is a contiguous prefix.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FreespaceLruKey {
-    /// `[0..1]` `0` = empty, `255` = nearly full, `1..=254` = in
-    /// between (formula in ALLOCATION-DESIGN§1.4).
+    /// `0` = empty, `255` = nearly full, `1..=254` = in between (formula in
+    /// ALLOCATION-DESIGN§1.4).
     pub fragmentation_band: u8,
-    /// `[1..3]` disk id.
+    /// Disk id; goes when each disk has its own LRU (ALLOCATION5).
     pub disk_id: u16,
-    /// `[3..7]` bucket number within the disk.
+    /// Bucket number within the disk.
     pub bucket_no: u32,
-}
-
-const_assert_eq!(core::mem::size_of::<FreespaceLruKey>(), 7);
-
-/// Size in bytes of [`FreespaceLruKey`] (7). Pinned by `const_assert_eq!`.
-pub const FREESPACE_LRU_KEY_SIZE: usize = 7;
-
-// `#[repr(C, packed)]` disables auto-derived comparison/hash because
-// the `u16` and `u32` fields are unaligned.
-impl PartialEq for FreespaceLruKey {
-    fn eq(&self, other: &Self) -> bool {
-        let (a_band, a_disk, a_bucket) =
-            (self.fragmentation_band, self.disk_id, self.bucket_no);
-        let (b_band, b_disk, b_bucket) =
-            (other.fragmentation_band, other.disk_id, other.bucket_no);
-        a_band == b_band && a_disk == b_disk && a_bucket == b_bucket
-    }
-}
-
-impl Eq for FreespaceLruKey {}
-
-impl PartialOrd for FreespaceLruKey {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for FreespaceLruKey {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        let (a_band, a_disk, a_bucket) =
-            (self.fragmentation_band, self.disk_id, self.bucket_no);
-        let (b_band, b_disk, b_bucket) =
-            (other.fragmentation_band, other.disk_id, other.bucket_no);
-        (a_band, a_disk, a_bucket).cmp(&(b_band, b_disk, b_bucket))
-    }
-}
-
-impl core::hash::Hash for FreespaceLruKey {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        let (band, disk, bucket) =
-            (self.fragmentation_band, self.disk_id, self.bucket_no);
-        band.hash(state);
-        disk.hash(state);
-        bucket.hash(state);
-    }
 }
 
 impl FreespaceLruKey {
@@ -131,92 +60,34 @@ impl FreespaceLruKey {
     }
 }
 
-impl Serialize for FreespaceLruKey {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_bytes(bytemuck::bytes_of(self))
+impl RegionKey for FreespaceLruKey {
+    const FIELDS: &'static [FieldKind] = &[FieldKind::Unsigned, FieldKind::Unsigned, FieldKind::Unsigned];
+
+    fn field_values(&self, out: &mut [u64]) {
+        out[0] = self.fragmentation_band as u64;
+        out[1] = self.disk_id as u64;
+        out[2] = self.bucket_no as u64;
     }
-}
 
-impl<'de> Deserialize<'de> for FreespaceLruKey {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        use serde::de::{Error, SeqAccess, Visitor};
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Vec<u8>;
-            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-                f.write_str("byte string")
-            }
-            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-                Ok(v.to_vec())
-            }
-            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
-                Ok(v)
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut out = Vec::new();
-                while let Some(b) = seq.next_element::<u8>()? {
-                    out.push(b);
-                }
-                Ok(out)
-            }
-        }
-        let bytes: Vec<u8> = de.deserialize_bytes(V)?;
-        if bytes.len() != FREESPACE_LRU_KEY_SIZE {
-            return Err(serde::de::Error::custom(format!(
-                "expected {FREESPACE_LRU_KEY_SIZE} bytes for FreespaceLruKey, got {}",
-                bytes.len()
-            )));
-        }
-        let mut buf = [0u8; FREESPACE_LRU_KEY_SIZE];
-        buf.copy_from_slice(&bytes);
-        Ok(*bytemuck::from_bytes::<Self>(&buf))
-    }
-}
-
-/// Empty wire value (zero on-disk bytes).
-///
-/// ALLOCATION-DESIGN§1.4 describes the freespace LRU as a key-only B+ tree. To
-/// fit the [`LoadedNode<K, V>`] generic shape, we round-trip a
-/// zero-byte placeholder via CBOR (`null` in CBOR = 1 byte). Once ALLOCATION5
-/// teaches the BTREE-DESIGN§1.6 packed-key codec to handle zero-width values,
-/// this becomes a true zero-payload encoding.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Empty;
-
-impl Serialize for Empty {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_unit()
-    }
-}
-
-impl<'de> Deserialize<'de> for Empty {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        struct V;
-        impl<'de> serde::de::Visitor<'de> for V {
-            type Value = Empty;
-            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-                f.write_str("unit")
-            }
-            fn visit_unit<E>(self) -> Result<Empty, E> {
-                Ok(Empty)
-            }
-            fn visit_none<E>(self) -> Result<Empty, E> {
-                Ok(Empty)
-            }
-        }
-        de.deserialize_unit(V)
+    fn from_field_values(fields: &[u64]) -> Result<Self, StorageError> {
+        let out_of_range = |_| StorageError::RegionCorrupt("freespace key field out of range");
+        Ok(Self {
+            fragmentation_band: u8::try_from(fields[0]).map_err(out_of_range)?,
+            disk_id: u16::try_from(fields[1]).map_err(out_of_range)?,
+            bucket_no: u32::try_from(fields[2]).map_err(out_of_range)?,
+        })
     }
 }
 
 /// In-memory mirror of the ALLOCATION-DESIGN§1.4 freespace LRU.
 ///
-/// Backed by a `BTreeMap<FreespaceLruKey, ()>`. Lookups are point
-/// (`contains`) or banded prefix scans (`iter_band`). This only ships
-/// the persistence skeleton; live allocator integration (foreground
-/// "scan band 0", lazy reband, copygc producer) is ALLOCATION5 / RECONCILE3.
+/// Lookups are point (`contains`) or banded prefix scans (`iter_band`). This
+/// only ships the persistence skeleton; live allocator integration
+/// (foreground "scan band 0", lazy reband, copygc producer) is ALLOCATION5 /
+/// RECONCILE3.
 #[derive(Clone, Debug, Default)]
 pub struct FreespaceLru {
-    entries: BTreeMap<FreespaceLruKey, ()>,
+    entries: BTreeSet<FreespaceLruKey>,
 }
 
 impl FreespaceLru {
@@ -228,10 +99,8 @@ impl FreespaceLru {
     /// Insert `(band, disk_id, bucket_no)`. Idempotent — the second
     /// call is a no-op.
     pub fn insert(&mut self, fragmentation_band: u8, disk_id: u16, bucket_no: u32) {
-        self.entries.insert(
-            FreespaceLruKey::new(fragmentation_band, disk_id, bucket_no),
-            (),
-        );
+        self.entries
+            .insert(FreespaceLruKey::new(fragmentation_band, disk_id, bucket_no));
     }
 
     /// Remove `(band, disk_id, bucket_no)`. Returns `true` iff the
@@ -239,27 +108,21 @@ impl FreespaceLru {
     pub fn remove(&mut self, fragmentation_band: u8, disk_id: u16, bucket_no: u32) -> bool {
         self.entries
             .remove(&FreespaceLruKey::new(fragmentation_band, disk_id, bucket_no))
-            .is_some()
     }
 
     /// `true` iff `(band, disk_id, bucket_no)` is present.
     pub fn contains(&self, fragmentation_band: u8, disk_id: u16, bucket_no: u32) -> bool {
         self.entries
-            .contains_key(&FreespaceLruKey::new(fragmentation_band, disk_id, bucket_no))
+            .contains(&FreespaceLruKey::new(fragmentation_band, disk_id, bucket_no))
     }
 
     /// Iterate over every key with the given fragmentation band, in
     /// ascending `(disk_id, bucket_no)` order. The allocator fast path
     /// uses this with `band == 0`; copygc uses it with high bands.
-    pub fn iter_band(
-        &self,
-        fragmentation_band: u8,
-    ) -> impl Iterator<Item = &FreespaceLruKey> {
-        let lo = FreespaceLruKey::new(fragmentation_band, 0, 0);
-        let hi = FreespaceLruKey::new(fragmentation_band, u16::MAX, u32::MAX);
-        self.entries
-            .range((Bound::Included(lo), Bound::Included(hi)))
-            .map(|(k, _)| k)
+    pub fn iter_band(&self, fragmentation_band: u8) -> impl Iterator<Item = &FreespaceLruKey> {
+        let low = FreespaceLruKey::new(fragmentation_band, 0, 0);
+        let high = FreespaceLruKey::new(fragmentation_band, u16::MAX, u32::MAX);
+        self.entries.range((Bound::Included(low), Bound::Included(high)))
     }
 
     /// Number of entries in the LRU.
@@ -274,74 +137,39 @@ impl FreespaceLru {
 
     /// Iterate over every entry in `(band, disk_id, bucket_no)` order.
     pub fn iter(&self) -> impl Iterator<Item = &FreespaceLruKey> {
-        self.entries.keys()
+        self.entries.iter()
     }
 
-    // ----------------------------------------------------------------
-    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
-    // ----------------------------------------------------------------
-
-    /// Build a [`LoadedNode`] containing every entry as a single CBOR
-    /// sorted run, sorted by [`FreespaceLruKey`]. The node uses
-    /// [`BtreeKind::FreespaceLru`] and the spec's 18-bit (256 KiB)
-    /// region size.
-    pub fn to_loaded_node(&self) -> LoadedNode<FreespaceLruKey, Empty> {
-        let entries: Vec<(FreespaceLruKey, Empty)> =
-            self.entries.keys().map(|k| (*k, Empty)).collect();
-
-        let mut node: LoadedNode<FreespaceLruKey, Empty> = LoadedNode::new(
-            BtreeKind::FreespaceLru,
-            0,
-            FREESPACE_LRU_REGION_SIZE_LOG2,
-        );
-        if !entries.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, entries);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        node
+    /// Write the LRU as the 256 KiB region at byte `offset`.
+    pub fn flush_to_region<D: BlockDevice>(&self, device: &D, offset: u64) -> Result<(), StorageError> {
+        let params = RegionParams {
+            kind: BtreeKind::FreespaceLru,
+            level: 0,
+            region_size_log2: FREESPACE_LRU_REGION_SIZE_LOG2,
+            node_seq: 0,
+            created_lsn: 0,
+        };
+        let mut region = Region::create_in_place(device, offset, params, &[])?;
+        let entries: Vec<(FreespaceLruKey, RunEntry<'_>)> =
+            self.entries.iter().map(|key| (*key, RunEntry::Value(&[]))).collect();
+        region.append_entries(device, 0, &entries)
     }
 
-    /// Restore the in-memory state from a [`LoadedNode`] read via
-    /// [`BtreeRegion::read`].
-    pub fn from_loaded_node(node: &LoadedNode<FreespaceLruKey, Empty>) -> Self {
-        let mut entries: BTreeMap<FreespaceLruKey, ()> = BTreeMap::new();
-        for (k, _) in node.merge_iter() {
-            entries.insert(*k, ());
-        }
-        Self { entries }
-    }
-
-    /// Write the in-memory state as a fresh 256 KiB region at byte
-    /// `offset` on `device`.
-    pub fn flush_to_region<D: BlockDevice>(
-        &self,
-        device: &D,
-        offset: u64,
-    ) -> Result<(), StorageError> {
-        let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, FreespaceLruKey, Empty>(device, offset, &mut node)?;
-        Ok(())
-    }
-
-    /// Read the in-memory state from the 256 KiB region at byte
-    /// `offset` on `device`. An all-zero region returns
-    /// [`Self::default`].
-    pub fn load_from_region<D: BlockDevice>(
-        device: &D,
-        offset: u64,
-    ) -> Result<Self, StorageError> {
+    /// Read the LRU from the region at byte `offset`; a never-written
+    /// (all-zero) region is an empty LRU.
+    pub fn load_from_region<D: BlockDevice>(device: &D, offset: u64) -> Result<Self, StorageError> {
         let mut probe = [0u8; 8];
         device.read_at(offset, &mut probe)?;
-        if probe.iter().all(|&b| b == 0) {
+        if probe.iter().all(|&byte| byte == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, FreespaceLruKey, Empty>(
-            device,
-            offset,
-            BtreeKind::FreespaceLru,
-        )?;
-        Ok(Self::from_loaded_node(&node))
+        let region = Region::open(device, offset, BtreeKind::FreespaceLru)?;
+        let entries = region
+            .entries::<D, FreespaceLruKey>(device)?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        Ok(Self { entries })
     }
 }
 
@@ -357,11 +185,6 @@ mod tests {
         let path = dir.path().join("freespace_lru.bin");
         let dev = FileBlockDevice::open(&path, 1 << 20).unwrap();
         (dir, dev)
-    }
-
-    #[test]
-    fn freespace_lru_key_is_7_bytes() {
-        assert_eq!(core::mem::size_of::<FreespaceLruKey>(), 7);
     }
 
     #[test]
@@ -410,41 +233,10 @@ mod tests {
 
         let band0: Vec<_> = lru.iter_band(0).collect();
         assert_eq!(band0.len(), 3);
-        for k in &band0 {
-            let band = k.fragmentation_band;
-            assert_eq!(band, 0);
-        }
+        assert!(band0.iter().all(|key| key.fragmentation_band == 0));
 
-        let band100: Vec<_> = lru.iter_band(100).collect();
-        assert_eq!(band100.len(), 1);
-        let band1 = lru.iter_band(1).count();
-        assert_eq!(band1, 0);
-    }
-
-    #[test]
-    fn freespace_lru_to_loaded_node_round_trip_preserves_entries() {
-        let mut lru = FreespaceLru::new();
-        for band in [0u8, 100, 255] {
-            for bucket in 0u32..5 {
-                lru.insert(band, 0, bucket);
-            }
-        }
-        let node = lru.to_loaded_node();
-        let back = FreespaceLru::from_loaded_node(&node);
-        assert_eq!(back.len(), lru.len());
-        for band in [0u8, 100, 255] {
-            for bucket in 0u32..5 {
-                assert!(back.contains(band, 0, bucket));
-            }
-        }
-    }
-
-    #[test]
-    fn freespace_lru_to_loaded_node_round_trip_empty() {
-        let lru = FreespaceLru::new();
-        let node = lru.to_loaded_node();
-        let back = FreespaceLru::from_loaded_node(&node);
-        assert!(back.is_empty());
+        assert_eq!(lru.iter_band(100).count(), 1);
+        assert_eq!(lru.iter_band(1).count(), 0);
     }
 
     #[test]
@@ -476,20 +268,9 @@ mod tests {
         lru.flush_to_region(&dev, 0).unwrap();
         let back = FreespaceLru::load_from_region(&dev, 0).unwrap();
         assert_eq!(back.len(), total);
-        for bucket in 0u32..20 {
-            assert!(back.contains(0, 0, bucket));
-        }
-        for bucket in 100u32..110 {
-            assert!(back.contains(100, 0, bucket));
-        }
-        for bucket in 200u32..205 {
-            assert!(back.contains(255, 0, bucket));
-        }
+        assert_eq!(back.iter().collect::<Vec<_>>(), lru.iter().collect::<Vec<_>>());
         assert!(back.contains(50, 7, 999));
-
-        // Banded scan still works after round-trip.
-        let band0: Vec<_> = back.iter_band(0).collect();
-        assert_eq!(band0.len(), 20);
+        assert_eq!(back.iter_band(0).count(), 20);
     }
 
     #[test]
@@ -513,21 +294,15 @@ mod tests {
     #[test]
     fn freespace_lru_region_kind_mismatch_errors() {
         // Write a BucketAlloc-kind region at offset 0, then try to load
-        // it as FreespaceLru — must surface InvalidBtreeKind.
+        // it as FreespaceLru — must surface RegionKindMismatch.
         let (_dir, dev) = fresh_device();
-        let alloc = crate::alloc::BucketAllocTable::new();
-        // Emit a non-empty alloc table so the region isn't all-zero
-        // (the all-zero shortcut would otherwise hide the kind check).
-        let mut alloc = alloc;
+        let mut alloc = crate::alloc::BucketAllocTable::new();
         alloc.insert(
             0,
-            crate::alloc::BucketAllocEntry {
-                generation: 1,
-                ..Default::default()
-            },
+            crate::alloc::BucketAllocEntry::new(1, crate::alloc::BucketKind::Free, 0, 0),
         );
-        alloc.flush_to_region(&dev, 0, 0).unwrap();
+        alloc.flush_to_region(&dev, 0).unwrap();
         let err = FreespaceLru::load_from_region(&dev, 0).err();
-        assert!(matches!(err, Some(StorageError::InvalidBtreeKind(_))));
+        assert!(matches!(err, Some(StorageError::RegionKindMismatch { expected: 13, actual: 12 })));
     }
 }

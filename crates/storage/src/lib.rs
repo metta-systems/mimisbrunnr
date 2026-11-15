@@ -34,8 +34,8 @@ mod zone_map;
 pub use {
     addressing::block_no_to_bucket,
     alloc::{
-        BUCKET_ALLOC_ENTRY_SIZE, BUCKET_ALLOC_KEY_SIZE, BUCKET_ALLOC_REGION_SIZE,
-        BUCKET_FLAG_NEEDS_DISCARD, BucketAllocEntry, BucketAllocKey, BucketAllocTable,
+        BUCKET_ALLOC_ENTRY_SIZE, BUCKET_ALLOC_REGION_SIZE, BUCKET_FLAG_NEEDS_DISCARD,
+        BucketAllocEntry, BucketAllocTable,
         BucketKind, LIVE_SECTORS_MAX,
     },
     allocator::{BucketAllocator, OpenBucket, WritePoints},
@@ -65,7 +65,7 @@ pub use {
     error::StorageError,
     file_device::FileBlockDevice,
     freespace::{
-        Empty, FREESPACE_LRU_KEY_SIZE, FREESPACE_LRU_REGION_SIZE, FreespaceLru, FreespaceLruKey,
+        FREESPACE_LRU_REGION_SIZE, FreespaceLru, FreespaceLruKey,
     },
     preamble::{
         LAYOUT_VERSION, MAGIC_JOURNAL_SET, MAGIC_PAGE_RUN_INDEX, MAGIC_REGION, MAGIC_RUN_INDEX,

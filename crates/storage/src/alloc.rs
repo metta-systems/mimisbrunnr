@@ -7,11 +7,9 @@
 //!
 //! ## Persistence
 //!
-//! On disk the table occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
-//! [`BtreeKind::BucketAlloc`]. The mirror is materialised into a single
-//! CBOR-encoded sorted run via [`BtreeRegion::write_full`] keyed by
-//! [`BucketAllocKey`] ascending; values are the 8-byte
-//! [`BucketAllocEntry`] byte image.
+//! On disk the table occupies one 256 KiB [`Region`] of
+//! [`BtreeKind::BucketAlloc`] keyed by `bucket_no`; values are the 8-byte
+//! [`BucketAllocEntry`].
 //!
 //! `live_sectors` changes only through [`BucketAllocTable::add_live_sectors`]
 //! and [`BucketAllocTable::remove_live_sectors`], called for the journal
@@ -20,34 +18,21 @@
 //! TODO(ALLOCATION10): call them from replay of the data ops and from the
 //! checkpoint's region accounting.
 //!
-//! Per ALLOCATION-DESIGN§1.2 each disk gets its **own** B+ tree rooted at
-//! `DiskDescriptorOnDisk.buckets_root`. For now this is one
-//! pool-scoped tree carried in the index zone. The wire key already
-//! carries `disk_id: u16` so the per-disk split (ALLOCATION4) is a layout-only
-//! change with no on-disk format break.
-//!
-//! TODO(ALLOCATION4): split into per-disk metadata zones per
-//! ALLOCATION-DESIGN§1.2 — one bucket alloc B+ tree per disk, rooted at
-//! `DiskDescriptorOnDisk.buckets_root`.
-//!
-//! TODO(ALLOCATION4): switch to the BTREE-DESIGN§1.6 packed-key codec
-//! (the prefix-template fix it needed has landed).
-//! Keys are dense small `u32`, ideal for packed bit-width
-//! compression.
+//! TODO(ALLOCATION4): one table per disk, rooted in its disk descriptor
+//! (ALLOCATION-DESIGN§1.2); for now one pool-scoped table in the index zone.
 
 use std::collections::BTreeMap;
 
 use {
     bytemuck::{Pod, Zeroable},
-    serde::{Deserialize, Serialize},
     static_assertions::const_assert_eq,
 };
 
 use crate::{
     block::BtreeKind,
     block_device::BlockDevice,
-    btree::{BtreeRegion, LoadedNode, SortedRun},
     error::StorageError,
+    region::{Region, RegionParams, RunEntry},
 };
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
@@ -135,163 +120,6 @@ impl BucketAllocEntry {
         debug_assert!(live_sectors <= LIVE_SECTORS_MAX);
         let [low, middle, high, _] = live_sectors.to_le_bytes();
         self.live_sectors = [low, middle, high];
-    }
-}
-
-// Round-trip the `Pod` byte image so the CBOR wire form mirrors the on-disk
-// layout exactly. TODO(ALLOCATION6): goes with the packed-key codec.
-impl Serialize for BucketAllocEntry {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_bytes(bytemuck::bytes_of(self))
-    }
-}
-
-impl<'de> Deserialize<'de> for BucketAllocEntry {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        use serde::de::{Error, SeqAccess, Visitor};
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Vec<u8>;
-            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-                f.write_str("byte string")
-            }
-            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-                Ok(v.to_vec())
-            }
-            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
-                Ok(v)
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut out = Vec::new();
-                while let Some(b) = seq.next_element::<u8>()? {
-                    out.push(b);
-                }
-                Ok(out)
-            }
-        }
-        let bytes: Vec<u8> = de.deserialize_bytes(V)?;
-        if bytes.len() != BUCKET_ALLOC_ENTRY_SIZE {
-            return Err(serde::de::Error::custom(format!(
-                "expected {BUCKET_ALLOC_ENTRY_SIZE} bytes for BucketAllocEntry, got {}",
-                bytes.len()
-            )));
-        }
-        let mut buf = [0u8; BUCKET_ALLOC_ENTRY_SIZE];
-        buf.copy_from_slice(&bytes);
-        Ok(*bytemuck::from_bytes::<Self>(&buf))
-    }
-}
-
-/// Wire key for the bucket-alloc B+ tree.
-///
-/// Per ALLOCATION-DESIGN§1.2, the per-disk tree is keyed by `bucket_no: u32` only.
-/// For now this is one pool-scoped tree; `disk_id: u16` is added to
-/// the key so this can split per-disk later (ALLOCATION4) without an on-disk
-/// format break. Lexicographic ordering of the byte image matches
-/// `(disk_id, bucket_no)`.
-///
-/// Layout:
-/// ```text
-///  [0..2]  disk_id    u16
-///  [2..6]  bucket_no  u32
-/// ```
-#[repr(C, packed)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
-pub struct BucketAllocKey {
-    /// `[0..2]` disk id.
-    pub disk_id: u16,
-    /// `[2..6]` bucket index within the disk.
-    pub bucket_no: u32,
-}
-
-const_assert_eq!(core::mem::size_of::<BucketAllocKey>(), 6);
-
-/// Size in bytes of [`BucketAllocKey`] (6). Pinned by `const_assert_eq!`.
-pub const BUCKET_ALLOC_KEY_SIZE: usize = 6;
-
-// `#[repr(C, packed)]` disables auto-derived comparison/hash because
-// fields are unaligned. Implement explicitly using copied locals.
-impl PartialEq for BucketAllocKey {
-    fn eq(&self, other: &Self) -> bool {
-        let (a_disk, a_bucket) = (self.disk_id, self.bucket_no);
-        let (b_disk, b_bucket) = (other.disk_id, other.bucket_no);
-        a_disk == b_disk && a_bucket == b_bucket
-    }
-}
-
-impl Eq for BucketAllocKey {}
-
-impl PartialOrd for BucketAllocKey {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for BucketAllocKey {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        let (a_disk, a_bucket) = (self.disk_id, self.bucket_no);
-        let (b_disk, b_bucket) = (other.disk_id, other.bucket_no);
-        (a_disk, a_bucket).cmp(&(b_disk, b_bucket))
-    }
-}
-
-impl core::hash::Hash for BucketAllocKey {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        let (disk, bucket) = (self.disk_id, self.bucket_no);
-        disk.hash(state);
-        bucket.hash(state);
-    }
-}
-
-impl BucketAllocKey {
-    /// Construct a new key.
-    pub const fn new(disk_id: u16, bucket_no: u32) -> Self {
-        Self {
-            disk_id,
-            bucket_no,
-        }
-    }
-}
-
-impl Serialize for BucketAllocKey {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_bytes(bytemuck::bytes_of(self))
-    }
-}
-
-impl<'de> Deserialize<'de> for BucketAllocKey {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        use serde::de::{Error, SeqAccess, Visitor};
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Vec<u8>;
-            fn expecting(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-                f.write_str("byte string")
-            }
-            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-                Ok(v.to_vec())
-            }
-            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
-                Ok(v)
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut out = Vec::new();
-                while let Some(b) = seq.next_element::<u8>()? {
-                    out.push(b);
-                }
-                Ok(out)
-            }
-        }
-        let bytes: Vec<u8> = de.deserialize_bytes(V)?;
-        if bytes.len() != BUCKET_ALLOC_KEY_SIZE {
-            return Err(serde::de::Error::custom(format!(
-                "expected {BUCKET_ALLOC_KEY_SIZE} bytes for BucketAllocKey, got {}",
-                bytes.len()
-            )));
-        }
-        let mut buf = [0u8; BUCKET_ALLOC_KEY_SIZE];
-        buf.copy_from_slice(&bytes);
-        Ok(*bytemuck::from_bytes::<Self>(&buf))
     }
 }
 
@@ -424,95 +252,44 @@ impl BucketAllocTable {
         Ok(())
     }
 
-    // ----------------------------------------------------------------
-    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
-    // ----------------------------------------------------------------
-
-    /// Build a [`LoadedNode`] containing every entry as a single CBOR
-    /// sorted run, sorted by [`BucketAllocKey`]. The node uses
-    /// [`BtreeKind::BucketAlloc`] and the spec's 18-bit (256 KiB) region
-    /// size.
-    ///
-    /// Every entry is keyed by `(disk_id, bucket_no)`. The flush emits a
-    /// single-disk view because the in-memory `BucketAllocTable` is
-    /// pool-scoped — callers pass `disk_id = 0` until ALLOCATION4 splits the
-    /// allocator per-disk.
-    pub fn to_loaded_node(
-        &self,
-        disk_id: u16,
-    ) -> LoadedNode<BucketAllocKey, BucketAllocEntry> {
-        let entries: Vec<(BucketAllocKey, BucketAllocEntry)> = self
+    /// Write the table as the 256 KiB region at byte `offset`, keyed by
+    /// `bucket_no`, each value an 8-byte [`BucketAllocEntry`].
+    pub fn flush_to_region<D: BlockDevice>(&self, device: &D, offset: u64) -> Result<(), StorageError> {
+        let mut region = Region::create_in_place(device, offset, region_params(), &[])?;
+        let entries: Vec<(u32, RunEntry<'_>)> = self
             .entries
             .iter()
-            .map(|(bucket_no, e)| (BucketAllocKey::new(disk_id, *bucket_no), *e))
+            .map(|(bucket_no, entry)| (*bucket_no, RunEntry::Value(bytemuck::bytes_of(entry))))
             .collect();
-
-        let mut node: LoadedNode<BucketAllocKey, BucketAllocEntry> = LoadedNode::new(
-            BtreeKind::BucketAlloc,
-            0,
-            BUCKET_ALLOC_REGION_SIZE_LOG2,
-        );
-        if !entries.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, entries);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        node
+        region.append_entries(device, 0, &entries)
     }
 
-    /// Restore the in-memory state from a [`LoadedNode`] read via
-    /// [`BtreeRegion::read`].
-    ///
-    /// The loader ignores the wire `disk_id`: the in-memory table is
-    /// pool-wide, indexed only by `bucket_no`. ALLOCATION4 will split per-disk
-    /// and use the full key.
-    pub fn from_loaded_node(
-        node: &LoadedNode<BucketAllocKey, BucketAllocEntry>,
-    ) -> Self {
-        let mut entries: BTreeMap<u32, BucketAllocEntry> = BTreeMap::new();
-        for (k, v) in node.merge_iter() {
-            // Drop disk_id for now; ALLOCATION4 will key the in-memory map by
-            // (disk_id, bucket_no).
-            entries.insert(k.bucket_no, *v);
-        }
-        Self { entries }
-    }
-
-    /// Write the in-memory state as a fresh 256 KiB region at byte
-    /// `offset` on `device`.
-    ///
-    /// `disk_id` is the wire-level disk id stamped onto every emitted
-    /// key. Pool-scoped callers pass `0` until ALLOCATION4.
-    pub fn flush_to_region<D: BlockDevice>(
-        &self,
-        device: &D,
-        offset: u64,
-        disk_id: u16,
-    ) -> Result<(), StorageError> {
-        let mut node = self.to_loaded_node(disk_id);
-        BtreeRegion::write_full::<D, BucketAllocKey, BucketAllocEntry>(
-            device, offset, &mut node,
-        )?;
-        Ok(())
-    }
-
-    /// Read the in-memory state from the 256 KiB region at byte `offset`
-    /// on `device`. An all-zero region returns [`Self::default`].
-    pub fn load_from_region<D: BlockDevice>(
-        device: &D,
-        offset: u64,
-    ) -> Result<Self, StorageError> {
+    /// Read the table from the region at byte `offset`; a never-written
+    /// (all-zero) region is an empty table.
+    pub fn load_from_region<D: BlockDevice>(device: &D, offset: u64) -> Result<Self, StorageError> {
         let mut probe = [0u8; 8];
         device.read_at(offset, &mut probe)?;
-        if probe.iter().all(|&b| b == 0) {
+        if probe.iter().all(|&byte| byte == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, BucketAllocKey, BucketAllocEntry>(
-            device,
-            offset,
-            BtreeKind::BucketAlloc,
-        )?;
-        Ok(Self::from_loaded_node(&node))
+        let region = Region::open(device, offset, BtreeKind::BucketAlloc)?;
+        let mut entries = BTreeMap::new();
+        for (bucket_no, value) in region.entries::<D, u32>(device)? {
+            let entry = bytemuck::try_pod_read_unaligned::<BucketAllocEntry>(&value)
+                .map_err(|_| StorageError::RegionCorrupt("bucket alloc entry is not 8 bytes"))?;
+            entries.insert(bucket_no, entry);
+        }
+        Ok(Self { entries })
+    }
+}
+
+fn region_params() -> RegionParams {
+    RegionParams {
+        kind: BtreeKind::BucketAlloc,
+        level: 0,
+        region_size_log2: BUCKET_ALLOC_REGION_SIZE_LOG2,
+        node_seq: 0,
+        created_lsn: 0,
     }
 }
 
@@ -585,22 +362,6 @@ mod tests {
     }
 
     #[test]
-    fn bucket_alloc_key_is_6_bytes() {
-        assert_eq!(core::mem::size_of::<BucketAllocKey>(), 6);
-    }
-
-    #[test]
-    fn bucket_alloc_key_orders_by_disk_then_bucket() {
-        let a = BucketAllocKey::new(0, 0);
-        let b = BucketAllocKey::new(0, 100);
-        let c = BucketAllocKey::new(1, 0);
-        let d = BucketAllocKey::new(1, 50);
-        assert!(a < b);
-        assert!(b < c);
-        assert!(c < d);
-    }
-
-    #[test]
     fn bucket_kind_discriminants_pinned() {
         for raw in 0u8..=7 {
             let kind = BucketKind::from_u8(raw).unwrap();
@@ -639,25 +400,19 @@ mod tests {
     }
 
     #[test]
-    fn bucket_alloc_to_loaded_node_round_trip_preserves_entries() {
+    fn bucket_alloc_region_packs_keys_and_values_without_cbor() {
+        // 16 sequential buckets: 1-byte keys, 8-byte fixed values, one data block.
+        let (_dir, dev) = fresh_device();
         let mut t = BucketAllocTable::new();
         for i in 0u32..16 {
             t.insert(i, entry(i, BucketKind::Data, 0));
         }
-        let node = t.to_loaded_node(0);
-        let back = BucketAllocTable::from_loaded_node(&node);
-        assert_eq!(back.len(), t.len());
-        for i in 0u32..16 {
-            assert_eq!(back.get(i).expect("missing"), t.get(i).unwrap());
-        }
-    }
-
-    #[test]
-    fn bucket_alloc_to_loaded_node_round_trip_empty() {
-        let t = BucketAllocTable::new();
-        let node = t.to_loaded_node(0);
-        let back = BucketAllocTable::from_loaded_node(&node);
-        assert!(back.is_empty());
+        t.flush_to_region(&dev, 0).unwrap();
+        let region = Region::open(&dev, 0, BtreeKind::BucketAlloc).unwrap();
+        assert_eq!(region.run_count(), 1);
+        assert_eq!(region.next_block(), 3, "block 0, one index block, one data block");
+        let value = region.lookup(&dev, &5u32).unwrap().unwrap();
+        assert_eq!(value.as_bytes(), bytemuck::bytes_of(t.get(5).unwrap()));
     }
 
     #[test]
@@ -677,7 +432,7 @@ mod tests {
         t.insert(99, entry(7, BucketKind::Journal, BUCKET_FLAG_NEEDS_DISCARD));
         t.insert(100, entry(42, BucketKind::Bad, 0));
 
-        t.flush_to_region(&dev, 0, 0).unwrap();
+        t.flush_to_region(&dev, 0).unwrap();
         let back = BucketAllocTable::load_from_region(&dev, 0).unwrap();
         assert_eq!(back.len(), t.len());
         for i in 0u32..50 {
@@ -697,7 +452,7 @@ mod tests {
         let (_dir, dev) = fresh_device();
         let mut t = BucketAllocTable::new();
         t.insert(42, entry(7, BucketKind::Node, 0));
-        t.flush_to_region(&dev, 0, 0).unwrap();
+        t.flush_to_region(&dev, 0).unwrap();
         let back = BucketAllocTable::load_from_region(&dev, 0).unwrap();
         assert_eq!(back.len(), 1);
         let got = back.get(42).unwrap();
@@ -711,11 +466,11 @@ mod tests {
         let mut first = BucketAllocTable::new();
         first.insert(1, entry(1, BucketKind::Free, 0));
         first.insert(2, entry(2, BucketKind::Free, 0));
-        first.flush_to_region(&dev, 0, 0).unwrap();
+        first.flush_to_region(&dev, 0).unwrap();
 
         let mut second = BucketAllocTable::new();
         second.insert(99, entry(7, BucketKind::Stripe, 0));
-        second.flush_to_region(&dev, 0, 0).unwrap();
+        second.flush_to_region(&dev, 0).unwrap();
 
         let back = BucketAllocTable::load_from_region(&dev, 0).unwrap();
         assert_eq!(back.len(), 1);
@@ -726,12 +481,12 @@ mod tests {
     #[test]
     fn bucket_alloc_region_kind_mismatch_errors() {
         // Write a node with a *different* BtreeKind, then try to load it
-        // back as BucketAlloc — must return InvalidBtreeKind.
+        // back as BucketAlloc — must return RegionKindMismatch.
         let (_dir, dev) = fresh_device();
         // Borrow the freespace path to write a different kind at offset 0.
         let lru = crate::freespace::FreespaceLru::new();
         lru.flush_to_region(&dev, 0).unwrap();
         let err = BucketAllocTable::load_from_region(&dev, 0).err();
-        assert!(matches!(err, Some(StorageError::InvalidBtreeKind(_))));
+        assert!(matches!(err, Some(StorageError::RegionKindMismatch { expected: 12, actual: 13 })));
     }
 }
