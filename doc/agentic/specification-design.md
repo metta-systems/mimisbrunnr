@@ -707,6 +707,7 @@ enum DiskState {
     Draining = 1,        // reads only, migrating data off
     Removed  = 2,        // data migrated, safe to detach
     Faulted  = 3,        // failed, needs resilver
+    Degraded = 4,        // a write failed; written only when no Online disk can take a replica
 }
 
 ```
@@ -828,10 +829,15 @@ precedence is ONTOLOGY-D5.
 
 **Resilver:** Proportional to data on the failed disk, not pool size. Prioritized by surviving replica count.
 
-**Disk health.** The engine faults a disk itself only when the disk can no longer be written
-safely: a write or flush fails, or the device disappears. The disk goes `Faulted` at once, the
-commit whose write failed is not acknowledged, no replica is placed on the disk again, and
-reconcile starts replica repair. Everything else is evidence, not a verdict: read errors and
+**Disk health.** An error a `BlockDevice` returns is final for that I/O: retries and device
+resets are the driver's, which knows the device, and the engine never reissues the same I/O. A
+commit whose write or flush failed is never acknowledged. A disk that disappears goes `Faulted`
+at once. A disk still present whose write or flush failed goes `Degraded`: no new replica is
+placed on it while an `Online` disk can take the replica, writes continue there when none can —
+a one-disk pool keeps writing whenever the device does — and replica repair moves its data off
+where it can. A further failure on a `Degraded` disk changes only its counters and the event log;
+moving it to `Faulted`, or back to `Online`, is the health component's. Everything else is
+evidence, not a verdict: read errors and
 checksum mismatches — each repaired from another replica — are counted per disk
 (POOL-DESIGN§1.1), and latency outliers against the figures measured at mount are reported as
 pool events. Thresholds belong to an external health component — a Vesper service, or a host

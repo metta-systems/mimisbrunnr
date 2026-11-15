@@ -108,6 +108,8 @@ pub enum DiskState {
     Removed,
     /// Failed; awaits resilver.
     Faulted,
+    // TODO(POOL10): `Degraded = 4` — a write failed; written only when no
+    // `Online` disk can take a replica (SPECIFICATION-DESIGN§8.4 "Disk health").
 }
 
 impl DiskState {
