@@ -18,6 +18,11 @@ pub enum StorageError {
     #[error("invalid btree kind: {0}")]
     InvalidBtreeKind(u16),
 
+    /// A header whose preamble names no structure this format knows — a
+    /// newer layout, another program's data, or corruption.
+    #[error("unknown structure: magic {magic:#010x}, version {version}, kind {kind}")]
+    UnknownStructure { magic: u32, version: u16, kind: u16 },
+
     #[error("invalid bucket kind: {0}")]
     InvalidBucketKind(u8),
 

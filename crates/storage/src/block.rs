@@ -49,9 +49,9 @@ pub const BLOCK_FLAG_CONTINUATION: u32 = 1 << 1;
 
 /// 32-byte header that prefixes every persistent 4 KiB block.
 ///
-/// TODO(BTREE11): the spec replaces `BlockHeader`, `BlockKind` and the packed
-/// `BlockPreamble` with one aligned `Preamble { magic, version, kind }` and
-/// 64-bit checksum slots (FORMAT-DESIGN§1.3–1.4).
+/// TODO(ENGINE4): `BlockHeader`, `BlockKind` and the packed `BlockPreamble`
+/// go with their last users; every header begins with the aligned
+/// [`crate::Preamble`] and ends with a 64-bit checksum slot (FORMAT-DESIGN§1.3–1.4).
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct BlockHeader {
@@ -130,73 +130,94 @@ impl BlockKind {
 
 // ---------- BtreeKind ----------
 
-/// `BtreeKind` enumerates the large-region (256 KiB) types. FORMAT-DESIGN§1.3.
+/// The tree a region belongs to, carried in its preamble's `kind`.
+/// **Discriminants 0–26 are pinned by FORMAT-DESIGN§1.3.**
 ///
-/// TODO(BTREE11): take the spec's contiguous values 0–26; the kinds the spec
-/// no longer has go as their replacements land.
+/// The four kinds from `0x8000` up are not in the format: their trees are
+/// replaced by the spec's own, and each kind goes with its tree.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BtreeKind {
-    ObjectTable = 0,
-    ObjectHistory = 1,
-    LocationTable = 2,
-    LocationHistory = 3,
+    // Object metadata
+    ObjectRoots = 0,
+    ObjectTable = 1,
+    ObjectHistory = 2,
+    ContentMap = 3,
+    // Term index
     Forward = 4,
     ForwardOverflow = 5,
-    TagDirectory = 6,
-    Range = 7,
-    KvDirectory = 8,
-    ValueSpill = 9,
+    TermDictionary = 6,
+    TermTable = 7,
+    Postings = 8,
+    Sequences = 9,
+    // Deduplication
     ChunkIndex = 10,
-    ChunkList = 11,
-    Backpointer = 12,
-    Ontology = 13,
-    Subscriptions = 14,
+    // Physical space
+    Backpointer = 11,
+    BucketAlloc = 12,
+    FreespaceLru = 13,
+    // Ontology and snapshots
+    Ontology = 14,
     Snapshots = 15,
-    BucketAlloc = 16,
-    FreespaceLru = 17,
-    DiskDescriptors = 18,
-    PlacementRules = 19,
-    ClusterPeers = 20,
-    ReconcileWork = 21,
-    ReconcileHighPrio = 22,
-    ReconcileWorkPhys = 23,
-    ReconcileHighPrioPhys = 24,
+    // Subscriptions
+    Subscriptions = 16,
+    SubscriptionMembers = 17,
+    SubscriptionEvents = 18,
+    // Pool and cluster
+    PoolState = 19,
+    DiskDescriptors = 20,
+    PlacementRules = 21,
+    ClusterPeers = 22,
+    Transfers = 23,
+    // Reconcile
+    ReconcileWork = 24,
     ReconcilePending = 25,
     ReconcileScan = 26,
+    /// TODO(METADATA7): goes with the location table.
+    LocationTable = 0x8000,
+    /// TODO(INDEX13): goes with the tag index, replaced by `Postings`.
+    TagDirectory = 0x8001,
+    /// TODO(INDEX12): goes with the range index, replaced by `TermDictionary`.
+    Range = 0x8002,
+    /// TODO(INDEX12): goes with the kv index, replaced by `TermDictionary`.
+    KvDirectory = 0x8003,
 }
 
 impl BtreeKind {
     /// Decode a raw u16 into a `BtreeKind`.
     pub fn from_u16(value: u16) -> Result<Self, StorageError> {
         Ok(match value {
-            0 => Self::ObjectTable,
-            1 => Self::ObjectHistory,
-            2 => Self::LocationTable,
-            3 => Self::LocationHistory,
+            0 => Self::ObjectRoots,
+            1 => Self::ObjectTable,
+            2 => Self::ObjectHistory,
+            3 => Self::ContentMap,
             4 => Self::Forward,
             5 => Self::ForwardOverflow,
-            6 => Self::TagDirectory,
-            7 => Self::Range,
-            8 => Self::KvDirectory,
-            9 => Self::ValueSpill,
+            6 => Self::TermDictionary,
+            7 => Self::TermTable,
+            8 => Self::Postings,
+            9 => Self::Sequences,
             10 => Self::ChunkIndex,
-            11 => Self::ChunkList,
-            12 => Self::Backpointer,
-            13 => Self::Ontology,
-            14 => Self::Subscriptions,
+            11 => Self::Backpointer,
+            12 => Self::BucketAlloc,
+            13 => Self::FreespaceLru,
+            14 => Self::Ontology,
             15 => Self::Snapshots,
-            16 => Self::BucketAlloc,
-            17 => Self::FreespaceLru,
-            18 => Self::DiskDescriptors,
-            19 => Self::PlacementRules,
-            20 => Self::ClusterPeers,
-            21 => Self::ReconcileWork,
-            22 => Self::ReconcileHighPrio,
-            23 => Self::ReconcileWorkPhys,
-            24 => Self::ReconcileHighPrioPhys,
+            16 => Self::Subscriptions,
+            17 => Self::SubscriptionMembers,
+            18 => Self::SubscriptionEvents,
+            19 => Self::PoolState,
+            20 => Self::DiskDescriptors,
+            21 => Self::PlacementRules,
+            22 => Self::ClusterPeers,
+            23 => Self::Transfers,
+            24 => Self::ReconcileWork,
             25 => Self::ReconcilePending,
             26 => Self::ReconcileScan,
+            0x8000 => Self::LocationTable,
+            0x8001 => Self::TagDirectory,
+            0x8002 => Self::Range,
+            0x8003 => Self::KvDirectory,
             other => return Err(StorageError::InvalidBtreeKind(other)),
         })
     }
@@ -227,10 +248,27 @@ mod tests {
 
     #[test]
     fn btree_kind_round_trips() {
-        for raw in 0u16..=26 {
+        for raw in (0u16..=26).chain(0x8000..=0x8003) {
             let k = BtreeKind::from_u16(raw).unwrap();
             assert_eq!(k as u16, raw);
         }
-        assert!(BtreeKind::from_u16(99).is_err());
+        assert!(BtreeKind::from_u16(27).is_err());
+        assert!(BtreeKind::from_u16(0x8004).is_err());
+    }
+
+    #[test]
+    fn btree_kind_spec_discriminants_pinned() {
+        // FORMAT-DESIGN§1.3, contiguous and grouped by subsystem.
+        assert_eq!(BtreeKind::ObjectRoots as u16, 0);
+        assert_eq!(BtreeKind::ContentMap as u16, 3);
+        assert_eq!(BtreeKind::Forward as u16, 4);
+        assert_eq!(BtreeKind::Postings as u16, 8);
+        assert_eq!(BtreeKind::ChunkIndex as u16, 10);
+        assert_eq!(BtreeKind::BucketAlloc as u16, 12);
+        assert_eq!(BtreeKind::Ontology as u16, 14);
+        assert_eq!(BtreeKind::PoolState as u16, 19);
+        assert_eq!(BtreeKind::ClusterPeers as u16, 22);
+        assert_eq!(BtreeKind::Transfers as u16, 23);
+        assert_eq!(BtreeKind::ReconcileScan as u16, 26);
     }
 }

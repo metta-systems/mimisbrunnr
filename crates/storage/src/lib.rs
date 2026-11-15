@@ -25,6 +25,7 @@ mod checksum;
 mod error;
 mod file_device;
 mod freespace;
+mod preamble;
 mod root_pointer;
 mod superblock;
 mod zone_map;
@@ -64,6 +65,10 @@ pub use {
     file_device::FileBlockDevice,
     freespace::{
         Empty, FREESPACE_LRU_KEY_SIZE, FREESPACE_LRU_REGION_SIZE, FreespaceLru, FreespaceLruKey,
+    },
+    preamble::{
+        LAYOUT_VERSION, MAGIC_JOURNAL_SET, MAGIC_PAGE_RUN_INDEX, MAGIC_REGION, MAGIC_RUN_INDEX,
+        MAGIC_SUPERBLOCK, Preamble, Structure,
     },
     root_pointer::{BlobRef, BlockRef, RootPointer},
     superblock::{ChunkParamsRecord, SUPERBLOCK_MAGIC_FULL, Superblock},

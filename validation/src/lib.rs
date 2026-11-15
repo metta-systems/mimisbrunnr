@@ -45,65 +45,77 @@ pub const BLOCK_KIND_COUNT:             u16 = 11;
 // Sanity: every BlockKind must be unique and densely numbered from 0.
 const _: () = assert!(BLOCK_KIND_OVERFLOW_RECORD + 1 == BLOCK_KIND_COUNT);
 
-// BtreeKind (BtreeNodeHeader.kind, magic = "MIMB")
-// Logical radix (current view + per-snapshot history sidecars)
-pub const BTREE_KIND_OBJECT_TABLE:            u16 = 0;
-pub const BTREE_KIND_OBJECT_HISTORY:          u16 = 1;
-pub const BTREE_KIND_LOCATION_TABLE:          u16 = 2;
-pub const BTREE_KIND_LOCATION_HISTORY:        u16 = 3;
-// Forward index family
+// BtreeKind (Preamble.kind of a "BREG" region), FORMAT-DESIGN§1.3 — contiguous 0–26
+// Object metadata
+pub const BTREE_KIND_OBJECT_ROOTS:            u16 = 0;
+pub const BTREE_KIND_OBJECT_TABLE:            u16 = 1;
+pub const BTREE_KIND_OBJECT_HISTORY:          u16 = 2;
+pub const BTREE_KIND_CONTENT_MAP:             u16 = 3;
+// Term index
 pub const BTREE_KIND_FORWARD:                 u16 = 4;
 pub const BTREE_KIND_FORWARD_OVERFLOW:        u16 = 5;
-// Inverted / range indexes
-pub const BTREE_KIND_TAG_DIRECTORY:           u16 = 6;
-pub const BTREE_KIND_RANGE:                   u16 = 7;
-// KV equality + value storage
-pub const BTREE_KIND_KV_DIRECTORY:            u16 = 8;
-pub const BTREE_KIND_VALUE_SPILL:             u16 = 9;
-// Chunk content-addressing
+pub const BTREE_KIND_TERM_DICTIONARY:         u16 = 6;
+pub const BTREE_KIND_TERM_TABLE:              u16 = 7;
+pub const BTREE_KIND_POSTINGS:                u16 = 8;
+pub const BTREE_KIND_SEQUENCES:               u16 = 9;
+// Deduplication
 pub const BTREE_KIND_CHUNK_INDEX:             u16 = 10;
-pub const BTREE_KIND_CHUNK_LIST:              u16 = 11;
-// Physical reverse mapping
-pub const BTREE_KIND_BACKPOINTER:             u16 = 12;
-// Catalogs (snapshot-aware)
-pub const BTREE_KIND_ONTOLOGY:                u16 = 13;
-pub const BTREE_KIND_SUBSCRIPTIONS:           u16 = 14;
-// Snapshot tree itself
+// Physical space
+pub const BTREE_KIND_BACKPOINTER:             u16 = 11;
+pub const BTREE_KIND_BUCKET_ALLOC:            u16 = 12;
+pub const BTREE_KIND_FREESPACE_LRU:           u16 = 13;
+// Ontology and snapshots
+pub const BTREE_KIND_ONTOLOGY:                u16 = 14;
 pub const BTREE_KIND_SNAPSHOTS:               u16 = 15;
-// Per-disk physical allocation
-pub const BTREE_KIND_BUCKET_ALLOC:            u16 = 16;
-pub const BTREE_KIND_FREESPACE_LRU:           u16 = 17;
-// Pool / cluster state
-pub const BTREE_KIND_DISK_DESCRIPTORS:        u16 = 18;
-pub const BTREE_KIND_PLACEMENT_RULES:         u16 = 19;
-pub const BTREE_KIND_CLUSTER_PEERS:           u16 = 20;
-// Reconcile queues (transient)
-pub const BTREE_KIND_RECONCILE_WORK:          u16 = 21;
-pub const BTREE_KIND_RECONCILE_HIGH_PRIO:     u16 = 22;
-pub const BTREE_KIND_RECONCILE_WORK_PHYS:     u16 = 23;
-pub const BTREE_KIND_RECONCILE_HIGH_PRIO_PHYS:u16 = 24;
+// Subscriptions
+pub const BTREE_KIND_SUBSCRIPTIONS:           u16 = 16;
+pub const BTREE_KIND_SUBSCRIPTION_MEMBERS:    u16 = 17;
+pub const BTREE_KIND_SUBSCRIPTION_EVENTS:     u16 = 18;
+// Pool and cluster
+pub const BTREE_KIND_POOL_STATE:              u16 = 19;
+pub const BTREE_KIND_DISK_DESCRIPTORS:        u16 = 20;
+pub const BTREE_KIND_PLACEMENT_RULES:         u16 = 21;
+pub const BTREE_KIND_CLUSTER_PEERS:           u16 = 22;
+pub const BTREE_KIND_TRANSFERS:               u16 = 23;
+// Reconcile
+pub const BTREE_KIND_RECONCILE_WORK:          u16 = 24;
 pub const BTREE_KIND_RECONCILE_PENDING:       u16 = 25;
 pub const BTREE_KIND_RECONCILE_SCAN:          u16 = 26;
 pub const BTREE_KIND_COUNT:                   u16 = 27;
 const _: () = assert!(BTREE_KIND_RECONCILE_SCAN + 1 == BTREE_KIND_COUNT);
 
-// SNAPSHOTS-DESIGN§1.5 — snapshot-aware btrees. Synchronous SnapshotDelete cost is
-// `1 + N` WAL entries where N is this count. Doc claim: "7 in the current
-// format: the five in SNAPSHOTS-DESIGN§1.2's table plus the two radix sidecars".
+// SNAPSHOTS-DESIGN§1.2 — the snapshot-aware btrees (the yes-rows of its table), which
+// one snapshot cleanup pass walks (SNAPSHOTS-DESIGN§1.5).
 pub const SNAPSHOT_AWARE_BTREE_COUNT: usize = 7;
 const _: () = {
     // Enumerate them so additions to BtreeKind force a review here.
     let snapshot_aware: [u16; SNAPSHOT_AWARE_BTREE_COUNT] = [
-        BTREE_KIND_OBJECT_HISTORY,    // sidecar
-        BTREE_KIND_LOCATION_HISTORY,  // sidecar
         BTREE_KIND_FORWARD,
-        BTREE_KIND_TAG_DIRECTORY,
-        BTREE_KIND_RANGE,
+        BTREE_KIND_TERM_DICTIONARY,
+        BTREE_KIND_POSTINGS,
+        BTREE_KIND_SEQUENCES,
+        BTREE_KIND_CONTENT_MAP,
         BTREE_KIND_ONTOLOGY,
-        BTREE_KIND_SUBSCRIPTIONS,
+        BTREE_KIND_OBJECT_HISTORY,    // sidecar of the object table
     ];
     let _ = snapshot_aware;
 };
+
+// FORMAT-DESIGN§1.3 Preamble — 8 B, first field of every persistent header
+#[repr(C)]
+pub struct Preamble {
+    pub magic: u32,     // [0..4] little-endian ASCII
+    pub version: u16,   // [4..6]
+    pub kind: u16,      // [6..8] BtreeKind for a region, else 0
+}
+const _: () = assert!(size_of::<Preamble>() == 8);
+const _: () = assert!(std::mem::offset_of!(Preamble, version) == 4);
+const _: () = assert!(std::mem::offset_of!(Preamble, kind) == 6);
+pub const MAGIC_SUPERBLOCK:     u32 = u32::from_le_bytes(*b"MIMR");
+pub const MAGIC_REGION:         u32 = u32::from_le_bytes(*b"BREG");
+pub const MAGIC_RUN_INDEX:      u32 = u32::from_le_bytes(*b"BIDX");
+pub const MAGIC_PAGE_RUN_INDEX: u32 = u32::from_le_bytes(*b"BPGS");
+pub const MAGIC_JOURNAL_SET:    u32 = u32::from_le_bytes(*b"JRNL");
 
 // BtreeNodeHeader.flags
 pub const BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS: u8 = 1 << 0;
