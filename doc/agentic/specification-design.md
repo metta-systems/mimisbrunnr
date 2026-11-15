@@ -835,7 +835,9 @@ commit whose write or flush failed is never acknowledged. A disk that disappears
 at once. A disk still present whose write or flush failed goes `Degraded`: no new replica is
 placed on it while an `Online` disk can take the replica, writes continue there when none can —
 a one-disk pool keeps writing whenever the device does — and replica repair moves its data off
-where it can. A further failure on a `Degraded` disk changes only its counters and the event log;
+where it can. The bucket a write, read or checksum failed in is marked `Bad` and never written again, its
+data moved off (ALLOCATION-DESIGN§1.2), so retries and repairs never return to the failing area.
+A further failure on a `Degraded` disk changes only its counters, its bad buckets and the event log;
 moving it to `Faulted`, or back to `Online`, is the health component's. Everything else is
 evidence, not a verdict: read errors and
 checksum mismatches — each repaired from another replica — are counted per disk

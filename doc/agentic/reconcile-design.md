@@ -46,6 +46,7 @@ because each extent is evaluated independently, at the time it is processed.
 | Chunks written without deduplication (streams, policy-marked writes) while deduplication is on for the object | Background deduplication at idle priority (RECONCILE-DESIGN§1.10) |
 | `AutoTier` access-time threshold crossed (how time triggers fire is POOL-D3; access time is METADATA-D7) | Migrate Hot → Warm → Cold → Glacier          |
 | Bucket fragmentation > copygc threshold           | Run copy GC (ALLOCATION-DESIGN§1.6)          |
+| `Bad` bucket with live data (ALLOCATION-DESIGN§1.2) | Copy GC on it ahead of fragmented buckets  |
 | Disk in `Draining` state                          | Evacuate via backpointer scan (METADATA-DESIGN§2.2) |
 | Disk failure detected, replicas missing           | Resilver (CLUSTER-DESIGN§1) — re-replicate from peers |
 | Tree-node copy fails verification (ENGINE-DESIGN§1.2) | Rewrite the copy from a good one          |

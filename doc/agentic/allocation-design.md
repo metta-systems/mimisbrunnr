@@ -102,8 +102,20 @@ enum BucketKind {
     Packed    = 4,                           // small-object blocks (BLOB-D4)
     Stripe    = 5,                           // erasure-coding stripes (future)
     Reserved  = 6,                           // copygc forward-progress reserve
+    Bad       = 7,                           // a write, read or checksum failed in it; never allocated
 }
 ```
+
+**Bad buckets.** A bucket in which a write or flush failed, a read failed or a checksum did not
+match (SPECIFICATION-DESIGN§8.4 "Disk health") becomes `Bad` through a `BucketAlloc` entry with
+`kind = Bad`, keeping its generation. The allocator never hands it out, so a retried commit and
+every repair write go to another bucket; its live data, written before the failure, is evacuated
+through the copy-GC move path (ALLOCATION-DESIGN§1.6, RECONCILE-DESIGN§1.5), and its `live_sectors` falls to zero as the
+references go. Its sectors stay marked: devices remap failed cells and sectors themselves, so an
+error they report means more than one sector is gone, and a bucket is the unit the allocator
+already keeps state for. The mark clears only through an administrative call for one disk, which
+turns its empty `Bad` buckets back into `Free` with a generation bump (after a reader or cable is
+replaced); the count of `Bad` buckets per disk is evidence for the health component.
 
 **Live-sector accounting.** `live_sectors` changes only through entries that already exist for
 other reasons, so replay recomputes it without accounting entries of its own:

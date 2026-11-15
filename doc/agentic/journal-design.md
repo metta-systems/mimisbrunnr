@@ -305,7 +305,8 @@ FinalizeObject   : { oid: u64, content_hash: [u8;32], total_length: u64,
                    //   range-deletes the old keys (oid, *) at the current snapshot.
 
 // Bucket lifecycle (ALLOCATION-DESIGN§1)
-BucketAlloc      : { disk_id: u16, bucket_no: u32, kind: u8, generation: u32 }  // bucket opened
+BucketAlloc      : { disk_id: u16, bucket_no: u32, kind: u8, generation: u32 }  // bucket opened,
+                   //   or with kind = Bad marked bad, generation unchanged (ALLOCATION-DESIGN§1.2)
 BucketGenBump    : { disk_id: u16, bucket_no: u32, new_generation: u32 }  // bucket freed for reuse
 // live_sectors has no op: replay derives it from the entries that add and drop references
 //   (ALLOCATION-DESIGN§1.2).
