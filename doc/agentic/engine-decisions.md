@@ -17,7 +17,7 @@ Estimated checkpoint entry size under (c), with 64 errors of 64-byte detail and 
 | `RootListHead` + ~18 `RootEntry` (`8 + 16R`) | 88 B + 40–72 B | 0.8 KiB | 1.1 KiB |
 | Pool state (~60 B fixed + errors ~25 B + detail) | | 5.6 KiB | 5.6 KiB |
 | Object roots (`16 + 16R`) | 48–80 B | 0.05 KiB | 4 KiB |
-| Disk descriptors (`32 + 32R`) | 96–160 B | 0.3 KiB | 8 KiB |
+| Disk descriptors (`40 + 32R`) | 104–168 B | 0.3 KiB | 8.5 KiB |
 | Cluster peers (layout undefined, ~200 B assumed) | | 0 | 12.6 KiB |
 | Scan records | ~300 B | ≤ 1.2 KiB | 4.8 KiB |
 | **Total** | | **~8 KiB** | **~36 KiB** |

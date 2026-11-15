@@ -35,14 +35,18 @@ placement-rule ids come from the `PlacementRule` counter the same way. The descr
 
 ```rust
 #[repr(C)]
-struct DiskDescriptor {                      // 24 + 32 × R bytes (R = metadata_replicas)
+struct DiskDescriptor {                      // 40 + 32 × R bytes (R = metadata_replicas)
     disk_uuid: [u8; 16],                     //  [0..16]   matches the device's Superblock.disk_uuid
     media_type: u8,                          // [16..17]   MediaType
     tier: u8,                                // [17..18]   StorageTier
     state: u8,                               // [18..19]   DiskState
     flags: u8,                               // [19..20]   DISK_FLAG_*
     bucket_count: u32,                       // [20..24]   copy of the device's capacity in buckets
-    buckets_root: NodePtr,                   // [24..)     ALLOCATION-DESIGN§1.2 bucket alloc table
+    read_errors: u32,                        // [24..28]   failed reads since the disk was added
+    write_errors: u32,                       // [28..32]   failed writes and flushes
+    checksum_errors: u32,                    // [32..36]   reads whose checksum did not match
+    repaired: u32,                           // [36..40]   chunks and blocks rewritten from another replica
+    buckets_root: NodePtr,                   // [40..)     ALLOCATION-DESIGN§1.2 bucket alloc table
     freespace_root: NodePtr,                 //            ALLOCATION-DESIGN§1.4 freespace LRU
 }
 
@@ -56,7 +60,9 @@ and `disk_id` (ENGINE-DESIGN§1.1). The one copy is `bucket_count`, the device's
 buckets, kept only so that a pool can display a missing disk's capacity. The superblock's geometry
 is the source of truth and nothing reads `bucket_count` for allocation or validation; when an
 opened device's capacity differs — a grown partition or virtual disk — the copy is refreshed at
-the next checkpoint. Usage is the alloc table's. The per-disk allocation trees are COW under the standard checkpoint machinery, so every
+the next checkpoint. Usage is the alloc table's. The error counters are the disk's health record
+(SPECIFICATION-DESIGN§8.4 "Disk health"): kept in memory between checkpoints, advanced at each,
+saturating at `u32::MAX`, so a trend survives reboots. The per-disk allocation trees are COW under the standard checkpoint machinery, so every
 checkpoint captures a self-consistent state of every disk's allocation.
 
 **Opening a pool.** Read every supplied device's superblock; group by `fs_uuid`; load the root

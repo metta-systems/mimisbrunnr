@@ -828,6 +828,19 @@ precedence is ONTOLOGY-D5.
 
 **Resilver:** Proportional to data on the failed disk, not pool size. Prioritized by surviving replica count.
 
+**Disk health.** The engine faults a disk itself only when the disk can no longer be written
+safely: a write or flush fails, or the device disappears. The disk goes `Faulted` at once, the
+commit whose write failed is not acknowledged, no replica is placed on the disk again, and
+reconcile starts replica repair. Everything else is evidence, not a verdict: read errors and
+checksum mismatches — each repaired from another replica — are counted per disk
+(POOL-DESIGN§1.1), and latency outliers against the figures measured at mount are reported as
+pool events. Thresholds belong to an external health component — a Vesper service, or a host
+daemon reading SMART — which changes a disk's state through the administrative interface, and
+moves a disk predicted to fail to `Draining` so it is evacuated while still readable. A read
+error with no other replica to repair from returns a defined error naming the object and byte
+range, leaves the disk's state unchanged and is logged. State changes commit by checkpoint
+(POOL-DESIGN§1.2) and are device events for reconcile (RECONCILE-DESIGN§1.7).
+
 **Automatic tiering:** Objects migrate between tiers based on tags and access patterns. Explicit placement rules take precedence, then access-time-based defaults.
 
 ---
