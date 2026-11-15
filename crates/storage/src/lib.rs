@@ -26,6 +26,7 @@ mod error;
 mod file_device;
 mod freespace;
 mod preamble;
+pub mod region;
 mod root_pointer;
 mod superblock;
 mod zone_map;

@@ -18,6 +18,31 @@ pub enum StorageError {
     #[error("invalid btree kind: {0}")]
     InvalidBtreeKind(u16),
 
+    /// A region's structure is inconsistent: a field out of range or a
+    /// layout that disagrees with itself.
+    #[error("corrupt region: {0}")]
+    RegionCorrupt(&'static str),
+
+    /// A 64-bit block checksum (FORMAT-DESIGN§1.4) did not match.
+    #[error("checksum mismatch: expected {expected:#018x}, got {actual:#018x}")]
+    ChecksumMismatch { expected: u64, actual: u64 },
+
+    /// A region belongs to another tree than the one reading it.
+    #[error("region kind mismatch: expected {expected}, found {actual}")]
+    RegionKindMismatch { expected: u16, actual: u16 },
+
+    /// A run is marked encrypted; runs are not encrypted in this format.
+    #[error("run is encrypted; encrypted runs are not supported")]
+    RunEncrypted,
+
+    /// Entries given to a run were not in strictly ascending key order.
+    #[error("run entries are not in strictly ascending key order")]
+    UnsortedRunEntries,
+
+    /// One index block cannot describe the run.
+    #[error("run too large for one index block")]
+    RunTooLarge,
+
     /// A header whose preamble names no structure this format knows — a
     /// newer layout, another program's data, or corruption.
     #[error("unknown structure: magic {magic:#010x}, version {version}, kind {kind}")]
