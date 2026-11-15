@@ -8,7 +8,7 @@
 //! [40..4072] entries        [BlockRef; 252]   (4 032 B; local-depth-tagged buckets)
 //! [4072..4088] spillover_root BlockRef          (16 B; 0 unless global_depth ≥ 8)
 //! [4088..4092] _pad_tail    [u8; 4]
-//! [4092..4096] crc          u32     (CRC32C over bytes [0..4092] with crc=0)
+//! [4092..4096] crc          u32     (low 32 bits of checksum64 over bytes [0..4092] with crc=0)
 //! ```
 //!
 //! Total = 4 096 B = 4 KiB.
@@ -34,7 +34,7 @@ use {
     bytemuck::{Pod, Zeroable},
     mimisbrunnr_storage::{
         BLOCK_PREAMBLE_MAGIC_BLOCK, BLOCK_SIZE, BlockDevice, BlockHeader, BlockKind, BlockRef,
-        block_crc,
+        checksum64,
     },
     static_assertions::const_assert_eq,
 };
@@ -159,10 +159,10 @@ impl KvDirectoryBlock {
         }
     }
 
-    /// Recompute and store the trailing CRC32C.
+    /// Recompute and store the trailing checksum (low 32 bits of `checksum64`).
     pub fn recompute_crc(&mut self) {
         self.crc = 0;
-        let crc = block_crc(&bytemuck::bytes_of(self)[..CRC_OFFSET]);
+        let crc = checksum64(&bytemuck::bytes_of(self)[..CRC_OFFSET]) as u32;
         self.crc = crc;
     }
 
@@ -171,7 +171,7 @@ impl KvDirectoryBlock {
         let expected = { self.crc };
         let mut copy = *self;
         copy.crc = 0;
-        let actual = block_crc(&bytemuck::bytes_of(&copy)[..CRC_OFFSET]);
+        let actual = checksum64(&bytemuck::bytes_of(&copy)[..CRC_OFFSET]) as u32;
         if expected == actual {
             Ok(())
         } else {
@@ -335,7 +335,7 @@ mod tests {
         for b in &mut zeroed[CRC_OFFSET..CRC_OFFSET + 4] {
             *b = 0;
         }
-        let new_crc = block_crc(&zeroed[..CRC_OFFSET]);
+        let new_crc = checksum64(&zeroed[..CRC_OFFSET]) as u32;
         buf[CRC_OFFSET..CRC_OFFSET + 4].copy_from_slice(&new_crc.to_le_bytes());
         dev.write_at(0, &buf).unwrap();
 

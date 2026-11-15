@@ -202,14 +202,6 @@ impl BtreeKind {
     }
 }
 
-// ---------- CRC helpers ----------
-
-/// Compute CRC32C (Castagnoli) over a byte slice. The caller is responsible
-/// for zeroing any in-band CRC slot before invoking this. FORMAT-DESIGN§1.4.
-pub fn block_crc(bytes_with_zeroed_crc_slot: &[u8]) -> u32 {
-    crc32c::crc32c(bytes_with_zeroed_crc_slot)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,13 +232,5 @@ mod tests {
             assert_eq!(k as u16, raw);
         }
         assert!(BtreeKind::from_u16(99).is_err());
-    }
-
-    #[test]
-    fn crc32c_known_vector() {
-        // crc32c of empty input is 0.
-        assert_eq!(block_crc(&[]), 0);
-        // Known vector: crc32c("123456789") == 0xE3069283.
-        assert_eq!(block_crc(b"123456789"), 0xE306_9283);
     }
 }

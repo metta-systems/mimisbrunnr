@@ -450,8 +450,8 @@ pub struct WalEntryHeader {
 const _: () = assert!(size_of::<WalEntryHeader>() == 40);
 
 // JOURNAL-DESIGN§1.2 / ENCRYPTION-DESIGN§1 — encrypted WAL entry framing.
-// Plaintext entry overhead = WalEntryHeader (40) + framing CRC32C (4) = 44 B.
-// Encrypted entry overhead = header (40) + GCM tag (16) + framing CRC32C (4) = 60 B.
+// Plaintext entry overhead = WalEntryHeader (40) + framing checksum (4, low half of checksum64) = 44 B.
+// Encrypted entry overhead = header (40) + GCM tag (16) + framing checksum (4, low half of checksum64) = 60 B.
 // The GCM tag does NOT replace `payload_crc` (4 B is too narrow for a 16 B tag);
 // it sits between the ciphertext and the trailing framing CRC.
 pub const WAL_FRAMING_CRC_BYTES: usize = 4;

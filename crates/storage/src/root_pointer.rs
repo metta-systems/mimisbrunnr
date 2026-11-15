@@ -40,7 +40,7 @@ const_assert_eq!(core::mem::size_of::<BlobRef>(), 16);
 /// 408-byte root pointer. ENGINE-DESIGN§1.2.
 ///
 /// Holds two scalars (`seq`, `lsn`), 24 `BlockRef` slots, a `flags` word and
-/// a trailing CRC32C over bytes `[0..404]`.
+/// a trailing checksum (low 32 bits of `checksum64`) over bytes `[0..404]`.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
 pub struct RootPointer {
@@ -74,7 +74,7 @@ pub struct RootPointer {
     pub cluster_peers_root: BlockRef,           // [384..400]
 
     pub flags: u32, // [400..404]
-    pub crc: u32,   // [404..408]  CRC32C of bytes [0..404]
+    pub crc: u32,   // [404..408]  low 32 bits of checksum64 of bytes [0..404]
 }
 
 const_assert_eq!(core::mem::size_of::<RootPointer>(), 408);
@@ -86,7 +86,7 @@ impl RootPointer {
     /// Recompute and store the CRC over bytes `[0..404]`.
     pub fn recompute_crc(&mut self) {
         self.crc = 0;
-        let crc = crc32c::crc32c(&bytemuck::bytes_of(self)[..Self::CRC_OFFSET]);
+        let crc = crate::checksum::checksum64(&bytemuck::bytes_of(self)[..Self::CRC_OFFSET]) as u32;
         self.crc = crc;
     }
 
@@ -96,7 +96,7 @@ impl RootPointer {
         let expected = { self.crc };
         let mut copy = *self;
         copy.crc = 0;
-        let actual = crc32c::crc32c(&bytemuck::bytes_of(&copy)[..Self::CRC_OFFSET]);
+        let actual = crate::checksum::checksum64(&bytemuck::bytes_of(&copy)[..Self::CRC_OFFSET]) as u32;
         if expected == actual {
             Ok(())
         } else {

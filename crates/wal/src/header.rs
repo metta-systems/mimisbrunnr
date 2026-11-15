@@ -3,7 +3,7 @@
 
 use {
     bytemuck::{Pod, Zeroable},
-    mimisbrunnr_storage::{BLOCK_SIZE, BlockHeader, BlockKind, block_crc},
+    mimisbrunnr_storage::{BLOCK_SIZE, BlockHeader, BlockKind, checksum64},
     static_assertions::const_assert_eq,
 };
 
@@ -30,7 +30,7 @@ pub struct WalHeader {
     pub _pad: u32,                                 // [76..80]
     pub encryption_keyid: [u8; 16],                // [80..96]
     pub _reserved: [u8; WAL_HEADER_RESERVED_LEN],  // [96..4092]
-    pub crc: u32,                                  // [4092..4096]   CRC32C of [0..4092]
+    pub crc: u32,                                  // [4092..4096]   low 32 bits of checksum64 of [0..4092]
 }
 
 const_assert_eq!(core::mem::size_of::<WalHeader>(), BLOCK_SIZE);
@@ -61,7 +61,7 @@ impl WalHeader {
     pub fn recompute_crc(&mut self) {
         self.crc = 0;
         let bytes = bytemuck::bytes_of(self);
-        let crc = block_crc(&bytes[..Self::CRC_OFFSET]);
+        let crc = checksum64(&bytes[..Self::CRC_OFFSET]) as u32;
         self.crc = crc;
     }
 
@@ -72,7 +72,7 @@ impl WalHeader {
         let mut copy = *self;
         copy.crc = 0;
         let bytes = bytemuck::bytes_of(&copy);
-        let actual = block_crc(&bytes[..Self::CRC_OFFSET]);
+        let actual = checksum64(&bytes[..Self::CRC_OFFSET]) as u32;
         if expected == actual {
             Ok(())
         } else {

@@ -929,15 +929,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crc32c"
-version = "0.6.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
-dependencies = [
- "rustc_version",
-]
-
-[[package]]
 name = "crc32fast"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2304,7 +2295,6 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "ciborium",
- "crc32c",
  "itertools",
  "log",
  "mimisbrunnr-types",
@@ -2313,6 +2303,7 @@ dependencies = [
  "static_assertions",
  "tempfile",
  "thiserror 2.0.18",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -2358,7 +2349,6 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "ciborium",
- "crc32c",
  "log",
  "mimisbrunnr-storage",
  "mimisbrunnr-types",
@@ -4967,6 +4957,12 @@ name = "xml-rs"
 version = "0.8.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40de123dbb523ebcc00d61ec01840ad192578afc378d859f3429caa38308fad5"
 
 [[package]]
 name = "yoke"

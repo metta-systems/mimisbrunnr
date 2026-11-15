@@ -3,7 +3,8 @@
 //!
 //! Implements:
 //!
-//! - FORMAT-DESIGN§1 — block headers, kind enumerations, CRC32C, B+ tree node and
+//! - FORMAT-DESIGN§1 — block headers, kind enumerations, the XXH3-64 block
+//!   checksum, B+ tree node and
 //!   sorted-run envelopes (structs only — see crate docs for deferred items).
 //! - ENGINE-DESIGN§1 — superblock, zone map, atomic root commit (steps 5–6).
 //! - ALLOCATION-DESIGN§1 (partial) — bucket alloc record, data-type enum, generation
@@ -20,6 +21,7 @@ mod block;
 mod block_device;
 mod btree;
 mod btree_node;
+mod checksum;
 mod error;
 mod file_device;
 mod freespace;
@@ -38,8 +40,9 @@ pub use {
     block::{
         BLOCK_FLAG_CONTINUATION, BLOCK_FLAG_ENCRYPTED, BLOCK_PREAMBLE_MAGIC_BLOCK,
         BLOCK_PREAMBLE_MAGIC_BTREE, BLOCK_SIZE, BLOCK_SIZE_LOG2, BlockHeader, BlockKind,
-        BlockPreamble, BtreeKind, block_crc,
+        BlockPreamble, BtreeKind,
     },
+    checksum::{Checksum64, checksum64},
     block_device::BlockDevice,
     btree::{
         BtreeRegion, JournalEntry, JournalOp, JournalPin, LoadedNode, MergeIter, SortedRun,

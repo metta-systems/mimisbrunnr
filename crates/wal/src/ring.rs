@@ -14,7 +14,7 @@
 
 use {
     log::trace,
-    mimisbrunnr_storage::{BLOCK_SIZE, BlockDevice, block_crc},
+    mimisbrunnr_storage::{BLOCK_SIZE, BlockDevice, checksum64},
     mimisbrunnr_types::HybridTimestamp as LogicalHybridTimestamp,
     serde::Serialize,
 };
@@ -29,7 +29,7 @@ use crate::{
 };
 
 /// Per-sector framing: a sector contains at most one entry. The header lives
-/// at the start, payload immediately after, and the trailing framing CRC32C
+/// at the start, payload immediately after, and the trailing framing checksum (low 32 bits of checksum64)
 /// occupies the last 4 bytes of the entry frame (not the sector — anything
 /// after is zero padding that the iterator skips).
 ///
@@ -337,7 +337,7 @@ impl Wal {
 
         // Build entry header with payload_crc filled in.
         let mut hdr = WalEntryHeader::new(op_kind, flags, lsn, ts, payload_len as u32);
-        hdr.payload_crc = block_crc(payload);
+        hdr.payload_crc = checksum64(payload) as u32;
 
         // Assemble sector buffer (zero-padded tail).
         let mut sector = [0u8; WAL_SECTOR_SIZE];
@@ -345,8 +345,8 @@ impl Wal {
         sector[..hdr_bytes.len()].copy_from_slice(hdr_bytes);
         let payload_off = hdr_bytes.len();
         sector[payload_off..payload_off + payload_len].copy_from_slice(payload);
-        // Trailing framing CRC = CRC32C(WalEntryHeader || payload).
-        let frame_crc = block_crc(&sector[..hdr_bytes.len() + payload_len]);
+        // Trailing framing CRC = low 32 bits of checksum64(WalEntryHeader || payload).
+        let frame_crc = checksum64(&sector[..hdr_bytes.len() + payload_len]) as u32;
         let crc_off = hdr_bytes.len() + payload_len;
         sector[crc_off..crc_off + WAL_FRAMING_CRC_LEN]
             .copy_from_slice(&frame_crc.to_le_bytes());
@@ -504,7 +504,7 @@ impl Iterator for WalIter<'_> {
                 sector[frame_end + 2],
                 sector[frame_end + 3],
             ]);
-            let computed = block_crc(&sector[..frame_end]);
+            let computed = checksum64(&sector[..frame_end]) as u32;
             if stored_crc != computed {
                 self.done = true;
                 return Some(Err(WalError::CrcMismatch {
@@ -516,7 +516,7 @@ impl Iterator for WalIter<'_> {
             // Verify payload CRC (computed over plaintext payload bytes).
             let payload_slice = &sector[hdr_size..hdr_size + payload_len];
             let stored_payload_crc = { hdr.payload_crc };
-            let computed_payload_crc = block_crc(payload_slice);
+            let computed_payload_crc = checksum64(payload_slice) as u32;
             if stored_payload_crc != computed_payload_crc {
                 self.done = true;
                 return Some(Err(WalError::CrcMismatch {

@@ -42,10 +42,9 @@ Independent of each other unless an order is given.
 
 - **Encodings** (FORMAT-DESIGN§1.6): [SPEC25](specification-implementation-plan.md) and [INDEX9](index-implementation-plan.md) first; then [JOURNAL8](journal-implementation-plan.md) (binary payloads, then [JOURNAL9](journal-implementation-plan.md): journal buckets and journal sets, after JOURNAL7), [QUERY11](query-implementation-plan.md) and [ONTOLOGY10](ontology-implementation-plan.md); after QUERY11, [SUBSCRIPTION7](subscriptions-implementation-plan.md) and [POOL5](pool-implementation-plan.md) (native placement-rules tree).
 - [SPEC24](specification-implementation-plan.md) — no packed on-disk structs.
-- [JOURNAL7](journal-implementation-plan.md) — one checksum algorithm, XXH3-64; before BTREE9, whose new headers it checksums.
 - [POOL1](pool-implementation-plan.md) — one disk-descriptor tree (after ALLOCATION9).
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
-- [BTREE11](btree-implementation-plan.md) — one preamble; then [BTREE9](btree-implementation-plan.md) — write-once regions, block-addressable runs and one run format for every tree (after JOURNAL7); then [BTREE10](btree-implementation-plan.md) — positional page regions.
+- [BTREE11](btree-implementation-plan.md) — one preamble; then [BTREE9](btree-implementation-plan.md) — write-once regions, block-addressable runs and one run format for every tree; then [BTREE10](btree-implementation-plan.md) — positional page regions.
 - [ONTOLOGY2](ontology-implementation-plan.md) — storage errors.
 - [ONTOLOGY10](ontology-implementation-plan.md) (per-record ontology tree, in the encodings group above), then [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator with ad-hoc tags in `local` — and [ONTOLOGY15](ontology-implementation-plan.md) — tag uids and name resolution; [ONTOLOGY11](ontology-implementation-plan.md) — ontology journal ops, after JOURNAL8.
 - [ALLOCATION9](allocation-implementation-plan.md) — bucket-relative pointers and node pointers.

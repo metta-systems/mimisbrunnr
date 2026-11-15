@@ -12,7 +12,8 @@ use {
 };
 
 use crate::{
-    block::{BLOCK_SIZE, BlockHeader, BlockKind, block_crc},
+    block::{BLOCK_SIZE, BlockHeader, BlockKind},
+    checksum::checksum64,
     block_device::BlockDevice,
     error::StorageError,
     root_pointer::{BlockRef, RootPointer},
@@ -227,7 +228,7 @@ impl Superblock {
     /// slot zeroed).
     pub fn recompute_crc(&mut self) {
         self.crc = 0;
-        let crc = block_crc(&bytemuck::bytes_of(self)[..SUPERBLOCK_CRC_OFFSET]);
+        let crc = checksum64(&bytemuck::bytes_of(self)[..SUPERBLOCK_CRC_OFFSET]) as u32;
         self.crc = crc;
     }
 
@@ -236,7 +237,7 @@ impl Superblock {
         let expected = { self.crc };
         let mut copy = *self;
         copy.crc = 0;
-        let actual = block_crc(&bytemuck::bytes_of(&copy)[..SUPERBLOCK_CRC_OFFSET]);
+        let actual = checksum64(&bytemuck::bytes_of(&copy)[..SUPERBLOCK_CRC_OFFSET]) as u32;
         if expected == actual {
             Ok(())
         } else {
@@ -550,7 +551,7 @@ mod tests {
             buf[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4].copy_from_slice(&[0; 4]);
             let mut tmp_sb_bytes = buf.clone();
             tmp_sb_bytes[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4].copy_from_slice(&[0; 4]);
-            let new_crc = crc32c::crc32c(&tmp_sb_bytes[..SUPERBLOCK_CRC_OFFSET]);
+            let new_crc = checksum64(&tmp_sb_bytes[..SUPERBLOCK_CRC_OFFSET]) as u32;
             buf[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4]
                 .copy_from_slice(&new_crc.to_le_bytes());
             dev.write_at(off, &buf).unwrap();
@@ -621,7 +622,7 @@ mod tests {
         buf[69] = 200;
         // Recompute the trailing CRC so the block-level checks pass.
         buf[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4].copy_from_slice(&[0; 4]);
-        let new_crc = crc32c::crc32c(&buf[..SUPERBLOCK_CRC_OFFSET]);
+        let new_crc = checksum64(&buf[..SUPERBLOCK_CRC_OFFSET]) as u32;
         buf[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4]
             .copy_from_slice(&new_crc.to_le_bytes());
 

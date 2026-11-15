@@ -8,7 +8,7 @@
 //! [36..4068] entries      [{ tag_id u32 | value_hash u64 | bitmap_ref BlockRef }; 144]
 //!                                                                       (4 032 B)
 //! [4068..4092] _pad_tail  [u8; 24]
-//! [4092..4096] crc        u32     (CRC32C over bytes [0..4092] with crc=0)
+//! [4092..4096] crc        u32     (low 32 bits of checksum64 over bytes [0..4092] with crc=0)
 //! ```
 //!
 //! Total = 4 096 B = 4 KiB. Each entry is 28 B (4 + 8 + 16); 144 entries
@@ -18,7 +18,7 @@ use {
     bytemuck::{Pod, Zeroable},
     mimisbrunnr_storage::{
         BLOCK_PREAMBLE_MAGIC_BLOCK, BLOCK_SIZE, BlockDevice, BlockHeader, BlockKind, BlockRef,
-        block_crc,
+        checksum64,
     },
     static_assertions::const_assert_eq,
 };
@@ -174,10 +174,10 @@ impl KvBucketBlock {
         self.entries.iter().take(count)
     }
 
-    /// Recompute and store the trailing CRC32C.
+    /// Recompute and store the trailing checksum (low 32 bits of `checksum64`).
     pub fn recompute_crc(&mut self) {
         self.crc = 0;
-        let crc = block_crc(&bytemuck::bytes_of(self)[..CRC_OFFSET]);
+        let crc = checksum64(&bytemuck::bytes_of(self)[..CRC_OFFSET]) as u32;
         self.crc = crc;
     }
 
@@ -186,7 +186,7 @@ impl KvBucketBlock {
         let expected = { self.crc };
         let mut copy = *self;
         copy.crc = 0;
-        let actual = block_crc(&bytemuck::bytes_of(&copy)[..CRC_OFFSET]);
+        let actual = checksum64(&bytemuck::bytes_of(&copy)[..CRC_OFFSET]) as u32;
         if expected == actual {
             Ok(())
         } else {

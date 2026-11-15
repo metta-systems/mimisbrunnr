@@ -104,7 +104,7 @@ pub struct SortedRunHeader {
     pub entry_count: u32,     // [16..20]
     pub payload_length: u32,  // [20..24]
     pub flags: u32,           // [24..28] SORTED_RUN_FLAG_*
-    pub crc: u32,             // [28..32] CRC32C over (header || payload), CRC slot zeroed
+    pub crc: u32,             // [28..32] low 32 bits of the block checksum over (header || payload), slot zeroed
 }
 
 const_assert_eq!(core::mem::size_of::<SortedRunHeader>(), 32);
@@ -113,11 +113,14 @@ const_assert_eq!(core::mem::size_of::<SortedRunHeader>(), 32);
 pub const SORTED_RUN_MAGIC: u32 = u32::from_le_bytes(*b"BSET");
 
 impl SortedRunHeader {
-    /// Compute the CRC32C of (header || payload) with the CRC slot zeroed.
+    /// The block checksum (FORMAT-DESIGN§1.4) of (header || payload) with the
+    /// slot zeroed, truncated to the 32-bit slot this header still has.
+    /// TODO(BTREE9): the run header's 64-bit slot.
     pub fn compute_crc(header_with_zero_crc: &[u8], payload: &[u8]) -> u32 {
-        let mut h = crc32c::crc32c(header_with_zero_crc);
-        h = crc32c::crc32c_append(h, payload);
-        h
+        let mut checksum = crate::checksum::Checksum64::new();
+        checksum.update(header_with_zero_crc);
+        checksum.update(payload);
+        checksum.finish() as u32
     }
 
     /// Validate this header's CRC against `payload`.

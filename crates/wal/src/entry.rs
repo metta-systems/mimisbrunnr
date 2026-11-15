@@ -26,7 +26,7 @@ pub const WAL_ENTRY_FORMAT_VERSION: u8 = 1;
 /// sites.)
 pub const WAL_SECTOR_SIZE: usize = 4096;
 
-/// Trailing framing CRC32C (4 B) appended after every entry.
+/// Trailing framing checksum, low 32 bits of `checksum64` (4 B), appended after every entry.
 pub const WAL_FRAMING_CRC_LEN: usize = 4;
 
 /// AES-256-GCM authentication-tag length in encrypted framing.
@@ -102,7 +102,7 @@ pub struct WalEntryHeader {
     pub lsn: u64,                          // [8..16]
     pub timestamp: WalHybridTimestampWire, // [16..32] 16 B
     pub payload_length: u32,               // [32..36]
-    pub payload_crc: u32,                  // [36..40] CRC32C(payload)
+    pub payload_crc: u32,                  // [36..40] low 32 bits of checksum64(payload)
 }
 
 const_assert_eq!(core::mem::size_of::<WalEntryHeader>(), 40);

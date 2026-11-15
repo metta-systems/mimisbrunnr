@@ -41,7 +41,7 @@ pub struct ZoneMap {
     pub _pad: [u8; 6],                      // [34..40]
     pub extents: [ZoneMapEntry; 126],       // [40..4072]   126 × 32 B
     pub _pad_tail: [u8; 20],                // [4072..4092]
-    pub crc: u32,                           // [4092..4096] trailing CRC32C
+    pub crc: u32,                           // [4092..4096] trailing checksum, low 32 bits of checksum64
 }
 
 const_assert_eq!(core::mem::size_of::<ZoneMap>(), 4096);

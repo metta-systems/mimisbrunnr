@@ -12,7 +12,7 @@ use {
     log::trace,
     mimisbrunnr_storage::{
         BLOCK_PREAMBLE_MAGIC_BLOCK, BLOCK_SIZE, BlockDevice, BlockHeader, BlockKind, BtreeKind,
-        BtreeRegion, LoadedNode, SortedRun, block_crc,
+        BtreeRegion, LoadedNode, SortedRun, checksum64,
     },
     static_assertions::const_assert_eq,
 };
@@ -53,7 +53,7 @@ pub struct PoolStateRoot {
     pub cluster_node_count: u32,    // [36..40]
     pub inline_disks: [DiskDescriptorOnDisk; POOL_STATE_ROOT_INLINE_DISKS], // [40..3112]
     pub _reserved: [u8; POOL_STATE_ROOT_RESERVED], // [3112..4092]
-    pub crc: u32,                   // [4092..4096]   CRC32C of bytes [0..4092]
+    pub crc: u32,                   // [4092..4096]   low 32 bits of checksum64 of bytes [0..4092]
 }
 
 const_assert_eq!(core::mem::size_of::<PoolStateRoot>(), POOL_STATE_ROOT_SIZE);
@@ -76,10 +76,10 @@ impl PoolStateRoot {
         out
     }
 
-    /// Recompute and store the trailing CRC32C over bytes `[0..4092]`.
+    /// Recompute and store the trailing checksum (low 32 bits of `checksum64`) over bytes `[0..4092]`.
     pub fn recompute_crc(&mut self) {
         self.crc = 0;
-        let crc = block_crc(&bytemuck::bytes_of(self)[..POOL_STATE_ROOT_CRC_OFFSET]);
+        let crc = checksum64(&bytemuck::bytes_of(self)[..POOL_STATE_ROOT_CRC_OFFSET]) as u32;
         self.crc = crc;
     }
 
@@ -88,7 +88,7 @@ impl PoolStateRoot {
         let expected = { self.crc };
         let mut copy = *self;
         copy.crc = 0;
-        let actual = block_crc(&bytemuck::bytes_of(&copy)[..POOL_STATE_ROOT_CRC_OFFSET]);
+        let actual = checksum64(&bytemuck::bytes_of(&copy)[..POOL_STATE_ROOT_CRC_OFFSET]) as u32;
         if expected == actual {
             Ok(())
         } else {
@@ -335,7 +335,7 @@ mod tests {
         buf[5] = 0;
         // Recompute trailing CRC.
         buf[POOL_STATE_ROOT_CRC_OFFSET..POOL_STATE_ROOT_CRC_OFFSET + 4].copy_from_slice(&[0; 4]);
-        let new_crc = block_crc(&buf[..POOL_STATE_ROOT_CRC_OFFSET]);
+        let new_crc = checksum64(&buf[..POOL_STATE_ROOT_CRC_OFFSET]) as u32;
         buf[POOL_STATE_ROOT_CRC_OFFSET..POOL_STATE_ROOT_CRC_OFFSET + 4]
             .copy_from_slice(&new_crc.to_le_bytes());
         dev.write_at(0, &buf).unwrap();

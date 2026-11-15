@@ -13,7 +13,7 @@
 //! [36..52]     next_page     BlockRef   (16 B; ZERO = tail of chain)
 //! [52..4088]   bitmap_bytes  [u8; 4036]
 //! [4088..4092] _pad          [u8; 4]
-//! [4092..4096] crc           u32        (CRC32C over bytes [0..4092] with crc=0)
+//! [4092..4096] crc           u32        (low 32 bits of checksum64 over bytes [0..4092] with crc=0)
 //! ```
 //!
 //! Used by both KvIndex (INDEX-DESIGN§4.1; one page per `(tag_id, value_hash)`, always
@@ -25,7 +25,7 @@ use {
     bytemuck::{Pod, Zeroable},
     mimisbrunnr_storage::{
         BLOCK_PREAMBLE_MAGIC_BLOCK, BLOCK_SIZE, BlockDevice, BlockHeader, BlockKind, BlockRef,
-        block_crc,
+        checksum64,
     },
     roaring::RoaringBitmap,
     static_assertions::const_assert_eq,
@@ -157,7 +157,7 @@ impl TagBitmapPage {
 
     pub fn recompute_crc(&mut self) {
         self.crc = 0;
-        let crc = block_crc(&bytemuck::bytes_of(self)[..CRC_OFFSET]);
+        let crc = checksum64(&bytemuck::bytes_of(self)[..CRC_OFFSET]) as u32;
         self.crc = crc;
     }
 
@@ -165,7 +165,7 @@ impl TagBitmapPage {
         let expected = { self.crc };
         let mut copy = *self;
         copy.crc = 0;
-        let actual = block_crc(&bytemuck::bytes_of(&copy)[..CRC_OFFSET]);
+        let actual = checksum64(&bytemuck::bytes_of(&copy)[..CRC_OFFSET]) as u32;
         if expected == actual {
             Ok(())
         } else {
