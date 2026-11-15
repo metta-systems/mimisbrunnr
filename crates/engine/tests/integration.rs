@@ -1114,10 +1114,7 @@ fn all_ten_migrated_structures_round_trip_together() {
 
 #[test]
 fn r1b4_bucket_alloc_table_persists_across_commit_drop_open() {
-    use mimisbrunnr_storage::{
-        BUCKET_FLAG_NEEDS_DISCARD, BUCKET_FLAG_PINNED_BY_SNAPSHOT, BucketAllocEntry,
-        BucketDataType,
-    };
+    use mimisbrunnr_storage::{BUCKET_FLAG_NEEDS_DISCARD, BucketAllocEntry, BucketKind};
 
     let tmp = TempDir::new().unwrap();
     let (cfg, cfg_path) = small_pool(&tmp);
@@ -1127,35 +1124,16 @@ fn r1b4_bucket_alloc_table_persists_across_commit_drop_open() {
     // inject directly so we can prove the round-trip works.
     let entries: Vec<(u32, BucketAllocEntry)> = (0u32..16)
         .map(|i| {
-            (
-                i,
-                BucketAllocEntry {
-                    generation: i + 1,
-                    data_type: BucketDataType::Blob as u8,
-                    flags: if i % 4 == 0 {
-                        BUCKET_FLAG_NEEDS_DISCARD
-                    } else {
-                        0
-                    },
-                    dirty_sectors: (i & 0xff) as u16,
-                    last_modify_lsn: i as u64 * 100,
-                },
-            )
+            let flags = if i % 4 == 0 { BUCKET_FLAG_NEEDS_DISCARD } else { 0 };
+            (i, BucketAllocEntry::new(i + 1, BucketKind::Data, flags, i & 0xff))
         })
         .collect();
     for (k, v) in &entries {
         de.engine.bucket_alloc.insert(*k, *v);
     }
-    de.engine.bucket_alloc.insert(
-        9999,
-        BucketAllocEntry {
-            generation: 42,
-            data_type: BucketDataType::Metadata as u8,
-            flags: BUCKET_FLAG_PINNED_BY_SNAPSHOT,
-            dirty_sectors: 17,
-            last_modify_lsn: 999_999,
-        },
-    );
+    de.engine
+        .bucket_alloc
+        .insert(9999, BucketAllocEntry::new(42, BucketKind::Bad, 0, 17));
     let pre_len = de.engine.bucket_alloc.len();
     assert_eq!(pre_len, 17);
 
@@ -1170,13 +1148,11 @@ fn r1b4_bucket_alloc_table_persists_across_commit_drop_open() {
             .bucket_alloc
             .get(*k)
             .expect("bucket missing after round-trip");
-        assert_eq!({ got.generation }, { v.generation });
-        assert_eq!(got.data_type, v.data_type);
-        assert_eq!(got.flags, v.flags);
-        assert_eq!({ got.last_modify_lsn }, { v.last_modify_lsn });
+        assert_eq!(got, v);
     }
-    let pinned = de2.engine.bucket_alloc.get(9999).expect("pinned missing");
-    assert_eq!(pinned.flags, BUCKET_FLAG_PINNED_BY_SNAPSHOT);
+    let bad = de2.engine.bucket_alloc.get(9999).expect("bad bucket missing");
+    assert_eq!(bad.kind().unwrap(), BucketKind::Bad);
+    assert_eq!(bad.live_sectors(), 17);
 }
 
 #[test]
@@ -1228,7 +1204,7 @@ fn r1b4_freespace_lru_persists_across_commit_drop_open() {
 #[test]
 fn all_twelve_migrated_structures_round_trip_together() {
     use mimisbrunnr_meta::{BackpointerKey, BackpointerValue, OwnerKind};
-    use mimisbrunnr_storage::{BucketAllocEntry, BucketDataType};
+    use mimisbrunnr_storage::{BucketAllocEntry, BucketKind};
 
     // ChunkIndex + KvIndex + ForwardIndex + TagIndex + RangeIndex +
     // ObjectTable + LocationTable + Ontology + Subscriptions +
@@ -1269,13 +1245,7 @@ fn all_twelve_migrated_structures_round_trip_together() {
     // BucketAllocTable.
     de.engine.bucket_alloc.insert(
         13,
-        BucketAllocEntry {
-            generation: 13,
-            data_type: BucketDataType::Blob as u8,
-            flags: 0,
-            dirty_sectors: 1,
-            last_modify_lsn: 13,
-        },
+        BucketAllocEntry::new(13, BucketKind::Data, 0, 1),
     );
 
     // FreespaceLru.
@@ -1314,7 +1284,7 @@ fn all_twelve_migrated_structures_round_trip_together() {
     // Bucket alloc + freespace LRU.
     assert_eq!(de2.engine.bucket_alloc.len(), 1);
     let ba = de2.engine.bucket_alloc.get(13).unwrap();
-    assert_eq!({ ba.generation }, 13);
+    assert_eq!(ba.generation, 13);
     assert_eq!(de2.engine.freespace_lru.len(), 2);
     assert!(de2.engine.freespace_lru.contains(0, 0, 13));
     assert!(de2.engine.freespace_lru.contains(255, 0, 99));

@@ -171,9 +171,10 @@ const _: () = assert!(STORE_KIND_WHITEOUT != STORE_KIND_RANKED);
 pub const SNAPSHOT_FLAG_LEAF:    u8 = 1 << 0;
 pub const SNAPSHOT_FLAG_DELETED: u8 = 1 << 1;
 
-// BucketAllocEntry.flags
-pub const BUCKET_FLAG_NEEDS_DISCARD:      u8 = 1 << 0;
-pub const BUCKET_FLAG_PINNED_BY_SNAPSHOT: u8 = 1 << 1;
+// BucketAllocEntry.kind_flags: low nibble BucketKind (0–7 assigned), high nibble flags
+pub const BUCKET_FLAG_NEEDS_DISCARD: u8 = 1 << 4;
+pub const BUCKET_KIND_BAD:           u8 = 7;
+const _: () = assert!(BUCKET_FLAG_NEEDS_DISCARD & 0x0f == 0);
 
 // WorkItem.flags
 pub const WORK_FLAG_RATELIMITED: u32 = 1 << 0;
@@ -945,17 +946,17 @@ const _: () = assert!(size_of::<SnapshotNode>() == 64);
 const _: () = assert!(std::mem::offset_of!(SnapshotNode, ancestor_bitmap) == 16);
 
 // =====================================================================
-// ALLOCATION-DESIGN§1.2 BucketAllocEntry — 16 B
+// ALLOCATION-DESIGN§1.2 BucketAllocEntry — 8 B
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct BucketAllocEntry {
-    pub generation: u32,
-    pub data_type: u8,
-    pub flags: u8,
-    pub dirty_sectors: u16,
-    pub last_modify_lsn: u64,
+    pub generation: u32,         // [0..4]
+    pub kind_flags: u8,          // [4..5]
+    pub live_sectors: [u8; 3],   // [5..8] u24 LE
 }
-const _: () = assert!(size_of::<BucketAllocEntry>() == 16);
+const _: () = assert!(size_of::<BucketAllocEntry>() == 8);
+const _: () = assert!(std::mem::offset_of!(BucketAllocEntry, kind_flags) == 4);
+const _: () = assert!(std::mem::offset_of!(BucketAllocEntry, live_sectors) == 5);
 
 // =====================================================================
 // RECONCILE-DESIGN§1.2 WorkItem — 48 B
@@ -1416,17 +1417,17 @@ const _: () = assert!(RANGE_ENTRIES_PER_RUN_BEST  >= 10_900 && RANGE_ENTRIES_PER
 const _: () = assert!(RANGE_ENTRIES_PER_RUN_WORST >=  9_350 && RANGE_ENTRIES_PER_RUN_WORST <  9_500);
 
 // =====================================================================
-// ALLOCATION-DESIGN§1.4 Freespace LRU fragmentation_band: ⌈255 × dirty / sectors⌉
+// ALLOCATION-DESIGN§1.4 Freespace LRU fragmentation_band: ⌈255 × live / sectors⌉
 // Endpoints:
-//   band == 0   iff dirty == 0 (empty bucket — full free)
-//   band == 255 when dirty is full *or near-full* (the formula saturates
-//               for the last few sectors because ⌈255·d/s⌉ rounds up)
-// Intermediate dirty values map into 1..=254. Reorder cost is bounded by
+//   band == 0   iff live == 0 (empty bucket — full free)
+//   band == 255 when live is full *or near-full* (the formula saturates
+//               for the last few sectors because ⌈255·l/s⌉ rounds up)
+// Intermediate live values map into 1..=254. Reorder cost is bounded by
 // allocation pressure, not write volume: bands are recomputed lazily when
-// dirty_sectors crosses an 8-sector boundary (ALLOCATION-DESIGN§1.4 prose).
+// live_sectors crosses an 8-sector boundary (ALLOCATION-DESIGN§1.4 prose).
 // =====================================================================
-pub const fn fragmentation_band(dirty: u64, sectors_per_bucket: u64) -> u8 {
-    let band = (255u64 * dirty).div_ceil(sectors_per_bucket);
+pub const fn fragmentation_band(live: u64, sectors_per_bucket: u64) -> u8 {
+    let band = (255u64 * live).div_ceil(sectors_per_bucket);
     band as u8
 }
 // Default bucket: 1 MiB / 4 KiB = 256 sectors.

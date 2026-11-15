@@ -150,7 +150,7 @@ impl WalEntryHeader {
 /// The numeric value is the on-disk `op_kind` byte in [`WalEntryHeader`].
 ///
 /// TODO(JOURNAL8): take the contiguous values 0–43 of the JOURNAL-DESIGN§1.3 op-kind
-/// table; `BucketWrite`, `TagBitmapGrow`, `TagBitmapShrink`, `FormatPromote`,
+/// table; `TagBitmapGrow`, `TagBitmapShrink`, `FormatPromote`,
 /// `BackpointerInsert` and `BackpointerRemove` go, and the chunk-list ops and
 /// `ExtendObject` become the chunk ops (`AppendChunks`, `ReplaceChunks`,
 /// `TruncateChunks`) over fixed 128-byte `ChunkSpec`s.
@@ -177,7 +177,7 @@ pub enum WalOpKind {
     ChunkObjectFinalize = 13,
     /// Bucket lifecycle (METADATA-DESIGN§2.1 / ALLOCATION-DESIGN§1).
     BucketAlloc = 14,
-    BucketWrite = 15,
+    // 15 unassigned: live sectors are derived, not journaled (ALLOCATION-DESIGN§1.2).
     BucketGenBump = 16,
     BucketDiscard = 17,
     /// Backpointers (METADATA-DESIGN§2.2).
@@ -221,7 +221,6 @@ impl WalOpKind {
             12 => Self::ChunkListShrink,
             13 => Self::ChunkObjectFinalize,
             14 => Self::BucketAlloc,
-            15 => Self::BucketWrite,
             16 => Self::BucketGenBump,
             17 => Self::BucketDiscard,
             18 => Self::BackpointerInsert,
@@ -388,13 +387,6 @@ pub struct BucketAlloc {
     pub bucket_no: u32,
     pub data_type: u8,
     pub generation: u32,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BucketWrite {
-    pub disk_id: u16,
-    pub bucket_no: u32,
-    pub sectors_added: u16,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -595,7 +587,6 @@ pub enum WalOp {
     ChunkListShrink(ChunkListShrink),
     ChunkObjectFinalize(ChunkObjectFinalize),
     BucketAlloc(BucketAlloc),
-    BucketWrite(BucketWrite),
     BucketGenBump(BucketGenBump),
     BucketDiscard(BucketDiscard),
     BackpointerInsert(BackpointerInsert),
@@ -633,7 +624,6 @@ impl WalOp {
             Self::ChunkListShrink(_) => WalOpKind::ChunkListShrink,
             Self::ChunkObjectFinalize(_) => WalOpKind::ChunkObjectFinalize,
             Self::BucketAlloc(_) => WalOpKind::BucketAlloc,
-            Self::BucketWrite(_) => WalOpKind::BucketWrite,
             Self::BucketGenBump(_) => WalOpKind::BucketGenBump,
             Self::BucketDiscard(_) => WalOpKind::BucketDiscard,
             Self::BackpointerInsert(_) => WalOpKind::BackpointerInsert,
@@ -672,7 +662,6 @@ impl WalOp {
             Self::ChunkListShrink(p) => ciborium::ser::into_writer(p, &mut buf)?,
             Self::ChunkObjectFinalize(p) => ciborium::ser::into_writer(p, &mut buf)?,
             Self::BucketAlloc(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::BucketWrite(p) => ciborium::ser::into_writer(p, &mut buf)?,
             Self::BucketGenBump(p) => ciborium::ser::into_writer(p, &mut buf)?,
             Self::BucketDiscard(p) => ciborium::ser::into_writer(p, &mut buf)?,
             Self::BackpointerInsert(p) => ciborium::ser::into_writer(p, &mut buf)?,
@@ -721,7 +710,6 @@ impl WalOp {
                 Self::ChunkObjectFinalize(ciborium::de::from_reader(payload)?)
             }
             WalOpKind::BucketAlloc => Self::BucketAlloc(ciborium::de::from_reader(payload)?),
-            WalOpKind::BucketWrite => Self::BucketWrite(ciborium::de::from_reader(payload)?),
             WalOpKind::BucketGenBump => Self::BucketGenBump(ciborium::de::from_reader(payload)?),
             WalOpKind::BucketDiscard => Self::BucketDiscard(ciborium::de::from_reader(payload)?),
             WalOpKind::BackpointerInsert => {
@@ -778,10 +766,12 @@ mod tests {
 
     #[test]
     fn op_kind_round_trip_full_range() {
-        for v in 0u8..=31 {
+        for v in (0u8..=31).filter(|&v| v != 15) {
             let k = WalOpKind::from_u8(v).unwrap();
             assert_eq!(k as u8, v);
         }
+        // 15 was BucketWrite; live sectors are derived (ALLOCATION-DESIGN§1.2).
+        assert!(WalOpKind::from_u8(15).is_err());
         assert!(WalOpKind::from_u8(32).is_err());
         assert!(WalOpKind::from_u8(255).is_err());
     }
@@ -907,11 +897,6 @@ mod tests {
                 bucket_no: 1,
                 data_type: 0,
                 generation: 1,
-            }),
-            WalOp::BucketWrite(BucketWrite {
-                disk_id: 0,
-                bucket_no: 1,
-                sectors_added: 4,
             }),
             WalOp::BucketGenBump(BucketGenBump {
                 disk_id: 0,

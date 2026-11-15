@@ -168,7 +168,6 @@ pub fn replay_wal_op(
         | WalOp::ChunkListShrink(_)
         | WalOp::ChunkObjectFinalize(_)
         | WalOp::BucketAlloc(_)
-        | WalOp::BucketWrite(_)
         | WalOp::BucketGenBump(_)
         | WalOp::BucketDiscard(_)
         | WalOp::BackpointerInsert(_)

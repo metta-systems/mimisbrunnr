@@ -18,7 +18,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 use {
     log::{trace, warn},
     mimisbrunnr_storage::{
-        BLOCK_SIZE, BlockDevice, BucketDataType, FileBlockDevice, Superblock, ZoneExtent,
+        BLOCK_SIZE, BlockDevice, BucketKind, FileBlockDevice, Superblock, ZoneExtent,
     },
     mimisbrunnr_types::{DiskId, DiskState, MediaType, NodeId, PlacementRule, StorageTier},
 };
@@ -419,7 +419,7 @@ impl PoolManager {
     pub fn pick_disk(
         &self,
         tier_pref: StorageTier,
-        _data_type: BucketDataType,
+        _kind: BucketKind,
     ) -> Option<DiskId> {
         let mut best: Option<(DiskId, u64)> = None;
         for (id, rt) in &self.disks {
@@ -646,12 +646,12 @@ mod tests {
         let cfg = small_pool(&tmp);
         let mgr = PoolManager::create(cfg).unwrap();
         // disk 0 is Hot; disk 1 is Cold.
-        let hot = mgr.pick_disk(StorageTier::Hot, BucketDataType::Blob);
-        let cold = mgr.pick_disk(StorageTier::Cold, BucketDataType::Blob);
+        let hot = mgr.pick_disk(StorageTier::Hot, BucketKind::Data);
+        let cold = mgr.pick_disk(StorageTier::Cold, BucketKind::Data);
         assert_eq!(hot, Some(0));
         assert_eq!(cold, Some(1));
         // Warm has no disk in this pool.
-        assert_eq!(mgr.pick_disk(StorageTier::Warm, BucketDataType::Blob), None);
+        assert_eq!(mgr.pick_disk(StorageTier::Warm, BucketKind::Data), None);
     }
 
     #[test]
@@ -661,7 +661,7 @@ mod tests {
         let mut mgr = PoolManager::create(cfg).unwrap();
         // Draining disk 0 (Hot) — pick_disk(Hot) should return None.
         mgr.remove_disk(0).unwrap();
-        assert_eq!(mgr.pick_disk(StorageTier::Hot, BucketDataType::Blob), None);
+        assert_eq!(mgr.pick_disk(StorageTier::Hot, BucketKind::Data), None);
     }
 
     #[test]

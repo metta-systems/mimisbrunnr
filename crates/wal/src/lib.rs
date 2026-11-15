@@ -33,7 +33,7 @@ pub use {
     dirty::DirtyNode,
     entry::{
         AddRelation, AddTag, BackpointerInsert, BackpointerKeyWire, BackpointerRemove,
-        BackpointerValueWire, BlockRefWire, BucketAlloc, BucketDiscard, BucketGenBump, BucketWrite,
+        BackpointerValueWire, BlockRefWire, BucketAlloc, BucketDiscard, BucketGenBump,
         Checkpoint, ChunkInsertBatch, ChunkInsertEntry, ChunkListAppend, ChunkListReplace,
         ChunkListShrink, ChunkObjectFinalize, CreateObject, DeleteObject, FormatPromote,
         ReconcileDequeue, ReconcileEnqueue, ReconcileMove, ReconcileScanStep, RemoveAttr,

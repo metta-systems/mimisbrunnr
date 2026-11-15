@@ -18,8 +18,8 @@ pub enum StorageError {
     #[error("invalid btree kind: {0}")]
     InvalidBtreeKind(u16),
 
-    #[error("invalid bucket data type: {0}")]
-    InvalidBucketDataType(u8),
+    #[error("invalid bucket kind: {0}")]
+    InvalidBucketKind(u8),
 
     #[error("invalid media type discriminant: {0}")]
     InvalidMediaType(u8),
@@ -86,4 +86,27 @@ pub enum StorageError {
     /// Free called on a bucket that has no live `BucketAllocEntry`.
     #[error("free of unallocated bucket {bucket_no}")]
     FreeOfUnallocatedBucket { bucket_no: u32 },
+
+    /// Live-sector accounting named a bucket the alloc table has no entry for.
+    #[error("unknown bucket {bucket_no}")]
+    UnknownBucket { bucket_no: u32 },
+
+    /// Adding live sectors would exceed the bucket's sector count.
+    #[error(
+        "bucket {bucket_no}: {live} live + {added} sectors exceeds capacity {capacity}"
+    )]
+    LiveSectorsOverflow {
+        bucket_no: u32,
+        live: u32,
+        added: u32,
+        capacity: u32,
+    },
+
+    /// Removing live sectors would take the count below zero.
+    #[error("bucket {bucket_no}: removing {removed} sectors from {live} live")]
+    LiveSectorsUnderflow {
+        bucket_no: u32,
+        live: u32,
+        removed: u32,
+    },
 }

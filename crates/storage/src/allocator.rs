@@ -6,10 +6,10 @@
 //!
 //! ## Allocation model (first pass)
 //!
-//! - Linear scan for a `BucketDataType::Free` bucket; bump its
-//!   `generation`, stamp the requested `data_type`, return a
+//! - Linear scan for a `BucketKind::Free` bucket; bump its
+//!   `generation`, stamp the requested kind, return a
 //!   [`BlockRef`] pointing at the bucket's first block.
-//! - Free reverses: `data_type → Free`, `dirty_sectors → 0`.
+//! - Free reverses: kind → `Free`, `live_sectors` → 0.
 //! - Generation check on deref: `BlockRef.generation` must match the
 //!   live `BucketAllocEntry.generation`; mismatch returns
 //!   [`StorageError::StaleBlockRef`].
@@ -32,7 +32,7 @@
 use {
     crate::{
         addressing::block_no_to_bucket,
-        alloc::{BucketAllocEntry, BucketAllocTable, BucketDataType},
+        alloc::{BucketAllocEntry, BucketAllocTable, BucketKind},
         block::BLOCK_SIZE_LOG2,
         error::StorageError,
         root_pointer::BlockRef,
@@ -112,39 +112,29 @@ impl<'a> BucketAllocator<'a> {
         (block_no as u64) << BLOCK_SIZE_LOG2
     }
 
-    /// Allocate a fresh bucket of the given `data_type`. Returns a
+    /// Allocate a fresh bucket of the given `kind`. Returns a
     /// [`BlockRef`] at the bucket's first block.
     ///
     /// Linear scan over the table; first `Free` bucket past
-    /// `first_usable_bucket` wins. Bumps the bucket's `generation` (so
-    /// any prior `BlockRef`s referencing the old contents become
-    /// stale).
-    pub fn alloc(&mut self, data_type: BucketDataType) -> Result<BlockRef, StorageError> {
-        debug_assert!(data_type != BucketDataType::Free);
+    /// `first_usable_bucket` wins — a `Bad` bucket is never taken. Bumps
+    /// the bucket's `generation` (so any prior `BlockRef`s referencing the
+    /// old contents become stale) and clears `BUCKET_FLAG_NEEDS_DISCARD`
+    /// (ALLOCATION-DESIGN§1.7).
+    pub fn alloc(&mut self, kind: BucketKind) -> Result<BlockRef, StorageError> {
+        debug_assert!(!matches!(kind, BucketKind::Free | BucketKind::Bad));
         for bucket_no in self.first_usable_bucket..self.total_buckets {
             let entry = self.table.get(bucket_no).copied();
             let is_free = match entry {
                 None => true, // never-allocated; treat as free.
-                Some(e) => {
-                    let dt = e.data_type;
-                    dt == BucketDataType::Free as u8
-                }
+                Some(e) => e.kind()? == BucketKind::Free,
             };
             if !is_free {
                 continue;
             }
-            let prev_gen = entry.map(|e| { e.generation }).unwrap_or(0);
+            let prev_gen = entry.map(|e| e.generation).unwrap_or(0);
             let new_gen = prev_gen.saturating_add(1);
-            self.table.insert(
-                bucket_no,
-                BucketAllocEntry {
-                    generation: new_gen,
-                    data_type: data_type as u8,
-                    flags: 0,
-                    dirty_sectors: 0,
-                    last_modify_lsn: 0,
-                },
-            );
+            self.table
+                .insert(bucket_no, BucketAllocEntry::new(new_gen, kind, 0, 0));
             let block_no = bucket_no << (self.bucket_size_log2 - BLOCK_SIZE_LOG2);
             trace!(
                 "BucketAllocator::alloc disk={} bucket={} → block_no={} gen={}",
@@ -158,7 +148,7 @@ impl<'a> BucketAllocator<'a> {
             });
         }
         Err(StorageError::AllocatorExhausted {
-            requested: data_type as u8,
+            requested: kind as u8,
         })
     }
 
@@ -184,7 +174,7 @@ impl<'a> BucketAllocator<'a> {
             .copied()
             .ok_or(StorageError::FreeOfUnallocatedBucket { bucket_no })?;
         let expected_gen = { block_ref.generation };
-        let actual_gen = { entry.generation } as u64;
+        let actual_gen = entry.generation as u64;
         if expected_gen != actual_gen {
             return Err(StorageError::StaleBlockRef {
                 expected: expected_gen,
@@ -195,13 +185,7 @@ impl<'a> BucketAllocator<'a> {
         // bucket bumps it past `actual_gen`.
         self.table.insert(
             bucket_no,
-            BucketAllocEntry {
-                generation: { entry.generation },
-                data_type: BucketDataType::Free as u8,
-                flags: 0,
-                dirty_sectors: 0,
-                last_modify_lsn: 0,
-            },
+            BucketAllocEntry::new(entry.generation, BucketKind::Free, 0, 0),
         );
         trace!(
             "BucketAllocator::free disk={} bucket={} block_no={} gen={}",
@@ -232,7 +216,7 @@ impl<'a> BucketAllocator<'a> {
                 actual: 0,
             })?;
         let expected = { block_ref.generation };
-        let actual = { entry.generation } as u64;
+        let actual = entry.generation as u64;
         if expected != actual {
             return Err(StorageError::StaleBlockRef {
                 expected,
@@ -251,16 +235,8 @@ impl<'a> BucketAllocator<'a> {
     pub fn seed_freelist(&mut self) {
         for bucket_no in self.first_usable_bucket..self.total_buckets {
             if self.table.get(bucket_no).is_none() {
-                self.table.insert(
-                    bucket_no,
-                    BucketAllocEntry {
-                        generation: 1,
-                        data_type: BucketDataType::Free as u8,
-                        flags: 0,
-                        dirty_sectors: 0,
-                        last_modify_lsn: 0,
-                    },
-                );
+                self.table
+                    .insert(bucket_no, BucketAllocEntry::new(1, BucketKind::Free, 0, 0));
             }
         }
     }
@@ -279,7 +255,7 @@ mod tests {
         let mut table = alloc_table();
         let mut allocator = BucketAllocator::new(&mut table, 0, 20, 32, 1024);
         allocator.seed_freelist();
-        let r = allocator.alloc(BucketDataType::BtreeNode).unwrap();
+        let r = allocator.alloc(BucketKind::Node).unwrap();
         assert_eq!({ r.disk_id }, 0);
         // First usable bucket = 32; with 1 MiB buckets, block_no = 32 * 256 = 8192.
         assert_eq!({ r.block_no }, 32 * 256);
@@ -287,7 +263,26 @@ mod tests {
         assert_eq!({ r.generation }, 2);
         // Table entry reflects.
         let entry = allocator.table.get(32).copied().unwrap();
-        assert_eq!(entry.data_type, BucketDataType::BtreeNode as u8);
+        assert_eq!(entry.kind().unwrap(), BucketKind::Node);
+    }
+
+    #[test]
+    fn alloc_never_takes_a_bad_bucket_and_clears_needs_discard() {
+        use crate::alloc::BUCKET_FLAG_NEEDS_DISCARD;
+        let mut table = alloc_table();
+        table.insert(0, BucketAllocEntry::new(3, BucketKind::Bad, 0, 0));
+        table.insert(1, BucketAllocEntry::new(5, BucketKind::Free, BUCKET_FLAG_NEEDS_DISCARD, 0));
+        let mut allocator = BucketAllocator::new(&mut table, 0, 20, 0, 2);
+        let r = allocator.alloc(BucketKind::Data).unwrap();
+        assert_eq!({ r.block_no }, 256); // bucket 1, not the bad bucket 0
+        let taken = *allocator.table().get(1).unwrap();
+        assert_eq!(taken.generation, 6);
+        assert_eq!(taken.flags(), 0);
+        assert!(matches!(
+            allocator.alloc(BucketKind::Data),
+            Err(StorageError::AllocatorExhausted { .. })
+        ));
+        assert_eq!(allocator.table().get(0).unwrap().kind().unwrap(), BucketKind::Bad);
     }
 
     #[test]
@@ -295,8 +290,8 @@ mod tests {
         let mut table = alloc_table();
         let mut allocator = BucketAllocator::new(&mut table, 0, 20, 0, 16);
         allocator.seed_freelist();
-        let r1 = allocator.alloc(BucketDataType::BtreeNode).unwrap();
-        let r2 = allocator.alloc(BucketDataType::BtreeNode).unwrap();
+        let r1 = allocator.alloc(BucketKind::Node).unwrap();
+        let r2 = allocator.alloc(BucketKind::Node).unwrap();
         assert_ne!({ r1.block_no }, { r2.block_no });
         // First two buckets claimed.
         assert_eq!({ r1.block_no }, 0);
@@ -308,10 +303,10 @@ mod tests {
         let mut table = alloc_table();
         let mut allocator = BucketAllocator::new(&mut table, 0, 20, 0, 4);
         allocator.seed_freelist();
-        let r1 = allocator.alloc(BucketDataType::BtreeNode).unwrap();
+        let r1 = allocator.alloc(BucketKind::Node).unwrap();
         let r1_gen = { r1.generation };
         allocator.free(r1).unwrap();
-        let r2 = allocator.alloc(BucketDataType::BtreeNode).unwrap();
+        let r2 = allocator.alloc(BucketKind::Node).unwrap();
         // r2 may pick the same bucket (bucket 0 is now free) or a later one.
         // Either way, if it lands on bucket 0, generation must be > r1's.
         if { r2.block_no } == 0 {
@@ -324,7 +319,7 @@ mod tests {
         let mut table = alloc_table();
         let mut allocator = BucketAllocator::new(&mut table, 0, 20, 0, 4);
         allocator.seed_freelist();
-        let r = allocator.alloc(BucketDataType::BtreeNode).unwrap();
+        let r = allocator.alloc(BucketKind::Node).unwrap();
         // Tamper.
         let stale = BlockRef {
             disk_id: { r.disk_id },
@@ -341,9 +336,9 @@ mod tests {
         let mut table = alloc_table();
         let mut allocator = BucketAllocator::new(&mut table, 0, 20, 0, 2);
         allocator.seed_freelist();
-        let _ = allocator.alloc(BucketDataType::BtreeNode).unwrap();
-        let _ = allocator.alloc(BucketDataType::BtreeNode).unwrap();
-        let err = allocator.alloc(BucketDataType::BtreeNode).unwrap_err();
+        let _ = allocator.alloc(BucketKind::Node).unwrap();
+        let _ = allocator.alloc(BucketKind::Node).unwrap();
+        let err = allocator.alloc(BucketKind::Node).unwrap_err();
         assert!(matches!(err, StorageError::AllocatorExhausted { .. }));
     }
 
@@ -367,7 +362,7 @@ mod tests {
         let mut table = alloc_table();
         let mut allocator = BucketAllocator::new(&mut table, 0, 20, 0, 4);
         allocator.seed_freelist();
-        let r = allocator.alloc(BucketDataType::BtreeNode).unwrap();
+        let r = allocator.alloc(BucketKind::Node).unwrap();
         let cross = BlockRef {
             disk_id: 99,
             _pad: 0,

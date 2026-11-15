@@ -157,14 +157,8 @@ mod tests {
 
     #[test]
     fn generation_check_matches_and_mismatches() {
-        use crate::alloc::{BucketAllocEntry, BucketDataType};
-        let alloc = BucketAllocEntry {
-            generation: 42,
-            data_type: BucketDataType::Index as u8,
-            flags: 0,
-            dirty_sectors: 0,
-            last_modify_lsn: 0,
-        };
+        use crate::alloc::{BucketAllocEntry, BucketKind};
+        let alloc = BucketAllocEntry::new(42, BucketKind::Node, 0, 0);
         let fresh = BlockRef::new(0, 1024, 42);
         assert!(fresh.dereference_check(&alloc));
         let stale = BlockRef::new(0, 1024, 41);

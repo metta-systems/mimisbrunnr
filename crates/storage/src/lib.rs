@@ -31,8 +31,8 @@ pub use {
     addressing::block_no_to_bucket,
     alloc::{
         BUCKET_ALLOC_ENTRY_SIZE, BUCKET_ALLOC_KEY_SIZE, BUCKET_ALLOC_REGION_SIZE,
-        BUCKET_FLAG_NEEDS_DISCARD, BUCKET_FLAG_PINNED_BY_SNAPSHOT, BucketAllocEntry,
-        BucketAllocKey, BucketAllocTable, BucketDataType,
+        BUCKET_FLAG_NEEDS_DISCARD, BucketAllocEntry, BucketAllocKey, BucketAllocTable,
+        BucketKind, LIVE_SECTORS_MAX,
     },
     allocator::BucketAllocator,
     block::{

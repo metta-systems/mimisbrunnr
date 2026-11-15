@@ -50,7 +50,7 @@ Independent of each other unless an order is given.
 - [BTREE9](btree-implementation-plan.md) — write-once regions with block-addressable runs; then [BTREE10](btree-implementation-plan.md) — positional page regions, and [BTREE8](btree-implementation-plan.md) — one run format for every tree.
 - [ONTOLOGY2](ontology-implementation-plan.md) — storage errors.
 - [ONTOLOGY10](ontology-implementation-plan.md) (per-record ontology tree, in the encodings group above), then [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator with ad-hoc tags in `local` — and [ONTOLOGY15](ontology-implementation-plan.md) — tag uids and name resolution; [ONTOLOGY11](ontology-implementation-plan.md) — ontology journal ops, after JOURNAL8.
-- [ALLOCATION9](allocation-implementation-plan.md) — bucket-relative pointers and node pointers (after POOL-D1); [ALLOCATION10](allocation-implementation-plan.md) — 8-byte bucket entries, derived live sectors.
+- [ALLOCATION9](allocation-implementation-plan.md) — bucket-relative pointers and node pointers (after POOL-D1).
 - [ALLOCATION2](allocation-implementation-plan.md) — freelist seeding at format time.
 
 ### 3. Term index
@@ -75,7 +75,7 @@ The term dictionary, postings and forward index replace every index structure, s
 ### 5. Copy-on-write allocation
 
 1. [ALLOCATION1](allocation-implementation-plan.md) — sub-bucket regions.
-2. [ENGINE3](engine-implementation-plan.md) — COW commit; then [JOURNAL12](journal-implementation-plan.md) — root in the journal; then [ENGINE12](engine-implementation-plan.md) — superblock and root list (also after ALLOCATION9); then [POOL3](pool-implementation-plan.md) — pool state record (also after SPEC25), [ENGINE11](engine-implementation-plan.md) — typed chunking defaults in pool state, and [POOL7](pool-implementation-plan.md) — pool assembled from its devices, no `pool.toml` (after POOL1); then [POOL8](pool-implementation-plan.md) — administrative changes commit by checkpoint.
+2. [ENGINE3](engine-implementation-plan.md) — COW commit; then [ALLOCATION10](allocation-implementation-plan.md) — derived live sectors (also after JOURNAL8 and METADATA3); then [JOURNAL12](journal-implementation-plan.md) — root in the journal; then [ENGINE12](engine-implementation-plan.md) — superblock and root list (also after ALLOCATION9); then [POOL3](pool-implementation-plan.md) — pool state record (also after SPEC25), [ENGINE11](engine-implementation-plan.md) — typed chunking defaults in pool state, and [POOL7](pool-implementation-plan.md) — pool assembled from its devices, no `pool.toml` (after POOL1); then [POOL8](pool-implementation-plan.md) — administrative changes commit by checkpoint.
 3. [ALLOCATION3](allocation-implementation-plan.md) — resident generations and the dereference check.
 4. [BTREE7](btree-implementation-plan.md), then [ENGINE2](engine-implementation-plan.md) — compaction.
 5. [METADATA1](metadata-implementation-plan.md) — multi-level radix per origin node.
