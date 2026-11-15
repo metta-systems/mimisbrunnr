@@ -8,11 +8,11 @@
 //! ## Persistence
 //!
 //! On disk the engine occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
-//! [`BtreeKind::Subscriptions`]. The directory holds one sorted-run
-//! entry per subscription, keyed by `(SubscriptionId, snapshot)`
-//! (BTREE-DESIGN§1.6 packed) with the value tail being the CBOR-serialised
-//! [`PersistedSub`] (the spec's `SubscriptionRecord`) under
-//! `VALUE_SIZE_KIND_VARINT`. `next_id` is not persisted — it's
+//! [`BtreeKind::Subscriptions`]. The directory holds one entry per
+//! subscription in an ordinary [`Region`] run, keyed by
+//! [`SubscriptionsKey`] `(SubscriptionId, snapshot)` (BTREE-DESIGN§1.6) with
+//! the value bytes being the CBOR-serialised [`PersistedSub`] (the spec's
+//! `SubscriptionRecord`). `next_id` is not persisted — it's
 //! re-derived at load time from `max(loaded_ids) + 1`.
 //!
 //! `cached_result` rides inline in the record's CBOR. The
@@ -29,8 +29,8 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use mimisbrunnr_index::RoaringBitmap;
 use mimisbrunnr_ontology::OntologyState;
 use mimisbrunnr_storage::{
-    BlockDevice, BtreeKind, BtreeRegion, FieldHints, LoadedNode, PackError, PackableKey,
-    SortedRun,
+    BlockDevice, BtreeKind, StorageError,
+    region::{FieldKind, Region, RegionKey, RegionParams, RunEntry},
 };
 use mimisbrunnr_types::{
     ChangeInterest, HybridTimestamp, NodeId, ObjectId, Query, SubscriptionId, SubscriptionState,
@@ -446,79 +446,35 @@ impl SubscriptionEngine {
         Self::from_records(records)
     }
 
-    /// Build a [`LoadedNode`] with one sorted-run entry per
-    /// subscription, sorted by id. Used by the BTREE-DESIGN§1 B+ tree flush
-    /// path (and by tests that want the underlying node shape).
-    pub fn to_loaded_node(
-        &self,
-    ) -> Result<LoadedNode<SubscriptionsKey, SubscriptionsValue>, WatchError> {
-        let records = self.snapshot_records()?;
-        let mut entries: Vec<(SubscriptionsKey, SubscriptionsValue)> =
-            Vec::with_capacity(records.len());
-        for rec in records {
-            let mut bytes = Vec::new();
-            ciborium::ser::into_writer(&rec, &mut bytes)
-                .map_err(|e| WatchError::CborEncode(e.to_string()))?;
-            entries.push((
-                SubscriptionsKey {
-                    id: rec.id,
-                    snapshot: 0,
-                },
-                SubscriptionsValue(bytes),
-            ));
-        }
-        entries.sort_by_key(|(k, _)| (k.id, k.snapshot));
-
-        let mut node: LoadedNode<SubscriptionsKey, SubscriptionsValue> =
-            LoadedNode::new(BtreeKind::Subscriptions, 0, REGION_SIZE_LOG2);
-        if !entries.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, entries);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        Ok(node)
-    }
-
-    /// Restore the in-memory state from a [`LoadedNode`] of
-    /// per-record entries. Empty node → [`Self::default`].
-    pub fn from_loaded_node(
-        node: &LoadedNode<SubscriptionsKey, SubscriptionsValue>,
-    ) -> Result<Self, WatchError> {
-        let mut records: Vec<PersistedSub> = Vec::new();
-        for (_, v) in node.merge_iter() {
-            let bytes: &[u8] = v.as_ref();
-            if bytes.is_empty() {
-                continue;
-            }
-            let rec: PersistedSub = ciborium::de::from_reader(bytes)
-                .map_err(|e| WatchError::CborDecode(e.to_string()))?;
-            records.push(rec);
-        }
-        Self::from_records(records)
-    }
-
-    /// Write the in-memory state to a fresh 256 KiB region at byte
-    /// `offset` on `device`. One sorted-run entry per subscription,
-    /// keyed by `(SubscriptionId, snapshot)` via the BTREE-DESIGN§1.6 packed
-    /// codec; CBOR value tails ride under `VALUE_SIZE_KIND_VARINT`.
+    /// Write the in-memory state to a fresh 256 KiB [`Region`] of
+    /// [`BtreeKind::Subscriptions`] at byte `offset` on `device`. One entry
+    /// per subscription, keyed by [`SubscriptionsKey`] `(SubscriptionId,
+    /// snapshot)`, the value the CBOR byte image of its [`PersistedSub`].
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
         offset: u64,
     ) -> Result<(), WatchError> {
-        let mut node = self.to_loaded_node()?;
-        // value_size is informational under VARINT; pass 0 since the
-        // codec reads the per-entry length from the wire.
-        BtreeRegion::write_full_packed_force_varint::<
-            D,
-            SubscriptionsKey,
-            SubscriptionsValue,
-        >(device, offset, &mut node, 0)?;
+        // `snapshot_records` is sorted by id and every key carries
+        // snapshot 0, so the keys are strictly ascending.
+        let mut encoded: Vec<(SubscriptionsKey, Vec<u8>)> = Vec::new();
+        for record in self.snapshot_records()? {
+            let mut record_bytes = Vec::new();
+            ciborium::ser::into_writer(&record, &mut record_bytes)
+                .map_err(|e| WatchError::CborEncode(e.to_string()))?;
+            encoded.push((SubscriptionsKey { id: record.id, snapshot: 0 }, record_bytes));
+        }
+        let entries: Vec<(SubscriptionsKey, RunEntry<'_>)> = encoded
+            .iter()
+            .map(|(key, record_bytes)| (*key, RunEntry::Value(record_bytes)))
+            .collect();
+        let mut region = Region::create_in_place(device, offset, region_params(), &[])?;
+        region.append_entries(device, 0, &entries)?;
         Ok(())
     }
 
     /// Read the in-memory state from the 256 KiB region at byte
-    /// `offset` on `device`. An all-zero region returns
+    /// `offset` on `device`. An all-zero (never-written) region returns
     /// [`Self::default`].
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
@@ -529,13 +485,14 @@ impl SubscriptionEngine {
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read_packed::<D, SubscriptionsKey, SubscriptionsValue>(
-            device,
-            offset,
-            BtreeKind::Subscriptions,
-            0,
-        )?;
-        Self::from_loaded_node(&node)
+        let region = Region::open(device, offset, BtreeKind::Subscriptions)?;
+        let mut records: Vec<PersistedSub> = Vec::new();
+        for (_key, record_bytes) in region.entries::<D, SubscriptionsKey>(device)? {
+            let record: PersistedSub = ciborium::de::from_reader(record_bytes.as_slice())
+                .map_err(|e| WatchError::CborDecode(e.to_string()))?;
+            records.push(record);
+        }
+        Self::from_records(records)
     }
 
     /// Build the sorted list of per-subscription records. Each record
@@ -693,114 +650,45 @@ fn walk_with_ontology(query: &Query, ontology: &OntologyState, out: &mut BTreeSe
 /// Snapshots are deferred to SNAPSHOT2; every key written today carries
 /// `snapshot = 0`. The field is on-disk now so SNAPSHOT2 won't need a layout
 /// break.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+/// The derived `Ord` compares `id` then `snapshot`, matching the
+/// [`RegionKey`] field order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SubscriptionsKey {
     pub id: u64,
     pub snapshot: u32,
 }
 
-const SUBSCRIPTIONS_KEY_HINTS: [FieldHints; 2] =
-    [FieldHints::unsigned(), FieldHints::unsigned()];
+impl RegionKey for SubscriptionsKey {
+    const FIELDS: &'static [FieldKind] = &[FieldKind::Unsigned, FieldKind::Unsigned];
 
-impl PackableKey for SubscriptionsKey {
-    fn nr_fields() -> usize {
-        2
-    }
-    fn key_header_bytes() -> usize {
-        0
-    }
-    fn field_hints() -> &'static [FieldHints] {
-        &SUBSCRIPTIONS_KEY_HINTS
-    }
     fn field_values(&self, out: &mut [u64]) {
         out[0] = self.id;
         out[1] = self.snapshot as u64;
     }
-    fn from_components(_header: u32, fields: &[u64]) -> Result<Self, PackError> {
-        if fields.len() != 2 {
-            return Err(PackError::Malformed("SubscriptionsKey: wrong field count"));
-        }
-        if fields[1] > u32::MAX as u64 {
-            return Err(PackError::Malformed("SubscriptionsKey: snapshot overflow"));
-        }
+
+    fn from_field_values(fields: &[u64]) -> Result<Self, StorageError> {
+        let snapshot = u32::try_from(fields[1])
+            .map_err(|_| StorageError::RegionCorrupt("subscriptions key snapshot out of range"))?;
         Ok(Self {
             id: fields[0],
-            snapshot: fields[1] as u32,
+            snapshot,
         })
     }
 }
 
-/// B+ tree value tail for the subscriptions directory: the CBOR
-/// byte image of a [`PersistedSub`] (the spec's `SubscriptionRecord`).
-/// Variable-length, written under `VALUE_SIZE_KIND_VARINT`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SubscriptionsValue(pub Vec<u8>);
-
-impl AsRef<[u8]> for SubscriptionsValue {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl From<Vec<u8>> for SubscriptionsValue {
-    fn from(v: Vec<u8>) -> Self {
-        Self(v)
-    }
-}
-
-// `SubscriptionsValue` needs `Serialize + Deserialize + Clone` to
-// satisfy the `BtreeRegion::read_packed` bounds (its CBOR fallback
-// path). We always write packed runs via
-// `write_full_packed_force_varint`, so the CBOR codec is never
-// exercised for this type.
-impl Serialize for SubscriptionsValue {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_bytes(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for SubscriptionsValue {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        let bytes: Vec<u8> = serde_bytes_helper::deserialize_bytes(de)?;
-        Ok(Self(bytes))
-    }
-}
-
-mod serde_bytes_helper {
-    use serde::de::{Error, SeqAccess, Visitor};
-
-    pub fn deserialize_bytes<'de, D: serde::Deserializer<'de>>(
-        de: D,
-    ) -> Result<Vec<u8>, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Vec<u8>;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("byte string")
-            }
-            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-                Ok(v.to_vec())
-            }
-            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
-                Ok(v)
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut out = Vec::new();
-                while let Some(b) = seq.next_element::<u8>()? {
-                    out.push(b);
-                }
-                Ok(out)
-            }
-        }
-        de.deserialize_bytes(V)
+fn region_params() -> RegionParams {
+    RegionParams {
+        kind: BtreeKind::Subscriptions,
+        level: 0,
+        region_size_log2: REGION_SIZE_LOG2,
+        node_seq: 0,
+        created_lsn: 0,
     }
 }
 
 /// Per-subscription on-disk record (the spec's
-/// `SubscriptionRecord`). Serialised via CBOR into the
-/// [`SubscriptionsValue`] byte tail. Mirrors [`Subscription`] modulo
+/// `SubscriptionRecord`). Serialised via CBOR into the value bytes of
+/// its [`SubscriptionsKey`] entry. Mirrors [`Subscription`] modulo
 /// the roaring-bitmap proxy (`cached_result` carries the
 /// `RoaringBitmap::serialize_into` byte image; externalization to a
 /// INDEX-DESIGN§3.2 `TagBitmap` is SUBSCRIPTION1).
@@ -1386,17 +1274,11 @@ mod tests {
     }
 
     #[test]
-    fn watch_region_uses_varint_codec() {
-        use mimisbrunnr_storage::{
-            BLOCK_SIZE, SORTED_RUN_FLAG_PACKED_KEYS,
-        };
+    fn watch_region_stores_cbor_records_in_one_ordinary_run() {
         let (_dir, dev) = fresh_device();
         let mut e = fresh();
-        // Single subscription — exercises the force-VARINT path
-        // (without it the codec would fall back to FIXED and the
-        // single-entry run would be unreadable for variable-length
-        // CBOR values).
-        e.register(
+        // A single subscription: one variable-length CBOR value.
+        let id = e.register(
             "only".into(),
             Query::HasTag(t(7)),
             ChangeInterest::ALL,
@@ -1406,20 +1288,21 @@ mod tests {
         );
         e.flush_to_region(&dev, 0).unwrap();
 
-        // SortedRunHeader layout: [magic u32 | seq u32 | journal_seq u64
-        // | entry_count u32 | payload_length u32 | flags u32 | crc u32].
-        // We only need the `flags` field at offset 24.
-        let mut buf = [0u8; 32];
-        dev.read_at(BLOCK_SIZE as u64, &mut buf).unwrap();
-        let flags = u32::from_le_bytes(buf[24..28].try_into().unwrap());
-        assert!((flags & SORTED_RUN_FLAG_PACKED_KEYS) != 0);
+        let region = Region::open(&dev, 0, BtreeKind::Subscriptions).unwrap();
+        assert_eq!(region.run_count(), 1);
+        let record_bytes = region
+            .lookup(&dev, &SubscriptionsKey { id, snapshot: 0 })
+            .unwrap()
+            .expect("subscription entry missing");
+        let record: PersistedSub = ciborium::de::from_reader(record_bytes.as_bytes()).unwrap();
+        assert_eq!(record.id, id);
+        assert_eq!(record.name, "only");
     }
 
     #[test]
     fn watch_region_kind_mismatch_detected() {
         // Writing as Subscriptions then trying to read as a different
         // BtreeKind must fail.
-        use mimisbrunnr_storage::BtreeRegion;
         let (_dir, dev) = fresh_device();
         let mut e = fresh();
         e.register(
@@ -1431,25 +1314,52 @@ mod tests {
             0,
         );
         e.flush_to_region(&dev, 0).unwrap();
-        let res =
-            BtreeRegion::read_packed::<_, SubscriptionsKey, SubscriptionsValue>(
-                &dev,
-                0,
-                BtreeKind::Range,
-                0,
-            );
-        assert!(res.is_err());
+        let err = Region::open(&dev, 0, BtreeKind::Range).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::RegionKindMismatch { expected, actual }
+                    if expected == BtreeKind::Range as u16
+                        && actual == BtreeKind::Subscriptions as u16
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
-    fn subscriptions_key_packable_round_trip() {
+    fn watch_region_load_rejects_other_kind() {
+        let (_dir, dev) = fresh_device();
+        let params = RegionParams {
+            kind: BtreeKind::Ontology,
+            ..region_params()
+        };
+        let mut region = Region::create_in_place(&dev, 0, params, &[]).unwrap();
+        region
+            .append_entries(&dev, 0, &[(0u32, RunEntry::Value(b"not a subscription"))])
+            .unwrap();
+        let err = SubscriptionEngine::load_from_region(&dev, 0).err();
+        assert!(
+            matches!(
+                err,
+                Some(WatchError::Storage(StorageError::RegionKindMismatch { expected, actual }))
+                    if expected == BtreeKind::Subscriptions as u16
+                        && actual == BtreeKind::Ontology as u16
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn subscriptions_key_region_key_round_trip() {
         let k = SubscriptionsKey {
             id: 0xDEAD_BEEF_CAFE_BABE,
-            snapshot: 0,
+            snapshot: 7,
         };
         let mut fields = [0u64; 2];
         k.field_values(&mut fields);
-        let recovered = SubscriptionsKey::from_components(0, &fields).unwrap();
+        assert_eq!(fields, [0xDEAD_BEEF_CAFE_BABE, 7]);
+        let recovered = SubscriptionsKey::from_field_values(&fields).unwrap();
         assert_eq!(recovered, k);
+        assert!(SubscriptionsKey::from_field_values(&[1, u64::from(u32::MAX) + 1]).is_err());
     }
 }

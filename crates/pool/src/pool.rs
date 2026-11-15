@@ -12,7 +12,8 @@ use {
     log::trace,
     mimisbrunnr_storage::{
         BLOCK_PREAMBLE_MAGIC_BLOCK, BLOCK_SIZE, BlockDevice, BlockHeader, BlockKind, BtreeKind,
-        BtreeRegion, LoadedNode, SortedRun, checksum64,
+        StorageError, checksum64,
+        region::{Region, RegionParams, RunEntry},
     },
     static_assertions::const_assert_eq,
 };
@@ -168,65 +169,43 @@ impl PoolStateRoot {
 }
 
 // ----------------------------------------------------------------
-// disks_overflow_root BTREE-DESIGN§1 B+ tree (CBOR-encoded sorted run).
+// disks_overflow_root BTREE-DESIGN§1 B+ tree.
 // ----------------------------------------------------------------
 //
 // Pools with more than `POOL_STATE_ROOT_INLINE_DISKS` disks overflow the
 // inline `PoolStateRoot.inline_disks[]` array into a `BtreeKind::DiskDescriptors`
-// B+ tree (POOL-DESIGN§1). The region is keyed by `disk_id: u16` ascending,
-// values are 256-byte `DiskDescriptorOnDisk` byte images. `RootPointer.disks_overflow_root`
+// B+ tree (POOL-DESIGN§1). The region is keyed by `disk_id` ascending (a
+// single unsigned key field, carried as `u32`), values are 256-byte
+// `DiskDescriptorOnDisk` byte images. `RootPointer.disks_overflow_root`
 // refers to this region.
-//
-// TODO(POOL1): switch to the BTREE-DESIGN§1.6 packed-key codec (the
-// prefix-template fix it needed has landed).
 
-/// Build a [`LoadedNode`] containing one sorted-run entry per overflow
-/// disk, sorted by `disk_id`. The node uses [`BtreeKind::DiskDescriptors`]
-/// and the spec's 18-bit (256 KiB) region size.
-pub fn disks_overflow_to_loaded_node(
-    overflow: &[DiskDescriptorOnDisk],
-) -> LoadedNode<u16, DiskDescriptorOnDisk> {
-    let mut entries: Vec<(u16, DiskDescriptorOnDisk)> = overflow
-        .iter()
-        .map(|d| ({ d.disk_id }, *d))
-        .collect();
-    entries.sort_by_key(|(k, _)| *k);
-
-    let mut node: LoadedNode<u16, DiskDescriptorOnDisk> = LoadedNode::new(
-        BtreeKind::DiskDescriptors,
-        0,
-        DISKS_OVERFLOW_REGION_SIZE_LOG2,
-    );
-    if !entries.is_empty() {
-        let run = SortedRun::from_sorted(0, 0, entries);
-        node.sorted_runs.push(run);
-        node.header.sorted_run_count = 1;
-    }
-    node
-}
-
-/// Restore the overflow descriptor list from a [`LoadedNode`] read via
-/// [`BtreeRegion::read`].
-pub fn disks_overflow_from_loaded_node(
-    node: &LoadedNode<u16, DiskDescriptorOnDisk>,
-) -> Vec<DiskDescriptorOnDisk> {
-    node.merge_iter().map(|(_, v)| *v).collect()
-}
-
-/// Write the overflow descriptor list as a fresh 256 KiB region at byte
-/// `offset` on `device`.
+/// Write the overflow descriptor list as a fresh 256 KiB [`Region`] of
+/// [`BtreeKind::DiskDescriptors`] at byte `offset` on `device`, one entry
+/// per disk keyed by `disk_id`. Duplicate `disk_id`s are rejected by the
+/// region layer.
 pub fn flush_disks_overflow_to_region<D: BlockDevice>(
     overflow: &[DiskDescriptorOnDisk],
     device: &D,
     offset: u64,
 ) -> Result<(), PoolError> {
-    let mut node = disks_overflow_to_loaded_node(overflow);
-    BtreeRegion::write_full::<D, u16, DiskDescriptorOnDisk>(device, offset, &mut node)?;
+    let mut entries: Vec<(u32, RunEntry<'_>)> = overflow
+        .iter()
+        .map(|descriptor| {
+            (
+                u32::from(descriptor.disk_id),
+                RunEntry::Value(bytemuck::bytes_of(descriptor)),
+            )
+        })
+        .collect();
+    entries.sort_by_key(|(disk_id, _)| *disk_id);
+    let mut region = Region::create_in_place(device, offset, disks_overflow_region_params(), &[])?;
+    region.append_entries(device, 0, &entries)?;
     Ok(())
 }
 
 /// Read the overflow descriptor list from the 256 KiB region at byte
-/// `offset` on `device`. An all-zero region returns `Vec::new()`.
+/// `offset` on `device`, in `disk_id` order. An all-zero (never-written)
+/// region returns `Vec::new()`.
 pub fn load_disks_overflow_from_region<D: BlockDevice>(
     device: &D,
     offset: u64,
@@ -236,12 +215,29 @@ pub fn load_disks_overflow_from_region<D: BlockDevice>(
     if probe.iter().all(|&b| b == 0) {
         return Ok(Vec::new());
     }
-    let node = BtreeRegion::read::<D, u16, DiskDescriptorOnDisk>(
-        device,
-        offset,
-        BtreeKind::DiskDescriptors,
-    )?;
-    Ok(disks_overflow_from_loaded_node(&node))
+    let region = Region::open(device, offset, BtreeKind::DiskDescriptors)?;
+    region
+        .entries::<D, u32>(device)?
+        .into_iter()
+        .map(|(disk_id, descriptor_bytes)| {
+            let descriptor = bytemuck::try_pod_read_unaligned::<DiskDescriptorOnDisk>(&descriptor_bytes)
+                .map_err(|_| StorageError::RegionCorrupt("disk descriptor is not 256 bytes"))?;
+            if u32::from(descriptor.disk_id) != disk_id {
+                return Err(StorageError::RegionCorrupt("disk descriptor key does not match its disk_id").into());
+            }
+            Ok(descriptor)
+        })
+        .collect()
+}
+
+fn disks_overflow_region_params() -> RegionParams {
+    RegionParams {
+        kind: BtreeKind::DiskDescriptors,
+        level: 0,
+        region_size_log2: DISKS_OVERFLOW_REGION_SIZE_LOG2,
+        node_seq: 0,
+        created_lsn: 0,
+    }
 }
 
 #[cfg(test)]
@@ -424,5 +420,32 @@ mod tests {
         let back = load_disks_overflow_from_region(&dev, 0).unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!({ back[0].disk_id }, 99);
+    }
+
+    #[test]
+    fn disks_overflow_region_sorts_by_disk_id() {
+        let (_dir, dev) = fresh_overflow_device();
+        let unsorted = vec![make_disk(20, "/d20"), make_disk(13, "/d13"), make_disk(500, "/d500")];
+        flush_disks_overflow_to_region(&unsorted, &dev, 0).unwrap();
+        let back = load_disks_overflow_from_region(&dev, 0).unwrap();
+        let disk_ids: Vec<u16> = back.iter().map(|descriptor| descriptor.disk_id).collect();
+        assert_eq!(disk_ids, vec![13, 20, 500]);
+        assert_eq!(back[2].path_str().unwrap(), "/d500");
+    }
+
+    #[test]
+    fn disks_overflow_region_kind_mismatch_errors() {
+        let (_dir, dev) = fresh_overflow_device();
+        crate::flush_placement_rules_to_region(&[], &dev, 0).unwrap();
+        let err = load_disks_overflow_from_region(&dev, 0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PoolError::Storage(StorageError::RegionKindMismatch { expected, actual })
+                    if expected == BtreeKind::DiskDescriptors as u16
+                        && actual == BtreeKind::PlacementRules as u16
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 }

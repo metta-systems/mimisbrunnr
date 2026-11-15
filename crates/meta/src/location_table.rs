@@ -2,13 +2,10 @@
 //!
 //! ## Persistence
 //!
-//! On disk the table occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
-//! [`BtreeKind::LocationTable`]. The mirror is materialised into a single
-//! CBOR-encoded sorted run via [`BtreeRegion::write_full`] keyed by an
-//! [`LocationTableKey`] (`oid`, `snapshot`) pair ascending; values are
-//! variable-length serialised [`ObjectLocation`] byte images carried in
-//! [`LocationTableValue`]'s `Vec<u8>` newtype (header + N replicas per
-//! METADATA-DESIGN§2.1).
+//! On disk the table occupies one 256 KiB [`Region`] of
+//! [`BtreeKind::LocationTable`] keyed by [`LocationTableKey`] (`oid`,
+//! `snapshot`); values are the 48-byte [`ObjectLocation`] byte images
+//! (header + 4 replica slots per METADATA-DESIGN§2.1).
 //!
 //! `snapshot` is always 0 for now — see the analogous note on
 //! [`crate::object_table::ObjectTableKey`].
@@ -18,25 +15,28 @@
 
 use std::collections::{BTreeMap, btree_map};
 
-use {
-    mimisbrunnr_storage::{BlockDevice, BtreeKind, LoadedNode, SortedRun},
-    serde::{Deserialize, Serialize},
+use mimisbrunnr_storage::{
+    BlockDevice, BtreeKind, StorageError,
+    region::{FieldKind, Region, RegionKey, RegionParams, RunEntry},
 };
 
-use crate::{error::MetaError, location::ObjectLocation};
+use crate::{
+    error::MetaError,
+    location::{MAX_INLINE_REPLICAS, OBJECT_LOCATION_SIZE, ObjectLocation},
+};
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
 pub const LOCATION_TABLE_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
 
-// ---------- LocationTableKey / LocationTableValue (B+ tree wire types) ----------
+// ---------- LocationTableKey (region key) ----------
 
-/// B+ tree key for the location table.
+/// Region key for the location table.
 ///
 /// `oid` is the raw `ObjectId.to_u64()`. `snapshot` is the snapshot-aware
 /// bkey position (SNAPSHOTS-DESIGN§1.2) and is always 0 in the current revision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LocationTableKey {
     /// Raw `ObjectId.to_u64()`.
     pub oid: u64,
@@ -51,24 +51,21 @@ impl LocationTableKey {
     }
 }
 
-/// B+ tree value for the location table: the variable-length
-/// `LocationHeader || N × ReplicaRef` byte image (METADATA-DESIGN§2.1) carried as a
-/// length-tagged byte vector. We can't use the fixed-shape POD form here
-/// because the payload length depends on `replica_count`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocationTableValue(pub Vec<u8>);
+impl RegionKey for LocationTableKey {
+    const FIELDS: &'static [FieldKind] = &[FieldKind::Unsigned, FieldKind::Unsigned];
 
-impl LocationTableValue {
-    /// Serialise an `ObjectLocation` to its variable-length byte image.
-    pub fn from_location(location: &ObjectLocation) -> Self {
-        Self(location.serialize())
+    fn field_values(&self, out: &mut [u64]) {
+        out[0] = self.oid;
+        out[1] = self.snapshot as u64;
     }
 
-    /// Decode the carried bytes into an `ObjectLocation`. Wraps
-    /// [`ObjectLocation::parse`].
-    pub fn to_location(&self) -> Result<ObjectLocation, MetaError> {
-        let (loc, _consumed) = ObjectLocation::parse(&self.0)?;
-        Ok(loc)
+    fn from_field_values(fields: &[u64]) -> Result<Self, StorageError> {
+        let snapshot = u32::try_from(fields[1])
+            .map_err(|_| StorageError::RegionCorrupt("location table snapshot field out of range"))?;
+        Ok(Self {
+            oid: fields[0],
+            snapshot,
+        })
     }
 }
 
@@ -121,99 +118,75 @@ impl LocationTable {
         self.locations.iter()
     }
 
-    // ----------------------------------------------------------------
-    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
-    // ----------------------------------------------------------------
-
-    /// Build a [`LoadedNode`] containing every entry as a single CBOR
-    /// sorted run, sorted by `(oid, snapshot=0)`. The node uses
-    /// [`BtreeKind::LocationTable`] and the spec's 18-bit (256 KiB) region
-    /// size.
-    pub fn to_loaded_node(&self) -> LoadedNode<LocationTableKey, LocationTableValue> {
-        let entries: Vec<(LocationTableKey, LocationTableValue)> = self
-            .locations
-            .iter()
-            .map(|(oid, loc)| {
-                (
-                    LocationTableKey::current(*oid),
-                    LocationTableValue::from_location(loc),
-                )
-            })
-            .collect();
-
-        let mut node: LoadedNode<LocationTableKey, LocationTableValue> =
-            LoadedNode::new(BtreeKind::LocationTable, 0, REGION_SIZE_LOG2);
-        if !entries.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, entries);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        node
-    }
-
-    /// Restore the in-memory state from a [`LoadedNode`] read via
-    /// [`BtreeRegion::read`]. Entries with `snapshot != 0` are skipped.
-    pub fn from_loaded_node(
-        node: &LoadedNode<LocationTableKey, LocationTableValue>,
-    ) -> Result<Self, MetaError> {
-        let mut locations: BTreeMap<u64, ObjectLocation> = BTreeMap::new();
-        for (k, v) in node.merge_iter() {
-            if k.snapshot != 0 {
-                // TODO(SNAPSHOT3): merge snapshot history into the
-                // sidecar `LocationHistory` btree.
-                continue;
-            }
-            locations.insert(k.oid, v.to_location()?);
-        }
-        Ok(Self { locations })
-    }
-
-    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
-    /// on `device`.
-    ///
-    /// Writes via the native positional radix-leaf format
-    /// per METADATA-DESIGN§2.1 (see [`crate::LocationLeaf`]) — *no longer* via
-    /// the sorted-run B+ tree path. Leaf-only trees: any `oid_local ≥
-    /// LEAF_RECORDS_LOCATION (5440)` returns
-    /// [`MetaError::OidOutOfRange`]; multi-level descent + tree growth
-    /// land in a follow-up.
+    /// Write the table as the 256 KiB region at byte `offset`, keyed by
+    /// `(oid, snapshot = 0)`, each value a 48-byte [`ObjectLocation`].
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
         offset: u64,
     ) -> Result<(), MetaError> {
-        let mut leaf = crate::location_leaf::LocationLeaf::new();
-        for (oid, location) in self.locations.iter() {
-            let oid_local = oid & ((1u64 << 48) - 1);
-            leaf.set(oid_local, *location)?;
-        }
-        leaf.write(device, offset)?;
+        let mut region = Region::create_in_place(device, offset, region_params(), &[])?;
+        let entries: Vec<(LocationTableKey, RunEntry<'_>)> = self
+            .locations
+            .iter()
+            .map(|(oid, location)| {
+                (
+                    LocationTableKey::current(*oid),
+                    RunEntry::Value(bytemuck::bytes_of(location)),
+                )
+            })
+            .collect();
+        region.append_entries(device, 0, &entries)?;
         Ok(())
     }
 
-    /// Read the in-memory state from the 256 KiB region at byte `offset`
-    /// on `device`. An all-zero region returns [`Self::default`].
+    /// Read the table from the region at byte `offset`; a never-written
+    /// (all-zero) region is an empty table. Entries with `snapshot != 0`
+    /// are skipped.
     ///
-    /// Reads via the native positional radix-leaf format.
-    /// `node_id` is needed because the leaf only carries `oid_local`
-    /// (the low 48 bits of `ObjectId`); the high 16 bits encode the
-    /// node id (SPECIFICATION-DESIGN§2.1) which can't be recovered from an
-    /// `ObjectLocation` alone. The engine passes its own `node_id`
-    /// for single-node pools; multi-node cluster recovery uses
-    /// `ObjectTable` cross-reference (CLUSTER5).
+    /// Keys carry the full object id, node id included, so `_node_id` is
+    /// not needed. TODO(METADATA7): the parameter goes with the table.
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
         offset: u64,
-        node_id: u16,
+        _node_id: u16,
     ) -> Result<Self, MetaError> {
-        let leaf = crate::location_leaf::LocationLeaf::read(device, offset)?;
-        let mut locations: BTreeMap<u64, ObjectLocation> = BTreeMap::new();
-        let node_high = (node_id as u64) << 48;
-        for (oid_local, location) in leaf.iter() {
-            let full_oid = node_high | (oid_local & ((1u64 << 48) - 1));
-            locations.insert(full_oid, *location);
+        let mut probe = [0u8; 8];
+        device.read_at(offset, &mut probe)?;
+        if probe.iter().all(|&byte| byte == 0) {
+            return Ok(Self::default());
+        }
+        let region = Region::open(device, offset, BtreeKind::LocationTable)?;
+        let mut locations = BTreeMap::new();
+        for (key, value) in region.entries::<D, LocationTableKey>(device)? {
+            if key.snapshot != 0 {
+                // TODO(SNAPSHOT3): merge snapshot history into the
+                // sidecar `LocationHistory` btree.
+                continue;
+            }
+            let location = bytemuck::try_pod_read_unaligned::<ObjectLocation>(&value).map_err(|_| {
+                MetaError::BufferTooSmall {
+                    needed: OBJECT_LOCATION_SIZE,
+                    got: value.len(),
+                }
+            })?;
+            let replica_count = location.header.replica_count;
+            if replica_count as usize > MAX_INLINE_REPLICAS {
+                return Err(MetaError::InvalidReplicaCount(replica_count));
+            }
+            locations.insert(key.oid, location);
         }
         Ok(Self { locations })
+    }
+}
+
+fn region_params() -> RegionParams {
+    RegionParams {
+        kind: BtreeKind::LocationTable,
+        level: 0,
+        region_size_log2: REGION_SIZE_LOG2,
+        node_seq: 0,
+        created_lsn: 0,
     }
 }
 
@@ -251,16 +224,6 @@ mod tests {
         assert!(b < c);
     }
 
-    #[test]
-    fn value_round_trip_via_helpers() {
-        let r = ReplicaRef { disk_id: 1, sector_offset: 7, bucket_no: 9 };
-        let loc = ObjectLocation::new(0xdead, &[r]).unwrap();
-        let v = LocationTableValue::from_location(&loc);
-        let back = v.to_location().unwrap();
-        assert_eq!({ back.header.extent_length }, 0xdead);
-        assert_eq!(back.active_replicas(), &[r]);
-    }
-
     // ----- B+ tree region round-trip -----
 
     use mimisbrunnr_storage::FileBlockDevice;
@@ -278,11 +241,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_loaded_node_round_trip() {
-        let t = LocationTable::new();
-        let node = t.to_loaded_node();
-        assert_eq!(node.sorted_runs.len(), 0);
-        let back = LocationTable::from_loaded_node(&node).unwrap();
+    fn empty_table_flushes_to_a_region_without_runs() {
+        let (_dir, dev) = fresh_device();
+        LocationTable::new().flush_to_region(&dev, 0).unwrap();
+        let region = Region::open(&dev, 0, BtreeKind::LocationTable).unwrap();
+        assert_eq!(region.run_count(), 0);
+        let back = LocationTable::load_from_region(&dev, 0, 0).unwrap();
         assert!(back.is_empty());
     }
 
@@ -291,6 +255,22 @@ mod tests {
         let (_dir, dev) = fresh_device();
         let t = LocationTable::load_from_region(&dev, 0, 0).unwrap();
         assert!(t.is_empty());
+    }
+
+    #[test]
+    fn location_table_region_stores_location_images() {
+        let (_dir, dev) = fresh_device();
+        let r = ReplicaRef { disk_id: 1, sector_offset: 7, bucket_no: 9 };
+        let mut t = LocationTable::new();
+        t.insert(5, make_loc(0xdead, &[r]));
+        t.flush_to_region(&dev, 0).unwrap();
+        let region = Region::open(&dev, 0, BtreeKind::LocationTable).unwrap();
+        let value = region.lookup(&dev, &LocationTableKey::current(5)).unwrap().unwrap();
+        assert_eq!(value.as_bytes(), bytemuck::bytes_of(t.get(5).unwrap()));
+        let back = LocationTable::load_from_region(&dev, 0, 0).unwrap();
+        let loaded = back.get(5).unwrap();
+        assert_eq!({ loaded.header.extent_length }, 0xdead);
+        assert_eq!(loaded.active_replicas(), &[r]);
     }
 
     #[test]
@@ -330,6 +310,18 @@ mod tests {
     }
 
     #[test]
+    fn location_table_region_keeps_node_id_bits() {
+        let (_dir, dev) = fresh_device();
+        let r = ReplicaRef { disk_id: 0, sector_offset: 0, bucket_no: 1 };
+        let oid = (0x0007u64 << 48) | 12;
+        let mut t = LocationTable::new();
+        t.insert(oid, make_loc(0x100, &[r]));
+        t.flush_to_region(&dev, 0).unwrap();
+        let back = LocationTable::load_from_region(&dev, 0, 7).unwrap();
+        assert_eq!({ back.get(oid).unwrap().header.extent_length }, 0x100);
+    }
+
+    #[test]
     fn location_table_region_round_trip_single_entry() {
         let (_dir, dev) = fresh_device();
         let mut t = LocationTable::new();
@@ -363,20 +355,36 @@ mod tests {
     }
 
     #[test]
-    fn location_table_region_load_kind_mismatch_fails() {
-        use mimisbrunnr_storage::BtreeRegion;
+    fn location_table_region_rejects_invalid_replica_count() {
         let (_dir, dev) = fresh_device();
-        let mut node: LoadedNode<u64, Vec<u8>> =
-            LoadedNode::new(BtreeKind::ObjectTable, 0, REGION_SIZE_LOG2);
-        let run = SortedRun::from_sorted(0, 0, vec![(1u64, vec![0u8; 8])]);
-        node.sorted_runs.push(run);
-        node.header.sorted_run_count = 1;
-        BtreeRegion::write_full::<_, u64, Vec<u8>>(&dev, 0, &mut node).unwrap();
+        let mut location = make_loc(0x100, &[]);
+        location.header.replica_count = 5;
+        let mut region = Region::create_in_place(&dev, 0, region_params(), &[]).unwrap();
+        region
+            .append_entries(
+                &dev,
+                0,
+                &[(LocationTableKey::current(1), RunEntry::Value(bytemuck::bytes_of(&location)))],
+            )
+            .unwrap();
+        assert!(matches!(
+            LocationTable::load_from_region(&dev, 0, 0),
+            Err(MetaError::InvalidReplicaCount(5))
+        ));
+    }
+
+    #[test]
+    fn location_table_region_load_kind_mismatch_fails() {
+        let (_dir, dev) = fresh_device();
+        let mut objects = crate::ObjectTable::new();
+        objects.insert(crate::ObjectRecord::new(1));
+        objects.flush_to_region(&dev, 0).unwrap();
 
         let err = LocationTable::load_from_region(&dev, 0, 0).unwrap_err();
-        match err {
-            MetaError::Storage(_) => {}
-            other => panic!("expected MetaError::Storage, got {other:?}"),
-        }
+        assert!(matches!(
+            err,
+            MetaError::Storage(StorageError::RegionKindMismatch { expected, actual })
+                if expected == BtreeKind::LocationTable as u16 && actual == BtreeKind::ObjectTable as u16
+        ));
     }
 }

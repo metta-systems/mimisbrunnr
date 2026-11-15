@@ -1353,15 +1353,15 @@ fn rootpointer_slots_stable_across_commit() {
     assert!({ post_commit.lsn } >= { pre_commit.lsn });
 }
 
-// ----- object_table / location_table use native positional radix leaves -----
+// ----- the object table is a write-once region of keyed runs -----
 
 #[test]
-fn object_table_on_disk_uses_native_leaf_layout() {
-    // Insert one record, commit, reopen, then peek the on-disk leaf
-    // bytes. The header at the active object_table_root must carry
-    // BlockKind == ObjectTable and the magic "MIMB".
-    use mimisbrunnr_meta::OBJECT_LEAF_BITMAP_OFFSET;
-    use mimisbrunnr_storage::{BLOCK_PREAMBLE_MAGIC_BTREE, BlockDevice, BtreeKind};
+fn object_table_on_disk_is_a_region_of_records() {
+    // Insert one record, commit, then open the region at the active
+    // object_table_root: a BREG region of kind ObjectTable whose run holds
+    // the record under its (oid, snapshot 0) key.
+    use mimisbrunnr_meta::{ObjectRecord, ObjectTableKey};
+    use mimisbrunnr_storage::{BtreeKind, region::Region};
 
     let tmp = TempDir::new().unwrap();
     let (cfg, cfg_path) = small_pool(&tmp);
@@ -1374,38 +1374,18 @@ fn object_table_on_disk_uses_native_leaf_layout() {
     let offset = block_no as u64 * 4096;
     drop(de);
 
-    // Peek the leaf header.
     let dev = mimisbrunnr_storage::FileBlockDevice::open_read_only(
         small_pool_disk_path(&tmp),
     )
     .unwrap();
-    let mut header_bytes = [0u8; 8];
-    dev.read_at(offset, &mut header_bytes).unwrap();
-    let preamble: &mimisbrunnr_storage::BlockPreamble =
-        bytemuck::from_bytes(&header_bytes);
-    assert_eq!({ preamble.magic }, BLOCK_PREAMBLE_MAGIC_BTREE);
-    assert_eq!({ preamble.kind }, BtreeKind::ObjectTable as u16);
-
-    // Bitmap byte at offset 64 must have at least one bit set (the
-    // single object we created lives in some leaf slot).
-    let mut bitmap_byte = [0u8; 1];
-    dev.read_at(offset + OBJECT_LEAF_BITMAP_OFFSET as u64, &mut bitmap_byte)
-        .unwrap();
-    let oid_local = oid.to_u64() & ((1u64 << 48) - 1);
-    let slot = oid_local as usize % 2044;
-    if slot < 8 {
-        assert_ne!(bitmap_byte[0] & (1 << slot), 0);
-    } else {
-        // Read a different bitmap byte for the test-occupied slot.
-        let byte_idx = slot / 8;
-        let mut buf = [0u8; 1];
-        dev.read_at(
-            offset + OBJECT_LEAF_BITMAP_OFFSET as u64 + byte_idx as u64,
-            &mut buf,
-        )
-        .unwrap();
-        assert_ne!(buf[0] & (1 << (slot % 8)), 0);
-    }
+    let region = Region::open(&dev, offset, BtreeKind::ObjectTable).unwrap();
+    assert_eq!(region.run_count(), 1);
+    let value = region
+        .lookup(&dev, &ObjectTableKey::current(oid.to_u64()))
+        .unwrap()
+        .expect("the record is stored under its oid");
+    let record: ObjectRecord = bytemuck::pod_read_unaligned(value.as_bytes());
+    assert_eq!({ record.id }, oid.to_u64());
 }
 
 fn small_pool_disk_path(tmp: &TempDir) -> std::path::PathBuf {

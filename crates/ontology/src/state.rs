@@ -5,8 +5,9 @@
 //!
 //! The ontology is fully loaded into memory at mount and rewritten as a
 //! single coherent [`OntologyImage`] (CBOR) on every checkpoint. On disk
-//! the image lives as one sorted-run entry per snapshot inside the BTREE-DESIGN§1
-//! B+ tree region of [`BtreeKind::Ontology`] — `RootPointer.ontology_root`
+//! the image lives as one entry per snapshot (`u32` snapshot key, CBOR value
+//! bytes in an ordinary run) inside the BTREE-DESIGN§1 B+ tree [`Region`] of
+//! [`BtreeKind::Ontology`] — `RootPointer.ontology_root`
 //! points at this region directly (no 4 KiB envelope block).
 //!
 //! Updates are batch-shaped (rare; one update touches many tags and
@@ -16,7 +17,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun};
+use mimisbrunnr_storage::{
+    BlockDevice, BtreeKind,
+    region::{Region, RegionParams, RunEntry},
+};
 use mimisbrunnr_types::{ModuleId, StoragePolicy, TagDefinition, TagId, TagRelation};
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +36,16 @@ use crate::{
 #[allow(dead_code)] // not yet consumed by the engine layout.
 pub const ONTOLOGY_REGION_SIZE: u64 = 256 * 1024;
 const REGION_SIZE_LOG2: u8 = 18;
+
+fn region_params() -> RegionParams {
+    RegionParams {
+        kind: BtreeKind::Ontology,
+        level: 0,
+        region_size_log2: REGION_SIZE_LOG2,
+        node_seq: 0,
+        created_lsn: 0,
+    }
+}
 
 /// Bookkeeping per installed module: lets us scrub later by knowing which
 /// tags / implications / relations this module added.
@@ -498,62 +512,33 @@ impl OntologyState {
     }
 
     // ----------------------------------------------------------------
-    // BTREE-DESIGN§1 region persistence (ONTOLOGY-DESIGN§1) — one CBOR(OntologyImage)
-    // sorted-run entry per snapshot. SNAPSHOT2 will populate non-zero
-    // snapshots; today every write goes under `snapshot = 0`.
+    // BTREE-DESIGN§1 region persistence (ONTOLOGY-DESIGN§1) — one entry per
+    // snapshot, keyed by the `u32` snapshot id, value CBOR(OntologyImage).
+    // SNAPSHOT2 will populate non-zero snapshots; today every write goes
+    // under `snapshot = 0`.
     // ----------------------------------------------------------------
 
-    /// Build a [`LoadedNode`] containing a single sorted-run entry
-    /// `(snapshot = 0, OntologyImage)` for the current state. Uses
-    /// [`BtreeKind::Ontology`] and the spec's 18-bit (256 KiB) region
-    /// size.
-    pub fn to_loaded_node(&self) -> LoadedNode<u32, OntologyImage> {
-        let image = self.to_image();
-        let entries = vec![(0u32, image)];
-
-        let mut node: LoadedNode<u32, OntologyImage> =
-            LoadedNode::new(BtreeKind::Ontology, 0, REGION_SIZE_LOG2);
-        let run = SortedRun::from_sorted(0, 0, entries);
-        node.sorted_runs.push(run);
-        node.header.sorted_run_count = 1;
-        node
-    }
-
-    /// Restore the in-memory state from a [`LoadedNode`] read via
-    /// [`BtreeRegion::read`]. Picks the latest entry (highest snapshot
-    /// key) so newly-installed images shadow older ones; an empty node
-    /// returns the default.
-    pub fn from_loaded_node(
-        node: &LoadedNode<u32, OntologyImage>,
-    ) -> Result<Self, OntologyError> {
-        let mut latest: Option<(u32, OntologyImage)> = None;
-        for (k, v) in node.merge_iter() {
-            if latest.as_ref().is_none_or(|(prev_k, _)| *k >= *prev_k) {
-                latest = Some((*k, v.clone()));
-            }
-        }
-        match latest {
-            Some((_, image)) => image.into_state(),
-            None => Ok(Self::default()),
-        }
-    }
-
-    /// Write the in-memory state as a fresh 256 KiB region at byte
-    /// `offset` on `device`.
+    /// Write the in-memory state as a fresh 256 KiB [`Region`] of
+    /// [`BtreeKind::Ontology`] at byte `offset` on `device`: one entry
+    /// `(snapshot = 0, CBOR(OntologyImage))`.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
         offset: u64,
     ) -> Result<(), OntologyError> {
-        let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, u32, OntologyImage>(device, offset, &mut node)
+        let image_bytes = self.serialise()?;
+        let mut region = Region::create_in_place(device, offset, region_params(), &[])
             .map_err(|e| OntologyError::Cbor(e.to_string()))?;
-        Ok(())
+        let entries = [(0u32, RunEntry::Value(&image_bytes))];
+        region
+            .append_entries(device, 0, &entries)
+            .map_err(|e| OntologyError::Cbor(e.to_string()))
     }
 
     /// Read the in-memory state from the 256 KiB region at byte
-    /// `offset` on `device`. An all-zero region returns
-    /// [`Self::default`].
+    /// `offset` on `device`. Picks the entry with the highest snapshot
+    /// key; an all-zero (never-written) region or a region without
+    /// entries returns [`Self::default`].
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
         offset: u64,
@@ -565,13 +550,16 @@ impl OntologyState {
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, u32, OntologyImage>(
-            device,
-            offset,
-            BtreeKind::Ontology,
-        )
-        .map_err(|e| OntologyError::Cbor(e.to_string()))?;
-        Self::from_loaded_node(&node)
+        let region = Region::open(device, offset, BtreeKind::Ontology)
+            .map_err(|e| OntologyError::Cbor(e.to_string()))?;
+        let entries = region
+            .entries::<D, u32>(device)
+            .map_err(|e| OntologyError::Cbor(e.to_string()))?;
+        // Entries come back in key order: the last is the newest snapshot.
+        match entries.last() {
+            Some((_snapshot, image_bytes)) => Self::deserialise(image_bytes),
+            None => Ok(Self::default()),
+        }
     }
 
     fn to_image(&self) -> OntologyImage {
@@ -1064,6 +1052,60 @@ mod tests {
         assert!(!back.installed_modules.contains_key("a"));
         assert!(back.names.contains_key("z"));
         assert!(!back.names.contains_key("x"));
+    }
+
+    #[test]
+    fn ontology_region_latest_snapshot_wins() {
+        let (_dir, dev) = fresh_device();
+        let mut older = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        older
+            .install(module("old", vec![label("x")], &[]), &mut alloc)
+            .unwrap();
+        let mut newer = OntologyState::new();
+        let mut alloc2 = IdAllocator::new();
+        newer
+            .install(module("new", vec![label("y")], &[]), &mut alloc2)
+            .unwrap();
+        let older_bytes = older.serialise().unwrap();
+        let newer_bytes = newer.serialise().unwrap();
+        let mut region = Region::create_in_place(&dev, 0, region_params(), &[]).unwrap();
+        region
+            .append_entries(
+                &dev,
+                0,
+                &[
+                    (0u32, RunEntry::Value(&older_bytes)),
+                    (3u32, RunEntry::Value(&newer_bytes)),
+                ],
+            )
+            .unwrap();
+
+        let back = OntologyState::load_from_region(&dev, 0).unwrap();
+        assert!(back.installed_modules.contains_key("new"));
+        assert!(!back.installed_modules.contains_key("old"));
+    }
+
+    #[test]
+    fn ontology_region_kind_mismatch_errors() {
+        let (_dir, dev) = fresh_device();
+        let params = RegionParams {
+            kind: BtreeKind::Subscriptions,
+            ..region_params()
+        };
+        let mut region = Region::create_in_place(&dev, 0, params, &[]).unwrap();
+        region
+            .append_entries(&dev, 0, &[(0u32, RunEntry::Value(b"not an ontology"))])
+            .unwrap();
+        let err = OntologyState::load_from_region(&dev, 0).unwrap_err();
+        let expected = mimisbrunnr_storage::StorageError::RegionKindMismatch {
+            expected: BtreeKind::Ontology as u16,
+            actual: BtreeKind::Subscriptions as u16,
+        };
+        assert!(
+            matches!(&err, OntologyError::Cbor(message) if *message == expected.to_string()),
+            "unexpected error: {err:?}"
+        );
     }
 
     // ----- Tag relations (mutex / requires / alias) -----

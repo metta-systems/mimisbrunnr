@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use {
     bytemuck::{Pod, Zeroable},
-    mimisbrunnr_storage::{BlockDevice, BtreeKind, LoadedNode, SortedRun},
+    mimisbrunnr_storage::BlockDevice,
     mimisbrunnr_types::{TagId, Value, value_hash},
     roaring::RoaringBitmap,
     serde::{Deserialize, Serialize},
@@ -26,7 +26,6 @@ use crate::error::IndexError;
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
 #[allow(dead_code)] // not yet consumed by the engine layout.
 pub const KV_INDEX_REGION_SIZE: u64 = 256 * 1024;
-const REGION_SIZE_LOG2: u8 = 18;
 
 // ---------- KvHashDirectoryHeader ----------
 
@@ -205,70 +204,8 @@ impl KvIndex {
     }
 
     // ----------------------------------------------------------------
-    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
+    // On-disk persistence (INDEX-DESIGN§4.1 extendible hash).
     // ----------------------------------------------------------------
-    //
-    // Variable-shape values (roaring bitmaps, serialised to bytes) preclude
-    // the BTREE-DESIGN§1.6 packed-key codec: it requires every entry's value to share
-    // the same byte length. Without variable-size value
-    // support in the packed codec, this path flushes through the CBOR run codec.
-
-    /// Build a [`LoadedNode`] containing every entry as a single CBOR sorted
-    /// run, sorted by `(tag_id, value_hash)`. Each value is the per-key
-    /// [`RoaringBitmap`] serialised via `RoaringBitmap::serialize_into`.
-    ///
-    /// The node uses [`BtreeKind::KvDirectory`] (the spec doesn't yet
-    /// allocate a dedicated `BtreeKind::KvIndex` — see TODO below) and the
-    /// spec's 18-bit (256 KiB) region size.
-    /// TODO(INDEX12): superseded by the term dictionary; once `BtreeKind::KvIndex` exists in the
-    /// storage spec, switch to it.
-    pub fn to_loaded_node(&self) -> LoadedNode<KvIndexKey, KvIndexValue> {
-        let mut entries: Vec<(KvIndexKey, KvIndexValue)> = self
-            .entries
-            .iter()
-            .map(|(k, bm)| {
-                let mut bytes = Vec::with_capacity(bm.0.serialized_size());
-                // serialize_into errors only on I/O; Vec write is infallible.
-                bm.0.serialize_into(&mut bytes)
-                    .expect("RoaringBitmap::serialize_into into Vec must not fail");
-                (
-                    KvIndexKey {
-                        tag_id: k.0.raw(),
-                        value_hash: k.1,
-                    },
-                    KvIndexValue(bytes),
-                )
-            })
-            .collect();
-        entries.sort_by_key(|(key, _)| *key);
-
-        let mut node: LoadedNode<KvIndexKey, KvIndexValue> =
-            LoadedNode::new(BtreeKind::KvDirectory, 0, REGION_SIZE_LOG2);
-        if !entries.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, entries);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        node
-    }
-
-    /// Restore the in-memory state from a [`LoadedNode`] read via
-    /// [`BtreeRegion::read`]. Re-deserialises each per-entry roaring bitmap
-    /// from its byte image.
-    pub fn from_loaded_node(
-        node: &LoadedNode<KvIndexKey, KvIndexValue>,
-    ) -> Result<Self, IndexError> {
-        let mut entries: HashMap<(TagId, u64), RoaringBitmapSerde> = HashMap::new();
-        for (k, v) in node.merge_iter() {
-            let bm = RoaringBitmap::deserialize_from(v.0.as_slice())
-                .map_err(|e| IndexError::Roaring(e.to_string()))?;
-            entries.insert((TagId::new(k.tag_id), k.value_hash), RoaringBitmapSerde(bm));
-        }
-        Ok(Self {
-            entries,
-            secret: [0u8; 16],
-        })
-    }
 
     /// Write the in-memory state into a fresh 256 KiB region at byte
     /// `offset` on `device`.
@@ -277,10 +214,7 @@ impl KvIndex {
     /// layout — `KvDirectory` 4 KiB block at slot 0, `KvBucket` 4 KiB
     /// blocks in slots `1..=bucket_count`, `TagBitmapPage` 4 KiB
     /// blocks one per `(tag_id, value_hash)` entry in the trailing
-    /// slots. Replaces the CBOR sorted-run path
-    /// ([`Self::to_loaded_node`] / [`Self::from_loaded_node`] stay
-    /// available for tooling but are no longer the engine's
-    /// persistence path).
+    /// slots.
     ///
     /// ## Capacity
     ///
@@ -497,26 +431,6 @@ fn load_extendible_hash<D: BlockDevice>(
     })
 }
 
-// ---------- KvIndexKey / KvIndexValue (B+ tree wire types) ----------
-
-/// B+ tree key for the KV index: `(tag_id, value_hash)` per INDEX-DESIGN§4.1.
-///
-/// Order is `tag_id` then `value_hash`, lexicographically — matches the
-/// derived `Ord` impl below.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct KvIndexKey {
-    pub tag_id: u32,
-    pub value_hash: u64,
-}
-
-/// B+ tree value for the KV index: the roaring bitmap of object-locals,
-/// serialised via `RoaringBitmap::serialize_into`. Wrapping in a newtype
-/// gives us `Serialize` / `Deserialize` via serde's blanket
-/// `Vec<u8>` impls without conflicting with the
-/// [`RoaringBitmapSerde`] proxy used by the CBOR-blob persistence path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KvIndexValue(pub Vec<u8>);
-
 // ---------- RoaringBitmapSerde (serde wrapper) ----------
 
 #[derive(Debug, Clone, Default)]
@@ -628,24 +542,23 @@ mod tests {
     }
 
     #[test]
-    fn empty_loaded_node_round_trip() {
-        let idx = KvIndex::new();
-        let node = idx.to_loaded_node();
-        assert_eq!(node.sorted_runs.len(), 0);
-        let back = KvIndex::from_loaded_node(&node).unwrap();
+    fn region_round_trip_flushed_empty_index() {
+        let (_dir, dev) = fresh_device();
+        KvIndex::new().flush_to_region(&dev, 0).unwrap();
+        let back = KvIndex::load_from_region(&dev, 0).unwrap();
         assert_eq!(back.entry_count(), 0);
     }
 
     #[test]
-    fn loaded_node_round_trip_preserves_entries() {
+    fn region_round_trip_preserves_entries() {
+        let (_dir, dev) = fresh_device();
         let mut idx = KvIndex::new();
         idx.insert(t(1), &Value::Int(42), 100);
         idx.insert(t(1), &Value::Int(42), 101);
         idx.insert(t(1), &Value::Int(7), 200);
         idx.insert(t(2), &Value::Text("foo".into()), 300);
-        let node = idx.to_loaded_node();
-        assert_eq!(node.sorted_runs.len(), 1);
-        let back = KvIndex::from_loaded_node(&node).unwrap();
+        idx.flush_to_region(&dev, 0).unwrap();
+        let back = KvIndex::load_from_region(&dev, 0).unwrap();
         assert_eq!(back.entry_count(), 3);
         let bm = back.lookup(t(1), &Value::Int(42));
         assert!(bm.contains(100));

@@ -4,19 +4,19 @@
 //!
 //! On disk the rule set occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
 //! [`BtreeKind::PlacementRules`]. The whole `Vec<PlacementRule>` is
-//! materialised into a single CBOR-encoded sorted-run entry keyed by
-//! `u32 snapshot` (always `0` today) via [`BtreeRegion::write_full`];
-//! reload goes through [`BtreeRegion::read`]. The
-//! [`encode_placement_rules`] / [`decode_placement_rules`] CBOR-blob
-//! helpers are retained for one revision so callers using the raw
-//! CBOR-blob path keep working while the engine migration lands.
+//! encoded with [`encode_placement_rules`] into the opaque value bytes of a
+//! single entry keyed by `u32 snapshot` (always `0` today) in an ordinary
+//! run of a [`Region`]; reload decodes it with [`decode_placement_rules`].
 //!
 //! TODO(POOL5): replace the single-entry blob with the
 //! POOL-DESIGN§1 native per-rule shape — a sorted run keyed by `(rule_id,
 //! snapshot)` with one `PlacementRule` per entry. `RootPointer.placement_rules_root`
 //! refers to this region.
 
-use mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun};
+use mimisbrunnr_storage::{
+    BlockDevice, BtreeKind,
+    region::{Region, RegionParams, RunEntry},
+};
 use mimisbrunnr_types::PlacementRule;
 
 use crate::error::PoolError;
@@ -45,53 +45,26 @@ pub fn decode_placement_rules(bytes: &[u8]) -> Result<Vec<PlacementRule>, PoolEr
 }
 
 // ----------------------------------------------------------------
-// BTREE-DESIGN§1 B+ tree persistence (single-entry CBOR run).
+// BTREE-DESIGN§1 B+ tree persistence (single CBOR-valued entry).
 // ----------------------------------------------------------------
 
-/// Build a [`LoadedNode`] containing a single sorted-run entry
-/// `(snapshot=0, rules.to_vec())`. The node uses
-/// [`BtreeKind::PlacementRules`] and the spec's 18-bit (256 KiB) region
-/// size.
-pub fn placement_rules_to_loaded_node(
-    rules: &[PlacementRule],
-) -> LoadedNode<u32, Vec<PlacementRule>> {
-    let entries = vec![(0u32, rules.to_vec())];
-    let mut node: LoadedNode<u32, Vec<PlacementRule>> =
-        LoadedNode::new(BtreeKind::PlacementRules, 0, REGION_SIZE_LOG2);
-    let run = SortedRun::from_sorted(0, 0, entries);
-    node.sorted_runs.push(run);
-    node.header.sorted_run_count = 1;
-    node
-}
-
-/// Restore the rule list from a [`LoadedNode`] read via
-/// [`BtreeRegion::read`]. Picks the entry under `snapshot = 0`; an empty
-/// node returns `Vec::new()`.
-pub fn placement_rules_from_loaded_node(
-    node: &LoadedNode<u32, Vec<PlacementRule>>,
-) -> Vec<PlacementRule> {
-    for (k, v) in node.merge_iter() {
-        if *k == 0 {
-            return v.clone();
-        }
-    }
-    Vec::new()
-}
-
-/// Write the rule list as a fresh 256 KiB region at byte `offset` on
-/// `device`.
+/// Write the rule list as a fresh 256 KiB [`Region`] of
+/// [`BtreeKind::PlacementRules`] at byte `offset` on `device`: one entry
+/// `(snapshot = 0, CBOR(Vec<PlacementRule>))`.
 pub fn flush_placement_rules_to_region<D: BlockDevice>(
     rules: &[PlacementRule],
     device: &D,
     offset: u64,
 ) -> Result<(), PoolError> {
-    let mut node = placement_rules_to_loaded_node(rules);
-    BtreeRegion::write_full::<D, u32, Vec<PlacementRule>>(device, offset, &mut node)?;
+    let rules_bytes = encode_placement_rules(rules)?;
+    let mut region = Region::create_in_place(device, offset, region_params(), &[])?;
+    region.append_entries(device, 0, &[(0u32, RunEntry::Value(&rules_bytes))])?;
     Ok(())
 }
 
 /// Read the rule list from the 256 KiB region at byte `offset` on
-/// `device`. An all-zero region returns `Vec::new()`.
+/// `device`. Picks the entry under `snapshot = 0`; an all-zero
+/// (never-written) region or one without that entry returns `Vec::new()`.
 pub fn load_placement_rules_from_region<D: BlockDevice>(
     device: &D,
     offset: u64,
@@ -101,12 +74,21 @@ pub fn load_placement_rules_from_region<D: BlockDevice>(
     if probe.iter().all(|&b| b == 0) {
         return Ok(Vec::new());
     }
-    let node = BtreeRegion::read::<D, u32, Vec<PlacementRule>>(
-        device,
-        offset,
-        BtreeKind::PlacementRules,
-    )?;
-    Ok(placement_rules_from_loaded_node(&node))
+    let region = Region::open(device, offset, BtreeKind::PlacementRules)?;
+    match region.lookup(device, &0u32)? {
+        Some(rules_bytes) => decode_placement_rules(rules_bytes.as_bytes()),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn region_params() -> RegionParams {
+    RegionParams {
+        kind: BtreeKind::PlacementRules,
+        level: 0,
+        region_size_log2: REGION_SIZE_LOG2,
+        node_seq: 0,
+        created_lsn: 0,
+    }
 }
 
 #[cfg(test)]
@@ -227,5 +209,41 @@ mod tests {
         let back = load_placement_rules_from_region(&dev, 0).unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!(back, second);
+    }
+
+    #[test]
+    fn placement_rules_region_kind_mismatch_errors() {
+        let (_dir, dev) = fresh_device();
+        let params = RegionParams {
+            kind: BtreeKind::Ontology,
+            ..region_params()
+        };
+        let mut region = Region::create_in_place(&dev, 0, params, &[]).unwrap();
+        region
+            .append_entries(&dev, 0, &[(0u32, RunEntry::Value(b"not rules"))])
+            .unwrap();
+        let err = load_placement_rules_from_region(&dev, 0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PoolError::Storage(mimisbrunnr_storage::StorageError::RegionKindMismatch {
+                    expected,
+                    actual,
+                }) if expected == BtreeKind::PlacementRules as u16
+                    && actual == BtreeKind::Ontology as u16
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn placement_rules_region_undecodable_value_errors() {
+        let (_dir, dev) = fresh_device();
+        let mut region = Region::create_in_place(&dev, 0, region_params(), &[]).unwrap();
+        region
+            .append_entries(&dev, 0, &[(0u32, RunEntry::Value(&[0xff, 0xff]))])
+            .unwrap();
+        let err = load_placement_rules_from_region(&dev, 0).unwrap_err();
+        assert!(matches!(err, PoolError::CborDecode(_)), "unexpected error: {err:?}");
     }
 }

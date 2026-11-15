@@ -16,24 +16,19 @@
 //!
 //! ## Persistence
 //!
-//! On disk the index occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
-//! [`BtreeKind::ChunkIndex`]. Entries are serialised through the
-//! `SORTED_RUN_FLAG_PACKED_KEYS` codec (BTREE-DESIGN§1.6) — keys are packed as four
-//! big-endian `u64` fields covering the 32-byte hash, values are written as
-//! the 24-byte [`ChunkIndexValue`] byte image. The descriptor persists the
-//! `common_value_prefix` bytes inline in the descriptor, so the codec
-//! correctly round-trips even single-entry runs and runs whose values
-//! happen to share leading bytes (e.g. all entries with the same `disk_id`).
+//! On disk the index occupies one 256 KiB BTREE-DESIGN§1 [`Region`] of
+//! [`BtreeKind::ChunkIndex`]. Keys are [`ChunkHashKey`]s — four big-endian
+//! byte fields covering the 32-byte hash (BTREE-DESIGN§1.6) — and each value
+//! is the 24-byte [`ChunkIndexValue`] byte image.
 
 use std::collections::HashMap;
 
 use {
     bytemuck::{Pod, Zeroable},
     mimisbrunnr_storage::{
-        BlobRef, BlockDevice, BtreeKind, BtreeRegion, FieldHints, LoadedNode, PackError,
-        PackableKey, SortedRun,
+        BlobRef, BlockDevice, BtreeKind, StorageError,
+        region::{FieldKind, Region, RegionKey, RegionParams, RunEntry},
     },
-    serde::{Deserialize, Serialize},
     static_assertions::const_assert_eq,
 };
 
@@ -76,11 +71,11 @@ const_assert_eq!(
 );
 // 32 (chunk_hash) + 4 (ref_count) + 4 (length) + 16 (BlobRef) = 56
 
-// ---------- ChunkHashKey (packable key) ----------
+// ---------- ChunkHashKey (region key) ----------
 
 /// 32-byte BLAKE3 chunk hash. Used as the [`ChunkIndex`] map key and as the
-/// BTREE-DESIGN§1.6 packed-run key (decomposes into four big-endian `u64` fields so
-/// byte-wise lexicographic compare matches the natural hash byte order).
+/// region key (four big-endian byte fields, so field order matches the
+/// natural hash byte order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkHashKey(pub [u8; 32]);
 
@@ -103,85 +98,28 @@ impl From<ChunkHashKey> for [u8; 32] {
     }
 }
 
-impl Serialize for ChunkHashKey {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        // Lowercase base-16; 64 chars total, no separators. Used by the CBOR
-        // fallback path inside `BtreeRegion::read_packed`'s `K: Deserialize`
-        // bound; the production path round-trips through the packed codec.
-        let mut buf = [0u8; 64];
-        for (i, byte) in self.0.iter().enumerate() {
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            buf[2 * i] = HEX[(byte >> 4) as usize];
-            buf[2 * i + 1] = HEX[(byte & 0xf) as usize];
-        }
-        // SAFETY: HEX bytes are all ASCII, so the buffer is valid UTF-8.
-        let s = core::str::from_utf8(&buf).map_err(serde::ser::Error::custom)?;
-        ser.serialize_str(s)
-    }
-}
+impl RegionKey for ChunkHashKey {
+    const FIELDS: &'static [FieldKind] = &[
+        FieldKind::BigEndianBytes,
+        FieldKind::BigEndianBytes,
+        FieldKind::BigEndianBytes,
+        FieldKind::BigEndianBytes,
+    ];
 
-impl<'de> Deserialize<'de> for ChunkHashKey {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(de)?;
-        if s.len() != 64 {
-            return Err(serde::de::Error::custom(format!(
-                "expected 64 hex chars, got {}",
-                s.len()
-            )));
-        }
-        let mut out = [0u8; 32];
-        let bytes = s.as_bytes();
-        for (i, slot) in out.iter_mut().enumerate() {
-            let hi = hex_nibble(bytes[2 * i]).map_err(serde::de::Error::custom)?;
-            let lo = hex_nibble(bytes[2 * i + 1]).map_err(serde::de::Error::custom)?;
-            *slot = (hi << 4) | lo;
-        }
-        Ok(Self(out))
-    }
-}
-
-fn hex_nibble(c: u8) -> Result<u8, &'static str> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(c - b'a' + 10),
-        b'A'..=b'F' => Ok(c - b'A' + 10),
-        _ => Err("non-hex character in ChunkHashKey"),
-    }
-}
-
-const CHUNK_HASH_KEY_HINTS: [FieldHints; 4] = [
-    FieldHints::unsigned_msb(),
-    FieldHints::unsigned_msb(),
-    FieldHints::unsigned_msb(),
-    FieldHints::unsigned_msb(),
-];
-
-impl PackableKey for ChunkHashKey {
-    fn nr_fields() -> usize {
-        4
-    }
-    fn key_header_bytes() -> usize {
-        0
-    }
-    fn field_hints() -> &'static [FieldHints] {
-        &CHUNK_HASH_KEY_HINTS
-    }
     fn field_values(&self, out: &mut [u64]) {
-        // Big-endian within each 8-byte chunk so lexicographic byte compare
-        // matches numeric compare (and matches the packed `MSB_FIRST` flag).
-        let mut buf = [0u8; 8];
-        for (i, slot) in out.iter_mut().enumerate().take(4) {
-            buf.copy_from_slice(&self.0[i * 8..i * 8 + 8]);
-            *slot = u64::from_be_bytes(buf);
+        // Big-endian within each 8-byte chunk so numeric field compare
+        // matches lexicographic byte compare.
+        let (chunks, _) = self.0.as_chunks::<8>();
+        for (slot, chunk) in out.iter_mut().zip(chunks) {
+            *slot = u64::from_be_bytes(*chunk);
         }
     }
-    fn from_components(_header: u32, fields: &[u64]) -> Result<Self, PackError> {
-        if fields.len() != 4 {
-            return Err(PackError::Malformed("ChunkHashKey: wrong field count"));
-        }
+
+    fn from_field_values(fields: &[u64]) -> Result<Self, StorageError> {
         let mut bytes = [0u8; 32];
-        for (i, &field) in fields.iter().enumerate().take(4) {
-            bytes[i * 8..i * 8 + 8].copy_from_slice(&field.to_be_bytes());
+        let (chunks, _) = bytes.as_chunks_mut::<8>();
+        for (chunk, field) in chunks.iter_mut().zip(fields) {
+            *chunk = field.to_be_bytes();
         }
         Ok(Self(bytes))
     }
@@ -194,7 +132,7 @@ impl PackableKey for ChunkHashKey {
 pub const CHUNK_INDEX_VALUE_SIZE: usize = 24;
 
 /// Fixed-size 24-byte value tail for the [`ChunkIndex`] B+ tree. Together
-/// with the 32 B `chunk_hash` packed-key prefix this reproduces the spec's
+/// with the 32 B `chunk_hash` key this reproduces the spec's
 /// 56 B [`ChunkIndexLeafEntry`] layout. Field order matches INDEX-DESIGN§4.3.
 ///
 /// ```text
@@ -244,65 +182,12 @@ impl AsRef<[u8]> for ChunkIndexValue {
     }
 }
 
-impl From<Vec<u8>> for ChunkIndexValue {
-    fn from(v: Vec<u8>) -> Self {
-        // The packed reader always supplies exactly `value_size` bytes; pad
-        // or truncate defensively so a malformed payload yields a zero value
-        // instead of panicking. (`BtreeRegion::read_packed` validates the
-        // sorted-run CRC before we get here, so this is belt-and-braces.)
-        let mut buf = [0u8; CHUNK_INDEX_VALUE_SIZE];
-        let n = v.len().min(CHUNK_INDEX_VALUE_SIZE);
-        buf[..n].copy_from_slice(&v[..n]);
-        *bytemuck::from_bytes(&buf)
-    }
-}
-
-// `ChunkIndexValue` needs `Serialize + Deserialize + Clone` to satisfy the
-// `BtreeRegion::read_packed` bounds (the CBOR fallback path). We always
-// write packed runs so the CBOR codec is never exercised for this type, but
-// the compiler needs the impls anyway.
-impl Serialize for ChunkIndexValue {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_bytes(self.as_ref())
-    }
-}
-
-impl<'de> Deserialize<'de> for ChunkIndexValue {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        let bytes: Vec<u8> = serde_bytes_helper::deserialize_bytes(de)?;
-        Ok(Self::from(bytes))
-    }
-}
-
-mod serde_bytes_helper {
-    //! Tiny shim to deserialise a byte array via either `serialize_bytes` or
-    //! a sequence of u8 — `ciborium` emits one form, JSON the other.
-    use serde::de::{Error, SeqAccess, Visitor};
-
-    pub fn deserialize_bytes<'de, D: serde::Deserializer<'de>>(
-        de: D,
-    ) -> Result<Vec<u8>, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Vec<u8>;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("byte string")
-            }
-            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-                Ok(v.to_vec())
-            }
-            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
-                Ok(v)
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut out = Vec::new();
-                while let Some(b) = seq.next_element::<u8>()? {
-                    out.push(b);
-                }
-                Ok(out)
-            }
-        }
-        de.deserialize_bytes(V)
+impl ChunkIndexValue {
+    /// Decode a value read from the region; anything but exactly
+    /// [`CHUNK_INDEX_VALUE_SIZE`] bytes is a corrupt region.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, StorageError> {
+        bytemuck::try_pod_read_unaligned(bytes)
+            .map_err(|_| StorageError::RegionCorrupt("chunk index value is not 24 bytes"))
     }
 }
 
@@ -389,76 +274,54 @@ impl ChunkIndex {
     }
 
     // ----------------------------------------------------------------
-    // BTREE-DESIGN§1 B+ tree persistence (packed-key codec, BTREE-DESIGN§1.6).
+    // BTREE-DESIGN§1 region persistence.
     // ----------------------------------------------------------------
 
-    /// Build a [`LoadedNode`] containing every entry as a single packed
-    /// sorted run sorted by chunk hash. The node uses
-    /// [`BtreeKind::ChunkIndex`] and the spec's 18-bit (256 KiB) region
-    /// size.
-    pub fn to_loaded_node(&self) -> LoadedNode<ChunkHashKey, ChunkIndexValue> {
-        let mut entries: Vec<(ChunkHashKey, ChunkIndexValue)> =
-            self.entries.iter().map(|(k, v)| (*k, *v)).collect();
-        entries.sort_by_key(|e| e.0);
-
-        let mut node: LoadedNode<ChunkHashKey, ChunkIndexValue> =
-            LoadedNode::new(BtreeKind::ChunkIndex, 0, REGION_SIZE_LOG2);
-        if !entries.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, entries);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        node
-    }
-
-    /// Restore the in-memory state from a [`LoadedNode`] produced by
-    /// [`BtreeRegion::read_packed`].
-    pub fn from_loaded_node(node: &LoadedNode<ChunkHashKey, ChunkIndexValue>) -> Self {
-        let mut entries: HashMap<ChunkHashKey, ChunkIndexValue> = HashMap::new();
-        for (k, v) in node.merge_iter() {
-            entries.insert(*k, *v);
-        }
-        Self { entries }
-    }
-
-    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
-    /// on `device`. Replaces the region wholesale via
-    /// [`BtreeRegion::write_full_packed`].
+    /// Write the in-memory state as the 256 KiB region at byte `offset` on
+    /// `device`, replacing whatever was there.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
         offset: u64,
     ) -> Result<(), IndexError> {
-        let mut node = self.to_loaded_node();
-        BtreeRegion::write_full_packed::<D, ChunkHashKey, ChunkIndexValue>(
-            device,
-            offset,
-            &mut node,
-            CHUNK_INDEX_VALUE_SIZE,
-        )?;
+        let mut entries: Vec<(ChunkHashKey, RunEntry<'_>)> = self
+            .entries
+            .iter()
+            .map(|(hash, value)| (*hash, RunEntry::Value(bytemuck::bytes_of(value))))
+            .collect();
+        entries.sort_by_key(|(hash, _)| *hash);
+        let mut region = Region::create_in_place(device, offset, region_params(), &[])?;
+        region.append_entries(device, 0, &entries)?;
         Ok(())
     }
 
     /// Read the in-memory state from the 256 KiB region at byte `offset` on
-    /// `device`. An all-zero region is treated as "empty index" and returns
-    /// [`Self::default`].
+    /// `device`. A never-written (all-zero) region is an empty index.
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
         offset: u64,
     ) -> Result<Self, IndexError> {
-        // Probe the first 8 bytes — a fresh (all-zero) region has no magic.
         let mut probe = [0u8; 8];
         device.read_at(offset, &mut probe)?;
-        if probe.iter().all(|&b| b == 0) {
+        if probe.iter().all(|&byte| byte == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read_packed::<D, ChunkHashKey, ChunkIndexValue>(
-            device,
-            offset,
-            BtreeKind::ChunkIndex,
-            CHUNK_INDEX_VALUE_SIZE,
-        )?;
-        Ok(Self::from_loaded_node(&node))
+        let region = Region::open(device, offset, BtreeKind::ChunkIndex)?;
+        let mut entries: HashMap<ChunkHashKey, ChunkIndexValue> = HashMap::new();
+        for (hash, value) in region.entries::<D, ChunkHashKey>(device)? {
+            entries.insert(hash, ChunkIndexValue::from_bytes(&value)?);
+        }
+        Ok(Self { entries })
+    }
+}
+
+fn region_params() -> RegionParams {
+    RegionParams {
+        kind: BtreeKind::ChunkIndex,
+        level: 0,
+        region_size_log2: REGION_SIZE_LOG2,
+        node_seq: 0,
+        created_lsn: 0,
     }
 }
 
@@ -533,7 +396,7 @@ mod tests {
         assert_eq!(len, 2048);
     }
 
-    // ----- B+ tree region round-trip (packed wire format) -----
+    // ----- B+ tree region round-trip -----
 
     use mimisbrunnr_storage::FileBlockDevice;
     use tempfile::TempDir;
@@ -578,11 +441,8 @@ mod tests {
 
     #[test]
     fn region_round_trip_single_entry() {
-        // The single-entry case used to trigger a prefix-elision bug
-        // (the descriptor's `common_value_prefix` would saturate to the
-        // value's full length, eliding the entire value with no on-disk
-        // record). Post-C1, the descriptor persists the prefix bytes
-        // inline so reconstruction is byte-exact.
+        // A single-entry run: every key field is constant (width 0), so the
+        // key is carried entirely by the field bases.
         let (_dir, dev) = fresh_device();
         let mut idx = ChunkIndex::new();
         idx.insert_or_bump(h(42), b(4242), 8192);
@@ -596,13 +456,9 @@ mod tests {
 
     #[test]
     fn region_round_trip_with_shared_disk_id_value_prefix() {
-        // All entries share `disk_id = 0` + `_pad = 0`, so the value tail
-        // has 4 leading bytes (the BlobRef's leading u16+u16) shared
-        // across every entry — wait, actually with the new layout the
-        // BlobRef sits at offset 8, so the shared prefix is bounded by
-        // the prefix of the (ref_count, length) pair, which varies. Even
-        // so, this is a useful regression guard against future field
-        // reorderings.
+        // All entries share `disk_id = 0`, `ref_count = 1` and `length`, so
+        // most value bytes are identical across entries; values must still
+        // round-trip byte-exact.
         let (_dir, dev) = fresh_device();
         let mut idx = ChunkIndex::new();
         for i in 0u8..32 {
@@ -635,16 +491,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_index_round_trips_through_loaded_node() {
-        let idx = ChunkIndex::new();
-        let node = idx.to_loaded_node();
-        assert_eq!(node.sorted_runs.len(), 0);
-        let back = ChunkIndex::from_loaded_node(&node);
+    fn region_round_trip_flushed_empty_index() {
+        let (_dir, dev) = fresh_device();
+        ChunkIndex::new().flush_to_region(&dev, 0).unwrap();
+        let region = Region::open(&dev, 0, BtreeKind::ChunkIndex).unwrap();
+        assert_eq!(region.run_count(), 0);
+        let back = ChunkIndex::load_from_region(&dev, 0).unwrap();
         assert_eq!(back.chunk_count(), 0);
     }
 
     #[test]
-    fn loaded_node_round_trip_preserves_all_entries() {
+    fn region_round_trip_preserves_all_entries() {
+        let (_dir, dev) = fresh_device();
         let mut idx = ChunkIndex::new();
         for i in 1u8..=5 {
             idx.insert_or_bump(h(i), b(i as u32 * 10), i as u32 * 100);
@@ -652,10 +510,11 @@ mod tests {
         idx.insert_or_bump(h(3), b(30), 300);
         idx.insert_or_bump(h(3), b(30), 300);
 
-        let node = idx.to_loaded_node();
-        assert_eq!(node.sorted_runs.len(), 1);
-        assert_eq!(node.sorted_runs[0].entries.len(), 5);
-        let back = ChunkIndex::from_loaded_node(&node);
+        idx.flush_to_region(&dev, 0).unwrap();
+        let region = Region::open(&dev, 0, BtreeKind::ChunkIndex).unwrap();
+        assert_eq!(region.run_count(), 1);
+        assert_eq!(region.entries::<_, ChunkHashKey>(&dev).unwrap().len(), 5);
+        let back = ChunkIndex::load_from_region(&dev, 0).unwrap();
         assert_eq!(back.chunk_count(), 5);
         for i in 1u8..=5 {
             assert_eq!(back.lookup(&h(i)), Some(b(i as u32 * 10)));
@@ -692,10 +551,9 @@ mod tests {
     }
 
     #[test]
-    fn on_disk_run_carries_packed_keys_flag() {
-        use mimisbrunnr_storage::{
-            BLOCK_SIZE, BlockDevice, BtreeNodeHeader, SORTED_RUN_FLAG_PACKED_KEYS, SortedRunHeader,
-        };
+    fn on_disk_region_stores_value_byte_images() {
+        // Four entries fit one run of one data block; each value is the raw
+        // 24-byte image, looked up directly by hash.
         let (_dir, dev) = fresh_device();
         let mut idx = ChunkIndex::new();
         for i in 1u8..=4 {
@@ -703,22 +561,29 @@ mod tests {
         }
         idx.flush_to_region(&dev, 0).unwrap();
 
-        // Read the BTREE-DESIGN§1 region header + first sorted-run header off disk
-        // and verify the packed flag is set — the codec is in use.
-        let mut header_sector = vec![0u8; BLOCK_SIZE];
-        dev.read_at(0, &mut header_sector).unwrap();
-        let _ = BtreeNodeHeader::parse(&header_sector).unwrap();
+        let region = Region::open(&dev, 0, BtreeKind::ChunkIndex).unwrap();
+        assert_eq!(region.run_count(), 1);
+        assert_eq!(region.next_block(), 3, "block 0, one index block, one data block");
+        let value = region.lookup(&dev, &ChunkHashKey(h(3))).unwrap().unwrap();
+        assert_eq!(value.as_bytes(), ChunkIndexValue::new(b(3), 1, TEST_LEN).as_ref());
+        assert!(region.lookup(&dev, &ChunkHashKey(h(9))).unwrap().is_none());
+    }
 
-        let mut run_header_buf = [0u8; std::mem::size_of::<SortedRunHeader>()];
-        dev.read_at(BLOCK_SIZE as u64, &mut run_header_buf).unwrap();
-        let run_header: SortedRunHeader = *bytemuck::from_bytes(&run_header_buf);
-        assert!(({ run_header.flags } & SORTED_RUN_FLAG_PACKED_KEYS) != 0);
+    #[test]
+    fn region_kind_mismatch_errors() {
+        let (_dir, dev) = fresh_device();
+        mimisbrunnr_storage::FreespaceLru::new().flush_to_region(&dev, 0).unwrap();
+        let err = ChunkIndex::load_from_region(&dev, 0).err();
+        assert!(matches!(
+            err,
+            Some(IndexError::Storage(StorageError::RegionKindMismatch { expected: 10, actual: 13 }))
+        ));
     }
 
     // ----- ChunkHashKey scaffolding -----
 
     #[test]
-    fn chunk_hash_key_packable_round_trip() {
+    fn chunk_hash_key_region_key_round_trip() {
         let mut bytes = [0u8; 32];
         for (i, slot) in bytes.iter_mut().enumerate() {
             *slot = (i * 7 + 3) as u8;
@@ -726,8 +591,25 @@ mod tests {
         let key = ChunkHashKey(bytes);
         let mut fields = [0u64; 4];
         key.field_values(&mut fields);
-        let recovered = ChunkHashKey::from_components(0, &fields).unwrap();
+        let recovered = ChunkHashKey::from_field_values(&fields).unwrap();
         assert_eq!(recovered, key);
+    }
+
+    #[test]
+    fn chunk_hash_key_field_order_matches_ord() {
+        // Hashes differing only in the last byte order the same through
+        // their fields as through `Ord`.
+        let mut low_bytes = [0xffu8; 32];
+        low_bytes[31] = 0x01;
+        let mut high_bytes = [0xffu8; 32];
+        high_bytes[31] = 0x02;
+        let (low, high) = (ChunkHashKey(low_bytes), ChunkHashKey(high_bytes));
+        assert!(low < high);
+        let mut low_fields = [0u64; 4];
+        let mut high_fields = [0u64; 4];
+        low.field_values(&mut low_fields);
+        high.field_values(&mut high_fields);
+        assert!(low_fields < high_fields);
     }
 
     #[test]
@@ -735,11 +617,15 @@ mod tests {
         let v = ChunkIndexValue::new(b(42), 7, 8192);
         let bytes = v.as_ref().to_vec();
         assert_eq!(bytes.len(), CHUNK_INDEX_VALUE_SIZE);
-        let back = ChunkIndexValue::from(bytes);
+        let back = ChunkIndexValue::from_bytes(&bytes).unwrap();
         assert_eq!(back, v);
         assert_eq!(back.blob_ref(), b(42));
         assert_eq!(back.ref_count(), 7);
         assert_eq!(back.length(), 8192);
+        assert!(matches!(
+            ChunkIndexValue::from_bytes(&bytes[..23]),
+            Err(StorageError::RegionCorrupt(_))
+        ));
     }
 
     // ----- Two-region independence (ChunkIndex + KvIndex side-by-side) -----

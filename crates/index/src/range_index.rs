@@ -3,32 +3,30 @@
 //!
 //! ## Persistence
 //!
-//! On disk the index occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
-//! [`BtreeKind::Range`]. The in-memory mirror is materialised into a
-//! single CBOR-encoded sorted run via [`BtreeRegion::write_full`]; reload
-//! goes through [`BtreeRegion::read`]. Keys are `(u32 tag_id,
-//! NormalisedKey)` pairs sorted ascending; values are the per-key
-//! [`RoaringBitmapSerde`] (variable-length serialised bitmap).
+//! On disk the index occupies one 256 KiB BTREE-DESIGN§1 [`Region`] of
+//! [`BtreeKind::Range`], keyed by [`RangeIndexKey`] `(tag_id, norm_key,
+//! snapshot)` — four fields, the 16-byte normalised key as two big-endian
+//! byte fields so it orders lexicographically. Each value is the key's
+//! roaring bitmap in its portable serialisation (variable length).
 //!
-//! Variable-shape values preclude the BTREE-DESIGN§1.6 packed-key codec: it
-//! requires every entry's value to share the same byte length. Until
-//! INDEX1 moves the oids into the key, RangeIndex flushes
-//! through the CBOR run codec.
-//!
-//! TODO(INDEX12): replaced by term-dictionary scans; the old plan was to switch to the four-field key through the packed codec;
-//! with oids in the key the value side is fixed-shape, and a packed key
-//! buys O(20%) payload savings.
+//! TODO(INDEX12): replaced by term-dictionary scans.
 
 use std::collections::BTreeMap;
 
 use {
-    mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
+    mimisbrunnr_storage::{
+        BlockDevice, BtreeKind, StorageError,
+        region::{FieldKind, Region, RegionKey, RegionParams, RunEntry},
+    },
     mimisbrunnr_types::{TagId, Value},
     roaring::RoaringBitmap,
     serde::{Deserialize, Serialize},
 };
 
-use crate::{error::IndexError, normalised_key::NormalisedKey};
+use crate::{
+    error::IndexError,
+    normalised_key::{NORMALISED_KEY_LEN, NormalisedKey},
+};
 
 /// 256 KiB region size in bytes (matches the spec's 18-bit
 /// `region_size_log2`). Engine code sizes the on-disk slot from this.
@@ -120,106 +118,78 @@ impl RangeIndex {
     }
 
     // ----------------------------------------------------------------
-    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
+    // BTREE-DESIGN§1 region persistence.
     // ----------------------------------------------------------------
 
-    /// Build a [`LoadedNode`] containing every entry as a single CBOR
-    /// sorted run, sorted by `(tag_id, norm_key, snapshot)`. The node uses
-    /// [`BtreeKind::Range`] and the spec's 18-bit (256 KiB) region size.
-    ///
-    /// Each value is the per-key [`RoaringBitmap`] serialised via
-    /// `RoaringBitmap::serialize_into` and wrapped in [`RangeIndexValue`].
-    ///
-    /// Per SNAPSHOTS-DESIGN§1.2 the on-disk key carries a `snapshot: u32` suffix;
-    /// snapshots are deferred to SNAPSHOT2 so every key written today carries
-    /// `snapshot = 0`. The field is on-disk now so SNAPSHOT2 won't need a layout
-    /// break.
-    pub fn to_loaded_node(&self) -> LoadedNode<RangeIndexKey, RangeIndexValue> {
-        // BTreeMap iteration is already sorted by (TagId, NormalisedKey),
-        // which matches RangeIndexKey's derived (tag_id, norm_key, snapshot)
-        // ordering when snapshot is uniformly 0.
-        let entries: Vec<(RangeIndexKey, RangeIndexValue)> = self
-            .map
-            .iter()
-            .map(|((tag, norm), wrap)| {
-                let mut bytes = Vec::with_capacity(wrap.0.serialized_size());
-                wrap.0
-                    .serialize_into(&mut bytes)
-                    .expect("RoaringBitmap::serialize_into into Vec must not fail");
-                (
-                    RangeIndexKey {
-                        tag_id: tag.raw(),
-                        norm_key: *norm,
-                        snapshot: 0,
-                    },
-                    RangeIndexValue(bytes),
-                )
-            })
-            .collect();
-
-        let mut node: LoadedNode<RangeIndexKey, RangeIndexValue> =
-            LoadedNode::new(BtreeKind::Range, 0, REGION_SIZE_LOG2);
-        if !entries.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, entries);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        node
-    }
-
-    /// Restore the in-memory state from a [`LoadedNode`] read via
-    /// [`BtreeRegion::read`]. Re-deserialises each per-entry roaring
-    /// bitmap from its byte image.
-    pub fn from_loaded_node(
-        node: &LoadedNode<RangeIndexKey, RangeIndexValue>,
-    ) -> Result<Self, IndexError> {
-        let mut map: BTreeMap<(TagId, NormalisedKey), RoaringBitmapSerde> = BTreeMap::new();
-        for (k, v) in node.merge_iter() {
-            // Snapshot != 0 won't appear until SNAPSHOT2 lands snapshot-aware reads.
-            let bm = RoaringBitmap::deserialize_from(v.0.as_slice())
-                .map_err(|e| IndexError::Roaring(e.to_string()))?;
-            map.insert((TagId::new(k.tag_id), k.norm_key), RoaringBitmapSerde(bm));
-        }
-        Ok(Self { map })
-    }
-
-    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
-    /// on `device`. Replaces the region wholesale via
-    /// [`BtreeRegion::write_full`].
+    /// Write the in-memory state as the 256 KiB region at byte `offset` on
+    /// `device`, replacing whatever was there. Every key carries
+    /// `snapshot = 0` until SNAPSHOT2 (SNAPSHOTS-DESIGN§1.2).
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
         offset: u64,
     ) -> Result<(), IndexError> {
-        let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, RangeIndexKey, RangeIndexValue>(device, offset, &mut node)?;
+        // BTreeMap iteration is sorted by (TagId, NormalisedKey), which with
+        // a uniform zero snapshot is RangeIndexKey order.
+        let mut serialised: Vec<(RangeIndexKey, Vec<u8>)> = Vec::with_capacity(self.map.len());
+        for ((tag, norm_key), wrapped) in &self.map {
+            let mut bytes = Vec::with_capacity(wrapped.0.serialized_size());
+            wrapped
+                .0
+                .serialize_into(&mut bytes)
+                .map_err(|error| IndexError::Roaring(error.to_string()))?;
+            let key = RangeIndexKey {
+                tag_id: tag.raw(),
+                norm_key: *norm_key,
+                snapshot: 0,
+            };
+            serialised.push((key, bytes));
+        }
+        let entries: Vec<(RangeIndexKey, RunEntry<'_>)> = serialised
+            .iter()
+            .map(|(key, bytes)| (*key, RunEntry::Value(bytes)))
+            .collect();
+        let mut region = Region::create_in_place(device, offset, region_params(), &[])?;
+        region.append_entries(device, 0, &entries)?;
         Ok(())
     }
 
     /// Read the in-memory state from the 256 KiB region at byte `offset` on
-    /// `device`. An all-zero region is treated as "empty index" and returns
-    /// [`Self::default`].
+    /// `device`. A never-written (all-zero) region is an empty index.
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
         offset: u64,
     ) -> Result<Self, IndexError> {
         let mut probe = [0u8; 8];
         device.read_at(offset, &mut probe)?;
-        if probe.iter().all(|&b| b == 0) {
+        if probe.iter().all(|&byte| byte == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, RangeIndexKey, RangeIndexValue>(
-            device,
-            offset,
-            BtreeKind::Range,
-        )?;
-        Self::from_loaded_node(&node)
+        let region = Region::open(device, offset, BtreeKind::Range)?;
+        let mut map: BTreeMap<(TagId, NormalisedKey), RoaringBitmapSerde> = BTreeMap::new();
+        for (key, value) in region.entries::<D, RangeIndexKey>(device)? {
+            // Snapshot != 0 won't appear until SNAPSHOT2 lands snapshot-aware reads.
+            let bitmap = RoaringBitmap::deserialize_from(value.as_slice())
+                .map_err(|error| IndexError::Roaring(error.to_string()))?;
+            map.insert((TagId::new(key.tag_id), key.norm_key), RoaringBitmapSerde(bitmap));
+        }
+        Ok(Self { map })
     }
 }
 
-// ---------- RangeIndexKey / RangeIndexValue (B+ tree wire types) ----------
+fn region_params() -> RegionParams {
+    RegionParams {
+        kind: BtreeKind::Range,
+        level: 0,
+        region_size_log2: REGION_SIZE_LOG2,
+        node_seq: 0,
+        created_lsn: 0,
+    }
+}
 
-/// B+ tree key for the range index: `(tag_id, norm_key, snapshot)` per
+// ---------- RangeIndexKey (region key) ----------
+
+/// Region key for the range index: `(tag_id, norm_key, snapshot)` per
 /// INDEX-DESIGN§4.2 + SNAPSHOTS-DESIGN§1.2.
 ///
 /// `norm_key` is the 16-byte order-preserving encoding of the original
@@ -227,22 +197,41 @@ impl RangeIndex {
 /// carries `snapshot = 0`. Sort order is `(tag_id, norm_key, snapshot)`
 /// — the derived `Ord` matches because field order is the same as
 /// declaration order.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RangeIndexKey {
     pub tag_id: u32,
     pub norm_key: NormalisedKey,
     pub snapshot: u32,
 }
 
-/// B+ tree value for the range index: the roaring bitmap of object-locals,
-/// serialised via `RoaringBitmap::serialize_into`. Wrapping in a newtype
-/// gives us `Serialize`/`Deserialize` via serde's blanket `Vec<u8>` impl
-/// without conflicting with the [`RoaringBitmapSerde`] proxy used by the
-/// CBOR-blob persistence path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RangeIndexValue(pub Vec<u8>);
+impl RegionKey for RangeIndexKey {
+    const FIELDS: &'static [FieldKind] = &[
+        FieldKind::Unsigned,
+        FieldKind::BigEndianBytes,
+        FieldKind::BigEndianBytes,
+        FieldKind::Unsigned,
+    ];
+
+    fn field_values(&self, out: &mut [u64]) {
+        let (high_half, low_half) = self.norm_key.0.split_at(8);
+        out[0] = self.tag_id as u64;
+        out[1] = u64::from_be_bytes(high_half.try_into().expect("8-byte half"));
+        out[2] = u64::from_be_bytes(low_half.try_into().expect("8-byte half"));
+        out[3] = self.snapshot as u64;
+    }
+
+    fn from_field_values(fields: &[u64]) -> Result<Self, StorageError> {
+        let out_of_range = |_| StorageError::RegionCorrupt("range key field out of range");
+        let mut norm_key = [0u8; NORMALISED_KEY_LEN];
+        norm_key[..8].copy_from_slice(&fields[1].to_be_bytes());
+        norm_key[8..].copy_from_slice(&fields[2].to_be_bytes());
+        Ok(Self {
+            tag_id: u32::try_from(fields[0]).map_err(out_of_range)?,
+            norm_key: NormalisedKey(norm_key),
+            snapshot: u32::try_from(fields[3]).map_err(out_of_range)?,
+        })
+    }
+}
 
 // ---------- RoaringBitmapSerde (serde wrapper) ----------
 
@@ -404,21 +393,54 @@ mod tests {
     }
 
     #[test]
-    fn range_loaded_node_round_trip_empty() {
-        let idx = RangeIndex::new();
-        let node = idx.to_loaded_node();
-        assert_eq!(node.sorted_runs.len(), 0);
-        let back = RangeIndex::from_loaded_node(&node).unwrap();
+    fn range_region_round_trip_flushed_empty_index() {
+        // A written-but-empty region (header, no runs) loads as empty.
+        let (_dir, dev) = fresh_device();
+        RangeIndex::new().flush_to_region(&dev, 0).unwrap();
+        let region = Region::open(&dev, 0, BtreeKind::Range).unwrap();
+        assert_eq!(region.run_count(), 0);
+        let back = RangeIndex::load_from_region(&dev, 0).unwrap();
         assert_eq!(back.entry_count(), 0);
     }
 
     #[test]
-    fn range_loaded_node_keys_carry_zero_snapshot() {
+    fn range_region_keys_carry_zero_snapshot() {
+        let (_dir, dev) = fresh_device();
         let mut idx = RangeIndex::new();
         idx.insert(t(7), &Value::Int(42), 1);
-        let node = idx.to_loaded_node();
-        assert_eq!(node.sorted_runs[0].entries[0].0.snapshot, 0);
-        assert_eq!(node.sorted_runs[0].entries[0].0.tag_id, 7);
+        idx.flush_to_region(&dev, 0).unwrap();
+        let region = Region::open(&dev, 0, BtreeKind::Range).unwrap();
+        let entries = region.entries::<_, RangeIndexKey>(&dev).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0.snapshot, 0);
+        assert_eq!(entries[0].0.tag_id, 7);
+        assert_eq!(entries[0].0.norm_key, NormalisedKey::from_value(&Value::Int(42)));
+        let bitmap = RoaringBitmap::deserialize_from(entries[0].1.as_slice()).unwrap();
+        assert!(bitmap.contains(1));
+    }
+
+    #[test]
+    fn range_key_field_order_matches_ord() {
+        // Keys that differ only in the second half of the normalised key
+        // still order the same way through their fields.
+        let low = RangeIndexKey {
+            tag_id: 1,
+            norm_key: NormalisedKey::from_value(&Value::Text("abcdefghijk".into())),
+            snapshot: 0,
+        };
+        let high = RangeIndexKey {
+            tag_id: 1,
+            norm_key: NormalisedKey::from_value(&Value::Text("abcdefghijl".into())),
+            snapshot: 0,
+        };
+        assert!(low < high);
+        let mut low_fields = [0u64; 4];
+        let mut high_fields = [0u64; 4];
+        low.field_values(&mut low_fields);
+        high.field_values(&mut high_fields);
+        assert!(low_fields < high_fields);
+        assert_eq!(RangeIndexKey::from_field_values(&low_fields).unwrap(), low);
+        assert_eq!(RangeIndexKey::from_field_values(&high_fields).unwrap(), high);
     }
 
     #[test]
@@ -448,11 +470,36 @@ mod tests {
         let mut idx = RangeIndex::new();
         idx.insert(t(1), &Value::Int(42), 1);
         idx.flush_to_region(&dev, 0).unwrap();
-        let res = BtreeRegion::read::<_, RangeIndexKey, RangeIndexValue>(
-            &dev,
-            0,
-            BtreeKind::Forward,
-        );
-        assert!(res.is_err());
+        let err = Region::open(&dev, 0, BtreeKind::Forward).err();
+        assert!(matches!(
+            err,
+            Some(StorageError::RegionKindMismatch { expected: 4, actual: 0x8002 })
+        ));
+        // And the loader rejects a region of another kind.
+        mimisbrunnr_storage::FreespaceLru::new().flush_to_region(&dev, 0).unwrap();
+        let err = RangeIndex::load_from_region(&dev, 0).err();
+        assert!(matches!(
+            err,
+            Some(IndexError::Storage(StorageError::RegionKindMismatch { expected: 0x8002, actual: 13 }))
+        ));
+    }
+
+    #[test]
+    fn range_region_round_trip_large_bitmap_value() {
+        // A bitmap whose serialisation exceeds one 4 KiB block goes to value
+        // blocks and still round-trips.
+        let (_dir, dev) = fresh_device();
+        let mut idx = RangeIndex::new();
+        for member in 0u32..5_000 {
+            idx.insert(t(3), &Value::Int(1), member * 3);
+        }
+        idx.insert(t(3), &Value::Int(2), 7);
+        idx.flush_to_region(&dev, 0).unwrap();
+        let back = RangeIndex::load_from_region(&dev, 0).unwrap();
+        assert_eq!(back.entry_count(), 2);
+        let bitmap = back.lookup(t(3), &Value::Int(1));
+        assert_eq!(bitmap.len(), 5_000);
+        assert!(bitmap.contains(4_999 * 3));
+        assert!(back.lookup(t(3), &Value::Int(2)).contains(7));
     }
 }

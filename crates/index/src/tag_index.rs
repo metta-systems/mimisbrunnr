@@ -2,9 +2,9 @@
 //!
 //! On disk:
 //!
-//! - The directory is a BTREE-DESIGN§1 B+ tree region of [`BtreeKind::TagDirectory`]
-//!   with the 2-field packed key `(tag_id, snapshot)` and a 40 B value tail
-//!   ([`TagIndexValue`]) per entry. Together with the key bytes the value
+//! - The directory is a BTREE-DESIGN§1 [`Region`] of [`BtreeKind::TagDirectory`]
+//!   with the 2-field key `(tag_id, snapshot)` and a 40 B value tail
+//!   ([`TagIndexValue`]) per entry. Together with the key the value
 //!   reproduces the spec's 48 B [`TagIndexLeafEntry`] image.
 //! - The directory entry's `store_root: BlockRef` points at the head
 //!   [`TagBitmapPage`](crate::TagBitmapPage) of a singly-linked chain
@@ -16,8 +16,7 @@
 //!
 //! ## Persistence — Simple stores only
 //!
-//! - Directory: native packed sorted run, `value_size_kind = FIXED`,
-//!   40 B per value tail.
+//! - Directory: one run of fixed 40 B values.
 //! - Bitmap pages: linked chain of 4 KiB `TagBitmapPage`s allocated
 //!   sequentially within a per-pool *bitmap area* whose absolute byte
 //!   offset is supplied by the engine. Each page holds ≤ 4 036 B of the
@@ -32,8 +31,8 @@ use std::collections::HashMap;
 use {
     bytemuck::{Pod, Zeroable},
     mimisbrunnr_storage::{
-        BLOCK_SIZE, BlockDevice, BlockRef, BtreeKind, BtreeRegion, FieldHints, LoadedNode,
-        PackError, PackableKey, SortedRun,
+        BLOCK_SIZE, BlockDevice, BlockRef, BtreeKind, StorageError,
+        region::{FieldKind, Region, RegionKey, RegionParams, RunEntry},
     },
     mimisbrunnr_types::{ObjectId, TagId},
     roaring::RoaringBitmap,
@@ -129,7 +128,7 @@ const_assert_eq!(
 pub const TAG_INDEX_VALUE_SIZE: usize = 40;
 
 /// Fixed-size 40-byte value tail for the [`TagIndex`] B+ tree. Together
-/// with the 2-field packed key `(tag_id, snapshot)` (BTREE-DESIGN§1.6) this
+/// with the 2-field key `(tag_id, snapshot)` (BTREE-DESIGN§1.6) this
 /// reproduces the spec's 48 B [`TagIndexLeafEntry`] layout. Field order
 /// matches the leaf entry sans the two key fields.
 ///
@@ -160,58 +159,12 @@ impl AsRef<[u8]> for TagIndexValue {
     }
 }
 
-impl From<Vec<u8>> for TagIndexValue {
-    fn from(v: Vec<u8>) -> Self {
-        let mut buf = [0u8; TAG_INDEX_VALUE_SIZE];
-        let n = v.len().min(TAG_INDEX_VALUE_SIZE);
-        buf[..n].copy_from_slice(&v[..n]);
-        *bytemuck::from_bytes(&buf)
-    }
-}
-
-// `TagIndexValue` needs `Serialize + Deserialize` to satisfy the
-// `BtreeRegion::read_packed` bounds (the CBOR fallback path). We always
-// write packed runs so the CBOR codec is never exercised for this type.
-impl Serialize for TagIndexValue {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_bytes(self.as_ref())
-    }
-}
-
-impl<'de> Deserialize<'de> for TagIndexValue {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        let bytes: Vec<u8> = serde_bytes_helper::deserialize_bytes(de)?;
-        Ok(Self::from(bytes))
-    }
-}
-
-mod serde_bytes_helper {
-    use serde::de::{Error, SeqAccess, Visitor};
-
-    pub fn deserialize_bytes<'de, D: serde::Deserializer<'de>>(
-        de: D,
-    ) -> Result<Vec<u8>, D::Error> {
-        struct V;
-        impl<'de> Visitor<'de> for V {
-            type Value = Vec<u8>;
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("byte string")
-            }
-            fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-                Ok(v.to_vec())
-            }
-            fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
-                Ok(v)
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-                let mut out = Vec::new();
-                while let Some(b) = seq.next_element::<u8>()? {
-                    out.push(b);
-                }
-                Ok(out)
-            }
-        }
-        de.deserialize_bytes(V)
+impl TagIndexValue {
+    /// Decode a value read from the region; anything but exactly
+    /// [`TAG_INDEX_VALUE_SIZE`] bytes is a corrupt region.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, StorageError> {
+        bytemuck::try_pod_read_unaligned(bytes)
+            .map_err(|_| StorageError::RegionCorrupt("tag directory value is not 40 bytes"))
     }
 }
 
@@ -365,12 +318,12 @@ impl TagIndex {
     }
 
     // ----------------------------------------------------------------
-    // BTREE-DESIGN§1 B+ tree persistence (packed-codec native leaf +
-    // chained TagBitmapPages).
+    // BTREE-DESIGN§1 region persistence (directory region + chained
+    // TagBitmapPages).
     // ----------------------------------------------------------------
 
-    /// Restore the in-memory state from a [`LoadedNode`] of native leaf
-    /// entries plus a function that resolves each `store_root` BlockRef
+    /// Restore the in-memory state from directory leaf entries (in key
+    /// order) plus a function that resolves each `store_root` BlockRef
     /// to a [`TagStore::Simple`] bitmap. Tests use this directly; the
     /// production path goes through [`Self::load_from_region`].
     pub fn from_leaf_entries<F>(
@@ -411,8 +364,7 @@ impl TagIndex {
         bitmap_area_offset: u64,
         bitmap_area_cap_pages: usize,
     ) -> Result<usize, IndexError> {
-        // 1. Sort entries by (tag_id, snapshot) so the packed sorted run is
-        //    monotonic.
+        // 1. Sort entries by (tag_id, snapshot) so the run is ascending.
         let mut sorted: Vec<(TagId, &TagStore)> =
             self.stores.iter().map(|(k, v)| (*k, v)).collect();
         sorted.sort_by_key(|(t, _)| t.raw());
@@ -472,20 +424,20 @@ impl TagIndex {
             ));
         }
 
-        // 4. Write the directory's sorted run via the packed codec.
-        let mut node: LoadedNode<TagIndexKey, TagIndexValue> =
-            LoadedNode::new(BtreeKind::TagDirectory, 0, REGION_SIZE_LOG2);
-        if !leaves.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, leaves);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        BtreeRegion::write_full_packed::<D, TagIndexKey, TagIndexValue>(
-            device,
-            dir_offset,
-            &mut node,
-            TAG_INDEX_VALUE_SIZE,
-        )?;
+        // 4. Write the directory region: one run of 40-byte value images.
+        let entries: Vec<(TagIndexKey, RunEntry<'_>)> = leaves
+            .iter()
+            .map(|(key, value)| (*key, RunEntry::Value(bytemuck::bytes_of(value))))
+            .collect();
+        let params = RegionParams {
+            kind: BtreeKind::TagDirectory,
+            level: 0,
+            region_size_log2: REGION_SIZE_LOG2,
+            node_seq: 0,
+            created_lsn: 0,
+        };
+        let mut region = Region::create_in_place(device, dir_offset, params, &[])?;
+        region.append_entries(device, 0, &entries)?;
 
         Ok(next_page_slot)
     }
@@ -503,19 +455,15 @@ impl TagIndex {
     ) -> Result<Self, IndexError> {
         let mut probe = [0u8; 8];
         device.read_at(dir_offset, &mut probe)?;
-        if probe.iter().all(|&b| b == 0) {
+        if probe.iter().all(|&byte| byte == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read_packed::<D, TagIndexKey, TagIndexValue>(
-            device,
-            dir_offset,
-            BtreeKind::TagDirectory,
-            TAG_INDEX_VALUE_SIZE,
-        )?;
-        let mut entries: Vec<(TagIndexKey, TagIndexValue)> = Vec::new();
-        for (k, v) in node.merge_iter() {
-            entries.push((*k, *v));
-        }
+        let region = Region::open(device, dir_offset, BtreeKind::TagDirectory)?;
+        let entries = region
+            .entries::<D, TagIndexKey>(device)?
+            .into_iter()
+            .map(|(key, value)| Ok((key, TagIndexValue::from_bytes(&value)?)))
+            .collect::<Result<Vec<_>, StorageError>>()?;
         Self::from_leaf_entries(&entries, |head| read_bitmap_chain(device, head))
     }
 }
@@ -620,46 +568,30 @@ fn block_ref_at(byte_offset: u64) -> BlockRef {
     }
 }
 
-// ---------- TagIndexKey (B+ tree wire type) ----------
+// ---------- TagIndexKey (region key) ----------
 
-/// B+ tree key for the tag inverted index: `(tag_id, snapshot)` per
+/// Region key for the tag inverted index: `(tag_id, snapshot)` per
 /// SNAPSHOTS-DESIGN§1.2.
 ///
 /// Snapshots are deferred to SNAPSHOT2; every key written today carries
 /// `snapshot = 0`. The field is on-disk now so SNAPSHOT2 won't need a layout break.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TagIndexKey {
     pub tag_id: u32,
     pub snapshot: u32,
 }
 
-const TAG_INDEX_KEY_HINTS: [FieldHints; 2] = [FieldHints::unsigned(), FieldHints::unsigned()];
+impl RegionKey for TagIndexKey {
+    const FIELDS: &'static [FieldKind] = &[FieldKind::Unsigned, FieldKind::Unsigned];
 
-impl PackableKey for TagIndexKey {
-    fn nr_fields() -> usize {
-        2
-    }
-    fn key_header_bytes() -> usize {
-        0
-    }
-    fn field_hints() -> &'static [FieldHints] {
-        &TAG_INDEX_KEY_HINTS
-    }
     fn field_values(&self, out: &mut [u64]) {
         out[0] = self.tag_id as u64;
         out[1] = self.snapshot as u64;
     }
-    fn from_components(_header: u32, fields: &[u64]) -> Result<Self, PackError> {
-        if fields.len() != 2 {
-            return Err(PackError::Malformed("TagIndexKey: wrong field count"));
-        }
-        if fields[0] > u32::MAX as u64 || fields[1] > u32::MAX as u64 {
-            return Err(PackError::Malformed("TagIndexKey: field overflow"));
-        }
-        Ok(Self {
-            tag_id: fields[0] as u32,
-            snapshot: fields[1] as u32,
-        })
+
+    fn from_field_values(fields: &[u64]) -> Result<Self, StorageError> {
+        let (tag_id, snapshot) = <(u32, u32)>::from_field_values(fields)?;
+        Ok(Self { tag_id, snapshot })
     }
 }
 
@@ -814,8 +746,7 @@ mod tests {
 
     #[test]
     fn tag_region_round_trip_single_tag() {
-        // Single-entry runs round-trip post-C1 (the prefix bytes are
-        // persisted in the descriptor; no template needed).
+        // A single-entry run: both key fields are constant (width 0).
         let (_dir, dev) = fresh_device();
         let mut idx = TagIndex::new();
         idx.add_member(t(42), oid(100));
@@ -938,21 +869,42 @@ mod tests {
     }
 
     #[test]
-    fn on_disk_directory_uses_packed_codec() {
-        use mimisbrunnr_storage::{SORTED_RUN_FLAG_PACKED_KEYS, SortedRunHeader};
+    fn on_disk_directory_stores_value_images() {
         let (_dir, dev) = fresh_device();
         let mut idx = TagIndex::new();
         idx.add_member(t(1), oid(10));
         idx.add_member(t(2), oid(20));
+        idx.add_member(t(2), oid(21));
         flush(&idx, &dev).unwrap();
 
-        // Read the first sorted-run header off disk (offset = dir_offset
-        // + BLOCK_SIZE), assert the packed-keys flag is set.
-        let mut run_header_buf = [0u8; std::mem::size_of::<SortedRunHeader>()];
-        dev.read_at(TEST_DIR_OFFSET + BLOCK_SIZE as u64, &mut run_header_buf)
-            .unwrap();
-        let run_header: SortedRunHeader = *bytemuck::from_bytes(&run_header_buf);
-        assert!(({ run_header.flags } & SORTED_RUN_FLAG_PACKED_KEYS) != 0);
+        let region = Region::open(&dev, TEST_DIR_OFFSET, BtreeKind::TagDirectory).unwrap();
+        assert_eq!(region.run_count(), 1);
+        let key = TagIndexKey { tag_id: 2, snapshot: 0 };
+        let value = region.lookup(&dev, &key).unwrap().unwrap();
+        let value = TagIndexValue::from_bytes(value.as_bytes()).unwrap();
+        assert_eq!({ value.cardinality }, 2);
+        assert_eq!({ value.store_kind }, TagStoreKind::Simple as u8);
+        assert!(region.lookup(&dev, &TagIndexKey { tag_id: 3, snapshot: 0 }).unwrap().is_none());
+    }
+
+    #[test]
+    fn tag_region_round_trip_flushed_empty_index() {
+        let (_dir, dev) = fresh_device();
+        let pages = flush(&TagIndex::new(), &dev).unwrap();
+        assert_eq!(pages, 0);
+        let back = load(&dev).unwrap();
+        assert_eq!(back.tag_count(), 0);
+    }
+
+    #[test]
+    fn tag_region_kind_mismatch_errors() {
+        let (_dir, dev) = fresh_device();
+        mimisbrunnr_storage::FreespaceLru::new().flush_to_region(&dev, TEST_DIR_OFFSET).unwrap();
+        let err = load(&dev).err();
+        assert!(matches!(
+            err,
+            Some(IndexError::Storage(StorageError::RegionKindMismatch { expected: 0x8001, actual: 13 }))
+        ));
     }
 
     #[test]

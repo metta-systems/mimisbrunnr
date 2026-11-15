@@ -52,7 +52,7 @@ pub use {
     error::IndexError,
     faceted::{FacetCount, FacetedExplorer},
     forward_index::{
-        ForwardIndex, ForwardIndexKey, ForwardIndexValue, LEAF_ENTRY_INLINE_SPILL_THRESHOLD,
+        ForwardIndex, ForwardIndexKey, LEAF_ENTRY_INLINE_SPILL_THRESHOLD,
         LEAF_ENTRY_SPILL_FLAG, LEAF_ENTRY_TOTAL_MASK, LeafEntry, LeafEntryBody,
         PACKED_ASSERTION_SIZE, PACKED_ASSERTION_KIND_ATTR, PACKED_ASSERTION_KIND_RELATION,
         PACKED_ASSERTION_KIND_TAG, PACKED_ASSERTION_ORIGIN_DIRECT,
@@ -68,14 +68,14 @@ pub use {
     },
     kv_index::{
         KV_HASH_BUCKET_HEADER_SIZE, KV_HASH_DIRECTORY_HEADER_SIZE, KvHashBucketHeader,
-        KvHashDirectoryHeader, KvIndex, KvIndexKey, KvIndexValue,
+        KvHashDirectoryHeader, KvIndex,
     },
     tag_bitmap_page::{
         TAG_BITMAP_PAGE_FORMAT_VERSION, TAG_BITMAP_PAGE_MAX_BYTES, TAG_BITMAP_PAGE_SIZE,
         TagBitmapPage, TagBitmapPageError,
     },
     normalised_key::{NORMALISED_KEY_LEN, NormalisedKey},
-    range_index::{RangeIndex, RangeIndexKey, RangeIndexValue},
+    range_index::{RangeIndex, RangeIndexKey},
     tag_index::{TAG_INDEX_LEAF_ENTRY_SIZE, TagIndex, TagIndexKey, TagIndexLeafEntry, TagStoreKind},
     tag_store::TagStore,
 };

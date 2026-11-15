@@ -14,8 +14,10 @@
 
 use {
     bytemuck::{Pod, Zeroable},
-    mimisbrunnr_storage::{BlockDevice, BtreeKind, BtreeRegion, LoadedNode, SortedRun},
-    serde::{Deserialize, Serialize},
+    mimisbrunnr_storage::{
+        BlockDevice, BtreeKind, StorageError,
+        region::{FieldKind, Region, RegionKey, RegionParams, RunEntry},
+    },
     static_assertions::const_assert_eq,
     std::{
         collections::{BTreeMap, btree_map},
@@ -36,10 +38,9 @@ use crate::error::MetaError;
 ///  [6..8]  sector_offset  u16   4 KiB units within the bucket
 /// ```
 ///
-/// Total = 8 bytes; packed so that the BTREE-DESIGN§1.6 key-packing codec sees a
-/// stable byte order. Lexicographic ordering of the byte representation
-/// matches `(disk_id, bucket_no, sector_offset)` ordering — which is what
-/// the bucket-prefix range scan relies on.
+/// Total = 8 bytes. In a region the key is three unsigned fields
+/// (BTREE-DESIGN§1.6) in `(disk_id, bucket_no, sector_offset)` order — the
+/// order the bucket-prefix range scan relies on.
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
 pub struct BackpointerKey {
@@ -101,27 +102,22 @@ impl core::hash::Hash for BackpointerKey {
     }
 }
 
-/// Size in bytes of [`BackpointerKey`] (8). Pinned by `const_assert_eq!`.
-pub const BACKPOINTER_KEY_SIZE: usize = 8;
+impl RegionKey for BackpointerKey {
+    const FIELDS: &'static [FieldKind] = &[FieldKind::Unsigned, FieldKind::Unsigned, FieldKind::Unsigned];
 
-impl Serialize for BackpointerKey {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_bytes(bytemuck::bytes_of(self))
+    fn field_values(&self, out: &mut [u64]) {
+        out[0] = self.disk_id as u64;
+        out[1] = self.bucket_no as u64;
+        out[2] = self.sector_offset as u64;
     }
-}
 
-impl<'de> Deserialize<'de> for BackpointerKey {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        let bytes: Vec<u8> = crate::serde_pod_bytes::deserialize_bytes(de)?;
-        if bytes.len() != BACKPOINTER_KEY_SIZE {
-            return Err(serde::de::Error::custom(format!(
-                "expected {BACKPOINTER_KEY_SIZE} bytes for BackpointerKey, got {}",
-                bytes.len()
-            )));
-        }
-        let mut buf = [0u8; BACKPOINTER_KEY_SIZE];
-        buf.copy_from_slice(&bytes);
-        Ok(*bytemuck::from_bytes::<Self>(&buf))
+    fn from_field_values(fields: &[u64]) -> Result<Self, StorageError> {
+        let out_of_range = |_| StorageError::RegionCorrupt("backpointer key field out of range");
+        Ok(Self {
+            disk_id: u16::try_from(fields[0]).map_err(out_of_range)?,
+            bucket_no: u32::try_from(fields[1]).map_err(out_of_range)?,
+            sector_offset: u16::try_from(fields[2]).map_err(out_of_range)?,
+        })
     }
 }
 
@@ -207,44 +203,15 @@ impl BackpointerValue {
 /// Size in bytes of [`BackpointerValue`] (24). Pinned by `const_assert_eq!`.
 pub const BACKPOINTER_VALUE_SIZE: usize = 24;
 
-impl Serialize for BackpointerValue {
-    fn serialize<S: serde::Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_bytes(bytemuck::bytes_of(self))
-    }
-}
-
-impl<'de> Deserialize<'de> for BackpointerValue {
-    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-        let bytes: Vec<u8> = crate::serde_pod_bytes::deserialize_bytes(de)?;
-        if bytes.len() != BACKPOINTER_VALUE_SIZE {
-            return Err(serde::de::Error::custom(format!(
-                "expected {BACKPOINTER_VALUE_SIZE} bytes for BackpointerValue, got {}",
-                bytes.len()
-            )));
-        }
-        let mut buf = [0u8; BACKPOINTER_VALUE_SIZE];
-        buf.copy_from_slice(&bytes);
-        Ok(*bytemuck::from_bytes::<Self>(&buf))
-    }
-}
-
 // ---------------- BackpointerTable (in-memory placeholder) ----------------
 
 /// In-memory mirror of the global backpointer B+ tree.
 ///
 /// ## Persistence
 ///
-/// On disk the table occupies one 256 KiB BTREE-DESIGN§1 B+ tree region of
-/// [`BtreeKind::Backpointer`]. The mirror is materialised into a single
-/// CBOR-encoded sorted run via [`BtreeRegion::write_full`] keyed by
-/// 8-byte [`BackpointerKey`] ascending; values are the 24-byte
-/// [`BackpointerValue`] byte image.
-///
-/// TODO(METADATA3): switch to the BTREE-DESIGN§1.6 packed-key codec
-/// (the prefix-template fix it needed has landed).
-/// With ~9 000 backpointers per 256 KiB leaf via BTREE-DESIGN§1.6 key
-/// compression, that landing reduces this region's payload by an order
-/// of magnitude.
+/// On disk the table occupies one 256 KiB [`Region`] of
+/// [`BtreeKind::Backpointer`] keyed by [`BackpointerKey`]; values are the
+/// 24-byte [`BackpointerValue`] byte image.
 #[derive(Debug, Default)]
 pub struct BackpointerTable {
     entries: BTreeMap<BackpointerKey, BackpointerValue>,
@@ -319,71 +286,56 @@ impl BackpointerTable {
             .range((Bound::Included(lo), Bound::Included(hi)))
     }
 
-    // ----------------------------------------------------------------
-    // BTREE-DESIGN§1 B+ tree persistence (CBOR-encoded sorted run).
-    // ----------------------------------------------------------------
-
-    /// Build a [`LoadedNode`] containing every entry as a single CBOR
-    /// sorted run, sorted by [`BackpointerKey`]. The node uses
-    /// [`BtreeKind::Backpointer`] and the spec's 18-bit (256 KiB) region
-    /// size.
-    pub fn to_loaded_node(&self) -> LoadedNode<BackpointerKey, BackpointerValue> {
-        let entries: Vec<(BackpointerKey, BackpointerValue)> =
-            self.entries.iter().map(|(k, v)| (*k, *v)).collect();
-
-        let mut node: LoadedNode<BackpointerKey, BackpointerValue> =
-            LoadedNode::new(BtreeKind::Backpointer, 0, REGION_SIZE_LOG2);
-        if !entries.is_empty() {
-            let run = SortedRun::from_sorted(0, 0, entries);
-            node.sorted_runs.push(run);
-            node.header.sorted_run_count = 1;
-        }
-        node
-    }
-
-    /// Restore the in-memory state from a [`LoadedNode`] read via
-    /// [`BtreeRegion::read`].
-    pub fn from_loaded_node(node: &LoadedNode<BackpointerKey, BackpointerValue>) -> Self {
-        let mut entries: BTreeMap<BackpointerKey, BackpointerValue> = BTreeMap::new();
-        for (k, v) in node.merge_iter() {
-            entries.insert(*k, *v);
-        }
-        Self { entries }
-    }
-
-    /// Write the in-memory state as a fresh 256 KiB region at byte `offset`
-    /// on `device`.
+    /// Write the table as the 256 KiB region at byte `offset`, keyed by
+    /// [`BackpointerKey`], each value a 24-byte [`BackpointerValue`].
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
         offset: u64,
     ) -> Result<(), MetaError> {
-        let mut node = self.to_loaded_node();
-        BtreeRegion::write_full::<D, BackpointerKey, BackpointerValue>(
-            device, offset, &mut node,
-        )
-        .map_err(MetaError::from)?;
+        let mut region = Region::create_in_place(device, offset, region_params(), &[])?;
+        let entries: Vec<(BackpointerKey, RunEntry<'_>)> = self
+            .entries
+            .iter()
+            .map(|(key, value)| (*key, RunEntry::Value(bytemuck::bytes_of(value))))
+            .collect();
+        region.append_entries(device, 0, &entries)?;
         Ok(())
     }
 
-    /// Read the in-memory state from the 256 KiB region at byte `offset`
-    /// on `device`. An all-zero region returns [`Self::default`].
+    /// Read the table from the region at byte `offset`; a never-written
+    /// (all-zero) region is an empty table.
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
         offset: u64,
     ) -> Result<Self, MetaError> {
         let mut probe = [0u8; 8];
-        device.read_at(offset, &mut probe).map_err(MetaError::from)?;
-        if probe.iter().all(|&b| b == 0) {
+        device.read_at(offset, &mut probe)?;
+        if probe.iter().all(|&byte| byte == 0) {
             return Ok(Self::default());
         }
-        let node = BtreeRegion::read::<D, BackpointerKey, BackpointerValue>(
-            device,
-            offset,
-            BtreeKind::Backpointer,
-        )
-        .map_err(MetaError::from)?;
-        Ok(Self::from_loaded_node(&node))
+        let region = Region::open(device, offset, BtreeKind::Backpointer)?;
+        let mut entries = BTreeMap::new();
+        for (key, value) in region.entries::<D, BackpointerKey>(device)? {
+            let value = bytemuck::try_pod_read_unaligned::<BackpointerValue>(&value).map_err(|_| {
+                MetaError::BufferTooSmall {
+                    needed: BACKPOINTER_VALUE_SIZE,
+                    got: value.len(),
+                }
+            })?;
+            entries.insert(key, value);
+        }
+        Ok(Self { entries })
+    }
+}
+
+fn region_params() -> RegionParams {
+    RegionParams {
+        kind: BtreeKind::Backpointer,
+        level: 0,
+        region_size_log2: REGION_SIZE_LOG2,
+        node_seq: 0,
+        created_lsn: 0,
     }
 }
 
@@ -654,5 +606,48 @@ mod tests {
             OwnerKind::OverflowRecord as u8
         );
         assert!(back.get(&k1).is_none());
+    }
+
+    #[test]
+    fn backpointer_region_stores_fixed_values_under_three_field_keys() {
+        let (_dir, dev) = fresh_device();
+        let mut table = BackpointerTable::new();
+        for sector in 0u16..20 {
+            let (key, value) = make_bp(2, 40, sector, OwnerKind::BlobExtent);
+            table.insert(key, value);
+        }
+        table.flush_to_region(&dev, 0).unwrap();
+        let region = Region::open(&dev, 0, BtreeKind::Backpointer).unwrap();
+        assert_eq!(region.run_count(), 1);
+        let key = BackpointerKey::new(2, 40, 13);
+        let value = region.lookup(&dev, &key).unwrap().unwrap();
+        assert_eq!(value.as_bytes(), bytemuck::bytes_of(table.get(&key).unwrap()));
+        assert!(region.lookup(&dev, &BackpointerKey::new(2, 41, 0)).unwrap().is_none());
+    }
+
+    #[test]
+    fn backpointer_region_rejects_wrong_value_size() {
+        let (_dir, dev) = fresh_device();
+        let mut region = Region::create_in_place(&dev, 0, region_params(), &[]).unwrap();
+        let short_value = [0u8; 10];
+        region
+            .append_entries(&dev, 0, &[(BackpointerKey::new(1, 2, 3), RunEntry::Value(&short_value))])
+            .unwrap();
+        let err = BackpointerTable::load_from_region(&dev, 0).unwrap_err();
+        assert!(matches!(err, MetaError::BufferTooSmall { needed: BACKPOINTER_VALUE_SIZE, got: 10 }));
+    }
+
+    #[test]
+    fn backpointer_region_load_kind_mismatch_fails() {
+        let (_dir, dev) = fresh_device();
+        let mut objects = crate::ObjectTable::new();
+        objects.insert(crate::ObjectRecord::new(1));
+        objects.flush_to_region(&dev, 0).unwrap();
+        let err = BackpointerTable::load_from_region(&dev, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            MetaError::Storage(StorageError::RegionKindMismatch { expected, actual })
+                if expected == BtreeKind::Backpointer as u16 && actual == BtreeKind::ObjectTable as u16
+        ));
     }
 }
