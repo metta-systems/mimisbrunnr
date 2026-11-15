@@ -117,15 +117,10 @@ pub const MAGIC_RUN_INDEX:      u32 = u32::from_le_bytes(*b"BIDX");
 pub const MAGIC_PAGE_RUN_INDEX: u32 = u32::from_le_bytes(*b"BPGS");
 pub const MAGIC_JOURNAL_SET:    u32 = u32::from_le_bytes(*b"JRNL");
 
-// BtreeNodeHeader.flags
-pub const BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS: u8 = 1 << 0;
-pub const BTREE_NODE_FLAG_HEAD_OF_CHAIN:          u8 = 1 << 1;  // INDEX-DESIGN§4.3 ChunkList head
+// BtreeNodeHeader.flags (BTREE-DESIGN§1.1; bit 0 unassigned)
+pub const BTREE_NODE_FLAG_HEAD_OF_CHAIN: u8 = 1 << 1;  // first region of a positional chain
 
-// SortedRunHeader.flags
-pub const SORTED_RUN_FLAG_PACKED_KEYS: u32 = 1 << 0;
-pub const SORTED_RUN_FLAG_ENCRYPTED:   u32 = 1 << 1;
-
-// FieldFormat.flags
+// FieldFormat.flags (BTREE-DESIGN§1.6)
 pub const FIELD_FORMAT_FLAG_SIGNED:    u8 = 1 << 0;
 pub const FIELD_FORMAT_FLAG_MSB_FIRST: u8 = 1 << 1;
 
@@ -341,10 +336,7 @@ pub const RUN_ENTRY_FLAG_WHITEOUT: u8 = 1 << 0;
 pub const RUN_ENTRY_FLAG_LARGE:    u8 = 1 << 1;
 
 // =====================================================================
-// Legacy region and run headers. The forward-overflow chain still uses the
-// header (TODO(INDEX14)); the run header and field format below only feed
-// the per-run capacity figures further down, which are recomputed for the
-// write-once run format by TODO(BTREE12).
+// Legacy region header, still used by the forward-overflow chain (TODO(INDEX14)).
 // =====================================================================
 #[repr(C, packed)]
 pub struct BtreeNodeHeader {
@@ -364,37 +356,6 @@ const _: () = assert!(size_of::<BtreeNodeHeader>() == 64);
 const _: () = assert!(std::mem::offset_of!(BlockHeader, pre) == 0);
 const _: () = assert!(std::mem::offset_of!(BtreeNodeHeader, pre) == 0);
 
-// =====================================================================
-// BTREE-DESIGN§1.1 SortedRunHeader — 32 B
-// (bcachefs source calls this `bset` — sorted run = bset = single sorted
-// append-only commit unit within a btree node. On-disk magic still "BSET".)
-// =====================================================================
-#[repr(C, packed)]
-pub struct SortedRunHeader {
-    pub magic: u32,
-    pub seq: u32,
-    pub journal_seq: u64,
-    pub entry_count: u32,
-    pub payload_length: u32,
-    pub flags: u32,
-    pub crc: u32,
-}
-const _: () = assert!(size_of::<SortedRunHeader>() == 32);
-
-// =====================================================================
-// BTREE-DESIGN§1.6 SortedRunKeyFormat / FieldFormat
-// =====================================================================
-#[repr(C, packed)]
-pub struct FieldFormat {
-    pub bit_width: u8,
-    pub flags: u8,
-    pub _pad0: u16,
-    pub base: u64,
-    pub _pad1: u32,                          // tail pad to keep struct multiple-of-8 (FORMAT-DESIGN§1.1)
-}
-const _: () = assert!(size_of::<FieldFormat>() == 16);
-
-// (SortedRunKeyFormat is variable-length; spec says 8 + 16 × nr_fields.)
 
 // =====================================================================
 // ENGINE-DESIGN§1.1 ZoneExtent — 24 B
@@ -776,23 +737,6 @@ pub struct TagIndexLeafEntry {
 const _: () = assert!(size_of::<TagIndexLeafEntry>() == 48);
 const _: () = assert!(std::mem::align_of::<TagIndexLeafEntry>() == 8);
 
-// INDEX-DESIGN§3.1 leaf packing — verify the entries-per-run claim against the 2-key-field
-// SortedRunKeyFormat overhead (8 + 2×16 = 40 B/run, vs 56 for 3-field).
-// Per-key on-disk cost: ~3 B packed key (tag_id ~2.5 B + snapshot ~0 bits)
-// + ~34 B value (40 B − ~6 B common-prefix elision) = ~37 B.
-pub const TAG_DIR_RUN_KEY_FORMAT_2FIELD: usize = 8 + 2 * size_of::<FieldFormat>();
-const _: () = assert!(TAG_DIR_RUN_KEY_FORMAT_2FIELD == 40);
-pub const TAG_DIR_RUN_OVERHEAD: usize =
-    size_of::<SortedRunHeader>() + TAG_DIR_RUN_KEY_FORMAT_2FIELD;
-const _: () = assert!(TAG_DIR_RUN_OVERHEAD == 72);
-pub const TAG_DIR_PAYLOAD_PER_RUN: usize =
-    REGION - size_of::<BtreeNodeHeader>() - TAG_DIR_RUN_OVERHEAD;
-const _: () = assert!(TAG_DIR_PAYLOAD_PER_RUN == 262_008);
-pub const TAG_DIR_ENTRY_BYTES_PACKED: usize = 37;
-pub const TAG_DIR_ENTRIES_PER_RUN: usize =
-    TAG_DIR_PAYLOAD_PER_RUN / TAG_DIR_ENTRY_BYTES_PACKED;
-const _: () = assert!(TAG_DIR_ENTRIES_PER_RUN == 7_081);
-
 // SNAPSHOTS-DESIGN§1.2 — TagIndexLeafEntry gained 4 bytes of `snapshot` field; with
 // 8-byte struct alignment the on-disk size grew from 40 → 48 (4 B field
 // + 4 B trailing alignment pad). The snapshot field is at offset 28
@@ -919,16 +863,6 @@ const _: () = assert!(
             + INLINE_DISK_LIMIT * size_of::<DiskDescriptorOnDisk>()
             + 980 + 4                                        // _reserved + trailing_crc
 );
-
-// =====================================================================
-// FORMAT-DESIGN§16 Bucket-alloc footprint — 16 Mi buckets × 18 B/entry ≈ 288 MiB.
-// Pinning the arithmetic catches unit drift (MB vs MiB) at build time.
-// =====================================================================
-pub const ALLOC_BUCKETS_16TIB_DISK:    usize = 16 * 1024 * 1024;             // 1 MiB buckets
-pub const ALLOC_ENTRY_BYTES_PACKED:    usize = 18;                            // 16 B value + ~2 B packed bucket_no
-pub const ALLOC_FOOTPRINT_BYTES:       usize =
-    ALLOC_BUCKETS_16TIB_DISK * ALLOC_ENTRY_BYTES_PACKED;
-const _: () = assert!(ALLOC_FOOTPRINT_BYTES == 288 * 1024 * 1024);            // == 288 MiB exactly
 
 // =====================================================================
 // INDEX-DESIGN§4.3 ChunkIndexLeafEntry — 56 B
@@ -1102,202 +1036,130 @@ pub struct WorkItem {
 const _: () = assert!(size_of::<WorkItem>() == 48);
 
 // =====================================================================
-// BTREE-DESIGN§1 / METADATA-DESIGN§1 / METADATA-DESIGN§2.1 Large-node region capacity calculations
+// BTREE-DESIGN§1.2, §1.5–1.7 region capacity in the write-once format, and the
+// figures the design documents quote from it (METADATA-DESIGN§1, METADATA-DESIGN§2.2,
+// INDEX-DESIGN§4.3, ALLOCATION-DESIGN§1.1, FORMAT-DESIGN§16).
 // =====================================================================
 pub const REGION: usize = 256 * 1024; // 262 144
+pub const REGION_BLOCKS: usize = REGION / BLOCK_SIZE; // 64
+// One run: block 0, its index block, then data blocks.
+pub const REGION_DATA_BLOCKS_ONE_RUN: usize = REGION_BLOCKS - 2;
+const _: () = assert!(REGION_DATA_BLOCKS_ONE_RUN == 62);
 
-// METADATA-DESIGN§1 depth convention: *depth* counts inner levels above the leaves.
-// MAX_LEVELS bounds inner depth (deepest tree = depth 3 = 4 tiers).
-pub const MAX_LEVELS: usize = 3;
+const fn align8(value: usize) -> usize { value.div_ceil(8) * 8 }
 
-// Per-flush cost at depth D = (D + 1) × REGION (one rewrite per tier,
-// leaf included). Locks down the METADATA-DESIGN§1 "COW write path" formula.
-pub const fn flush_cost_bytes(depth: usize) -> usize { (depth + 1) * REGION }
-const _: () = assert!(flush_cost_bytes(0) == REGION);                 // leaf-only
-const _: () = assert!(flush_cost_bytes(1) == 2 * REGION);              // METADATA-DESIGN§1 "2 node rewrites" at 10 M
-const _: () = assert!(flush_cost_bytes(MAX_LEVELS) == 4 * REGION);     // 48-bit cap
-
-// --- Inner radix node (level ≥ 1): positional BlockRef array, no bitmap.
-// Empty slots use BlockRef.generation == 0 as the sentinel.
-pub const INNER_PAYLOAD: usize = REGION - size_of::<BtreeNodeHeader>();
-pub const INNER_ENTRIES: usize = INNER_PAYLOAD / size_of::<BlockRef>();
-const _: () = assert!(INNER_ENTRIES == 16380);
-const _: () = assert!(INNER_ENTRIES * size_of::<BlockRef>() + size_of::<BtreeNodeHeader>() == REGION);
-
-// --- Object Table leaf (level 0): N × 128 B records + occupancy bitmap + 32 B trailer.
-// Solve for max N such that 64 + ceil(N/8) + 32 + 128*N ≤ 262144 → N ≤ 2045.
-// Use N = 2044 with 256-byte bitmap (2048 bits, headroom).
-pub const OBJECT_TABLE_LEAF_RECORDS: usize = 2044;
-pub const OBJECT_TABLE_BITMAP_BYTES: usize = 256;     // ≥ ceil(2044/8) = 256
-pub const OBJECT_TABLE_TRAILER: usize = 32;            // generation, version, reserved
-pub const OBJECT_TABLE_USED: usize =
-    size_of::<BtreeNodeHeader>()
-        + OBJECT_TABLE_BITMAP_BYTES
-        + OBJECT_TABLE_TRAILER
-        + OBJECT_TABLE_LEAF_RECORDS * size_of::<ObjectRecord>();
-const _: () = assert!(OBJECT_TABLE_USED <= REGION);
-const _: () = assert!(OBJECT_TABLE_USED == 64 + 256 + 32 + 2044 * 128);
-// Trailing pad
-pub const OBJECT_TABLE_PAD: usize = REGION - OBJECT_TABLE_USED;
-const _: () = assert!(OBJECT_TABLE_PAD == 160);
-
-// --- Location Table leaf (level 0): N × 48 B + bitmap + 32 B trailer.
-// 64 + ceil(N/8) + 32 + 48*N ≤ 262144 → N ≤ 5444.
-// Use N = 5440 (multiple of 8 → bitmap exactly 680 B, no bit wastage).
-pub const LOCATION_TABLE_LEAF_RECORDS: usize = 5440;
-pub const LOCATION_TABLE_BITMAP_BYTES: usize = 680;     // 5440/8
-pub const LOCATION_TABLE_TRAILER: usize = 32;
-pub const LOCATION_TABLE_USED: usize =
-    size_of::<BtreeNodeHeader>()
-        + LOCATION_TABLE_BITMAP_BYTES
-        + LOCATION_TABLE_TRAILER
-        + LOCATION_TABLE_LEAF_RECORDS * size_of::<ObjectLocation>();
-const _: () = assert!(LOCATION_TABLE_USED <= REGION);
-const _: () = assert!(LOCATION_TABLE_USED == 64 + 680 + 32 + 5440 * 48);
-pub const LOCATION_TABLE_PAD: usize = REGION - LOCATION_TABLE_USED;
-const _: () = assert!(LOCATION_TABLE_PAD == 248);
-
-// =====================================================================
-// Capacity sanity checks (depth-vs-objects)
-// =====================================================================
-const _: () = assert!(OBJECT_TABLE_LEAF_RECORDS * INNER_ENTRIES > 33_000_000); // ≥33 M at depth 2
-const _: () = assert!(LOCATION_TABLE_LEAF_RECORDS * INNER_ENTRIES > 89_000_000); // ≥89 M at depth 2
-
-// =====================================================================
-// INDEX-DESIGN§2.1 Forward-index leaf packing — validate the entries-per-run and
-// entries-per-leaf claims against region budget arithmetic.
-//
-// Per-region budget (BTREE-DESIGN§1.1, BTREE-DESIGN§1.6):
-//   region:                      256 KiB   = 262 144 B
-//   - BtreeNodeHeader:                 64 B
-//   - per-run SortedRunHeader:         32 B
-//   - per-run SortedRunKeyFormat (2 fields after SNAPSHOTS-DESIGN§1.2: `(oid, snapshot)`,
-//                                 BTREE-DESIGN§1.6: 8 + 2 × FieldFormat):
-//                                      8 + 2 × 12 = 32 B
-//
-// Per-LeafEntry cost (inline body, no spill; INDEX-DESIGN§2.1 prose):
-//   - packed (oid, snapshot) key: ~2.5 B average (snapshot ~0 bits when one
-//     snapshot dominates a sorted run); 3 B integer ceiling for const math
-//   - LeafEntry.header:                 2 B
-//   - body: assertions × PackedAssertion (16 B each)
-// =====================================================================
-pub const FWD_RUN_KEY_FORMAT_2FIELD: usize = 8 + 2 * size_of::<FieldFormat>();
-const _: () = assert!(FWD_RUN_KEY_FORMAT_2FIELD == 40);
-
-pub const FWD_RUN_OVERHEAD: usize =
-    size_of::<SortedRunHeader>() + FWD_RUN_KEY_FORMAT_2FIELD;
-const _: () = assert!(FWD_RUN_OVERHEAD == 72);
-
-pub const FWD_ENTRY_KEY_BYTES_CEIL: usize = 3; // ⌈2.5⌉
-pub const FWD_ENTRY_HEADER_BYTES:  usize = 2;
-
-pub const fn fwd_entry_bytes(assertions: usize) -> usize {
-    FWD_ENTRY_KEY_BYTES_CEIL
-        + FWD_ENTRY_HEADER_BYTES
-        + assertions * size_of::<PackedAssertion>()
-}
-// At 8 assertions: 3 + 2 + 128 = 133 B (matches the INDEX-DESIGN§2.1 prose "~133 B").
-const _: () = assert!(fwd_entry_bytes(8) == 133);
-
-pub const fn fwd_payload_n_runs(runs: usize) -> usize {
-    REGION - size_of::<BtreeNodeHeader>() - runs * FWD_RUN_OVERHEAD
-}
-// One sorted run alone has 262 008 B of entry payload available.
-const _: () = assert!(fwd_payload_n_runs(1) == 262_008);
-// Four sorted runs share 261 792 B (the BTREE-DESIGN§1.4 trigger is sorted_run_count > 4).
-const _: () = assert!(fwd_payload_n_runs(4) == 261_792);
-
-// Sorted runs are appended into the *same* region (BTREE-DESIGN§1.2) — they share its
-// payload bytes. Adding a run does not multiply capacity; it slightly reduces
-// it (by one run's 32 B header + 40 B key-format descriptor = 72 B). The
-// total entry count a leaf can hold is therefore bounded by (region − header
-// − n×overhead) divided by entry size, not by per-run × n.
-pub const fn fwd_total_entries(runs: usize, assertions: usize) -> usize {
-    fwd_payload_n_runs(runs) / fwd_entry_bytes(assertions)
+/// Bytes an entry block uses for `count` entries: DataBlockHead, keys, entry flags and (for
+/// variable values) u16 value ends, padded to 8, then each value 8-aligned.
+const fn entry_block_bytes(count: usize, key_width: usize, value_len: usize, variable: bool) -> usize {
+    let value_ends = if variable { count * 2 } else { 0 };
+    align8(size_of::<DataBlockHead>() + count * key_width + count + value_ends) + count * align8(value_len)
 }
 
-// At "8 assertions per object" (the INDEX-DESIGN§2.2 inline-spill threshold and the
-// INDEX-DESIGN§2.1 calculation basis), a single-run leaf holds ~1 969 entries
-// (the doc prose rounds to "~1 970").
-const _: () = assert!(fwd_total_entries(1, 8) == 1_969);
+/// Entries one 4 KiB entry block holds (BTREE-DESIGN§1.2).
+pub const fn entries_per_block(key_width: usize, value_len: usize, variable: bool) -> usize {
+    let mut count = 0;
+    while entry_block_bytes(count + 1, key_width, value_len, variable) <= BLOCK_SIZE {
+        count += 1;
+    }
+    count
+}
 
-// At the BTREE-DESIGN§1.4 compaction trigger (sorted_run_count > 4) the leaf still
-// holds ~1 968 entries TOTAL — sorted runs share the region's payload
-// bytes (BTREE-DESIGN§1.2), so adding runs costs overhead without adding capacity.
-const _: () = assert!(fwd_total_entries(4, 8) == 1_968);
+/// Data blocks one index block can describe for keys of `fields` fields and `key_width` bytes.
+pub const fn blocks_per_index_block(fields: usize, key_width: usize) -> usize {
+    (BLOCK_SIZE - size_of::<RunHeader>() - size_of::<KeyFormatHead>() - fields * size_of::<RunFieldFormat>())
+        / (size_of::<RunBlockEntry>() + key_width)
+}
 
-// Lower-assertion regimes (smaller objects pack more densely; monotonic):
-const _: () = assert!(fwd_total_entries(1, 4) == 3_797);
-const _: () = assert!(fwd_total_entries(4, 4) == 3_794);
-const _: () = assert!(fwd_total_entries(1, 4) > fwd_total_entries(1, 8));
+/// Entries a leaf holds as one run filling the region.
+pub const fn entries_per_leaf(key_width: usize, value_len: usize, variable: bool) -> usize {
+    entries_per_block(key_width, value_len, variable) * REGION_DATA_BLOCKS_ONE_RUN
+}
 
-// Forward-index footprint at 10 M objects, basis = 8 assertions/entry
-// (the INDEX-DESIGN§2.2 inline-spill threshold, used as the INDEX-DESIGN§2.1 calculation basis).
-//
-// Tree shape at this scale: depth 2 (root inner + leaves).
-//   leaves = ⌈10_000_000 / fwd_total_entries(4, 8)⌉
-//   inner  = ⌈leaves / INNER_ENTRIES⌉   (= 1, since leaves « 16 380)
-//   total_bytes = (leaves + inner) × REGION
-pub const FWD_OBJECTS_10M: usize = 10_000_000;
-pub const FWD_LEAVES_10M_K8: usize =
-    FWD_OBJECTS_10M.div_ceil(fwd_total_entries(4, 8));
-pub const FWD_INNER_10M_K8: usize = FWD_LEAVES_10M_K8.div_ceil(INNER_ENTRIES);
-const _: () = assert!(FWD_LEAVES_10M_K8 == 5_082);
-const _: () = assert!(FWD_INNER_10M_K8 == 1);
+pub const OBJECTS_10M: usize = 10_000_000;
 
-pub const FWD_BYTES_10M_K8: usize = (FWD_LEAVES_10M_K8 + FWD_INNER_10M_K8) * REGION;
-// 5 083 × 256 KiB = 1 332 617 152 B ≈ 1.241 GiB.
-const _: () = assert!(FWD_BYTES_10M_K8 == 5_083 * 262_144);
-// Within [1.24 GiB, 1.25 GiB].
-const _: () = assert!(FWD_BYTES_10M_K8 > 1_330_000_000);
-const _: () = assert!(FWD_BYTES_10M_K8 < 1_335_000_000);
+// --- Positional radix (METADATA-DESIGN§1, BTREE-DESIGN§1.7) -----------------
+pub const RADIX_PAGES: usize = REGION_BLOCKS * 3 / 4;
+const _: () = assert!(RADIX_PAGES == POSITIONAL_LOGICAL_PAGES_256_KIB);
+pub const OBJECT_TABLE_LEAF_RECORDS: usize = RADIX_PAGES * (BLOCK_SIZE / size_of::<ObjectRecord>());
+const _: () = assert!(OBJECT_TABLE_LEAF_RECORDS == 1_536);          // "1 536 per leaf"
+/// NodePtr slots of an inner page at R metadata replicas (16 × R bytes each).
+pub const fn radix_inner_slots(replicas: usize) -> usize {
+    RADIX_PAGES * (BLOCK_SIZE / (size_of::<BlockRef>() * replicas))
+}
+const _: () = assert!(radix_inner_slots(1) == 12_288);               // "12 288 / R per node"
+const _: () = assert!(radix_inner_slots(2) == 6_144);
+pub const OBJECT_TABLE_LEAVES_10M: usize = OBJECTS_10M.div_ceil(OBJECT_TABLE_LEAF_RECORDS);
+const _: () = assert!(OBJECT_TABLE_LEAVES_10M == 6_511);             // "6 511 leaves"
+const _: () = assert!(OBJECT_TABLE_LEAVES_10M <= radix_inner_slots(1)); // under 1 inner at R = 1
+const _: () = assert!(OBJECT_TABLE_LEAVES_10M > radix_inner_slots(2) / 1); // depth 2 at R = 2 needs > 6 144 leaves
+// Records 10 M × 128 B ≈ 1.19 GiB; leaves 6 511 × 256 KiB ≈ 1.59 GiB ("~1.6 GiB").
+const _: () = assert!(OBJECTS_10M * size_of::<ObjectRecord>() == 1_280_000_000);
+const _: () = assert!(OBJECT_TABLE_LEAVES_10M * REGION > 1_700_000_000 && OBJECT_TABLE_LEAVES_10M * REGION < 1_710_000_000);
 
-// For comparison, the small-object regime (4 assertions/entry):
-pub const FWD_LEAVES_10M_K4: usize =
-    FWD_OBJECTS_10M.div_ceil(fwd_total_entries(4, 4));
-pub const FWD_BYTES_10M_K4: usize = (FWD_LEAVES_10M_K4 + 1) * REGION;
-const _: () = assert!(FWD_LEAVES_10M_K4 == 2_636);
-// 2 637 × 256 KiB ≈ 659 MiB.
-const _: () = assert!(FWD_BYTES_10M_K4 > 690_000_000);
-const _: () = assert!(FWD_BYTES_10M_K4 < 695_000_000);
+// METADATA-DESIGN§1 depth table and MAX_LEVELS = 4 (inner depth).
+pub const MAX_LEVELS: u32 = 4;
+pub const LOCAL_ID_SPACE: u64 = 1u64 << 48;
+pub const fn radix_capacity(inner_levels: u32, replicas: usize) -> u64 {
+    (OBJECT_TABLE_LEAF_RECORDS as u64) * (radix_inner_slots(replicas) as u64).pow(inner_levels)
+}
+const _: () = assert!(radix_capacity(1, 1) == 18_874_368);          // "≈ 18.9 M"
+const _: () = assert!(radix_capacity(1, 2) == 9_437_184);           // "≈ 9.4 M"
+const _: () = assert!(radix_capacity(3, 2) >= LOCAL_ID_SPACE);      // depth 3 for R ≤ 2
+const _: () = assert!(radix_capacity(3, 4) < LOCAL_ID_SPACE);
+const _: () = assert!(radix_capacity(MAX_LEVELS, 4) >= LOCAL_ID_SPACE); // depth 4 for R ≤ 4
+// A flush appends a page run per changed node: one changed page costs an index block
+// and the page (BTREE-DESIGN§1.7), so a one-record change at depth D writes (D + 1) × 8 KiB.
+pub const fn single_page_flush_bytes(depth: u32) -> usize { (depth as usize + 1) * 2 * BLOCK_SIZE }
+const _: () = assert!(single_page_flush_bytes(1) == 16 * 1024);
 
-// =====================================================================
-// METADATA-DESIGN§1 / METADATA-DESIGN§2.1 Radix-tree depth covers 48-bit local-id space.
-// MAX_LEVELS = 3 (inner levels above the leaf); the table in each
-// section claims depth 3 reaches ≥ 2^48 ≈ 281 T objects. Asserting
-// the inequality nails the METADATA-DESIGN§2.1 prose ("48-bit space reachable at
-// depth 3").
-// =====================================================================
-pub const LOCAL_ID_SPACE: u64 = 1u64 << 48;       // 2^48 ≈ 281.5 T
-pub const OBJECT_TABLE_DEPTH3_CAP: u64 =
-    OBJECT_TABLE_LEAF_RECORDS as u64
-        * INNER_ENTRIES as u64
-        * INNER_ENTRIES as u64
-        * INNER_ENTRIES as u64;
-pub const LOCATION_TABLE_DEPTH3_CAP: u64 =
-    LOCATION_TABLE_LEAF_RECORDS as u64
-        * INNER_ENTRIES as u64
-        * INNER_ENTRIES as u64
-        * INNER_ENTRIES as u64;
-const _: () = assert!(OBJECT_TABLE_DEPTH3_CAP >= LOCAL_ID_SPACE);
-const _: () = assert!(LOCATION_TABLE_DEPTH3_CAP >= LOCAL_ID_SPACE);
-// Depth 2 alone is NOT enough for the location table (would have caught
-// the METADATA-DESIGN§2.1 "depth 2" prose bug):
-pub const LOCATION_TABLE_DEPTH2_CAP: u64 =
-    LOCATION_TABLE_LEAF_RECORDS as u64 * INNER_ENTRIES as u64 * INNER_ENTRIES as u64;
-const _: () = assert!(LOCATION_TABLE_DEPTH2_CAP < LOCAL_ID_SPACE);
+// --- Keyed runs (BTREE-DESIGN§1.2, §1.6) ----------------------------------
+// Every tree below fits one run's data blocks in one index block.
+const _: () = assert!(blocks_per_index_block(7, 24) >= REGION_DATA_BLOCKS_ONE_RUN);
+const _: () = assert!(blocks_per_index_block(5, 16) >= REGION_DATA_BLOCKS_ONE_RUN);
 
-// =====================================================================
-// FORMAT-DESIGN§16 footprint: 10 M-object leaf counts (positional radix tables).
-// Pinning these against the doc's FORMAT-DESIGN§16 figures ensures off-by-one in the
-// leaf count is caught at build time.
-// =====================================================================
-pub const OBJECT_TABLE_LEAVES_10M: usize =
-    FWD_OBJECTS_10M.div_ceil(OBJECT_TABLE_LEAF_RECORDS);
-pub const LOCATION_TABLE_LEAVES_10M: usize =
-    FWD_OBJECTS_10M.div_ceil(LOCATION_TABLE_LEAF_RECORDS);
-const _: () = assert!(OBJECT_TABLE_LEAVES_10M == 4_893);    // FORMAT-DESIGN§16: 4 893 leaves
-const _: () = assert!(LOCATION_TABLE_LEAVES_10M == 1_839);  // FORMAT-DESIGN§16: 1 839 leaves
+// Content map (INDEX-DESIGN§4.3): ~5-byte keys (oid, end_offset, snapshot) and 88-byte
+// fixed ChunkEntry values — "about 43 entries per 4 KiB block … about 2 650 chunks".
+pub const CONTENT_MAP_ENTRY_BYTES: usize = 88;
+const _: () = assert!(entries_per_block(5, CONTENT_MAP_ENTRY_BYTES, false) == 43);
+const _: () = assert!(entries_per_block(6, CONTENT_MAP_ENTRY_BYTES, false) == 43);
+const _: () = assert!(entries_per_leaf(5, CONTENT_MAP_ENTRY_BYTES, false) == 2_666);
+
+// Backpointers (METADATA-DESIGN§2.2): ~12-byte keys and 24-byte fixed values, ~37 B per
+// entry — "about 6 800 backpointers per leaf".
+const _: () = assert!(entries_per_block(12, 24, false) == 110);
+const _: () = assert!(entries_per_leaf(12, 24, false) == 6_820);
+
+// Bucket alloc table (ALLOCATION-DESIGN§1.1, FORMAT-DESIGN§16): 2-byte bucket keys and
+// 8-byte entries, 11 B per entry — 23 002 buckets per leaf.
+pub const BUCKET_ALLOC_PER_LEAF: usize = entries_per_leaf(2, size_of::<BucketAllocEntry>(), false);
+const _: () = assert!(entries_per_block(2, size_of::<BucketAllocEntry>(), false) == 371);
+const _: () = assert!(BUCKET_ALLOC_PER_LEAF == 23_002);
+pub const fn bucket_alloc_table_bytes(buckets: usize) -> usize {
+    buckets.div_ceil(BUCKET_ALLOC_PER_LEAF) * REGION
+}
+const MIB: usize = 1024 * 1024;
+const _: () = assert!(bucket_alloc_table_bytes(64 << 20) / MIB == 729);  // 256 KiB buckets, 16 TiB: "~730 MiB"
+const _: () = assert!(bucket_alloc_table_bytes(16 << 20) / MIB == 182);  // 1 MiB buckets: "~180 MiB"
+const _: () = assert!(bucket_alloc_table_bytes(4 << 20) / MIB == 45);    // 4 MiB buckets: "~46 MiB"
+const _: () = assert!(bucket_alloc_table_bytes(256 << 10) / MIB == 3);   // 64 MiB buckets: "~3 MiB"
+const _: () = assert!(bucket_alloc_table_bytes(64 << 10) == 3 * REGION); // 256 MiB buckets: "~768 KiB"
+
+// Forward index (INDEX-DESIGN§2, FORMAT-DESIGN§16): ~3-byte (oid, snapshot) keys and
+// variable ForwardEntry values — 58 B at 8 direct terms, 48 B at 4.
+pub const FWD_PER_LEAF_8: usize = entries_per_leaf(3, 58, true);
+pub const FWD_PER_LEAF_4: usize = entries_per_leaf(3, 48, true);
+const _: () = assert!(entries_per_block(3, 58, true) == 58);
+const _: () = assert!(FWD_PER_LEAF_8 == 3_596);
+pub const FWD_LEAVES_10M_8: usize = OBJECTS_10M.div_ceil(FWD_PER_LEAF_8);
+const _: () = assert!(FWD_LEAVES_10M_8 == 2_781);                   // "~2 800 leaves"
+const _: () = assert!(FWD_LEAVES_10M_8 * REGION / MIB == 695);       // "~0.7 GiB"
+pub const FWD_LEAVES_10M_4: usize = OBJECTS_10M.div_ceil(FWD_PER_LEAF_4);
+const _: () = assert!(FWD_LEAVES_10M_4 * REGION / MIB == 537);       // "~0.5 GiB", about a quarter less
+
+// Term dictionary (INDEX-DESIGN§4.1): tag terms have ~4-byte keys (kind, value and
+// parent constant) and 56-byte fixed DictEntry values — "about 4 000 tag entries fit one leaf".
+const _: () = assert!(entries_per_block(4, 56, false) == 67);
+const _: () = assert!(entries_per_leaf(4, 56, false) == 4_154);
 
 // =====================================================================
 // JOURNAL-DESIGN§1.2 hard cap: a single WAL op fits in one 4 KiB sector. No continuation
@@ -1361,22 +1223,6 @@ const _: () = assert!(CHUNK_LIST_REPLACE_MAX_HASHES == 125);
 // All compute over a 32 GiB bulk write with no dedup.
 pub const CHUNK_LIST_ENTRIES_PER_REGION: usize = CHUNK_LIST_ENTRIES;        // 6_551
 
-// ChunkIndex is a snapshot-agnostic B+ tree keyed by `chunk_hash: [u8; 32]`. The key
-// is a hash, so the BTREE-DESIGN§1.6 packed-key encoding skips packing; each key is encoded as
-// four 64-bit `FieldFormat` limbs. Per-run overhead = SortedRunHeader (32) + key format
-// (8 + 4×16 = 72) = 104 B; per entry = 56 B (INDEX-DESIGN§4.3 ChunkIndexLeafEntry).
-pub const CHUNK_INDEX_RUN_KEY_FORMAT: usize = 8 + 4 * size_of::<FieldFormat>();
-const _: () = assert!(CHUNK_INDEX_RUN_KEY_FORMAT == 72);
-pub const CHUNK_INDEX_RUN_OVERHEAD:   usize =
-    size_of::<SortedRunHeader>() + CHUNK_INDEX_RUN_KEY_FORMAT;
-const _: () = assert!(CHUNK_INDEX_RUN_OVERHEAD == 104);
-pub const CHUNK_INDEX_RUN_PAYLOAD: usize =
-    REGION - size_of::<BtreeNodeHeader>() - CHUNK_INDEX_RUN_OVERHEAD;
-pub const CHUNK_INDEX_LEAF_ENTRIES: usize =
-    CHUNK_INDEX_RUN_PAYLOAD / size_of::<ChunkIndexLeafEntry>();
-// 261 976 / 56 = 4 678 — the doc's "~4 600" prose figure rounds conservatively;
-// we pin the exact derivation here so INDEX-DESIGN§4.3 stays honest.
-const _: () = assert!(CHUNK_INDEX_LEAF_ENTRIES == 4_678);
 const _: () = assert!(CHUNK_LIST_ENTRIES_PER_REGION == 6_551);
 
 pub const CHUNK_BULK_WRITE_BYTES:        usize = 32 * 1024 * 1024 * 1024;   // 32 GiB
@@ -1497,51 +1343,18 @@ const _: () = assert!(CHUNK_LIST_ENTRIES == 6_551);
 
 // =====================================================================
 // INDEX-DESIGN§4.1 KvDirectory inline capacity: 252 entries supports global_depth ≤ 7.
-// At global_depth ≥ 8 the directory spills into a BTREE-DESIGN§1 region holding
-// up to INNER_ENTRIES (16 380) BlockRef entries, supporting global_depth ≤ 13.
+// At global_depth ≥ 8 the directory spills into a region of 16 380 BlockRef entries,
+// supporting global_depth ≤ 13. TODO(INDEX12): goes with the extendible hash.
 // =====================================================================
+const KV_SPILLOVER_ENTRIES: usize = 16_380;
 pub const KV_INLINE_ENTRIES: usize = 252;
 pub const KV_INLINE_GLOBAL_DEPTH_MAX: u32 = 7;
 const _: () = assert!((1u32 << KV_INLINE_GLOBAL_DEPTH_MAX) <= KV_INLINE_ENTRIES as u32);
 // One step further would overflow:
 const _: () = assert!((1u32 << (KV_INLINE_GLOBAL_DEPTH_MAX + 1)) > KV_INLINE_ENTRIES as u32);
 pub const KV_SPILLOVER_GLOBAL_DEPTH_MAX: u32 = 13;
-const _: () = assert!((1usize << KV_SPILLOVER_GLOBAL_DEPTH_MAX) <= INNER_ENTRIES);
-const _: () = assert!((1usize << (KV_SPILLOVER_GLOBAL_DEPTH_MAX + 1)) > INNER_ENTRIES);
-
-// =====================================================================
-// INDEX-DESIGN§2.1 Forward-index inner-node packing (sanity check the prose's
-// "~13 000 children per run" claim).
-//
-// Inner entry: packed (oid, snapshot) key (~3 B) + BlockRef (16 B) ≈ 19 B.
-// Per-run payload uses the same 2-field SortedRunKeyFormat as the leaf.
-// =====================================================================
-pub const FWD_INNER_ENTRY_BYTES: usize = FWD_ENTRY_KEY_BYTES_CEIL + size_of::<BlockRef>();
-const _: () = assert!(FWD_INNER_ENTRY_BYTES == 19);
-pub const FWD_INNER_CHILDREN_PER_RUN: usize =
-    fwd_payload_n_runs(1) / FWD_INNER_ENTRY_BYTES;
-// 262 008 / 19 = 13 789 — pin the doc's tightened "~13 789" figure.
-const _: () = assert!(FWD_INNER_CHILDREN_PER_RUN == 13_789);
-
-// =====================================================================
-// INDEX-DESIGN§4.2 Range-index leaf packing (4-field key: attr_id, value, oid, snapshot).
-// Per-run overhead = SortedRunHeader (32) + SortedRunKeyFormat (8 + 4×16 = 72) = 104 B.
-// Per-entry on-disk cost = 8–12 B packed key + 16 B BlockRef value = 24–28 B.
-// =====================================================================
-pub const RANGE_RUN_KEY_FORMAT_4FIELD: usize = 8 + 4 * size_of::<FieldFormat>();
-const _: () = assert!(RANGE_RUN_KEY_FORMAT_4FIELD == 72);
-pub const RANGE_RUN_OVERHEAD: usize =
-    size_of::<SortedRunHeader>() + RANGE_RUN_KEY_FORMAT_4FIELD;
-const _: () = assert!(RANGE_RUN_OVERHEAD == 104);
-pub const RANGE_PAYLOAD_PER_RUN: usize =
-    REGION - size_of::<BtreeNodeHeader>() - RANGE_RUN_OVERHEAD;
-const _: () = assert!(RANGE_PAYLOAD_PER_RUN == 261_976);
-// Best/worst entries-per-run bounds (24–28 B/entry):
-pub const RANGE_ENTRIES_PER_RUN_BEST: usize = RANGE_PAYLOAD_PER_RUN / 24;
-pub const RANGE_ENTRIES_PER_RUN_WORST: usize = RANGE_PAYLOAD_PER_RUN / 28;
-// Pin the prose's "~9 350–10 900 entries" range.
-const _: () = assert!(RANGE_ENTRIES_PER_RUN_BEST  >= 10_900 && RANGE_ENTRIES_PER_RUN_BEST  < 11_000);
-const _: () = assert!(RANGE_ENTRIES_PER_RUN_WORST >=  9_350 && RANGE_ENTRIES_PER_RUN_WORST <  9_500);
+const _: () = assert!((1usize << KV_SPILLOVER_GLOBAL_DEPTH_MAX) <= KV_SPILLOVER_ENTRIES);
+const _: () = assert!((1usize << (KV_SPILLOVER_GLOBAL_DEPTH_MAX + 1)) > KV_SPILLOVER_ENTRIES);
 
 // =====================================================================
 // ALLOCATION-DESIGN§1.4 Freespace LRU fragmentation_band: ⌈255 × live / sectors⌉
@@ -1578,14 +1391,10 @@ const _: () = assert!(fragmentation_band(0, 1024) == 0 && fragmentation_band(1, 
 
 // =====================================================================
 // BTREE-DESIGN§1.5 depth table (10 M objects, 5000 tags, 100 snapshots) — pin the
-// concrete tier counts cited in the prose. Forward leaves are computed
-// at the INDEX-DESIGN§2.2 inline-spill threshold (8 assertions/object).
+// concrete tier counts cited in the prose.
 // =====================================================================
-const _: () = assert!(OBJECT_TABLE_LEAVES_10M   == 4_893);    // depth 1, fits under one inner
-const _: () = assert!(OBJECT_TABLE_LEAVES_10M   <= INNER_ENTRIES);
-const _: () = assert!(LOCATION_TABLE_LEAVES_10M == 1_839);
-const _: () = assert!(LOCATION_TABLE_LEAVES_10M <= INNER_ENTRIES);
-const _: () = assert!(FWD_LEAVES_10M_K8         == 5_082);
-const _: () = assert!(FWD_LEAVES_10M_K8         <= INNER_ENTRIES);
-// Tag directory at 5000 tags × 100 snapshots (no divergence): single leaf.
-const _: () = assert!(5_000 <= TAG_DIR_ENTRIES_PER_RUN);
+const _: () = assert!(OBJECT_TABLE_LEAVES_10M == 6_511);         // depth 1, under one inner
+// Forward index: ~2 800 leaves under one inner of separator keys (~3 B + NodePtr 16 B).
+const _: () = assert!(FWD_LEAVES_10M_8 <= entries_per_leaf(3, size_of::<BlockRef>(), false));
+// Term dictionary: about 4 000 tag entries fit one leaf.
+const _: () = assert!(entries_per_leaf(4, 56, false) >= 4_000);

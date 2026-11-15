@@ -58,11 +58,15 @@ A bucket is identified by `(disk_id, bucket_no)`. Bucket size is encoded as
 
 | `bucket_size_log2` | Bucket size | Buckets per 16 TiB disk | Alloc table size |
 | ------------------ | ----------- | ----------------------- | ---------------- |
-| 18                 | 256 KiB     | 64 M                    | ~640 MiB         |
-| 20 (default)       | 1 MiB       | 16 M                    | ~160 MiB         |
-| 22                 | 4 MiB       | 4 M                     | ~40 MiB          |
-| 26                 | 64 MiB      | 256 K                   | ~2.5 MiB         |
-| 28 (maximum)       | 256 MiB     | 64 K                    | ~640 KiB         |
+| 18                 | 256 KiB     | 64 M                    | ~730 MiB         |
+| 20 (default)       | 1 MiB       | 16 M                    | ~180 MiB         |
+| 22                 | 4 MiB       | 4 M                     | ~46 MiB          |
+| 26                 | 64 MiB      | 256 K                   | ~3 MiB           |
+| 28 (maximum)       | 256 MiB     | 64 K                    | ~768 KiB         |
+
+Each entry costs 11 bytes in a leaf — the 8-byte `BucketAllocEntry`, a 2-byte frame-of-reference
+`bucket_no` and an entry-flags byte (BTREE-DESIGN§1.2) — so one 256 KiB leaf holds about 23 000
+buckets.
 
 Bucket size is per disk, chosen at format or `add-disk` time for the device: small buckets
 where small objects and fine-grained reclaim matter (SD, small SSDs), large ones where long

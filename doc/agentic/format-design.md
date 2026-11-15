@@ -360,26 +360,26 @@ pool sets a cap (JOURNAL-DESIGN§1.6); its bucket list is typically 64 MiB on a 
 snapshot overhead scales with logical changes since each snapshot's parent. The forward-index
 sizing assumes 8 direct assertions per object (the INDEX-DESIGN§2.1 entry layout: a 32 B head
 plus frame-of-reference arrays); small-object workloads (~4 assertions) cut the forward index by
-about a third (~0.4 GiB at this scale). Tree sizes are for one copy of each node; with
+about a quarter (~0.5 GiB at this scale). Tree sizes are for one copy of each node; with
 `metadata_replicas` R every tree-node row is R times larger.
 
 | Structure              | Size      | Notes                                              |
 | ---------------------- | --------- | -------------------------------------------------- |
 | Superblock × 3         | 12 KiB    | Fixed                                              |
 | Journal                | ~64 MiB   | Journal buckets (JOURNAL-DESIGN§1); retained history only with a pool cap; per hot device holding the journal (mirroring, JOURNAL-D1) |
-| Bucket alloc table     | ~160 MiB  | 16 M buckets × ~10 B/entry (8 B value + ~2 B packed `bucket_no`) + sorted-run overhead (BTREE-DESIGN§1.1 headers, format descriptors, tail padding) |
+| Bucket alloc table     | ~180 MiB  | 16 M buckets × 11 B/entry (8 B value, ~2 B frame-of-reference `bucket_no`, 1 B entry flags) in ~730 leaves of ~23 000 entries (ALLOCATION-DESIGN§1.1) |
 | Freespace LRU          | ~12 MiB   | Sparse; key packing on `(band, bucket_no)`         |
 | Object table (records) | ~1.6 GiB  | Positional — 1.19 GiB of records in 6 511 leaves × 256 KiB (¾ of each region holds pages, the rest absorbs page runs); content locators included |
 | Object table (radix, roots) | < 1 MiB | One inner node per origin node at R = 1 (depth 1), a few at R = 2 (depth 2, METADATA-DESIGN§1); `ObjectRoots` one leaf |
-| Backpointers           | ~360 MiB  | METADATA-DESIGN§2.2 — one per owner of each location: 10 M chunks × ~38 B packed; a deduplicated chunk adds one per further owner |
-| Forward index          | ~0.6 GiB  | INDEX-DESIGN§2 — ~58 B per object at 8 direct assertions/object (32 B head + frame-of-reference term arrays); implied tags are not stored. Includes any `unix-path` and other path-projection attributes (UNIX-DESIGN§1) — those are ordinary `Attr` terms. |
+| Backpointers           | ~360 MiB  | METADATA-DESIGN§2.2 — one per owner of each location: 10 M chunks × ~37 B in ~1 470 leaves of ~6 800; a deduplicated chunk adds one per further owner |
+| Forward index          | ~0.7 GiB  | INDEX-DESIGN§2 — ~58 B per object at 8 direct assertions/object (32 B head + frame-of-reference term arrays), ~3 600 objects in each of ~2 800 leaves; implied tags are not stored. Includes any `unix-path` and other path-projection attributes (UNIX-DESIGN§1) — those are ordinary `Attr` terms. |
 | Postings               | 200–400 MiB | INDEX-DESIGN§3 — roaring containers, one tree entry per (term, 65 536-id window); 5 000 tags |
 | Term dictionary + term table | 0.1–1 GiB | INDEX-DESIGN§4.1 — ~100 B per distinct attribute value; the upper end is one unique value per object |
 | Ontology               | <10 MiB   | One positional CBOR record per tag, rule, constraint and module, snapshot-tagged (ONTOLOGY-DESIGN§1) |
 | Subscriptions          | ~700 KiB + membership + pending events | Per 1 000 subs with packed `sub_id`; membership as posting containers, ~2 B per member; ~32 B per pending event, bounded per subscription (SUBSCRIPTIONS-DESIGN§1) |
 | Snapshots btree        | ~10 KiB   | 100 snapshot nodes × 64 B + skiplist overhead      |
-| Snapshot key overhead  | ~80 MiB   | Per-snapshot divergent keys across the 6 snapshot-aware btrees (see breakdown below) |
-| **Total metadata**     | **~2.9–3.9 GiB** | Replicated to every node; dominated by object records (1.19 GiB), the forward index and, with many distinct attribute values, the term dictionary |
+| Snapshot key overhead  | ~80 MiB   | Per-snapshot divergent keys across the 7 snapshot-aware btrees (see breakdown below) |
+| **Total metadata**     | **~3.0–4.0 GiB** | Replicated to every node; dominated by object records (1.19 GiB), the forward index and, with many distinct attribute values, the term dictionary |
 
 **Snapshot key overhead breakdown.** "Snapshot key overhead" is the sum of *divergent* keys —
 keys whose value at one snapshot differs from its value at an ancestor. Shared keys cost nothing

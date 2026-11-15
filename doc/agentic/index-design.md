@@ -605,9 +605,9 @@ enum ChunkingAlgo {
 ```
 
 With compression, a chunk is decoded whole, so the cutter also ends a chunk at
-`encoded_extent_max` plaintext bytes (POOL-DESIGN§1.2). At about 45 entries per 4 KiB block, a
-256 KiB leaf of 60 data blocks holds about 2 700 chunks: ≈ 10 MiB of plaintext at 4 KiB chunks,
-≈ 670 MiB at 256 KiB.
+`encoded_extent_max` plaintext bytes (POOL-DESIGN§1.2). At about 43 entries per 4 KiB block (88-byte entries
+under ~5-byte keys), a 256 KiB leaf of 62 data blocks holds about 2 650 chunks: ≈ 10 MiB of
+plaintext at 4 KiB chunks, ≈ 665 MiB at 256 KiB.
 
 **Re-cutting after policy change.** When the resolved storage policy (SPECIFICATION-DESIGN§3.5) for an
 object changes — typically because the operator updated a `PlacementRule::Chunk` or because

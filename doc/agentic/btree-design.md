@@ -219,8 +219,8 @@ snapshots, every tree is shallow:
 | Tree                | Depth  | Levels | Notes                                      |
 | ------------------- | ------ | ------ | ------------------------------------------ |
 | Object table (METADATA-DESIGN§1)   | 1      | 2      | 6 511 leaves under 1 inner (R = 1)       |
-| Forward index (INDEX-DESIGN§2)  | 1      | 2      | ~3 000 leaves (~58 B per object at 8 direct assertions) under 1 inner |
-| Term dictionary (INDEX-DESIGN§4.1) | 0–1 | 1–2    | 5 000 tag entries fit one leaf; depth 1 once attribute values number in the millions |
+| Forward index (INDEX-DESIGN§2)  | 1      | 2      | ~2 800 leaves of ~3 600 objects (~58 B per object at 8 direct assertions) under 1 inner |
+| Term dictionary (INDEX-DESIGN§4.1) | 1   | 2      | about 4 000 tag entries fit one leaf, so 5 000 tags take two under one inner; attribute values add leaves under the same inner until they number in the millions |
 | Postings (INDEX-DESIGN§3.1)     | 1      | 2      | one entry per (term, 65 536-id window)     |
 
 (See the depth convention in METADATA-DESIGN§1: *depth* counts inner levels above the leaves; *levels* is the

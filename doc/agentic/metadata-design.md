@@ -483,8 +483,8 @@ would silently break that match.
 
 The pair is 40 bytes unpacked; with BTREE-DESIGN§1.6 key packing (`disk_id` constant per leaf,
 `bucket_no` packs to ~16–20 bits, `sector_offset` by bucket size, the owner's object id by
-frame of reference) per-key disk cost is about **36–40 B**. A 256 KiB leaf packs ~6 000
-backpointers per sorted run.
+frame of reference) per-key disk cost is about **36–40 B**. A 256 KiB leaf holds about 6 800
+backpointers.
 
 #### Properties
 

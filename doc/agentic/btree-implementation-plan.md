@@ -2,11 +2,6 @@
 
 Design: [btree-design.md](btree-design.md) · Decisions: [btree-decisions.md](btree-decisions.md) · Order: [operations-plan.md](operations-plan.md)
 
-## Region format
-
-
-- [ ] **BTREE12 — Footprint figures for the write-once run format.** The per-run capacities `validation/` pins (forward, tag-directory, range and chunk-index entries per run, inner fan-out) and the figures the design documents quote for them are recomputed for index blocks, fixed-width keys and 4 KiB data blocks (BTREE-DESIGN§1.2, BTREE-DESIGN§1.6); the legacy `SortedRunHeader` and bit-width `FieldFormat` mirrors in `validation/` go. Acceptance: every capacity constant in `validation/` is derived from the region structs, and each figure it pins appears in its design section.
-
 ## Live tree machinery
 
 - [ ] **BTREE4 — Separator keys for descent.** Inner nodes route by full separator keys with `NodePtr` values; descent checks that a loaded child's first key is not below its separator and reports corruption otherwise. Acceptance: a tree of term-dictionary keys (wider than 16 bytes) and one of chunk hashes descend correctly across three levels.
