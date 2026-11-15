@@ -65,6 +65,7 @@ Its `TagId` is allocated locally from 1 upward and never reused: the counter is 
 - an **inverse name** — `derived-from` with inverse `produces`. The inverse resolves like any other name and reads the same edges backwards (reverse traversal through the relation term's postings); nothing extra is stored.
 - **symmetric** — `duplicate-of`, `see-also`. One stored edge; `Related` and traversal read forward and reverse together. A symmetric predicate has no inverse name.
 - **transitive** — `depends-on`, `derived-from`, `bundles`. `Related` and traversal follow the closure by default, by frontier expansion at query time (QUERY-DESIGN "Post-operations"); one-step traversal stays available. Closures are never materialised, so adding or removing an edge touches only that edge.
+- **composite** — `part-of`, from a part to its whole. An object stored as several named parts (an object file's code, data and debug info) is a whole plus one object per part, each with its own tags (the part's name is an attribute of the part, `section = debug-info`, so queries, placement and presence can select it), its own placement and presence, and links of its own (a linker refers to the code part alone). Deleting the whole deletes every object with a composite edge to it, transitively, in the same mutation; copying the whole copies its parts, sharing their chunks through deduplication.
 - an **annotation type** — one of the value types. Each edge may then carry one annotation of that type, set, changed or cleared after the edge exists: an input's content hash on `derived-from`, a label on a link, a part or range of the target that the application encodes. Annotations live with the edge in the subject's forward entry (INDEX-DESIGN§2.1) and are not indexed. One edge — one subject, predicate and target — holds one annotation; several ranges of one target are encoded in one value.
 
 **Storage policy** attaches to a tag and resolves per object over its derived closure (SPECIFICATION-DESIGN§3.5).
@@ -266,6 +267,7 @@ Language, origin and role are independent assertions, and the module has no rule
 | `links` | artifact → library | inverse `linked-by`; target must be `role = library` |
 | `depends-on` | source → source | transitive |
 | `bundles` | package → contents | transitive, inverse `bundled-in` |
+| `part-of` | section → its object file | composite, inverse `has-part`; the section names itself with `section` (attribute, text, single: `text`, `data`, `debug-info`) |
 
 Keys, predicates and constraints, in module syntax:
 
@@ -312,6 +314,8 @@ bcm2711-rpi-4-b.dtb     project=vesper component=hal                      origin
                         derived-from→ bcm2711-rpi-4-b.dts
 main.o                  project=vesper component=kernel                   origin=generated role=object build-state=current  target=aarch64-unknown-none profile=release
                         opt-level=2 lto=fat toolchain=nightly-2024-01-15  derived-from→ main.rs, kernel_api.rs
+main.o:text             project=vesper component=kernel                   origin=generated section=text  part-of→ main.o
+main.o:debug-info       project=vesper component=kernel                   origin=generated section=debug-info  part-of→ main.o
 libhal.rlib             project=vesper component=hal                      origin=generated role=library build-state=current  target=… profile=release
 vesper                  project=vesper component=kernel                   origin=generated role=executable build-state=current symbols=debug-info
                         derived-from→ main.o  links→ libhal.rlib
@@ -335,6 +339,7 @@ vesper-0.1.0-rpi4.img   project=vesper                                    origin
 | Uncommitted work | `project=vesper AND dirty` |
 | Objects from an old toolchain | `project=vesper AND role=object AND toolchain=nightly-2024-01-10` |
 | Everything of one component | `project=vesper AND component=hal` |
+| Kernel debug info | `project=vesper AND component=kernel AND section=debug-info` |
 | Latest kernel test results | `project=vesper AND component=kernel AND role=test-result AND build-state=current`, newest `created` first |
 | Tests touching a source file | `produces` from `main.rs` (the closure of `derived-from` reversed), intersected with `role=test-result` |
 | Users of a library | `linked-by` from `libhal.rlib` |
@@ -344,7 +349,7 @@ vesper-0.1.0-rpi4.img   project=vesper                                    origin
 
 **Build integration.** After compiling, a build hook tags the output (`origin = generated`, `role = object`, `build-state = current`, `target`, `profile`, `opt-level`, `toolchain`, `project`, `component`, `lto`, `symbols`), records `derived-from` to each input with the input's content hash as the edge's annotation, and sets `build-state = stale` on the previous current build of the same output — same `component`, `target`, `profile` and output `unix-path`; setting the single-valued key replaces `current`. Cleaning is a query (`project=vesper AND build-state=stale AND NOT exempt-from-cleaning`, `project=vesper AND role=intermediate`) whose result is deleted, not a path glob. Rebuild detection walks `derived-from` and compares each input's current content hash with the hash annotated on its edge at build time, so it does not depend on clock skew or mtimes.
 
-**Placement.** The same tags drive `PlacementRule`s (SPECIFICATION-DESIGN§8.3): `Pin { origin=source, Hot }` and `Replicate { origin=source, 2 }`; `Pin { role=intermediate OR role=object, Hot }`; `Replicate { role=bundle AND released, 3 }` with `Prefer { role=bundle AND released, Warm }`; `Prefer { origin=vendored, Cold }`.
+**Placement.** The same tags drive `PlacementRule`s (SPECIFICATION-DESIGN§8.3): `Pin { origin=source, Hot }` and `Replicate { origin=source, 2 }`; `Pin { role=intermediate OR role=object, Hot }`; `Replicate { role=bundle AND released, 3 }` with `Prefer { role=bundle AND released, Warm }`; `Prefer { origin=vendored, Cold }`; `Prefer { section=debug-info, Cold }`, so object files' debug info sits on cheap disks while their code stays hot.
 
 **Presence.** Presence rules (SPECIFICATION-DESIGN§8.3) are node-local and use the same tags. A laptop keeps the sources, only the start of each released image and drops stale build outputs after a week: `KeepLocal { project=vesper AND origin=source }`, `Stub { role=bundle AND released, 64 KiB }`, `Evict { build-state=stale, 7 days, keep_prefix 0 }`. Eviction drops this node's copy of the content and leaves the object, its tags and the other nodes' copies in place; cleaning deletes the objects from the pool.
 
@@ -386,7 +391,8 @@ TagRecord    = [version, uid: bytes(16), name: text, aliases: [text],
                                          //   entry's modified_ns and state_ns); 0 otherwise
                 inverse: text / null,    // kind 3: the inverse name
                 flags: uint]             // bit 0: system label, derived by the engine;
-                                         //   kind 3: bit 1 symmetric, bit 2 transitive;
+                                         //   kind 3: bit 1 symmetric, bit 2 transitive,
+                                         //   bit 4 composite;
                                          //   kind 1: bit 3 single-valued
 
 RuleRecord   = [version, kind: uint, params, provenance: [bytes(16)],

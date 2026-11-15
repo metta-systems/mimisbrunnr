@@ -186,6 +186,7 @@ enum TagKind {
         inverse: Option<String>,          // "derived-from" read backwards: "produces"
         symmetric: bool,                  // duplicate-of: one edge, read both ways
         transitive: bool,                 // depends-on: Related follows the closure
+        composite: bool,                  // part-of: deleting or copying the whole includes its parts
         annotation: Option<ValueType>,    // one value per edge, set or changed later
     },
 }
