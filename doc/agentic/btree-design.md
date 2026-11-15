@@ -132,7 +132,7 @@ runs from block 1: each run's index block must carry the magic, the next `seq`, 
 tag and a valid checksum; the first block that does not ends the node. A torn append therefore
 loses only the run being written, whose entries the journal still holds.
 
-**Region tag.** A run's `region_tag` binds it to the region it was appended to: block 0 differs
+**Region tag.** A run's `region_tag` — a page run's too (BTREE-DESIGN§1.7) — binds it to the region it was appended to: block 0 differs
 between any two regions — its `node_seq` and `created_lsn` change with every new region — so a
 run left in reused space by an earlier region, whose sequence and checksum are otherwise
 valid, carries another tag and ends the walk.
@@ -286,13 +286,15 @@ A positional region holds a fixed-size record array of `logical_pages` 4 KiB pag
 
 ```rust
 #[repr(C)]
-struct PageRunHeader {                       // 32 bytes, start of the page-run index block
+struct PageRunHeader {                       // 40 bytes, start of the page-run index block
     pre: Preamble,                           //  [0..8]   magic "BPGS", kind 0 (FORMAT-DESIGN§1.3)
     seq: u32,                                //  [8..12]  1 for the first run, +1 per run
     page_count: u16,                         // [12..14]  pages in this run
     _reserved: u16,                          // [14..16]
     journal_seq: u64,                        // [16..24]
-    checksum: u64,                           // [24..32]  of the index block, this field zeroed
+    region_tag: u32,                         // [24..28]  low 32 bits of block 0's checksum (BTREE-DESIGN§1.2)
+    _pad: u32,                               // [28..32]
+    checksum: u64,                           // [32..40]  of the index block, this field zeroed
 }
 // followed by [PageRunEntry; page_count]
 

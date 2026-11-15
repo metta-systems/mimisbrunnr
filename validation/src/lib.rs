@@ -309,14 +309,40 @@ pub struct LargeValueRef {
 }
 const _: () = assert!(size_of::<LargeValueRef>() == 8);
 
+// BTREE-DESIGN§1.7 positional regions (crates/storage/src/page_region.rs)
+#[repr(C)]
+pub struct PageRunHeader {
+    pub pre: Preamble,                // [0..8]   "BPGS", kind 0
+    pub seq: u32,                     // [8..12]
+    pub page_count: u16,              // [12..14]
+    pub _reserved: u16,               // [14..16]
+    pub journal_seq: u64,             // [16..24]
+    pub region_tag: u32,              // [24..28]
+    pub _pad: u32,                    // [28..32]
+    pub checksum: u64,                // [32..40]
+}
+const _: () = assert!(size_of::<PageRunHeader>() == 40);
+const _: () = assert!(std::mem::offset_of!(PageRunHeader, region_tag) == 24);
+
+#[repr(C)]
+pub struct PageRunEntry {
+    pub page_no: u16,
+    pub _pad: [u8; 6],
+    pub checksum: u64,
+}
+const _: () = assert!(size_of::<PageRunEntry>() == 16);
+// logical_pages = ¾ of a 256 KiB region's 64 blocks.
+pub const POSITIONAL_LOGICAL_PAGES_256_KIB: usize = 64 * 3 / 4;
+const _: () = assert!(POSITIONAL_LOGICAL_PAGES_256_KIB == 48);
+
 pub const RUN_FLAG_ENCRYPTED:      u16 = 1 << 0;
 pub const RUN_BLOCK_FLAG_VALUE:    u16 = 1 << 0;
 pub const RUN_ENTRY_FLAG_WHITEOUT: u8 = 1 << 0;
 pub const RUN_ENTRY_FLAG_LARGE:    u8 = 1 << 1;
 
 // =====================================================================
-// Legacy region and run headers. The positional regions still use the
-// header (TODO(BTREE10)); the run header and field format below only feed
+// Legacy region and run headers. The forward-overflow chain still uses the
+// header (TODO(INDEX14)); the run header and field format below only feed
 // the per-run capacity figures further down, which are recomputed for the
 // write-once run format by TODO(BTREE12).
 // =====================================================================

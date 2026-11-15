@@ -11,7 +11,7 @@
 //!   check, in-memory `BucketAllocTable` placeholder.
 //!
 //! Not yet implemented: the remaining BTREE-DESIGN§1 B+ tree machinery
-//! (BTREE4–BTREE10), encryption ciphers (ENCRYPTION1, ENCRYPTION4); zones and
+//! (BTREE4, BTREE5, BTREE7), encryption ciphers (ENCRYPTION1, ENCRYPTION4); zones and
 //! `ZoneMap` are retired in favour of bucket placement (TODO(ENGINE4)).
 
 mod addressing;
@@ -25,6 +25,7 @@ mod error;
 mod file_device;
 mod freespace;
 mod journal_pin;
+pub mod page_region;
 mod preamble;
 pub mod region;
 mod root_pointer;

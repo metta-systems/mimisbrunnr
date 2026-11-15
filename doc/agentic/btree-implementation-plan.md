@@ -4,7 +4,6 @@ Design: [btree-design.md](btree-design.md) · Decisions: [btree-decisions.md](bt
 
 ## Region format
 
-- [ ] **BTREE10 — Positional page regions.** Radix leaves and inner nodes and forward overflow as `logical_pages` pages written in page runs; backward-linked chains (BTREE-DESIGN§1.7), in `crates/storage/src/region.rs` beside the keyed runs. The forward-overflow chain (`crates/index/src/forward_index.rs`) and the object and location tables move onto them; the legacy `btree_node::BtreeNodeHeader`, `object_leaf.rs` and `location_leaf.rs` go. Acceptance: changing one record of a full radix leaf writes 8 KiB; a never-written page reads as zeros; a chain of three regions is appended without rewriting the first two.
 
 - [ ] **BTREE12 — Footprint figures for the write-once run format.** The per-run capacities `validation/` pins (forward, tag-directory, range and chunk-index entries per run, inner fan-out) and the figures the design documents quote for them are recomputed for index blocks, fixed-width keys and 4 KiB data blocks (BTREE-DESIGN§1.2, BTREE-DESIGN§1.6); the legacy `SortedRunHeader` and bit-width `FieldFormat` mirrors in `validation/` go. Acceptance: every capacity constant in `validation/` is derived from the region structs, and each figure it pins appears in its design section.
 

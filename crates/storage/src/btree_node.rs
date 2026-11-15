@@ -1,9 +1,8 @@
-//! The legacy 64-byte header of positional regions: the forward-overflow
-//! chain and the object and location radix leaves.
+//! The legacy 64-byte header of the forward-overflow chain's regions.
 //!
-//! TODO(BTREE10): goes when those become positional page regions
-//! (BTREE-DESIGN§1.7), headed by [`crate::region::BtreeNodeHeader`] with
-//! `layout = LAYOUT_PAGES`. Keyed trees use [`crate::region`].
+//! TODO(INDEX14): goes when that chain is a chain of positional page regions
+//! ([`crate::page_region`], BTREE-DESIGN§1.7). Keyed trees use
+//! [`crate::region`].
 
 use {
     bytemuck::{Pod, Zeroable},

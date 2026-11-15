@@ -11,9 +11,9 @@
 //! present today so the migration to snapshot-keyed records is a value
 //! mutation rather than a key-shape mutation.
 //!
-//! TODO(BTREE10): the object table is a positional radix tree whose leaves
-//! are page regions (METADATA-DESIGN§1, BTREE-DESIGN§1.7); until page regions
-//! land it is one keyed-run region.
+//! TODO(METADATA1): the object table is a positional radix tree whose leaves
+//! are page regions (METADATA-DESIGN§1, BTREE-DESIGN§1.7); until then it is
+//! one keyed-run region.
 
 use std::collections::{BTreeMap, btree_map};
 

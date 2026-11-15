@@ -511,7 +511,7 @@ pub struct Region {
 
 /// Read `count` blocks from `first_block` of the region at `offset` into an
 /// 8-aligned buffer.
-fn read_blocks<D: BlockDevice>(device: &D, offset: u64, first_block: u32, count: u32) -> Result<Vec<u64>, StorageError> {
+pub(crate) fn read_blocks<D: BlockDevice>(device: &D, offset: u64, first_block: u32, count: u32) -> Result<Vec<u64>, StorageError> {
     let mut buffer = vec![0u64; count as usize * BLOCK_SIZE / 8];
     device.read_at(
         offset + first_block as u64 * BLOCK_SIZE as u64,
@@ -521,13 +521,87 @@ fn read_blocks<D: BlockDevice>(device: &D, offset: u64, first_block: u32, count:
 }
 
 /// Checksum of `block` with the 8-byte slot at `slot` zeroed.
-fn checksum_with_zeroed_slot(block: &[u8], slot: core::ops::Range<usize>) -> u64 {
+pub(crate) fn checksum_with_zeroed_slot(block: &[u8], slot: core::ops::Range<usize>) -> u64 {
     let mut copy = block.to_vec();
     copy[slot].fill(0);
     checksum64(&copy)
 }
 
-fn verify(expected: u64, actual: u64) -> Result<(), StorageError> {
+/// Write block 0 of a new region — its node header and kind header — and
+/// return the header with its checksum.
+pub(crate) fn write_block_zero<D: BlockDevice>(
+    device: &D,
+    offset: u64,
+    params: RegionParams,
+    layout: u8,
+    flags: u8,
+    logical_pages: u16,
+    kind_header: &[u8],
+) -> Result<BtreeNodeHeader, StorageError> {
+    if !(12..=19).contains(&params.region_size_log2) {
+        return Err(StorageError::RegionCorrupt("region size out of range"));
+    }
+    if kind_header.len() > BLOCK_SIZE - core::mem::size_of::<BtreeNodeHeader>() {
+        return Err(StorageError::RegionCorrupt("kind header does not fit block 0"));
+    }
+    let mut header = BtreeNodeHeader {
+        pre: Preamble::new(Structure::Region(params.kind)),
+        node_seq: params.node_seq,
+        created_lsn: params.created_lsn,
+        region_size_log2: params.region_size_log2,
+        level: params.level,
+        layout,
+        flags,
+        logical_pages,
+        kind_header_len: kind_header.len() as u16,
+        _reserved: [0; 24],
+        checksum: 0,
+    };
+    let mut block = vec![0u8; BLOCK_SIZE];
+    block[..64].copy_from_slice(bytemuck::bytes_of(&header));
+    block[64..64 + kind_header.len()].copy_from_slice(kind_header);
+    header.checksum = checksum64(&block);
+    block[NODE_HEADER_CHECKSUM].copy_from_slice(&header.checksum.to_le_bytes());
+    device.write_at(offset, &block)?;
+    Ok(header)
+}
+
+/// Read and check block 0 of the region at `offset`, which must belong to
+/// `kind` and have `layout`; returns its node header and kind header.
+pub(crate) fn read_block_zero<D: BlockDevice>(
+    device: &D,
+    offset: u64,
+    kind: BtreeKind,
+    layout: u8,
+) -> Result<(BtreeNodeHeader, Vec<u8>), StorageError> {
+    let block_zero = read_blocks(device, offset, 0, 1)?;
+    let bytes: &[u8] = bytemuck::cast_slice(&block_zero);
+    let header: BtreeNodeHeader = bytemuck::pod_read_unaligned(&bytes[..64]);
+    match Preamble::identify(bytes)? {
+        Structure::Region(found) if found == kind => {}
+        Structure::Region(found) => {
+            return Err(StorageError::RegionKindMismatch {
+                expected: kind as u16,
+                actual: found as u16,
+            });
+        }
+        _ => return Err(StorageError::RegionCorrupt("block 0 is not a region header")),
+    }
+    verify(header.checksum, checksum_with_zeroed_slot(bytes, NODE_HEADER_CHECKSUM))?;
+    if header.layout != layout {
+        return Err(StorageError::RegionCorrupt("region has another layout"));
+    }
+    if !(12..=19).contains(&header.region_size_log2) {
+        return Err(StorageError::RegionCorrupt("region size out of range"));
+    }
+    let kind_header_len = header.kind_header_len as usize;
+    if kind_header_len > BLOCK_SIZE - 64 {
+        return Err(StorageError::RegionCorrupt("kind header overruns block 0"));
+    }
+    Ok((header, bytes[64..64 + kind_header_len].to_vec()))
+}
+
+pub(crate) fn verify(expected: u64, actual: u64) -> Result<(), StorageError> {
     if expected == actual {
         Ok(())
     } else {
@@ -546,29 +620,7 @@ impl Region {
         if !(12..=19).contains(&params.region_size_log2) {
             return Err(StorageError::RegionCorrupt("region size out of range"));
         }
-        let header_room = BLOCK_SIZE - core::mem::size_of::<BtreeNodeHeader>();
-        if kind_header.len() > header_room {
-            return Err(StorageError::RegionCorrupt("kind header does not fit block 0"));
-        }
-        let mut header = BtreeNodeHeader {
-            pre: Preamble::new(Structure::Region(params.kind)),
-            node_seq: params.node_seq,
-            created_lsn: params.created_lsn,
-            region_size_log2: params.region_size_log2,
-            level: params.level,
-            layout: LAYOUT_RUNS,
-            flags: 0,
-            logical_pages: 0,
-            kind_header_len: kind_header.len() as u16,
-            _reserved: [0; 24],
-            checksum: 0,
-        };
-        let mut block = vec![0u8; BLOCK_SIZE];
-        block[..64].copy_from_slice(bytemuck::bytes_of(&header));
-        block[64..64 + kind_header.len()].copy_from_slice(kind_header);
-        header.checksum = checksum64(&block);
-        block[NODE_HEADER_CHECKSUM].copy_from_slice(&header.checksum.to_le_bytes());
-        device.write_at(offset, &block)?;
+        let header = write_block_zero(device, offset, params, LAYOUT_RUNS, 0, 0, kind_header)?;
         Ok(Self {
             offset,
             header,
@@ -605,31 +657,7 @@ impl Region {
     /// the next valid run, and the newest run is dropped if any of its data
     /// blocks fails its checksum — a torn append loses only that run.
     pub fn open<D: BlockDevice>(device: &D, offset: u64, kind: BtreeKind) -> Result<Self, StorageError> {
-        let block_zero = read_blocks(device, offset, 0, 1)?;
-        let bytes: &[u8] = bytemuck::cast_slice(&block_zero);
-        let header: BtreeNodeHeader = bytemuck::pod_read_unaligned(&bytes[..64]);
-        match Preamble::identify(bytes)? {
-            Structure::Region(found) if found == kind => {}
-            Structure::Region(found) => {
-                return Err(StorageError::RegionKindMismatch {
-                    expected: kind as u16,
-                    actual: found as u16,
-                });
-            }
-            _ => return Err(StorageError::RegionCorrupt("block 0 is not a region header")),
-        }
-        verify(header.checksum, checksum_with_zeroed_slot(bytes, NODE_HEADER_CHECKSUM))?;
-        if header.layout != LAYOUT_RUNS {
-            return Err(StorageError::RegionCorrupt("not a keyed-run region"));
-        }
-        if !(12..=19).contains(&header.region_size_log2) {
-            return Err(StorageError::RegionCorrupt("region size out of range"));
-        }
-        let kind_header_len = header.kind_header_len as usize;
-        if kind_header_len > BLOCK_SIZE - 64 {
-            return Err(StorageError::RegionCorrupt("kind header overruns block 0"));
-        }
-        let kind_header = bytes[64..64 + kind_header_len].to_vec();
+        let (header, kind_header) = read_block_zero(device, offset, kind, LAYOUT_RUNS)?;
         let mut region = Self {
             offset,
             header,

@@ -5,7 +5,7 @@
 //!
 //! Structures whose layout still has a 32-bit checksum field store
 //! `checksum64(..) as u32` until the item rewriting each gives it the 64-bit
-//! slot (keyed regions already have it): positional regions in BTREE10, the superblock and root pointer in
+//! slot (keyed and positional regions already have it): the forward-overflow chain in INDEX14, the superblock and root pointer in
 //! ENGINE12, the journal in JOURNAL9, the pool state root in POOL3, the kv and
 //! tag-bitmap pages in the term index (INDEX12–INDEX14), the zone map in ENGINE4.
 
