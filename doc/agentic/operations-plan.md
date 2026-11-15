@@ -44,7 +44,7 @@ Independent of each other unless an order is given.
 - [SPEC24](specification-implementation-plan.md) — no packed on-disk structs.
 - [POOL1](pool-implementation-plan.md) — one disk-descriptor tree (after ALLOCATION9).
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
-- [BTREE9](btree-implementation-plan.md) — write-once regions, block-addressable runs and one run format for every tree; then [BTREE10](btree-implementation-plan.md) — positional page regions.
+- [BTREE10](btree-implementation-plan.md) — positional page regions; [BTREE12](btree-implementation-plan.md) — footprint figures for the write-once run format.
 - [ONTOLOGY2](ontology-implementation-plan.md) — storage errors.
 - [ONTOLOGY10](ontology-implementation-plan.md) (per-record ontology tree, in the encodings group above), then [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator with ad-hoc tags in `local` — and [ONTOLOGY15](ontology-implementation-plan.md) — tag uids and name resolution; [ONTOLOGY11](ontology-implementation-plan.md) — ontology journal ops, after JOURNAL8.
 - [ALLOCATION9](allocation-implementation-plan.md) — bucket-relative pointers and node pointers.
@@ -54,7 +54,7 @@ Independent of each other unless an order is given.
 The term dictionary, postings and forward index replace every index structure, so they land before the tree machinery that writes them (INDEX-DESIGN).
 
 1. [INDEX12](index-implementation-plan.md) — term dictionary, term table and interning (after INDEX9).
-2. [INDEX13](index-implementation-plan.md) — postings containers (after BTREE9); then [INDEX14](index-implementation-plan.md) — forward index by `TermId`, direct terms only.
+2. [INDEX13](index-implementation-plan.md) — postings containers; then [INDEX14](index-implementation-plan.md) — forward index by `TermId`, direct terms only.
 3. [INDEX15](index-implementation-plan.md) — sequences; [INDEX16](index-implementation-plan.md) — queries, faceting, FUSE and watch over containers.
 4. [ONTOLOGY16](ontology-implementation-plan.md) — attribute flavours and key options (after INDEX15); then [INDEX18](index-implementation-plan.md) — hierarchy tries with roll-ups — and [INDEX19](index-implementation-plan.md) — n-gram postings over distinct values.
 5. [METADATA7](metadata-implementation-plan.md) — `ObjectRecord` with content locator, one object table (after INDEX14).
@@ -76,7 +76,7 @@ The term dictionary, postings and forward index replace every index structure, s
 4. [METADATA1](metadata-implementation-plan.md) — multi-level radix per origin node.
 5. [ENGINE4](engine-implementation-plan.md) — retire zones and fixed areas.
 6. [SUBSCRIPTION1](subscriptions-implementation-plan.md) — membership containers (after INDEX13).
-7. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md) — per-disk allocation trees (after BTREE9 and POOL1); then [ALLOCATION2](allocation-implementation-plan.md) — freelist seeding at format time.
+7. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md) — per-disk allocation trees (after POOL1); then [ALLOCATION2](allocation-implementation-plan.md) — freelist seeding at format time.
 8. [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup.
 9. [INDEX6](index-implementation-plan.md) — footprint benchmark.
 

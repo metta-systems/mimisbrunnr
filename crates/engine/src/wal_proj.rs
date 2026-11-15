@@ -182,7 +182,6 @@ pub fn replay_wal_op(
         | WalOp::ReconcileDequeue(_)
         | WalOp::ReconcileMove(_)
         | WalOp::ReconcileScanStep(_)
-        | WalOp::FormatPromote(_)
         | WalOp::Checkpoint(_) => {
             // Engine doesn't model these in the in-memory mirror; ignore.
         }

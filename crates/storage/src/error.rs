@@ -86,14 +86,8 @@ pub enum StorageError {
     #[error("CBOR decode error: {0}")]
     CborDecode(String),
 
-    #[error("invalid sorted-run magic: expected {expected:#010x}, got {actual:#010x}")]
-    InvalidSortedRunMagic { expected: u32, actual: u32 },
-
     #[error("region payload exhausted: payload_used={used} would exceed region_size={size}")]
     RegionFull { used: u64, size: u64 },
-
-    #[error("packed-key codec error: {0}")]
-    Pack(#[from] crate::btree::pack::PackError),
 
     /// Allocator could not find a free bucket of the requested kind.
     #[error("bucket allocator exhausted (requested kind {requested})")]

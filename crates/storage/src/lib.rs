@@ -19,12 +19,12 @@ mod alloc;
 mod allocator;
 mod block;
 mod block_device;
-mod btree;
 mod btree_node;
 mod checksum;
 mod error;
 mod file_device;
 mod freespace;
+mod journal_pin;
 mod preamble;
 pub mod region;
 mod root_pointer;
@@ -46,22 +46,8 @@ pub use {
     },
     checksum::{Checksum64, checksum64},
     block_device::BlockDevice,
-    btree::{
-        BtreeRegion, JournalEntry, JournalOp, JournalPin, LoadedNode, MergeIter, SortedRun,
-        compact,
-        pack::{
-            FieldHints, FormatFit, FormatPromoteEvent, PackError, PackableKey, check_fit,
-            compare_packed_keys, decode_packed_run, encode_packed_run, select_format,
-            select_format_with_hint,
-        },
-        should_compact,
-    },
-    btree_node::{
-        BTREE_NODE_FLAG_COMPACTION_IN_PROGRESS, BTREE_NODE_FLAG_HEAD_OF_CHAIN, BtreeNodeHeader,
-        FIELD_FORMAT_FLAG_MSB_FIRST, FIELD_FORMAT_FLAG_SIGNED, FieldFormat,
-        SORTED_RUN_FLAG_ENCRYPTED, SORTED_RUN_FLAG_PACKED_KEYS, SORTED_RUN_MAGIC,
-        SortedRunHeader, SortedRunKeyFormat,
-    },
+    btree_node::{BTREE_NODE_FLAG_HEAD_OF_CHAIN, BtreeNodeHeader},
+    journal_pin::JournalPin,
     error::StorageError,
     file_device::FileBlockDevice,
     freespace::{

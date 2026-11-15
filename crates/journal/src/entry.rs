@@ -150,7 +150,7 @@ impl WalEntryHeader {
 /// The numeric value is the on-disk `op_kind` byte in [`WalEntryHeader`].
 ///
 /// TODO(JOURNAL8): take the contiguous values 0–43 of the JOURNAL-DESIGN§1.3 op-kind
-/// table; `TagBitmapGrow`, `TagBitmapShrink`, `FormatPromote`,
+/// table; `TagBitmapGrow`, `TagBitmapShrink`,
 /// `BackpointerInsert` and `BackpointerRemove` go, and the chunk-list ops and
 /// `ExtendObject` become the chunk ops (`AppendChunks`, `ReplaceChunks`,
 /// `TruncateChunks`) over fixed 128-byte `ChunkSpec`s.
@@ -196,8 +196,7 @@ pub enum WalOpKind {
     ReconcileDequeue = 27,
     ReconcileMove = 28,
     ReconcileScanStep = 29,
-    /// Sorted-run format mutations (BTREE-DESIGN§1.6).
-    FormatPromote = 30,
+    // 30 unassigned: each run fixes its own key format (BTREE-DESIGN§1.6).
     /// Atomic root-pointer flip + GC reservation.
     Checkpoint = 31,
 }
@@ -235,7 +234,6 @@ impl WalOpKind {
             27 => Self::ReconcileDequeue,
             28 => Self::ReconcileMove,
             29 => Self::ReconcileScanStep,
-            30 => Self::FormatPromote,
             31 => Self::Checkpoint,
             other => return Err(WalError::InvalidOpKind(other)),
         })
@@ -524,16 +522,6 @@ pub struct ReconcileScanStep {
     pub cursor_key: Vec<u8>,
 }
 
-// --- Sorted-run promotion (BTREE-DESIGN§1.6) ---
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct FormatPromote {
-    pub node_ref: BlockRefWire,
-    pub sorted_run_seq: u32,
-    /// Encoded `SortedRunKeyFormat` payload (raw bytes — defined by storage).
-    pub new_format: Vec<u8>,
-}
-
 // --- Checkpoint ---
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -601,7 +589,6 @@ pub enum WalOp {
     ReconcileDequeue(ReconcileDequeue),
     ReconcileMove(ReconcileMove),
     ReconcileScanStep(ReconcileScanStep),
-    FormatPromote(FormatPromote),
     Checkpoint(Checkpoint),
 }
 
@@ -638,7 +625,6 @@ impl WalOp {
             Self::ReconcileDequeue(_) => WalOpKind::ReconcileDequeue,
             Self::ReconcileMove(_) => WalOpKind::ReconcileMove,
             Self::ReconcileScanStep(_) => WalOpKind::ReconcileScanStep,
-            Self::FormatPromote(_) => WalOpKind::FormatPromote,
             Self::Checkpoint(_) => WalOpKind::Checkpoint,
         }
     }
@@ -676,7 +662,6 @@ impl WalOp {
             Self::ReconcileDequeue(p) => ciborium::ser::into_writer(p, &mut buf)?,
             Self::ReconcileMove(p) => ciborium::ser::into_writer(p, &mut buf)?,
             Self::ReconcileScanStep(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::FormatPromote(p) => ciborium::ser::into_writer(p, &mut buf)?,
             Self::Checkpoint(p) => ciborium::ser::into_writer(p, &mut buf)?,
         }
         Ok((self.kind(), buf))
@@ -738,7 +723,6 @@ impl WalOp {
             WalOpKind::ReconcileScanStep => {
                 Self::ReconcileScanStep(ciborium::de::from_reader(payload)?)
             }
-            WalOpKind::FormatPromote => Self::FormatPromote(ciborium::de::from_reader(payload)?),
             WalOpKind::Checkpoint => Self::Checkpoint(ciborium::de::from_reader(payload)?),
         })
     }
@@ -766,12 +750,14 @@ mod tests {
 
     #[test]
     fn op_kind_round_trip_full_range() {
-        for v in (0u8..=31).filter(|&v| v != 15) {
+        for v in (0u8..=31).filter(|&v| v != 15 && v != 30) {
             let k = WalOpKind::from_u8(v).unwrap();
             assert_eq!(k as u8, v);
         }
         // 15 was BucketWrite; live sectors are derived (ALLOCATION-DESIGN§1.2).
         assert!(WalOpKind::from_u8(15).is_err());
+        // 30 was FormatPromote; each run fixes its own key format (BTREE-DESIGN§1.6).
+        assert!(WalOpKind::from_u8(30).is_err());
         assert!(WalOpKind::from_u8(32).is_err());
         assert!(WalOpKind::from_u8(255).is_err());
     }
@@ -969,11 +955,6 @@ mod tests {
                 scan_id: 1,
                 btree: 6,
                 cursor_key: vec![1, 2, 3],
-            }),
-            WalOp::FormatPromote(FormatPromote {
-                node_ref: BlockRef::new(0, 100, 1).into(),
-                sorted_run_seq: 1,
-                new_format: vec![0xff; 8],
             }),
             WalOp::Checkpoint(Checkpoint::from_root(&RootPointer::default(), 8)),
         ];

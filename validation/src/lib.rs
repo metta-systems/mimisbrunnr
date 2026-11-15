@@ -229,7 +229,96 @@ pub struct BlockHeader {
 const _: () = assert!(size_of::<BlockHeader>() == 32);
 
 // =====================================================================
-// BTREE-DESIGN§1.1 BtreeNodeHeader — 64 B
+// BTREE-DESIGN§1.1–1.2, §1.6 — write-once regions (crates/storage/src/region.rs)
+// =====================================================================
+#[repr(C)]
+pub struct RegionNodeHeader {
+    pub pre: Preamble,                // [0..8]   "BREG", kind ∈ BtreeKind
+    pub node_seq: u64,                // [8..16]
+    pub created_lsn: u64,             // [16..24]
+    pub region_size_log2: u8,         // [24..25]
+    pub level: u8,                    // [25..26]
+    pub layout: u8,                   // [26..27] 0 runs, 1 positional pages
+    pub flags: u8,                    // [27..28]
+    pub logical_pages: u16,           // [28..30]
+    pub kind_header_len: u16,         // [30..32]
+    pub _reserved: [u8; 24],          // [32..56]
+    pub checksum: u64,                // [56..64]
+}
+const _: () = assert!(size_of::<RegionNodeHeader>() == 64);
+const _: () = assert!(std::mem::offset_of!(RegionNodeHeader, checksum) == 56);
+
+#[repr(C)]
+pub struct RunHeader {
+    pub pre: Preamble,                // [0..8]   "BIDX", kind 0
+    pub seq: u32,                     // [8..12]
+    pub block_count: u16,             // [12..14]
+    pub flags: u16,                   // [14..16]
+    pub journal_seq: u64,             // [16..24]
+    pub entry_count: u32,             // [24..28]
+    pub _reserved: u32,               // [28..32]
+    pub checksum: u64,                // [32..40]
+}
+const _: () = assert!(size_of::<RunHeader>() == 40);
+const _: () = assert!(std::mem::offset_of!(RunHeader, checksum) == 32);
+
+#[repr(C)]
+pub struct KeyFormatHead {
+    pub nr_fields: u8,
+    pub key_width: u8,
+    pub value_kind: u8,
+    pub _pad: u8,
+    pub fixed_value_len: u32,
+}
+const _: () = assert!(size_of::<KeyFormatHead>() == 8);
+
+#[repr(C)]
+pub struct RunFieldFormat {
+    pub width: u8,                    // 0, 1, 2, 4 or 8 bytes
+    pub flags: u8,
+    pub _pad: [u8; 6],
+    pub base: u64,
+}
+const _: () = assert!(size_of::<RunFieldFormat>() == 16);
+
+#[repr(C)]
+pub struct RunBlockEntry {
+    pub checksum: u64,                // [0..8]
+    pub entry_count: u16,             // [8..10]
+    pub flags: u16,                   // [10..12]
+    pub min_snapshot: u32,            // [12..16]
+    pub max_snapshot: u32,            // [16..20]
+    pub _pad: u32,                    // [20..24]
+}
+const _: () = assert!(size_of::<RunBlockEntry>() == 24);
+
+#[repr(C)]
+pub struct DataBlockHead {
+    pub entry_count: u16,
+    pub value_area: u16,
+    pub flags: u16,
+    pub _reserved: u16,
+}
+const _: () = assert!(size_of::<DataBlockHead>() == 8);
+
+#[repr(C)]
+pub struct LargeValueRef {
+    pub first_block: u16,
+    pub block_count: u16,
+    pub length: u32,
+}
+const _: () = assert!(size_of::<LargeValueRef>() == 8);
+
+pub const RUN_FLAG_ENCRYPTED:      u16 = 1 << 0;
+pub const RUN_BLOCK_FLAG_VALUE:    u16 = 1 << 0;
+pub const RUN_ENTRY_FLAG_WHITEOUT: u8 = 1 << 0;
+pub const RUN_ENTRY_FLAG_LARGE:    u8 = 1 << 1;
+
+// =====================================================================
+// Legacy region and run headers. The positional regions still use the
+// header (TODO(BTREE10)); the run header and field format below only feed
+// the per-run capacity figures further down, which are recomputed for the
+// write-once run format by TODO(BTREE12).
 // =====================================================================
 #[repr(C, packed)]
 pub struct BtreeNodeHeader {

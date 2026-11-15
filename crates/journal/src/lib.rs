@@ -35,7 +35,7 @@ pub use {
         AddRelation, AddTag, BackpointerInsert, BackpointerKeyWire, BackpointerRemove,
         BackpointerValueWire, BlockRefWire, BucketAlloc, BucketDiscard, BucketGenBump,
         Checkpoint, ChunkInsertBatch, ChunkInsertEntry, ChunkListAppend, ChunkListReplace,
-        ChunkListShrink, ChunkObjectFinalize, CreateObject, DeleteObject, FormatPromote,
+        ChunkListShrink, ChunkObjectFinalize, CreateObject, DeleteObject,
         ReconcileDequeue, ReconcileEnqueue, ReconcileMove, ReconcileScanStep, RemoveAttr,
         RemoveRelation, RemoveTag, SetAttr, SnapshotCreate, SnapshotDelete, SnapshotDepthUpdate,
         SnapshotUnlink, TagBitmapGrow, TagBitmapShrink, WAL_ENTRY_FLAG_COMPRESSED,
