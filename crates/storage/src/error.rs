@@ -87,6 +87,13 @@ pub enum StorageError {
     #[error("free of unallocated bucket {bucket_no}")]
     FreeOfUnallocatedBucket { bucket_no: u32 },
 
+    /// A region larger than a bucket, or smaller than a block, was requested.
+    #[error("region of 2^{region_size_log2} bytes does not fit a 2^{bucket_size_log2}-byte bucket")]
+    RegionDoesNotFitBucket {
+        region_size_log2: u8,
+        bucket_size_log2: u8,
+    },
+
     /// Live-sector accounting named a bucket the alloc table has no entry for.
     #[error("unknown bucket {bucket_no}")]
     UnknownBucket { bucket_no: u32 },

@@ -74,16 +74,15 @@ The term dictionary, postings and forward index replace every index structure, s
 
 ### 5. Copy-on-write allocation
 
-1. [ALLOCATION1](allocation-implementation-plan.md) — sub-bucket regions.
-2. [ENGINE3](engine-implementation-plan.md) — COW commit; then [ALLOCATION10](allocation-implementation-plan.md) — derived live sectors (also after JOURNAL8 and METADATA3); then [JOURNAL12](journal-implementation-plan.md) — root in the journal; then [ENGINE12](engine-implementation-plan.md) — superblock and root list (also after ALLOCATION9); then [POOL3](pool-implementation-plan.md) — pool state record (also after SPEC25), [ENGINE11](engine-implementation-plan.md) — typed chunking defaults in pool state, and [POOL7](pool-implementation-plan.md) — pool assembled from its devices, no `pool.toml` (after POOL1); then [POOL8](pool-implementation-plan.md) — administrative changes commit by checkpoint.
-3. [ALLOCATION3](allocation-implementation-plan.md) — resident generations and the dereference check.
-4. [BTREE7](btree-implementation-plan.md), then [ENGINE2](engine-implementation-plan.md) — compaction.
-5. [METADATA1](metadata-implementation-plan.md) — multi-level radix per origin node.
-6. [ENGINE4](engine-implementation-plan.md) — retire zones and fixed areas.
-7. [SUBSCRIPTION1](subscriptions-implementation-plan.md) — membership containers (after INDEX13).
-8. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md), [ALLOCATION6](allocation-implementation-plan.md) — per-disk allocation trees.
-9. [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup.
-10. [INDEX6](index-implementation-plan.md) — footprint benchmark.
+1. [ENGINE3](engine-implementation-plan.md) — COW commit; then [ALLOCATION10](allocation-implementation-plan.md) — derived live sectors (also after JOURNAL8 and METADATA3); then [JOURNAL12](journal-implementation-plan.md) — root in the journal; then [ENGINE12](engine-implementation-plan.md) — superblock and root list (also after ALLOCATION9); then [POOL3](pool-implementation-plan.md) — pool state record (also after SPEC25), [ENGINE11](engine-implementation-plan.md) — typed chunking defaults in pool state, and [POOL7](pool-implementation-plan.md) — pool assembled from its devices, no `pool.toml` (after POOL1); then [POOL8](pool-implementation-plan.md) — administrative changes commit by checkpoint.
+2. [ALLOCATION3](allocation-implementation-plan.md) — resident generations and the dereference check.
+3. [BTREE7](btree-implementation-plan.md), then [ENGINE2](engine-implementation-plan.md) — compaction.
+4. [METADATA1](metadata-implementation-plan.md) — multi-level radix per origin node.
+5. [ENGINE4](engine-implementation-plan.md) — retire zones and fixed areas.
+6. [SUBSCRIPTION1](subscriptions-implementation-plan.md) — membership containers (after INDEX13).
+7. [ALLOCATION4](allocation-implementation-plan.md), [ALLOCATION5](allocation-implementation-plan.md), [ALLOCATION6](allocation-implementation-plan.md) — per-disk allocation trees.
+8. [METADATA4](metadata-implementation-plan.md) — metadata wire-form cleanup.
+9. [INDEX6](index-implementation-plan.md) — footprint benchmark.
 
 ### 6. Content paths and legacy blob retirement
 

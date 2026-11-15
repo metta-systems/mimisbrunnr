@@ -20,14 +20,19 @@
 //!
 //! ## Region allocation
 //!
-//! Many B+ tree regions are 256 KiB — exactly the size of a 256 KiB
-//! bucket, but **smaller** than the default 1 MiB bucket. Spec BTREE-DESIGN§1.5:
-//! "A 256 KiB node in a 1 MiB bucket means **4 nodes per bucket**".
-//! For now we accept one region per bucket (sub-bucket packing
-//! is ALLOCATION1) — one bucket = one B+ tree region.
+//! A 256 KiB region is a quarter of a 1 MiB bucket (BTREE-DESIGN§1.5).
+//! [`BucketAllocator::alloc_region`] hands out successive regions of the
+//! bucket its [`WritePoints`] hold open for the kind, and opens a fresh bucket
+//! when the next region does not fit (ALLOCATION-DESIGN§1.5). Open-ness lives
+//! only in memory: a new `WritePoints` — after a crash, at mount — holds no
+//! bucket open, so every bucket starts closed.
 //!
-//! TODO(ALLOCATION1): pack 4 × 256 KiB regions per 1 MiB
-//! bucket via [`BucketAllocator::alloc_region`] returning sub-extents.
+//! Allocating a region does not make its sectors live; the checkpoint that
+//! first reaches it calls [`BucketAllocator::region_reached`], and the one
+//! that stops reaching it calls [`BucketAllocator::free_region`]
+//! (ALLOCATION-DESIGN§1.2). An open bucket's unwritten or unreached tail is
+//! therefore never live. A closed bucket becomes free when its live count
+//! reaches zero.
 
 use {
     crate::{
@@ -39,6 +44,43 @@ use {
     },
     log::trace,
 };
+
+/// The bucket a write point holds open, and how far it has been handed out.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OpenBucket {
+    /// The open bucket.
+    pub bucket_no: u32,
+    /// Its generation when opened.
+    pub generation: u32,
+    /// 4 KiB blocks from the bucket's start already handed out.
+    pub next_block: u32,
+}
+
+/// One disk's write points: the open bucket of each bucket kind
+/// (ALLOCATION-DESIGN§1.5). In memory only — never persisted.
+///
+/// TODO(ALLOCATION7): segregate by stream tag as well as by kind.
+#[derive(Clone, Debug, Default)]
+pub struct WritePoints {
+    open: [Option<OpenBucket>; 8],
+}
+
+impl WritePoints {
+    /// No bucket open, as at mount or after a crash.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The bucket open for `kind`, if any.
+    pub fn open_bucket(&self, kind: BucketKind) -> Option<OpenBucket> {
+        self.open[kind as usize]
+    }
+
+    /// Whether `bucket_no` is open for any kind.
+    pub fn is_open(&self, bucket_no: u32) -> bool {
+        self.open.iter().flatten().any(|open| open.bucket_no == bucket_no)
+    }
+}
 
 /// Live bucket allocator over a [`BucketAllocTable`].
 ///
@@ -240,6 +282,113 @@ impl<'a> BucketAllocator<'a> {
             }
         }
     }
+
+    /// 4 KiB blocks in a region of `2^region_size_log2` bytes; the region
+    /// must fit one bucket (nodes never span buckets, BTREE-DESIGN§1).
+    fn region_blocks(&self, region_size_log2: u8) -> Result<u32, StorageError> {
+        if region_size_log2 < BLOCK_SIZE_LOG2 || region_size_log2 > self.bucket_size_log2 {
+            return Err(StorageError::RegionDoesNotFitBucket {
+                region_size_log2,
+                bucket_size_log2: self.bucket_size_log2,
+            });
+        }
+        Ok(1 << (region_size_log2 - BLOCK_SIZE_LOG2))
+    }
+
+    /// Hand out the next region of `2^region_size_log2` bytes from the
+    /// bucket `write_points` hold open for `kind`; when the region does not
+    /// fit, release that bucket and open a fresh one (ALLOCATION-DESIGN§1.5).
+    /// The region is not live until [`Self::region_reached`].
+    pub fn alloc_region(
+        &mut self,
+        write_points: &mut WritePoints,
+        kind: BucketKind,
+        region_size_log2: u8,
+    ) -> Result<BlockRef, StorageError> {
+        let region_blocks = self.region_blocks(region_size_log2)?;
+        let open = match write_points.open_bucket(kind) {
+            Some(open) if open.next_block + region_blocks <= self.blocks_per_bucket() => open,
+            _ => {
+                self.release(write_points, kind)?;
+                let fresh = self.alloc(kind)?;
+                let (bucket_no, _) = block_no_to_bucket(fresh.block_no, self.bucket_size_log2);
+                OpenBucket {
+                    bucket_no,
+                    generation: { fresh.generation } as u32,
+                    next_block: 0,
+                }
+            }
+        };
+        let block_no = (open.bucket_no << (self.bucket_size_log2 - BLOCK_SIZE_LOG2)) + open.next_block;
+        write_points.open[kind as usize] = Some(OpenBucket {
+            next_block: open.next_block + region_blocks,
+            ..open
+        });
+        trace!(
+            "BucketAllocator::alloc_region disk={} bucket={} block_no={} blocks={}",
+            self.disk_id, open.bucket_no, block_no, region_blocks,
+        );
+        Ok(BlockRef {
+            disk_id: self.disk_id,
+            _pad: 0,
+            block_no,
+            generation: open.generation as u64,
+        })
+    }
+
+    /// Close the bucket open for `kind`, if any. Closing frees nothing:
+    /// regions handed out but not yet reached by a checkpoint are not live
+    /// yet, so the bucket becomes free only when a [`Self::free_region`]
+    /// takes its count to zero.
+    ///
+    /// shortcut: a bucket closed with regions that are never reached keeps
+    /// its kind until the next mount, where live sectors are recomputed and
+    /// it is free (ALLOCATION-DESIGN§1.8); tracking unreached regions in
+    /// memory would reclaim it sooner.
+    pub fn release(&mut self, write_points: &mut WritePoints, kind: BucketKind) -> Result<(), StorageError> {
+        write_points.open[kind as usize] = None;
+        Ok(())
+    }
+
+    /// The committed root now reaches the region at `block_ref`: its
+    /// sectors become live.
+    pub fn region_reached(&mut self, block_ref: &BlockRef, region_size_log2: u8) -> Result<(), StorageError> {
+        let region_blocks = self.region_blocks(region_size_log2)?;
+        self.validate(block_ref)?;
+        let (bucket_no, _) = block_no_to_bucket(block_ref.block_no, self.bucket_size_log2);
+        self.table
+            .add_live_sectors(bucket_no, region_blocks, self.blocks_per_bucket())
+    }
+
+    /// The committed root no longer reaches the region at `block_ref`: its
+    /// sectors stop being live, and a closed bucket left with none becomes
+    /// free. Returns whether the bucket was freed.
+    pub fn free_region(
+        &mut self,
+        write_points: &WritePoints,
+        block_ref: &BlockRef,
+        region_size_log2: u8,
+    ) -> Result<bool, StorageError> {
+        let region_blocks = self.region_blocks(region_size_log2)?;
+        self.validate(block_ref)?;
+        let (bucket_no, _) = block_no_to_bucket(block_ref.block_no, self.bucket_size_log2);
+        self.table.remove_live_sectors(bucket_no, region_blocks)?;
+        self.free_if_empty(write_points, bucket_no)
+    }
+
+    /// Mark `bucket_no` free when it is closed and holds no live sectors,
+    /// keeping its generation for the next [`Self::alloc`] to bump.
+    fn free_if_empty(&mut self, write_points: &WritePoints, bucket_no: u32) -> Result<bool, StorageError> {
+        let Some(mut entry) = self.table.get(bucket_no).copied() else {
+            return Err(StorageError::UnknownBucket { bucket_no });
+        };
+        if entry.live_sectors() != 0 || write_points.is_open(bucket_no) || entry.kind()? == BucketKind::Bad {
+            return Ok(false);
+        }
+        entry.set_kind(BucketKind::Free);
+        self.table.insert(bucket_no, entry);
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +413,126 @@ mod tests {
         // Table entry reflects.
         let entry = allocator.table.get(32).copied().unwrap();
         assert_eq!(entry.kind().unwrap(), BucketKind::Node);
+    }
+
+    /// 1 MiB buckets, 256 KiB regions: four regions per bucket.
+    const BUCKET_LOG2: u8 = 20;
+    const REGION_LOG2: u8 = 18;
+    const REGION_BLOCKS: u32 = 64;
+
+    fn bucket_of(block_ref: &BlockRef) -> u32 {
+        block_no_to_bucket(block_ref.block_no, BUCKET_LOG2).0
+    }
+
+    #[test]
+    fn four_regions_share_a_bucket_and_the_fifth_opens_another() {
+        let mut table = alloc_table();
+        let mut allocator = BucketAllocator::new(&mut table, 0, BUCKET_LOG2, 0, 4);
+        allocator.seed_freelist();
+        let mut write_points = WritePoints::new();
+        let regions: Vec<BlockRef> = (0..5)
+            .map(|_| allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap())
+            .collect();
+        let block_nos: Vec<u32> = regions.iter().map(|r| { r.block_no }).collect();
+        assert_eq!(block_nos, vec![0, 64, 128, 192, 256]);
+        assert!(regions[..4].iter().all(|r| bucket_of(r) == 0 && { r.generation } == 2));
+        assert_eq!(bucket_of(&regions[4]), 1);
+        assert_eq!(write_points.open_bucket(BucketKind::Node).unwrap().bucket_no, 1);
+        // Kinds never share a bucket.
+        let data = allocator.alloc_region(&mut write_points, BucketKind::Data, REGION_LOG2).unwrap();
+        assert_eq!(bucket_of(&data), 2);
+    }
+
+    #[test]
+    fn freeing_all_four_regions_of_a_closed_bucket_frees_it() {
+        let mut table = alloc_table();
+        let mut allocator = BucketAllocator::new(&mut table, 0, BUCKET_LOG2, 0, 4);
+        allocator.seed_freelist();
+        let mut write_points = WritePoints::new();
+        let regions: Vec<BlockRef> = (0..4)
+            .map(|_| allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap())
+            .collect();
+        for region in &regions {
+            allocator.region_reached(region, REGION_LOG2).unwrap();
+        }
+        assert_eq!(allocator.table().get(0).unwrap().live_sectors(), 4 * REGION_BLOCKS);
+        // The fifth region closes bucket 0.
+        allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap();
+        assert!(!write_points.is_open(0));
+        for region in &regions[..3] {
+            assert!(!allocator.free_region(&write_points, region, REGION_LOG2).unwrap());
+        }
+        assert!(allocator.free_region(&write_points, &regions[3], REGION_LOG2).unwrap());
+        let freed = *allocator.table().get(0).unwrap();
+        assert_eq!(freed.kind().unwrap(), BucketKind::Free);
+        assert_eq!(freed.live_sectors(), 0);
+        assert_eq!(freed.generation, 2, "the next alloc bumps it, not the free");
+        // A stale reference into the freed-and-reused bucket is detected.
+        let reused = allocator.alloc(BucketKind::Data).unwrap();
+        assert_eq!(bucket_of(&reused), 0);
+        assert!(matches!(
+            allocator.region_reached(&regions[0], REGION_LOG2),
+            Err(StorageError::StaleBlockRef { .. })
+        ));
+    }
+
+    #[test]
+    fn an_open_bucket_is_never_freed() {
+        let mut table = alloc_table();
+        let mut allocator = BucketAllocator::new(&mut table, 0, BUCKET_LOG2, 0, 4);
+        allocator.seed_freelist();
+        let mut write_points = WritePoints::new();
+        let first = allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap();
+        let second = allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap();
+        allocator.region_reached(&first, REGION_LOG2).unwrap();
+        allocator.region_reached(&second, REGION_LOG2).unwrap();
+        assert!(!allocator.free_region(&write_points, &first, REGION_LOG2).unwrap());
+        // Closing frees nothing: the second region is still live.
+        allocator.release(&mut write_points, BucketKind::Node).unwrap();
+        assert_eq!(allocator.table().get(0).unwrap().kind().unwrap(), BucketKind::Node);
+        // Handed-out regions of a released bucket are never reused.
+        let next = allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap();
+        assert_eq!(bucket_of(&next), 1);
+        assert!(allocator.free_region(&write_points, &second, REGION_LOG2).unwrap());
+        assert_eq!(allocator.table().get(0).unwrap().kind().unwrap(), BucketKind::Free);
+    }
+
+    #[test]
+    fn after_a_crash_an_open_bucket_is_closed_and_its_tail_not_live() {
+        let mut table = alloc_table();
+        let mut allocator = BucketAllocator::new(&mut table, 0, BUCKET_LOG2, 0, 4);
+        allocator.seed_freelist();
+        let mut write_points = WritePoints::new();
+        let reached = allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap();
+        let _unreached = allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap();
+        allocator.region_reached(&reached, REGION_LOG2).unwrap();
+
+        // Crash: write points are lost; every bucket is closed at mount.
+        let mut write_points = WritePoints::new();
+        assert!(!write_points.is_open(0));
+        assert_eq!(allocator.table().get(0).unwrap().live_sectors(), REGION_BLOCKS);
+        // New regions never land in the old bucket's tail.
+        let next = allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap();
+        assert_eq!(bucket_of(&next), 1);
+        // Once the one reached region goes, the closed bucket is free.
+        assert!(allocator.free_region(&write_points, &reached, REGION_LOG2).unwrap());
+    }
+
+    #[test]
+    fn a_region_must_fit_a_bucket() {
+        let mut table = alloc_table();
+        let mut allocator = BucketAllocator::new(&mut table, 0, REGION_LOG2, 0, 4);
+        allocator.seed_freelist();
+        let mut write_points = WritePoints::new();
+        assert!(matches!(
+            allocator.alloc_region(&mut write_points, BucketKind::Node, BUCKET_LOG2),
+            Err(StorageError::RegionDoesNotFitBucket { region_size_log2: 20, bucket_size_log2: 18 })
+        ));
+        // A region the size of the bucket takes the whole bucket.
+        let whole = allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap();
+        let next = allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap();
+        assert_eq!(block_no_to_bucket(whole.block_no, REGION_LOG2).0, 0);
+        assert_eq!(block_no_to_bucket(next.block_no, REGION_LOG2).0, 1);
     }
 
     #[test]

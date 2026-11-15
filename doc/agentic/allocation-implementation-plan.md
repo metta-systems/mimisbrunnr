@@ -9,7 +9,6 @@ Design: [allocation-design.md](allocation-design.md) · Decisions: [allocation-d
 
 ## Region allocation
 
-- [ ] **ALLOCATION1 — Sub-bucket region allocation.** `alloc_region(kind)` takes successive 256 KiB regions of an open bucket, then opens a new one; a bucket is closed when its write point releases it and free when closed with no live sectors (ALLOCATION-DESIGN§1.5). Acceptance: four region allocations share one bucket, the fifth opens a new one; freeing all four regions of a closed bucket makes it free; after a crash, a bucket that was open is closed and its unwritten tail is not live. Unblocks [ENGINE3](engine-implementation-plan.md), [METADATA1](metadata-implementation-plan.md), [SUBSCRIPTION1](subscriptions-implementation-plan.md).
 - [ ] **ALLOCATION2 — Seed the freelist at format time.** Format seeds every bucket from `first_usable_bucket` to the last bucket before the trailing superblock as `Free` with generation 1 through `seed_freelist`. Acceptance: a freshly created pool's alloc table lists exactly those buckets as free.
 - [ ] **ALLOCATION3 — Resident generations and the dereference check.** Per-disk generation arrays loaded at mount and maintained by replay; dereferencing a committed pointer with a mismatched generation fails with `StaleBlockRef`, a backpointer with one is skipped (ALLOCATION-DESIGN§1.3). Prerequisite: [ENGINE3](engine-implementation-plan.md). Acceptance: a tampered child-pointer generation fails the read; a stale backpointer is skipped by a bucket scan.
 

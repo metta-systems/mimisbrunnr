@@ -34,7 +34,7 @@ pub use {
         BUCKET_FLAG_NEEDS_DISCARD, BucketAllocEntry, BucketAllocKey, BucketAllocTable,
         BucketKind, LIVE_SECTORS_MAX,
     },
-    allocator::BucketAllocator,
+    allocator::{BucketAllocator, OpenBucket, WritePoints},
     block::{
         BLOCK_FLAG_CONTINUATION, BLOCK_FLAG_ENCRYPTED, BLOCK_PREAMBLE_MAGIC_BLOCK,
         BLOCK_PREAMBLE_MAGIC_BTREE, BLOCK_SIZE, BLOCK_SIZE_LOG2, BlockHeader, BlockKind,
