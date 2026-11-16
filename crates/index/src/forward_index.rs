@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use {
     bytemuck::{Pod, Zeroable},
     mimisbrunnr_storage::{
-        BLOCK_SIZE, BlobRef, BlockDevice, BlockRef, BtreeKind, BtreeNodeHeader, StorageError,
+        BlobRef, BlockDevice, BlockRef, BtreeKind, BtreeNodeHeader, DiskAddressing, StorageError,
         region::{FieldKind, Region, RegionKey, RegionParams, RunEntry},
     },
     mimisbrunnr_types::{Assertion, ObjectId, TagId, TagOrigin, Value, value_hash},
@@ -336,8 +336,7 @@ impl LeafEntry {
                     have: bytes.len(),
                 });
             }
-            let spill_ref: BlobRef =
-                *bytemuck::from_bytes(&bytes[14..14 + blob_size]);
+            let spill_ref: BlobRef = bytemuck::pod_read_unaligned(&bytes[14..14 + blob_size]);
             Ok((
                 Self {
                     oid,
@@ -492,11 +491,15 @@ impl ForwardIndex {
     ///   regions permitted; flush errors with
     ///   [`IndexError::OverflowAreaExhausted`] if a chain would overflow it.
     ///
+    /// - `addressing` names `device`'s disk and bucket size, so each
+    ///   overflow region's byte offset becomes a bucket-relative `BlockRef`.
+    ///
     /// Returns the count of overflow regions written so callers can
     /// record the live extent (and for tests).
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
+        addressing: DiskAddressing,
         dir_offset: u64,
         overflow_area_offset: u64,
         overflow_area_cap_regions: usize,
@@ -545,6 +548,7 @@ impl ForwardIndex {
                 // leaf entry.
                 let head_ref = write_overflow_chain(
                     device,
+                    addressing,
                     overflow_area_offset,
                     overflow_area_cap_regions,
                     &mut next_region_slot,
@@ -583,9 +587,11 @@ impl ForwardIndex {
     /// chain rooted at the embedded `BlockRef`.
     ///
     /// An all-zero directory region is treated as "empty index" and
-    /// returns [`Self::default`].
+    /// returns [`Self::default`]. `addressing` turns each chain link's
+    /// `BlockRef` back into a byte offset on `device`.
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
+        addressing: DiskAddressing,
         dir_offset: u64,
     ) -> Result<Self, IndexError> {
         let mut probe = [0u8; 8];
@@ -614,8 +620,8 @@ impl ForwardIndex {
                 if body.len() < need {
                     return Err(IndexError::BufferTooSmall { need, have: body.len() });
                 }
-                let head_ref: BlockRef = *bytemuck::from_bytes(&body[..need]);
-                read_overflow_chain(device, head_ref, total)?
+                let head_ref: BlockRef = bytemuck::pod_read_unaligned(&body[..need]);
+                read_overflow_chain(device, addressing, head_ref, total)?
             } else {
                 let need = total * PACKED_ASSERTION_SIZE;
                 if body.len() < need {
@@ -670,6 +676,7 @@ const_assert_eq!(
 /// `BlockRef`.
 fn write_overflow_chain<D: BlockDevice>(
     device: &D,
+    addressing: DiskAddressing,
     area_offset: u64,
     cap_regions: usize,
     next_slot: &mut usize,
@@ -697,11 +704,11 @@ fn write_overflow_chain<D: BlockDevice>(
         let slot = assigned[chunk_idx];
         let byte_offset = area_offset + (slot as u64) * FORWARD_OVERFLOW_REGION_SIZE as u64;
         write_overflow_region(device, byte_offset, chunk, next_link)?;
-        next_link = block_ref_at(byte_offset);
+        next_link = block_ref_at(addressing, byte_offset)?;
     }
 
     let head_offset = area_offset + (assigned[0] as u64) * FORWARD_OVERFLOW_REGION_SIZE as u64;
-    Ok(block_ref_at(head_offset))
+    block_ref_at(addressing, head_offset)
 }
 
 fn write_overflow_region<D: BlockDevice>(
@@ -740,19 +747,19 @@ fn write_overflow_region<D: BlockDevice>(
 /// entry's `total` slot drifted from the chain's `payload_used` sum.
 fn read_overflow_chain<D: BlockDevice>(
     device: &D,
+    addressing: DiskAddressing,
     head: BlockRef,
     expected_total: usize,
 ) -> Result<Vec<PackedAssertion>, IndexError> {
     let mut out: Vec<PackedAssertion> = Vec::with_capacity(expected_total);
     let mut cur = head;
-    let zero = BlockRef::zeroed();
     let mut guard = 0usize;
-    while cur != zero {
+    while !cur.is_null() {
         guard += 1;
         if guard > expected_total / FORWARD_OVERFLOW_REGION_CAPACITY + 2 {
             return Err(IndexError::CorruptOverflowChain("chain exceeds expected length"));
         }
-        let offset = (cur.block_no as u64) * BLOCK_SIZE as u64;
+        let offset = addressing.block_offset(&cur)?;
         let mut buf = vec![0u8; FORWARD_OVERFLOW_REGION_SIZE];
         device.read_at(offset, &mut buf)?;
 
@@ -783,8 +790,7 @@ fn read_overflow_chain<D: BlockDevice>(
         }
 
         // Read trailing next_page link.
-        let next: BlockRef = *bytemuck::from_bytes(&buf[FORWARD_OVERFLOW_NEXT_PAGE_OFFSET..]);
-        cur = next;
+        cur = bytemuck::pod_read_unaligned(&buf[FORWARD_OVERFLOW_NEXT_PAGE_OFFSET..]);
     }
     if out.len() != expected_total {
         return Err(IndexError::CorruptOverflowChain(
@@ -795,15 +801,10 @@ fn read_overflow_chain<D: BlockDevice>(
 }
 
 /// Construct a `BlockRef` pointing at the 4 KiB block whose byte offset
-/// is `byte_offset`. `generation = 1` is a placeholder; ENGINE3 will
-/// bump generation per allocation.
-fn block_ref_at(byte_offset: u64) -> BlockRef {
-    BlockRef {
-        disk_id: 0,
-        _pad: 0,
-        block_no: (byte_offset / BLOCK_SIZE as u64) as u32,
-        generation: 1,
-    }
+/// is `byte_offset`. `generation = 1` is a placeholder until the regions
+/// live in allocated buckets (TODO(ENGINE3)).
+fn block_ref_at(addressing: DiskAddressing, byte_offset: u64) -> Result<BlockRef, IndexError> {
+    Ok(addressing.block_ref(byte_offset, 1)?)
 }
 
 // ---------- ForwardIndexKey (region key) ----------
@@ -971,12 +972,7 @@ mod tests {
 
     #[test]
     fn leaf_entry_spill_round_trip() {
-        let blob = BlobRef {
-            disk_id: 1,
-            _pad: 0,
-            block_no: 1234,
-            length: 4096,
-        };
+        let blob = BlobRef::new(1, 1234, 5, 4096);
         let le = LeafEntry::spill(200, 0, 1234, blob).unwrap();
         let bytes = le.serialise();
         let (parsed, _) = LeafEntry::parse(&bytes).unwrap();
@@ -1083,9 +1079,16 @@ mod tests {
         (dir, dev)
     }
 
+    /// Disk 0 with 1 MiB buckets: the overflow regions are quarters of buckets.
+    const TEST_ADDRESSING: DiskAddressing = DiskAddressing {
+        disk_id: 0,
+        bucket_size_log2: 20,
+    };
+
     fn flush(idx: &ForwardIndex, dev: &FileBlockDevice) -> Result<usize, IndexError> {
         idx.flush_to_region(
             dev,
+            TEST_ADDRESSING,
             TEST_DIR_OFFSET,
             TEST_OVERFLOW_AREA_OFFSET,
             TEST_OVERFLOW_AREA_REGIONS,
@@ -1093,7 +1096,7 @@ mod tests {
     }
 
     fn load(dev: &FileBlockDevice) -> Result<ForwardIndex, IndexError> {
-        ForwardIndex::load_from_region(dev, TEST_DIR_OFFSET)
+        ForwardIndex::load_from_region(dev, TEST_ADDRESSING, TEST_DIR_OFFSET)
     }
 
     #[test]
@@ -1378,6 +1381,7 @@ mod tests {
         let err = fi
             .flush_to_region(
                 &dev,
+                TEST_ADDRESSING,
                 TEST_DIR_OFFSET,
                 TEST_OVERFLOW_AREA_OFFSET,
                 TEST_OVERFLOW_AREA_REGIONS,

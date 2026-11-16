@@ -138,7 +138,7 @@ pub const CHUNK_INDEX_VALUE_SIZE: usize = 24;
 /// ```text
 /// [0..4]   ref_count u32
 /// [4..8]   length    u32
-/// [8..24]  blob_ref  BlobRef   (disk_id u16 | _pad u16 | block_no u32 | length u64)
+/// [8..24]  blob_ref  BlobRef   (disk_id u16 | sector u16 | bucket_no u32 | length u64)
 /// ```
 #[repr(C, packed)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
@@ -333,13 +333,8 @@ mod tests {
         [byte; 32]
     }
 
-    fn b(no: u32) -> BlobRef {
-        BlobRef {
-            disk_id: 0,
-            _pad: 0,
-            block_no: no,
-            length: 4096,
-        }
+    fn b(bucket_no: u32) -> BlobRef {
+        BlobRef::new(0, bucket_no, 0, 4096)
     }
 
     const TEST_LEN: u32 = 4096;

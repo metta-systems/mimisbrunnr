@@ -767,7 +767,7 @@ mod tests {
         let payload = crate::entry::WriteBlob {
             oid: 7,
             content_hash: [0xaa; 32],
-            extent: mimisbrunnr_storage::BlockRef::new(0, 1, 1).into(),
+            extent: mimisbrunnr_storage::BlockRef::new(0, 1, 0, 1).into(),
             size: 4096,
         };
         let mut bytes = Vec::new();

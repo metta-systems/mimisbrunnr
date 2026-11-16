@@ -36,7 +36,6 @@
 
 use {
     crate::{
-        addressing::block_no_to_bucket,
         alloc::{BucketAllocEntry, BucketAllocTable, BucketKind},
         block::BLOCK_SIZE_LOG2,
         error::StorageError,
@@ -150,12 +149,11 @@ impl<'a> BucketAllocator<'a> {
     /// Convert a [`BlockRef`] to its absolute byte offset on the
     /// allocator's disk.
     pub fn block_ref_offset(&self, block_ref: &BlockRef) -> u64 {
-        let block_no = { block_ref.block_no };
-        (block_no as u64) << BLOCK_SIZE_LOG2
+        block_ref.byte_offset(self.bucket_size_log2)
     }
 
     /// Allocate a fresh bucket of the given `kind`. Returns a
-    /// [`BlockRef`] at the bucket's first block.
+    /// [`BlockRef`] at the bucket's first sector.
     ///
     /// Linear scan over the table; first `Free` bucket past
     /// `first_usable_bucket` wins — a `Bad` bucket is never taken. Bumps
@@ -177,17 +175,11 @@ impl<'a> BucketAllocator<'a> {
             let new_gen = prev_gen.saturating_add(1);
             self.table
                 .insert(bucket_no, BucketAllocEntry::new(new_gen, kind, 0, 0));
-            let block_no = bucket_no << (self.bucket_size_log2 - BLOCK_SIZE_LOG2);
             trace!(
-                "BucketAllocator::alloc disk={} bucket={} → block_no={} gen={}",
-                self.disk_id, bucket_no, block_no, new_gen,
+                "BucketAllocator::alloc disk={} bucket={} gen={}",
+                self.disk_id, bucket_no, new_gen,
             );
-            return Ok(BlockRef {
-                disk_id: self.disk_id,
-                _pad: 0,
-                block_no,
-                generation: new_gen as u64,
-            });
+            return Ok(BlockRef::new(self.disk_id, bucket_no, 0, new_gen));
         }
         Err(StorageError::AllocatorExhausted {
             requested: kind as u8,
@@ -199,24 +191,20 @@ impl<'a> BucketAllocator<'a> {
     /// (so stale [`BlockRef`]s remain detectable until the bucket is
     /// re-purposed).
     pub fn free(&mut self, block_ref: BlockRef) -> Result<(), StorageError> {
-        let block_no = { block_ref.block_no };
-        let disk = { block_ref._pad }; // packed-field read; disk_id is below
-        let _ = disk;
-        let disk_id_actual = { block_ref.disk_id };
-        if disk_id_actual != self.disk_id {
+        if block_ref.disk_id != self.disk_id {
             return Err(StorageError::CrossDiskBlockRef {
                 expected_disk: self.disk_id,
-                got_disk: disk_id_actual,
+                got_disk: block_ref.disk_id,
             });
         }
-        let (bucket_no, _in_bucket) = block_no_to_bucket(block_no, self.bucket_size_log2);
+        let bucket_no = block_ref.bucket_no;
         let entry = self
             .table
             .get(bucket_no)
             .copied()
             .ok_or(StorageError::FreeOfUnallocatedBucket { bucket_no })?;
-        let expected_gen = { block_ref.generation };
-        let actual_gen = entry.generation as u64;
+        let expected_gen = block_ref.generation;
+        let actual_gen = entry.generation;
         if expected_gen != actual_gen {
             return Err(StorageError::StaleBlockRef {
                 expected: expected_gen,
@@ -230,8 +218,8 @@ impl<'a> BucketAllocator<'a> {
             BucketAllocEntry::new(entry.generation, BucketKind::Free, 0, 0),
         );
         trace!(
-            "BucketAllocator::free disk={} bucket={} block_no={} gen={}",
-            self.disk_id, bucket_no, block_no, actual_gen,
+            "BucketAllocator::free disk={} bucket={} gen={}",
+            self.disk_id, bucket_no, actual_gen,
         );
         Ok(())
     }
@@ -241,24 +229,18 @@ impl<'a> BucketAllocator<'a> {
     /// [`StorageError::StaleBlockRef`] if the bucket's current
     /// generation doesn't match.
     pub fn validate(&self, block_ref: &BlockRef) -> Result<(), StorageError> {
-        let disk = { block_ref.disk_id };
-        if disk != self.disk_id {
+        if block_ref.disk_id != self.disk_id {
             return Err(StorageError::CrossDiskBlockRef {
                 expected_disk: self.disk_id,
-                got_disk: disk,
+                got_disk: block_ref.disk_id,
             });
         }
-        let block_no = { block_ref.block_no };
-        let (bucket_no, _) = block_no_to_bucket(block_no, self.bucket_size_log2);
+        let expected = block_ref.generation;
         let entry = self
             .table
-            .get(bucket_no)
-            .ok_or(StorageError::StaleBlockRef {
-                expected: { block_ref.generation },
-                actual: 0,
-            })?;
-        let expected = { block_ref.generation };
-        let actual = entry.generation as u64;
+            .get(block_ref.bucket_no)
+            .ok_or(StorageError::StaleBlockRef { expected, actual: 0 })?;
+        let actual = entry.generation;
         if expected != actual {
             return Err(StorageError::StaleBlockRef {
                 expected,
@@ -311,29 +293,28 @@ impl<'a> BucketAllocator<'a> {
             _ => {
                 self.release(write_points, kind)?;
                 let fresh = self.alloc(kind)?;
-                let (bucket_no, _) = block_no_to_bucket(fresh.block_no, self.bucket_size_log2);
                 OpenBucket {
-                    bucket_no,
-                    generation: { fresh.generation } as u32,
+                    bucket_no: fresh.bucket_no,
+                    generation: fresh.generation,
                     next_block: 0,
                 }
             }
         };
-        let block_no = (open.bucket_no << (self.bucket_size_log2 - BLOCK_SIZE_LOG2)) + open.next_block;
+        let Ok(sector) = u16::try_from(open.next_block) else {
+            return Err(StorageError::BlockOffsetUnaddressable {
+                offset: self.bucket_offset(open.bucket_no) + (u64::from(open.next_block) << BLOCK_SIZE_LOG2),
+                bucket_size_log2: self.bucket_size_log2,
+            });
+        };
         write_points.open[kind as usize] = Some(OpenBucket {
             next_block: open.next_block + region_blocks,
             ..open
         });
         trace!(
-            "BucketAllocator::alloc_region disk={} bucket={} block_no={} blocks={}",
-            self.disk_id, open.bucket_no, block_no, region_blocks,
+            "BucketAllocator::alloc_region disk={} bucket={} sector={} blocks={}",
+            self.disk_id, open.bucket_no, sector, region_blocks,
         );
-        Ok(BlockRef {
-            disk_id: self.disk_id,
-            _pad: 0,
-            block_no,
-            generation: open.generation as u64,
-        })
+        Ok(BlockRef::new(self.disk_id, open.bucket_no, sector, open.generation))
     }
 
     /// Close the bucket open for `kind`, if any. Closing frees nothing:
@@ -355,9 +336,8 @@ impl<'a> BucketAllocator<'a> {
     pub fn region_reached(&mut self, block_ref: &BlockRef, region_size_log2: u8) -> Result<(), StorageError> {
         let region_blocks = self.region_blocks(region_size_log2)?;
         self.validate(block_ref)?;
-        let (bucket_no, _) = block_no_to_bucket(block_ref.block_no, self.bucket_size_log2);
         self.table
-            .add_live_sectors(bucket_no, region_blocks, self.blocks_per_bucket())
+            .add_live_sectors(block_ref.bucket_no, region_blocks, self.blocks_per_bucket())
     }
 
     /// The committed root no longer reaches the region at `block_ref`: its
@@ -371,7 +351,7 @@ impl<'a> BucketAllocator<'a> {
     ) -> Result<bool, StorageError> {
         let region_blocks = self.region_blocks(region_size_log2)?;
         self.validate(block_ref)?;
-        let (bucket_no, _) = block_no_to_bucket(block_ref.block_no, self.bucket_size_log2);
+        let bucket_no = block_ref.bucket_no;
         self.table.remove_live_sectors(bucket_no, region_blocks)?;
         self.free_if_empty(write_points, bucket_no)
     }
@@ -405,11 +385,12 @@ mod tests {
         let mut allocator = BucketAllocator::new(&mut table, 0, 20, 32, 1024);
         allocator.seed_freelist();
         let r = allocator.alloc(BucketKind::Node).unwrap();
-        assert_eq!({ r.disk_id }, 0);
-        // First usable bucket = 32; with 1 MiB buckets, block_no = 32 * 256 = 8192.
-        assert_eq!({ r.block_no }, 32 * 256);
+        assert_eq!(r.disk_id, 0);
+        // First usable bucket = 32, at its first sector.
+        assert_eq!((r.bucket_no, r.sector), (32, 0));
+        assert_eq!(allocator.block_ref_offset(&r), 32 << 20);
         // Generation bumped from 1 (seeded) to 2.
-        assert_eq!({ r.generation }, 2);
+        assert_eq!(r.generation, 2);
         // Table entry reflects.
         let entry = allocator.table.get(32).copied().unwrap();
         assert_eq!(entry.kind().unwrap(), BucketKind::Node);
@@ -421,7 +402,7 @@ mod tests {
     const REGION_BLOCKS: u32 = 64;
 
     fn bucket_of(block_ref: &BlockRef) -> u32 {
-        block_no_to_bucket(block_ref.block_no, BUCKET_LOG2).0
+        block_ref.bucket_no
     }
 
     #[test]
@@ -433,9 +414,9 @@ mod tests {
         let regions: Vec<BlockRef> = (0..5)
             .map(|_| allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap())
             .collect();
-        let block_nos: Vec<u32> = regions.iter().map(|r| { r.block_no }).collect();
-        assert_eq!(block_nos, vec![0, 64, 128, 192, 256]);
-        assert!(regions[..4].iter().all(|r| bucket_of(r) == 0 && { r.generation } == 2));
+        let positions: Vec<(u32, u16)> = regions.iter().map(|r| (r.bucket_no, r.sector)).collect();
+        assert_eq!(positions, vec![(0, 0), (0, 64), (0, 128), (0, 192), (1, 0)]);
+        assert!(regions[..4].iter().all(|r| bucket_of(r) == 0 && r.generation == 2));
         assert_eq!(bucket_of(&regions[4]), 1);
         assert_eq!(write_points.open_bucket(BucketKind::Node).unwrap().bucket_no, 1);
         // Kinds never share a bucket.
@@ -531,8 +512,8 @@ mod tests {
         // A region the size of the bucket takes the whole bucket.
         let whole = allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap();
         let next = allocator.alloc_region(&mut write_points, BucketKind::Node, REGION_LOG2).unwrap();
-        assert_eq!(block_no_to_bucket(whole.block_no, REGION_LOG2).0, 0);
-        assert_eq!(block_no_to_bucket(next.block_no, REGION_LOG2).0, 1);
+        assert_eq!((whole.bucket_no, whole.sector), (0, 0));
+        assert_eq!((next.bucket_no, next.sector), (1, 0));
     }
 
     #[test]
@@ -543,7 +524,7 @@ mod tests {
         table.insert(1, BucketAllocEntry::new(5, BucketKind::Free, BUCKET_FLAG_NEEDS_DISCARD, 0));
         let mut allocator = BucketAllocator::new(&mut table, 0, 20, 0, 2);
         let r = allocator.alloc(BucketKind::Data).unwrap();
-        assert_eq!({ r.block_no }, 256); // bucket 1, not the bad bucket 0
+        assert_eq!((r.bucket_no, r.sector), (1, 0)); // bucket 1, not the bad bucket 0
         let taken = *allocator.table().get(1).unwrap();
         assert_eq!(taken.generation, 6);
         assert_eq!(taken.flags(), 0);
@@ -561,10 +542,10 @@ mod tests {
         allocator.seed_freelist();
         let r1 = allocator.alloc(BucketKind::Node).unwrap();
         let r2 = allocator.alloc(BucketKind::Node).unwrap();
-        assert_ne!({ r1.block_no }, { r2.block_no });
+        assert_ne!(r1.bucket_no, r2.bucket_no);
         // First two buckets claimed.
-        assert_eq!({ r1.block_no }, 0);
-        assert_eq!({ r2.block_no }, 256); // bucket 1
+        assert_eq!((r1.bucket_no, r1.sector), (0, 0));
+        assert_eq!((r2.bucket_no, r2.sector), (1, 0));
     }
 
     #[test]
@@ -573,13 +554,13 @@ mod tests {
         let mut allocator = BucketAllocator::new(&mut table, 0, 20, 0, 4);
         allocator.seed_freelist();
         let r1 = allocator.alloc(BucketKind::Node).unwrap();
-        let r1_gen = { r1.generation };
+        let r1_gen = r1.generation;
         allocator.free(r1).unwrap();
         let r2 = allocator.alloc(BucketKind::Node).unwrap();
         // r2 may pick the same bucket (bucket 0 is now free) or a later one.
         // Either way, if it lands on bucket 0, generation must be > r1's.
-        if { r2.block_no } == 0 {
-            assert!({ r2.generation } > r1_gen);
+        if r2.bucket_no == 0 {
+            assert!(r2.generation > r1_gen);
         }
     }
 
@@ -591,10 +572,8 @@ mod tests {
         let r = allocator.alloc(BucketKind::Node).unwrap();
         // Tamper.
         let stale = BlockRef {
-            disk_id: { r.disk_id },
-            _pad: 0,
-            block_no: { r.block_no },
-            generation: { r.generation } - 1,
+            generation: r.generation - 1,
+            ..r
         };
         let err = allocator.validate(&stale).unwrap_err();
         assert!(matches!(err, StorageError::StaleBlockRef { .. }));
@@ -616,12 +595,7 @@ mod tests {
         let mut table = alloc_table();
         let mut allocator = BucketAllocator::new(&mut table, 0, 20, 0, 4);
         // Construct a BlockRef pointing at a never-allocated bucket.
-        let bogus = BlockRef {
-            disk_id: 0,
-            _pad: 0,
-            block_no: 256, // bucket 1
-            generation: 5,
-        };
+        let bogus = BlockRef::new(0, 1, 0, 5);
         let err = allocator.free(bogus).unwrap_err();
         assert!(matches!(err, StorageError::FreeOfUnallocatedBucket { .. }));
     }
@@ -632,26 +606,18 @@ mod tests {
         let mut allocator = BucketAllocator::new(&mut table, 0, 20, 0, 4);
         allocator.seed_freelist();
         let r = allocator.alloc(BucketKind::Node).unwrap();
-        let cross = BlockRef {
-            disk_id: 99,
-            _pad: 0,
-            block_no: { r.block_no },
-            generation: { r.generation },
-        };
+        let cross = BlockRef { disk_id: 99, ..r };
         let err = allocator.free(cross).unwrap_err();
         assert!(matches!(err, StorageError::CrossDiskBlockRef { .. }));
     }
 
     #[test]
-    fn block_ref_offset_matches_block_no() {
+    fn block_ref_offset_is_bucket_relative() {
         let mut table = alloc_table();
         let allocator = BucketAllocator::new(&mut table, 0, 20, 0, 4);
-        let r = BlockRef {
-            disk_id: 0,
-            _pad: 0,
-            block_no: 256, // first block of bucket 1, with 1 MiB buckets
-            generation: 1,
-        };
-        assert_eq!(allocator.block_ref_offset(&r), 256u64 * 4096); // 1 MiB
+        let first_of_bucket_one = BlockRef::new(0, 1, 0, 1);
+        assert_eq!(allocator.block_ref_offset(&first_of_bucket_one), 1 << 20);
+        let third_sector_of_bucket_two = BlockRef::new(0, 2, 3, 1);
+        assert_eq!(allocator.block_ref_offset(&third_sector_of_bucket_two), (2 << 20) + 3 * 4096);
     }
 }

@@ -205,16 +205,6 @@ impl ObjectLocation {
         self.serialize_into(&mut out);
         out
     }
-
-    /// Convert a `(bucket_no, sector_offset)` pair derived from an absolute
-    /// `block_no` per METADATA-DESIGN§2.1's helper formulas. `bucket_size_log2` is the
-    /// log2 of the bucket size in bytes (e.g. 20 for 1 MiB buckets).
-    pub fn block_no_to_bucket_offset(block_no: u64, bucket_size_log2: u32) -> (u32, u16) {
-        let shift = bucket_size_log2 - 12;
-        let bucket_no = (block_no >> shift) as u32;
-        let sector_offset = (block_no & ((1u64 << shift) - 1)) as u16;
-        (bucket_no, sector_offset)
-    }
 }
 
 // ---------- Serialize / Deserialize via bytemuck ----------
@@ -367,13 +357,5 @@ mod tests {
             ObjectLocation::new(0, &too_many),
             Err(MetaError::InvalidReplicaCount(5))
         ));
-    }
-
-    #[test]
-    fn block_no_helper_round_trips() {
-        // 1 MiB buckets -> bucket_size_log2 = 20, shift = 8 (256 sectors / bucket).
-        let (b, s) = ObjectLocation::block_no_to_bucket_offset(0x301, 20);
-        assert_eq!(b, 3);
-        assert_eq!(s, 1);
     }
 }

@@ -69,7 +69,7 @@ mod tests {
 
     #[test]
     fn dirty_node_pinning_tracks_lsn_window() {
-        let mut node = DirtyNode::new(BlockRef::new(0, 100, 1), 5);
+        let mut node = DirtyNode::new(BlockRef::new(0, 100, 0, 1), 5);
         assert!(node.is_clean());
         node.pin(10);
         node.pin(11);

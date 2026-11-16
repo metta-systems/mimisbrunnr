@@ -188,6 +188,9 @@ struct BlobRef {                             // 16 bytes
 }
 ```
 
+An all-zero `BlockRef` or `BlobRef` names nothing: bucket 0, sector 0 holds a superblock copy and
+is never a node or extent. `_reserved` is zero; a reader rejects a pointer where it is not.
+
 Both are **bucket-relative**: their first 8 bytes have the `ReplicaRef` shape
 (METADATA-DESIGN§2.1) and the backpointer key's fields, so a disk addresses `2³²` buckets —
 4 PiB at the default 1 MiB bucket, 1 EiB at the 256 MiB maximum. A `BlockRef` names a tree node or region and

@@ -127,62 +127,65 @@ pub(crate) const FORWARD_OVERFLOW_AREA_REGIONS: usize = 32;
 #[allow(dead_code)] // referenced in size assertions / future dynamic layout work.
 pub(crate) const REGION_SIZE: u64 = 256 * 1024;
 
-/// Convert a [`BlockRef`] to its disk-absolute byte offset.
+/// The primary disk's addressing: its id and `Superblock.bucket_size_log2`,
+/// which turn the index zone's byte offsets into bucket-relative
+/// [`BlockRef`]s and back (ENGINE-DESIGN§1.3).
+fn primary_addressing(superblock: &Superblock) -> DiskAddressing {
+    DiskAddressing::new(superblock.disk_id, superblock.bucket_size_log2)
+}
+
+/// Byte offset on the primary disk of the tree a root slot names. A slot
+/// naming another disk fails with [`StorageError::CrossDiskBlockRef`].
 ///
-/// `BlockRef.block_no` is in 4 KiB units (ENGINE-DESIGN§1.3 / ALLOCATION-DESIGN§1.3). Used by the
-/// minimum-viable wiring that populates `RootPointer.*_root`
-/// slots from the existing fixed-offset region layout.
-fn block_ref_offset(block_ref: &BlockRef) -> u64 {
-    let block_no = { block_ref.block_no };
-    block_no as u64 * mimisbrunnr_storage::BLOCK_SIZE as u64
+/// [`StorageError::CrossDiskBlockRef`]: mimisbrunnr_storage::StorageError::CrossDiskBlockRef
+fn block_ref_offset(block_ref: BlockRef, addressing: DiskAddressing) -> Result<u64, EngineError> {
+    Ok(addressing.block_offset(&block_ref)?)
 }
 
 /// Build a [`BlockRef`] for the tree currently living at
 /// `zone_offset + tree_offset_in_zone`. Seeds the initial
 /// `RootPointer.*_root` slots at format/create time; subsequent commits
-/// don't reallocate (COW reallocation is ENGINE3).
+/// don't reallocate (TODO(ENGINE3): a fresh region per commit).
 ///
-/// `disk_id` is the primary-disk id; `generation` is `1` for fresh
-/// pools and never bumps while trees stay at fixed offsets (the buckets aren't reused).
-fn root_ref_for(disk_id: u16, zone_offset: u64, tree_offset_in_zone: u64) -> BlockRef {
-    let absolute = zone_offset + tree_offset_in_zone;
-    let block_no = (absolute / mimisbrunnr_storage::BLOCK_SIZE as u64) as u32;
-    BlockRef {
-        disk_id,
-        _pad: 0,
-        block_no,
-        generation: 1,
-    }
+/// `generation` is `1` for fresh pools and never bumps while trees stay at
+/// fixed offsets (the buckets aren't reused).
+fn root_ref_for(
+    addressing: DiskAddressing,
+    zone_offset: u64,
+    tree_offset_in_zone: u64,
+) -> Result<BlockRef, EngineError> {
+    Ok(addressing.block_ref(zone_offset + tree_offset_in_zone, 1)?)
 }
 
 /// Populate every `RootPointer.*_root` slot the engine knows about.
 /// Called once at format time and again on every `commit()`
-/// (the slots stay stable across commits; ENGINE3 will rotate them
+/// (the slots stay stable across commits; TODO(ENGINE3) rotates them
 /// per commit).
-fn seed_root_pointer(root: &mut mimisbrunnr_storage::RootPointer, disk_id: u16, zone_offset: u64) {
-    root.chunk_index_root = root_ref_for(disk_id, zone_offset, CHUNK_INDEX_REGION_OFFSET);
-    root.kv_index_root = root_ref_for(disk_id, zone_offset, KV_INDEX_REGION_OFFSET);
-    root.forward_index_root = root_ref_for(disk_id, zone_offset, FORWARD_INDEX_REGION_OFFSET);
-    root.tag_index_root = root_ref_for(disk_id, zone_offset, TAG_INDEX_REGION_OFFSET);
-    root.range_index_root = root_ref_for(disk_id, zone_offset, RANGE_INDEX_REGION_OFFSET);
-    root.object_table_root = root_ref_for(disk_id, zone_offset, OBJECT_TABLE_REGION_OFFSET);
-    root.location_table_root = root_ref_for(disk_id, zone_offset, LOCATION_TABLE_REGION_OFFSET);
-    root.ontology_root = root_ref_for(disk_id, zone_offset, ONTOLOGY_REGION_OFFSET);
-    root.subscriptions_root = root_ref_for(disk_id, zone_offset, SUBSCRIPTIONS_REGION_OFFSET);
-    root.backpointer_root = root_ref_for(disk_id, zone_offset, BACKPOINTER_TABLE_REGION_OFFSET);
+fn seed_root_pointer(
+    root: &mut mimisbrunnr_storage::RootPointer,
+    addressing: DiskAddressing,
+    zone_offset: u64,
+) -> Result<(), EngineError> {
+    root.chunk_index_root = root_ref_for(addressing, zone_offset, CHUNK_INDEX_REGION_OFFSET)?;
+    root.kv_index_root = root_ref_for(addressing, zone_offset, KV_INDEX_REGION_OFFSET)?;
+    root.forward_index_root = root_ref_for(addressing, zone_offset, FORWARD_INDEX_REGION_OFFSET)?;
+    root.tag_index_root = root_ref_for(addressing, zone_offset, TAG_INDEX_REGION_OFFSET)?;
+    root.range_index_root = root_ref_for(addressing, zone_offset, RANGE_INDEX_REGION_OFFSET)?;
+    root.object_table_root = root_ref_for(addressing, zone_offset, OBJECT_TABLE_REGION_OFFSET)?;
+    root.location_table_root = root_ref_for(addressing, zone_offset, LOCATION_TABLE_REGION_OFFSET)?;
+    root.ontology_root = root_ref_for(addressing, zone_offset, ONTOLOGY_REGION_OFFSET)?;
+    root.subscriptions_root = root_ref_for(addressing, zone_offset, SUBSCRIPTIONS_REGION_OFFSET)?;
+    root.backpointer_root = root_ref_for(addressing, zone_offset, BACKPOINTER_TABLE_REGION_OFFSET)?;
     // disks_overflow / placement_rules / cluster_peers / reconcile_*
     // / value_spill / *_history / snapshot_chain stay BlockRef::ZERO
     // until later phases populate them.
-    let _ = (
-        root.disks_overflow_root,
-        root.placement_rules_root,
-        root.cluster_peers_root,
-    );
+    Ok(())
 }
 use mimisbrunnr_ontology::{InstallResult, OntologyModule, OntologyState};
 use mimisbrunnr_pool::{DiskConfigEntry, PoolConfig, PoolManager, PoolStatus};
 use mimisbrunnr_storage::{
-    BlockDevice, BlockRef, BucketAllocTable, FileBlockDevice, FreespaceLru, Superblock,
+    BlockDevice, BlockRef, BucketAllocTable, DiskAddressing, FileBlockDevice, FreespaceLru,
+    Superblock,
 };
 use mimisbrunnr_types::{
     ChangeInterest, DiskId, ObjectId, Query, SubscriptionId, TagId, Value,
@@ -306,7 +309,7 @@ impl DiskEngine {
         let mut new_root = active;
         new_root.seq = { active.seq }.saturating_add(1);
         new_root.lsn = wal.next_lsn();
-        seed_root_pointer(&mut new_root, primary_id, zone_offset);
+        seed_root_pointer(&mut new_root, primary_addressing(&superblock), zone_offset)?;
         superblock.commit_root(primary_dev.as_ref(), new_root)?;
 
         // 7. Persist the pool config to TOML.
@@ -356,6 +359,7 @@ impl DiskEngine {
         load_all_regions(
             &mut engine,
             primary_dev.as_ref(),
+            primary_addressing(&superblock),
             zone_offset,
             superblock.active_root_pointer(),
             config.node_id,
@@ -441,6 +445,7 @@ impl DiskEngine {
         load_all_regions(
             &mut engine,
             primary_dev.as_ref(),
+            primary_addressing(&superblock),
             zone_offset,
             superblock.active_root_pointer(),
             config.node_id,
@@ -512,20 +517,22 @@ impl DiskEngine {
         //    values are seeded at format time and don't change across
         //    commits; ENGINE3 will rotate them per commit.
         let active = *self.superblock.active_root_pointer();
+        let addressing = primary_addressing(&self.superblock);
         let dev = self.primary_device.as_ref();
         self.engine
             .chunk_index
-            .flush_to_region(dev, block_ref_offset(&active.chunk_index_root))
+            .flush_to_region(dev, block_ref_offset(active.chunk_index_root, addressing)?)
             .map_err(EngineError::from)?;
         self.engine
             .kv_index
-            .flush_to_region(dev, block_ref_offset(&active.kv_index_root))
+            .flush_to_region(dev, addressing, block_ref_offset(active.kv_index_root, addressing)?)
             .map_err(EngineError::from)?;
         self.engine
             .forward_index
             .flush_to_region(
                 dev,
-                block_ref_offset(&active.forward_index_root),
+                addressing,
+                block_ref_offset(active.forward_index_root, addressing)?,
                 zone_offset + FORWARD_OVERFLOW_AREA_OFFSET,
                 FORWARD_OVERFLOW_AREA_REGIONS,
             )
@@ -537,34 +544,35 @@ impl DiskEngine {
             .tag_index
             .flush_to_region(
                 dev,
-                block_ref_offset(&active.tag_index_root),
+                addressing,
+                block_ref_offset(active.tag_index_root, addressing)?,
                 zone_offset + TAG_BITMAP_AREA_OFFSET,
                 TAG_BITMAP_AREA_PAGES,
             )
             .map_err(EngineError::from)?;
         self.engine
             .range_index
-            .flush_to_region(dev, block_ref_offset(&active.range_index_root))
+            .flush_to_region(dev, block_ref_offset(active.range_index_root, addressing)?)
             .map_err(EngineError::from)?;
         self.engine
             .object_table
-            .flush_to_region(dev, block_ref_offset(&active.object_table_root))
+            .flush_to_region(dev, block_ref_offset(active.object_table_root, addressing)?)
             .map_err(EngineError::from)?;
         self.engine
             .location_table
-            .flush_to_region(dev, block_ref_offset(&active.location_table_root))
+            .flush_to_region(dev, block_ref_offset(active.location_table_root, addressing)?)
             .map_err(EngineError::from)?;
         self.engine
             .ontology
-            .flush_to_region(dev, block_ref_offset(&active.ontology_root))
+            .flush_to_region(dev, block_ref_offset(active.ontology_root, addressing)?)
             .map_err(EngineError::from)?;
         self.engine
             .subscriptions
-            .flush_to_region(dev, block_ref_offset(&active.subscriptions_root))
+            .flush_to_region(dev, block_ref_offset(active.subscriptions_root, addressing)?)
             .map_err(EngineError::from)?;
         self.engine
             .backpointer_table
-            .flush_to_region(dev, block_ref_offset(&active.backpointer_root))
+            .flush_to_region(dev, block_ref_offset(active.backpointer_root, addressing)?)
             .map_err(EngineError::from)?;
         // Bucket alloc + freespace LRU. Pool-scoped until ALLOCATION4 /
         // ALLOCATION5 split them per disk (ALLOCATION-DESIGN§1.2).
@@ -614,6 +622,7 @@ impl DiskEngine {
         load_all_regions(
             &mut self.engine,
             self.primary_device.as_ref(),
+            primary_addressing(&self.superblock),
             zone_offset,
             &root,
             node_id,
@@ -692,8 +701,7 @@ impl DiskEngine {
         // region per commit); re-seeding each commit also heals a pool
         // created before the slots were populated.
         let zone_offset = { self.superblock.index_zone.offset };
-        let primary_id = { self.superblock.disk_id };
-        seed_root_pointer(&mut new_root, primary_id, zone_offset);
+        seed_root_pointer(&mut new_root, primary_addressing(&self.superblock), zone_offset)?;
         new_root.recompute_crc();
 
         // 3. Append checkpoint WAL entry.
@@ -996,63 +1004,62 @@ impl DiskEngine {
 fn load_all_regions<D: BlockDevice>(
     engine: &mut Engine,
     device: &D,
+    addressing: DiskAddressing,
     zone_offset: u64,
     root: &mimisbrunnr_storage::RootPointer,
     node_id: u16,
 ) -> Result<(), EngineError> {
-    engine.chunk_index = if is_zero(&root.chunk_index_root) {
+    let root = *root;
+    let offset = |block_ref: BlockRef| block_ref_offset(block_ref, addressing);
+    engine.chunk_index = if root.chunk_index_root.is_null() {
         ChunkIndex::default()
     } else {
-        ChunkIndex::load_from_region(device, block_ref_offset(&root.chunk_index_root))?
+        ChunkIndex::load_from_region(device, offset(root.chunk_index_root)?)?
     };
-    engine.kv_index = if is_zero(&root.kv_index_root) {
+    engine.kv_index = if root.kv_index_root.is_null() {
         KvIndex::default()
     } else {
-        KvIndex::load_from_region(device, block_ref_offset(&root.kv_index_root))?
+        KvIndex::load_from_region(device, addressing, offset(root.kv_index_root)?)?
     };
-    engine.forward_index = if is_zero(&root.forward_index_root) {
+    engine.forward_index = if root.forward_index_root.is_null() {
         ForwardIndex::default()
     } else {
-        ForwardIndex::load_from_region(device, block_ref_offset(&root.forward_index_root))?
+        ForwardIndex::load_from_region(device, addressing, offset(root.forward_index_root)?)?
     };
-    engine.tag_index = if is_zero(&root.tag_index_root) {
+    engine.tag_index = if root.tag_index_root.is_null() {
         TagIndex::default()
     } else {
-        TagIndex::load_from_region(device, block_ref_offset(&root.tag_index_root))?
+        TagIndex::load_from_region(device, addressing, offset(root.tag_index_root)?)?
     };
-    engine.range_index = if is_zero(&root.range_index_root) {
+    engine.range_index = if root.range_index_root.is_null() {
         RangeIndex::default()
     } else {
-        RangeIndex::load_from_region(device, block_ref_offset(&root.range_index_root))?
+        RangeIndex::load_from_region(device, offset(root.range_index_root)?)?
     };
-    engine.object_table = if is_zero(&root.object_table_root) {
+    engine.object_table = if root.object_table_root.is_null() {
         ObjectTable::default()
     } else {
-        ObjectTable::load_from_region(device, block_ref_offset(&root.object_table_root))?
+        ObjectTable::load_from_region(device, offset(root.object_table_root)?)?
     };
-    engine.location_table = if is_zero(&root.location_table_root) {
+    engine.location_table = if root.location_table_root.is_null() {
         LocationTable::default()
     } else {
-        LocationTable::load_from_region(
-            device,
-            block_ref_offset(&root.location_table_root),
-            node_id,
-        )?
+        LocationTable::load_from_region(device, offset(root.location_table_root)?, node_id)?
     };
-    engine.ontology = if is_zero(&root.ontology_root) {
+    engine.ontology = if root.ontology_root.is_null() {
         OntologyState::default()
     } else {
-        OntologyState::load_from_region(device, block_ref_offset(&root.ontology_root))?
+        OntologyState::load_from_region(device, offset(root.ontology_root)?)?
     };
-    engine.subscriptions = if is_zero(&root.subscriptions_root) {
+    engine.subscriptions = if root.subscriptions_root.is_null() {
         SubscriptionEngine::default()
     } else {
-        SubscriptionEngine::load_from_region(device, block_ref_offset(&root.subscriptions_root))?
+        SubscriptionEngine::load_from_region(device, offset(root.subscriptions_root)?)?
     };
-    engine.backpointer_table = if is_zero(&root.backpointer_root) {
+    engine.backpointer_table = if root.backpointer_root.is_null() {
         BackpointerTable::default()
     } else {
-        BackpointerTable::load_from_region(device, block_ref_offset(&root.backpointer_root))?
+        BackpointerTable::load_from_region(device, offset(root.backpointer_root)?)?
     };
     // Bootstrap roots stay at fixed offsets (ALLOCATION4 / ALLOCATION5 split them per disk).
     engine.bucket_alloc =
@@ -1062,13 +1069,6 @@ fn load_all_regions<D: BlockDevice>(
         FreespaceLru::load_from_region(device, zone_offset + FREESPACE_LRU_REGION_OFFSET)
             .map_err(EngineError::from)?;
     Ok(())
-}
-
-/// `true` when the `BlockRef` is the all-zero sentinel (uninitialised slot).
-fn is_zero(block_ref: &BlockRef) -> bool {
-    let block_no = { block_ref.block_no };
-    let generation = { block_ref.generation };
-    block_no == 0 && generation == 0
 }
 
 fn build_index_blob(

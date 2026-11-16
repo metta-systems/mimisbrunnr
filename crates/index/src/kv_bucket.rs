@@ -264,39 +264,24 @@ mod tests {
     #[test]
     fn upsert_then_lookup() {
         let mut b = KvBucketBlock::new(3);
-        let r = BlockRef {
-            disk_id: 0,
-            _pad: 0,
-            block_no: 100,
-            generation: 1,
-        };
+        let r = BlockRef::new(0, 100, 3, 1);
         b.upsert(7, 0xdeadbeef, r).unwrap();
         b.upsert(7, 0xbaadf00d, r).unwrap();
         assert_eq!(b.len(), 2);
         let got = b.lookup(7, 0xdeadbeef).unwrap();
-        assert_eq!({ got.block_no }, 100);
+        assert_eq!(got, r);
         assert!(b.lookup(7, 0xc0ffee).is_none());
     }
 
     #[test]
     fn upsert_replaces_in_place() {
         let mut b = KvBucketBlock::new(0);
-        let r1 = BlockRef {
-            disk_id: 0,
-            _pad: 0,
-            block_no: 1,
-            generation: 1,
-        };
-        let r2 = BlockRef {
-            disk_id: 0,
-            _pad: 0,
-            block_no: 2,
-            generation: 1,
-        };
+        let r1 = BlockRef::new(0, 1, 0, 1);
+        let r2 = BlockRef::new(0, 2, 0, 1);
         b.upsert(1, 0x1, r1).unwrap();
         b.upsert(1, 0x1, r2).unwrap(); // overwrite
         assert_eq!(b.len(), 1);
-        assert_eq!({ b.lookup(1, 0x1).unwrap().block_no }, 2);
+        assert_eq!(b.lookup(1, 0x1).unwrap().bucket_no, 2);
     }
 
     #[test]
@@ -317,18 +302,13 @@ mod tests {
         let path = dir.path().join("kv_bucket.bin");
         let dev = FileBlockDevice::open(&path, 1 << 20).unwrap();
         let mut b = KvBucketBlock::new(2);
-        let r = BlockRef {
-            disk_id: 1,
-            _pad: 0,
-            block_no: 4242,
-            generation: 13,
-        };
+        let r = BlockRef::new(1, 4242, 17, 13);
         b.upsert(99, 0xfeed, r).unwrap();
         b.upsert(100, 0xbeef, r).unwrap();
         b.write(&dev, 0).unwrap();
 
         let back = KvBucketBlock::read(&dev, 0).unwrap();
         assert_eq!(back.len(), 2);
-        assert_eq!({ back.lookup(99, 0xfeed).unwrap().block_no }, 4242);
+        assert_eq!(back.lookup(99, 0xfeed).unwrap(), r);
     }
 }

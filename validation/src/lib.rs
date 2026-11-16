@@ -149,7 +149,7 @@ const _: () = assert!(LEAF_ENTRY_SPILL_FLAG & LEAF_ENTRY_TOTAL_MASK == 0);
 //   Forward (INDEX-DESIGN§2.1):  LeafEntry.header == LEAF_ENTRY_SPILL_FLAG  (spill bit set,
 //                    total = 0). Real spills imply total > 8, so total = 0 in
 //                    spill mode is the unambiguous tombstone.
-//   Range (INDEX-DESIGN§4.2):    leaf BlockRef value zeroed (disk_id = block_no =
+//   Range (INDEX-DESIGN§4.2):    leaf BlockRef value zeroed (disk_id = sector = bucket_no =
 //                    generation = 0) — never a valid bitmap pointer.
 //   TagDirectory (INDEX-DESIGN§3.1): TagIndexLeafEntry.store_kind == STORE_KIND_WHITEOUT
 //                    with store_root zeroed.
@@ -188,16 +188,36 @@ pub const WORK_FLAG_RATELIMITED: u32 = 1 << 0;
 pub const WORK_FLAG_PERSISTENT:  u32 = 1 << 1;
 
 // =====================================================================
-// ENGINE-DESIGN§1.3 BlockRef — 16 B
+// ENGINE-DESIGN§1.2 BlockRef — 16 B, bucket-relative
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct BlockRef {
-    pub disk_id: u16,
-    pub _pad: u16,
-    pub block_no: u32,
-    pub generation: u64,
+    pub disk_id: u16,        //  [0..2]
+    pub sector: u16,         //  [2..4]   4 KiB sector within the bucket
+    pub bucket_no: u32,      //  [4..8]
+    pub generation: u32,     //  [8..12]  bucket generation at write time (ALLOCATION-DESIGN§1.3)
+    pub _reserved: u32,      // [12..16]  zero
 }
 const _: () = assert!(size_of::<BlockRef>() == 16);
+const _: () = assert!(std::mem::align_of::<BlockRef>() == 4);
+const _: () = assert!(std::mem::offset_of!(BlockRef, disk_id) == 0);
+const _: () = assert!(std::mem::offset_of!(BlockRef, sector) == 2);
+const _: () = assert!(std::mem::offset_of!(BlockRef, bucket_no) == 4);
+const _: () = assert!(std::mem::offset_of!(BlockRef, generation) == 8);
+const _: () = assert!(std::mem::offset_of!(BlockRef, _reserved) == 12);
+// A sector of the largest (256 MiB, 2^28) bucket fits `sector: u16`.
+const _: () = assert!((1u64 << 28) / 4096 - 1 == u16::MAX as u64);
+// Bucket 2^32 − 1 of the largest bucket size stays inside u64.
+const _: () = assert!(((u32::MAX as u64) << 28) + (u16::MAX as u64) * 4096 < u64::MAX);
+
+// ENGINE-DESIGN§1.2 NodePtr — R BlockRefs (R = metadata_replicas, 1..=4), 16 × R bytes.
+pub const MAX_METADATA_REPLICAS: usize = 4;
+pub const fn node_ptr_size(replicas: usize) -> usize {
+    size_of::<BlockRef>() * replicas
+}
+const _: () = assert!(node_ptr_size(1) == 16);
+const _: () = assert!(node_ptr_size(2) == 32);
+const _: () = assert!(node_ptr_size(MAX_METADATA_REPLICAS) == 64);
 
 // =====================================================================
 // FORMAT-DESIGN§1.3 BlockPreamble — 8 B (shared by BlockHeader and BtreeNodeHeader)
@@ -606,16 +626,20 @@ const _: () = assert!(std::mem::offset_of!(ObjectRecord, relation_count) == 86);
 // =====================================================================
 pub const OVERFLOW_ATTR_FLAG_SPILL: u8 = 1 << 0;
 
-// Placeholder layout for BlobRef (INDEX-DESIGN§1.1 / INDEX-DESIGN§4.3 — 16 bytes; the doc fixes
-// only its size and three logical fields, not the on-disk pad arrangement).
+// ENGINE-DESIGN§1.2 BlobRef — 16 B, bucket-relative; a length in place of a generation.
 #[repr(C)]
 pub struct BlobRef {
-    pub disk_id: u16,
-    pub _pad: u16,
-    pub block_no: u32,
-    pub length: u64,
+    pub disk_id: u16,        //  [0..2]
+    pub sector: u16,         //  [2..4]
+    pub bucket_no: u32,      //  [4..8]
+    pub length: u64,         //  [8..16]  bytes
 }
 const _: () = assert!(size_of::<BlobRef>() == 16);
+const _: () = assert!(std::mem::align_of::<BlobRef>() == 8);
+const _: () = assert!(std::mem::offset_of!(BlobRef, disk_id) == 0);
+const _: () = assert!(std::mem::offset_of!(BlobRef, sector) == 2);
+const _: () = assert!(std::mem::offset_of!(BlobRef, bucket_no) == 4);
+const _: () = assert!(std::mem::offset_of!(BlobRef, length) == 8);
 
 #[repr(C)]
 pub struct OverflowAttrHead {                // 16 B common prefix
@@ -725,7 +749,7 @@ const _: () = assert!(size_of::<PackedAssertion>() == 16);
 #[repr(C)]
 pub struct TagIndexLeafEntry {
     pub last_modify_lsn: u64,    //  8 @  0   (8-aligned)
-    pub store_root: BlockRef,    // 16 @  8   (8-aligned; BlockRef contains a u64)
+    pub store_root: BlockRef,    // 16 @  8   (4-aligned BlockRef at an 8-aligned offset)
     pub tag_id: u32,             //  4 @ 24   sort key
     pub snapshot: u32,           //  4 @ 28   sort key (suffix); SNAPSHOTS-DESIGN§1.2
     pub cardinality: u32,        //  4 @ 32

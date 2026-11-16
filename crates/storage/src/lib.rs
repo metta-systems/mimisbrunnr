@@ -25,6 +25,7 @@ mod error;
 mod file_device;
 mod freespace;
 mod journal_pin;
+mod node_ptr;
 pub mod page_region;
 mod preamble;
 pub mod region;
@@ -33,7 +34,10 @@ mod superblock;
 mod zone_map;
 
 pub use {
-    addressing::block_no_to_bucket,
+    addressing::{
+        DiskAddressing, MAX_BUCKET_SIZE_LOG2, bucket_relative_byte_offset, split_byte_offset,
+    },
+    node_ptr::{MAX_METADATA_REPLICAS, NODE_PTR_COPY_SIZE, NodePtr, ReplicaRead},
     alloc::{
         BUCKET_ALLOC_ENTRY_SIZE, BUCKET_ALLOC_REGION_SIZE, BUCKET_FLAG_NEEDS_DISCARD,
         BucketAllocEntry, BucketAllocTable,

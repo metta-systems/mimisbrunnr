@@ -5,35 +5,52 @@ use {
     static_assertions::const_assert_eq,
 };
 
-use crate::error::StorageError;
+use crate::{
+    addressing::{bucket_relative_byte_offset, split_byte_offset},
+    error::StorageError,
+};
 
 // ---------- BlockRef ----------
 
-/// 16-byte self-validating reference to a 4 KiB block.
-#[repr(C, packed)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug, Eq, PartialEq, Default)]
+/// 16-byte bucket-relative, generation-checked reference to a 4 KiB sector:
+/// a tree node or region. ENGINE-DESIGN§1.2, ALLOCATION-DESIGN§1.3.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Eq, PartialEq, Hash, Default)]
 pub struct BlockRef {
     pub disk_id: u16,    // [0..2]
-    pub _pad: u16,       // [2..4]
-    pub block_no: u32,   // [4..8]
-    pub generation: u64, // [8..16]
+    pub sector: u16,     // [2..4]   4 KiB sector within the bucket
+    pub bucket_no: u32,  // [4..8]
+    pub generation: u32, // [8..12]  bucket generation at write time
+    pub _reserved: u32,  // [12..16] zero
 }
 
 const_assert_eq!(core::mem::size_of::<BlockRef>(), 16);
+const_assert_eq!(core::mem::align_of::<BlockRef>(), 4);
+const_assert_eq!(core::mem::offset_of!(BlockRef, disk_id), 0);
+const_assert_eq!(core::mem::offset_of!(BlockRef, sector), 2);
+const_assert_eq!(core::mem::offset_of!(BlockRef, bucket_no), 4);
+const_assert_eq!(core::mem::offset_of!(BlockRef, generation), 8);
+const_assert_eq!(core::mem::offset_of!(BlockRef, _reserved), 12);
 
 // ---------- BlobRef ----------
 
-/// 16-byte reference to a contiguous byte extent in the blob zone.
-#[repr(C, packed)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug, Eq, PartialEq, Default)]
+/// 16-byte bucket-relative reference to a payload extent: a length in place
+/// of a generation. ENGINE-DESIGN§1.2.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Eq, PartialEq, Hash, Default)]
 pub struct BlobRef {
-    pub disk_id: u16,  // [0..2]
-    pub _pad: u16,     // [2..4]
-    pub block_no: u32, // [4..8]
-    pub length: u64,   // [8..16]   length in bytes
+    pub disk_id: u16,   // [0..2]
+    pub sector: u16,    // [2..4]
+    pub bucket_no: u32, // [4..8]
+    pub length: u64,    // [8..16]  bytes
 }
 
 const_assert_eq!(core::mem::size_of::<BlobRef>(), 16);
+const_assert_eq!(core::mem::align_of::<BlobRef>(), 8);
+const_assert_eq!(core::mem::offset_of!(BlobRef, disk_id), 0);
+const_assert_eq!(core::mem::offset_of!(BlobRef, sector), 2);
+const_assert_eq!(core::mem::offset_of!(BlobRef, bucket_no), 4);
+const_assert_eq!(core::mem::offset_of!(BlobRef, length), 8);
 
 // ---------- RootPointer ----------
 
@@ -106,23 +123,82 @@ impl RootPointer {
 }
 
 impl BlockRef {
-    /// Construct a new `BlockRef`.
-    pub fn new(disk_id: u16, block_no: u32, generation: u64) -> Self {
+    /// Construct a new `BlockRef` to `sector` of bucket `bucket_no`.
+    pub fn new(disk_id: u16, bucket_no: u32, sector: u16, generation: u32) -> Self {
         Self {
             disk_id,
-            _pad: 0,
-            block_no,
+            sector,
+            bucket_no,
             generation,
+            _reserved: 0,
         }
+    }
+
+    /// The reference to the 4 KiB-aligned byte `offset` of disk `disk_id`,
+    /// whose buckets are `2^bucket_size_log2` bytes. Fails with
+    /// [`StorageError::UnalignedBlockOffset`] or
+    /// [`StorageError::BlockOffsetUnaddressable`].
+    pub fn from_byte_offset(
+        disk_id: u16,
+        offset: u64,
+        bucket_size_log2: u8,
+        generation: u32,
+    ) -> Result<Self, StorageError> {
+        let (bucket_no, sector) = split_byte_offset(offset, bucket_size_log2)?;
+        Ok(Self::new(disk_id, bucket_no, sector, generation))
+    }
+
+    /// Byte offset on its disk: `(bucket_no << bucket_size_log2) + sector × 4096`.
+    pub fn byte_offset(&self, bucket_size_log2: u8) -> u64 {
+        bucket_relative_byte_offset(self.bucket_no, self.sector, bucket_size_log2)
+    }
+
+    /// Whether this is the all-zero reference, used as "no block". Takes
+    /// `self` by value so it reads a field of a packed struct directly.
+    pub fn is_null(self) -> bool {
+        self == Self::zeroed()
     }
 
     /// Generation check: the pointer is fresh iff its `generation` matches
     /// the bucket's current generation. Returns `true` when fresh.
     /// ALLOCATION-DESIGN§1.3.
     pub fn dereference_check(&self, alloc: &crate::alloc::BucketAllocEntry) -> bool {
-        let bucket_gen = { alloc.generation } as u64;
-        let ref_gen = { self.generation };
-        bucket_gen == ref_gen
+        alloc.generation == self.generation
+    }
+}
+
+impl BlobRef {
+    /// Construct a new `BlobRef` of `length` bytes from `sector` of bucket
+    /// `bucket_no`.
+    pub fn new(disk_id: u16, bucket_no: u32, sector: u16, length: u64) -> Self {
+        Self {
+            disk_id,
+            sector,
+            bucket_no,
+            length,
+        }
+    }
+
+    /// The extent of `length` bytes at the 4 KiB-aligned byte `offset` of
+    /// disk `disk_id`. Fails as [`BlockRef::from_byte_offset`] does.
+    pub fn from_byte_offset(
+        disk_id: u16,
+        offset: u64,
+        bucket_size_log2: u8,
+        length: u64,
+    ) -> Result<Self, StorageError> {
+        let (bucket_no, sector) = split_byte_offset(offset, bucket_size_log2)?;
+        Ok(Self::new(disk_id, bucket_no, sector, length))
+    }
+
+    /// Byte offset of the extent's start on its disk.
+    pub fn byte_offset(&self, bucket_size_log2: u8) -> u64 {
+        bucket_relative_byte_offset(self.bucket_no, self.sector, bucket_size_log2)
+    }
+
+    /// Whether this is the all-zero reference, used as "no extent".
+    pub fn is_null(self) -> bool {
+        self == Self::zeroed()
     }
 }
 
@@ -159,10 +235,78 @@ mod tests {
     fn generation_check_matches_and_mismatches() {
         use crate::alloc::{BucketAllocEntry, BucketKind};
         let alloc = BucketAllocEntry::new(42, BucketKind::Node, 0, 0);
-        let fresh = BlockRef::new(0, 1024, 42);
+        let fresh = BlockRef::new(0, 4, 0, 42);
         assert!(fresh.dereference_check(&alloc));
-        let stale = BlockRef::new(0, 1024, 41);
+        let stale = BlockRef::new(0, 4, 0, 41);
         assert!(!stale.dereference_check(&alloc));
+    }
+
+    /// 1 MiB buckets.
+    const ONE_MIB_BUCKET_LOG2: u8 = 20;
+
+    #[test]
+    fn block_ref_into_last_bucket_of_one_mib_disk_round_trips() {
+        let last_bucket = u32::MAX;
+        for sector in [0u16, 1, 255] {
+            let block_ref = BlockRef::new(7, last_bucket, sector, 0xdead_beef);
+            let offset = block_ref.byte_offset(ONE_MIB_BUCKET_LOG2);
+            assert_eq!(offset, (u64::from(last_bucket) << 20) + u64::from(sector) * 4096);
+            let back = BlockRef::from_byte_offset(7, offset, ONE_MIB_BUCKET_LOG2, 0xdead_beef).unwrap();
+            assert_eq!(back, block_ref);
+        }
+    }
+
+    #[test]
+    fn blob_ref_into_last_bucket_of_one_mib_disk_round_trips() {
+        let blob_ref = BlobRef::new(2, u32::MAX, 255, 12_345);
+        let offset = blob_ref.byte_offset(ONE_MIB_BUCKET_LOG2);
+        assert_eq!(BlobRef::from_byte_offset(2, offset, ONE_MIB_BUCKET_LOG2, 12_345).unwrap(), blob_ref);
+    }
+
+    #[test]
+    fn from_byte_offset_rejects_unaligned_and_unaddressable_offsets() {
+        assert!(matches!(
+            BlockRef::from_byte_offset(0, 4095, ONE_MIB_BUCKET_LOG2, 1),
+            Err(StorageError::UnalignedBlockOffset { offset: 4095 })
+        ));
+        assert!(matches!(
+            BlockRef::from_byte_offset(0, 1u64 << 52, ONE_MIB_BUCKET_LOG2, 1),
+            Err(StorageError::BlockOffsetUnaddressable { .. })
+        ));
+        // A 512 MiB bucket has sectors beyond u16.
+        assert!(matches!(
+            BlobRef::from_byte_offset(0, 0, 29, 1),
+            Err(StorageError::BlockOffsetUnaddressable { bucket_size_log2: 29, .. })
+        ));
+    }
+
+    #[test]
+    fn block_ref_encodes_to_fixed_bytes() {
+        let block_ref = BlockRef::new(0x0102, 0x0708_090a, 0x0304, 0x1112_1314);
+        assert_eq!(
+            bytemuck::bytes_of(&block_ref),
+            &[
+                0x02, 0x01, // disk_id
+                0x04, 0x03, // sector
+                0x0a, 0x09, 0x08, 0x07, // bucket_no
+                0x14, 0x13, 0x12, 0x11, // generation
+                0x00, 0x00, 0x00, 0x00, // _reserved
+            ]
+        );
+    }
+
+    #[test]
+    fn blob_ref_encodes_to_fixed_bytes() {
+        let blob_ref = BlobRef::new(0x0102, 0x0708_090a, 0x0304, 0x1112_1314_1516_1718);
+        assert_eq!(
+            bytemuck::bytes_of(&blob_ref),
+            &[
+                0x02, 0x01, // disk_id
+                0x04, 0x03, // sector
+                0x0a, 0x09, 0x08, 0x07, // bucket_no
+                0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, // length
+            ]
+        );
     }
 
     #[test]

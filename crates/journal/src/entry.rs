@@ -242,30 +242,33 @@ impl WalOpKind {
 
 // ---------- BlockRef wire helper for CBOR ----------
 
-/// CBOR-friendly mirror of [`mimisbrunnr_storage::BlockRef`]. The on-disk
-/// `BlockRef` is `#[repr(C, packed)]` (16 B) and not directly serde-compatible
-/// without a deterministic schema; we surface its three fields explicitly so
-/// CBOR carries the same shape every build.
+/// CBOR-friendly mirror of [`mimisbrunnr_storage::BlockRef`]
+/// (ENGINE-DESIGN§1.2). The on-disk `BlockRef` is a 16 B `#[repr(C)]` struct
+/// and not directly serde-compatible without a deterministic schema; we
+/// surface its fields explicitly so CBOR carries the same shape every build.
+/// The reserved word is always zero and is not carried.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BlockRefWire {
     pub disk_id: u16,
-    pub block_no: u32,
-    pub generation: u64,
+    pub sector: u16,
+    pub bucket_no: u32,
+    pub generation: u32,
 }
 
 impl From<BlockRef> for BlockRefWire {
-    fn from(b: BlockRef) -> Self {
+    fn from(block_ref: BlockRef) -> Self {
         Self {
-            disk_id: { b.disk_id },
-            block_no: { b.block_no },
-            generation: { b.generation },
+            disk_id: block_ref.disk_id,
+            sector: block_ref.sector,
+            bucket_no: block_ref.bucket_no,
+            generation: block_ref.generation,
         }
     }
 }
 
 impl From<BlockRefWire> for BlockRef {
-    fn from(w: BlockRefWire) -> Self {
-        BlockRef::new(w.disk_id, w.block_no, w.generation)
+    fn from(wire: BlockRefWire) -> Self {
+        BlockRef::new(wire.disk_id, wire.bucket_no, wire.sector, wire.generation)
     }
 }
 
@@ -788,12 +791,19 @@ mod tests {
 
     #[test]
     fn block_ref_wire_round_trip() {
-        let raw = BlockRef::new(3, 1024, 99);
-        let w: BlockRefWire = raw.into();
-        let back: BlockRef = w.into();
-        assert_eq!({ back.disk_id }, 3);
-        assert_eq!({ back.block_no }, 1024);
-        assert_eq!({ back.generation }, 99);
+        let raw = BlockRef::new(3, u32::MAX, 17, 99);
+        let wire: BlockRefWire = raw.into();
+        assert_eq!(
+            wire,
+            BlockRefWire {
+                disk_id: 3,
+                sector: 17,
+                bucket_no: u32::MAX,
+                generation: 99,
+            }
+        );
+        let back: BlockRef = wire.into();
+        assert_eq!(back, raw);
     }
 
     #[test]
@@ -847,20 +857,20 @@ mod tests {
             WalOp::WriteBlob(WriteBlob {
                 oid: 1,
                 content_hash: [0xab; 32],
-                extent: BlockRef::new(0, 100, 1).into(),
+                extent: BlockRef::new(0, 100, 0, 1).into(),
                 size: 4096,
             }),
             WalOp::ChunkInsertBatch(ChunkInsertBatch {
                 chunks: vec![ChunkInsertEntry {
                     chunk_hash: [0xcd; 32],
-                    extent: BlockRef::new(0, 200, 1).into(),
+                    extent: BlockRef::new(0, 200, 0, 1).into(),
                     length: 64 * 1024,
                 }],
             }),
             WalOp::ChunkListAppend(ChunkListAppend {
                 oid: 1,
                 position_start: 0,
-                region: BlockRef::new(0, 300, 1).into(),
+                region: BlockRef::new(0, 300, 0, 1).into(),
                 count: 1024,
             }),
             WalOp::ChunkListReplace(ChunkListReplace {
@@ -876,7 +886,7 @@ mod tests {
                 oid: 1,
                 content_hash: [9u8; 32],
                 total_length: 100,
-                list_head: BlockRef::new(0, 1, 1).into(),
+                list_head: BlockRef::new(0, 1, 0, 1).into(),
             }),
             WalOp::BucketAlloc(BucketAlloc {
                 disk_id: 0,
@@ -906,7 +916,7 @@ mod tests {
                 tag_id: 1,
                 snapshot: 0,
                 store_kind: 0,
-                new_root: BlockRef::new(0, 1, 1).into(),
+                new_root: BlockRef::new(0, 1, 0, 1).into(),
             }),
             WalOp::TagBitmapShrink(TagBitmapShrink {
                 tag_id: 1,
@@ -947,8 +957,8 @@ mod tests {
                 work_kind: 0,
             }),
             WalOp::ReconcileMove(ReconcileMove {
-                from_loc: BlockRef::new(0, 1, 1).into(),
-                to_loc: BlockRef::new(0, 2, 1).into(),
+                from_loc: BlockRef::new(0, 1, 0, 1).into(),
+                to_loc: BlockRef::new(0, 2, 0, 1).into(),
                 owner_key: vec![1; 16],
             }),
             WalOp::ReconcileScanStep(ReconcileScanStep {

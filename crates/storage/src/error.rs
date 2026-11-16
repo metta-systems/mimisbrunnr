@@ -96,7 +96,40 @@ pub enum StorageError {
     /// `BlockRef.generation` did not match the live
     /// `BucketAllocEntry.generation` — the reference is stale.
     #[error("stale BlockRef: expected generation {expected}, actual {actual}")]
-    StaleBlockRef { expected: u64, actual: u64 },
+    StaleBlockRef { expected: u32, actual: u32 },
+
+    /// A byte offset given for a `BlockRef` / `BlobRef` is not 4 KiB aligned.
+    #[error("byte offset {offset} is not 4 KiB aligned")]
+    UnalignedBlockOffset { offset: u64 },
+
+    /// A byte offset cannot be named bucket-relatively: the bucket size is
+    /// outside 4 KiB..=256 MiB, or the bucket number does not fit `u32`.
+    #[error("byte offset {offset} is not addressable with 2^{bucket_size_log2}-byte buckets")]
+    BlockOffsetUnaddressable { offset: u64, bucket_size_log2: u8 },
+
+    /// A `BlockRef`'s reserved word is not zero.
+    #[error("BlockRef reserved word is {reserved:#010x}, expected zero")]
+    BlockRefReservedNonZero { reserved: u32 },
+
+    /// A `NodePtr` replica count outside `1..=4`.
+    #[error("node pointer replica count {replicas} is outside 1..=4")]
+    InvalidReplicaCount { replicas: usize },
+
+    /// Two copies of one `NodePtr` name the same disk.
+    #[error("node pointer names disk {disk_id} twice")]
+    DuplicateReplicaDisk { disk_id: u16 },
+
+    /// An encoded `NodePtr` is not `16 × R` bytes.
+    #[error("node pointer encoding is {actual} bytes, expected {expected}")]
+    NodePtrLengthMismatch { expected: usize, actual: usize },
+
+    /// No copy of a node verified: every copy failed to read or to check.
+    #[error("none of the node's {replicas} copies verified")]
+    NoReplicaVerified { replicas: usize },
+
+    /// A disk id the pool does not know.
+    #[error("unknown disk {disk_id}")]
+    UnknownDisk { disk_id: u16 },
 
     /// `BlockRef.disk_id` doesn't match the allocator's disk.
     #[error(

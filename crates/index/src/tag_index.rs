@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use {
     bytemuck::{Pod, Zeroable},
     mimisbrunnr_storage::{
-        BLOCK_SIZE, BlockDevice, BlockRef, BtreeKind, StorageError,
+        BLOCK_SIZE, BlockDevice, BlockRef, BtreeKind, DiskAddressing, StorageError,
         region::{FieldKind, Region, RegionKey, RegionParams, RunEntry},
     },
     mimisbrunnr_types::{ObjectId, TagId},
@@ -355,11 +355,15 @@ impl TagIndex {
     ///   permitted in the bitmap area; flush errors with
     ///   [`IndexError::BitmapAreaExhausted`] when a chain would overflow it.
     ///
+    /// - `addressing` names `device`'s disk and bucket size, so each
+    ///   page's byte offset becomes a bucket-relative `BlockRef`.
+    ///
     /// Returns the count of bitmap pages written so callers can record
     /// the live extent.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
+        addressing: DiskAddressing,
         dir_offset: u64,
         bitmap_area_offset: u64,
         bitmap_area_cap_pages: usize,
@@ -402,6 +406,7 @@ impl TagIndex {
 
             let store_root = write_bitmap_chain(
                 device,
+                addressing,
                 bitmap_area_offset,
                 bitmap_area_cap_pages,
                 &mut next_page_slot,
@@ -448,9 +453,11 @@ impl TagIndex {
     /// membership bitmap.
     ///
     /// An all-zero directory region is treated as "empty index" and
-    /// returns [`Self::default`].
+    /// returns [`Self::default`]. `addressing` turns each page's
+    /// `BlockRef` back into a byte offset on `device`.
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
+        addressing: DiskAddressing,
         dir_offset: u64,
     ) -> Result<Self, IndexError> {
         let mut probe = [0u8; 8];
@@ -464,7 +471,7 @@ impl TagIndex {
             .into_iter()
             .map(|(key, value)| Ok((key, TagIndexValue::from_bytes(&value)?)))
             .collect::<Result<Vec<_>, StorageError>>()?;
-        Self::from_leaf_entries(&entries, |head| read_bitmap_chain(device, head))
+        Self::from_leaf_entries(&entries, |head| read_bitmap_chain(device, addressing, head))
     }
 }
 
@@ -480,6 +487,7 @@ impl TagIndex {
 /// `cap_pages` is the maximum number of slots in the area.
 fn write_bitmap_chain<D: BlockDevice>(
     device: &D,
+    addressing: DiskAddressing,
     bitmap_area_offset: u64,
     cap_pages: usize,
     next_slot: &mut usize,
@@ -524,12 +532,12 @@ fn write_bitmap_chain<D: BlockDevice>(
         let mut page = TagBitmapPage::from_bytes_chunk(chunk, next_link);
         page.write(device, byte_offset)
             .map_err(|e| IndexError::Roaring(e.to_string()))?;
-        next_link = block_ref_at(byte_offset);
+        next_link = block_ref_at(addressing, byte_offset)?;
     }
 
     // Head sits at `assigned[0]`.
     let head_offset = bitmap_area_offset + (assigned[0] as u64) * BLOCK_SIZE as u64;
-    Ok(block_ref_at(head_offset))
+    block_ref_at(addressing, head_offset)
 }
 
 /// Walk the [`TagBitmapPage`] chain rooted at `head`, concatenate each
@@ -537,13 +545,13 @@ fn write_bitmap_chain<D: BlockDevice>(
 /// as a roaring bitmap.
 fn read_bitmap_chain<D: BlockDevice>(
     device: &D,
+    addressing: DiskAddressing,
     head: BlockRef,
 ) -> Result<RoaringBitmap, IndexError> {
     let mut buf: Vec<u8> = Vec::new();
     let mut cur = head;
-    let zero = BlockRef::zeroed();
-    while cur != zero {
-        let offset = (cur.block_no as u64) * BLOCK_SIZE as u64;
+    while !cur.is_null() {
+        let offset = addressing.block_offset(&cur)?;
         let page = TagBitmapPage::read(device, offset)
             .map_err(|e| IndexError::Roaring(e.to_string()))?;
         buf.extend_from_slice(page.bitmap_slice());
@@ -557,15 +565,10 @@ fn read_bitmap_chain<D: BlockDevice>(
 }
 
 /// Construct a `BlockRef` pointing at the 4 KiB block whose byte offset is
-/// `byte_offset`. `generation = 1` is a placeholder; ENGINE3 will
-/// bump generation per allocation.
-fn block_ref_at(byte_offset: u64) -> BlockRef {
-    BlockRef {
-        disk_id: 0,
-        _pad: 0,
-        block_no: (byte_offset / BLOCK_SIZE as u64) as u32,
-        generation: 1,
-    }
+/// `byte_offset`. `generation = 1` is a placeholder until the pages live in
+/// allocated buckets (TODO(ENGINE3)).
+fn block_ref_at(addressing: DiskAddressing, byte_offset: u64) -> Result<BlockRef, IndexError> {
+    Ok(addressing.block_ref(byte_offset, 1)?)
 }
 
 // ---------- TagIndexKey (region key) ----------
@@ -701,9 +704,16 @@ mod tests {
         (dir, dev)
     }
 
+    /// Disk 0 with 64 KiB buckets, so the test layout spans several buckets.
+    const TEST_ADDRESSING: DiskAddressing = DiskAddressing {
+        disk_id: 0,
+        bucket_size_log2: 16,
+    };
+
     fn flush(idx: &TagIndex, dev: &FileBlockDevice) -> Result<usize, IndexError> {
         idx.flush_to_region(
             dev,
+            TEST_ADDRESSING,
             TEST_DIR_OFFSET,
             TEST_BITMAP_AREA_OFFSET,
             TEST_BITMAP_AREA_PAGES,
@@ -711,7 +721,7 @@ mod tests {
     }
 
     fn load(dev: &FileBlockDevice) -> Result<TagIndex, IndexError> {
-        TagIndex::load_from_region(dev, TEST_DIR_OFFSET)
+        TagIndex::load_from_region(dev, TEST_ADDRESSING, TEST_DIR_OFFSET)
     }
 
     #[test]
@@ -831,18 +841,18 @@ mod tests {
 
         // Walk the chain manually to verify linkage.
         let mut chain_len = 0usize;
-        let mut cur = BlockRef {
-            disk_id: 0,
-            _pad: 0,
-            block_no: (TEST_BITMAP_AREA_OFFSET / BLOCK_SIZE as u64) as u32,
-            generation: 1,
-        };
-        let zero = BlockRef::zeroed();
-        while cur != zero {
-            let page = TagBitmapPage::read(&dev, (cur.block_no as u64) * BLOCK_SIZE as u64)
-                .unwrap();
+        let mut cur = TEST_ADDRESSING.block_ref(TEST_BITMAP_AREA_OFFSET, 1).unwrap();
+        // 256 KiB into a 64 KiB-bucket disk: bucket 4, sector 0.
+        assert_eq!((cur.bucket_no, cur.sector), (4, 0));
+        while !cur.is_null() {
+            let page = TagBitmapPage::read(&dev, TEST_ADDRESSING.block_offset(&cur).unwrap()).unwrap();
             chain_len += 1;
             cur = page.next_link();
+            if !cur.is_null() {
+                // Successive slots of the area, bucket-relative.
+                let slot_offset = TEST_BITMAP_AREA_OFFSET + (chain_len * BLOCK_SIZE) as u64;
+                assert_eq!(cur, TEST_ADDRESSING.block_ref(slot_offset, 1).unwrap());
+            }
             assert!(chain_len <= TEST_BITMAP_AREA_PAGES, "infinite loop guard");
         }
         assert_eq!(chain_len, pages);
@@ -863,7 +873,7 @@ mod tests {
             idx.add_member(t(tag_no), oid(0));
         }
         let err = idx
-            .flush_to_region(&dev, TEST_DIR_OFFSET, TEST_BITMAP_AREA_OFFSET, TEST_BITMAP_AREA_PAGES)
+            .flush_to_region(&dev, TEST_ADDRESSING, TEST_DIR_OFFSET, TEST_BITMAP_AREA_OFFSET, TEST_BITMAP_AREA_PAGES)
             .unwrap_err();
         assert!(matches!(err, IndexError::BitmapAreaExhausted { .. }));
     }

@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use {
     bytemuck::{Pod, Zeroable},
-    mimisbrunnr_storage::BlockDevice,
+    mimisbrunnr_storage::{BlockDevice, BlockRef, DiskAddressing},
     mimisbrunnr_types::{TagId, Value, value_hash},
     roaring::RoaringBitmap,
     serde::{Deserialize, Serialize},
@@ -224,20 +224,26 @@ impl KvIndex {
     /// real spec capacity (~9 000 entries per region with global_depth
     /// ≥ 4 + bucket_alloc-driven page pool) needs sub-bucket
     /// allocation (INDEX4) to move bitmap pages out of the kv_index_root region.
+    ///
+    /// `addressing` names `device`'s disk and bucket size, so each block's
+    /// byte offset becomes a bucket-relative `BlockRef`.
     pub fn flush_to_region<D: BlockDevice>(
         &self,
         device: &D,
+        addressing: DiskAddressing,
         offset: u64,
     ) -> Result<(), IndexError> {
-        flush_extendible_hash(self, device, offset)
+        flush_extendible_hash(self, device, addressing, offset)
     }
 
     /// Read the in-memory state from the 256 KiB region at byte `offset`
     /// on `device`. An all-zero region returns [`Self::default`].
     ///
-    /// Reads via the native extendible-hash layout.
+    /// Reads via the native extendible-hash layout; `addressing` turns each
+    /// `BlockRef` back into a byte offset on `device`.
     pub fn load_from_region<D: BlockDevice>(
         device: &D,
+        addressing: DiskAddressing,
         offset: u64,
     ) -> Result<Self, IndexError> {
         let mut probe = [0u8; 8];
@@ -245,7 +251,7 @@ impl KvIndex {
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        load_extendible_hash(device, offset)
+        load_extendible_hash(device, addressing, offset)
     }
 }
 
@@ -285,20 +291,18 @@ fn select_global_depth(entry_count: usize) -> u8 {
     depth
 }
 
-fn slot_block_ref(region_offset: u64, slot_idx: usize, disk_id: u16) -> mimisbrunnr_storage::BlockRef {
-    let absolute = region_offset + (slot_idx as u64) * SLOT_SIZE;
-    let block_no = (absolute / SLOT_SIZE) as u32;
-    mimisbrunnr_storage::BlockRef {
-        disk_id,
-        _pad: 0,
-        block_no,
-        generation: 1,
-    }
+/// The `BlockRef` of slot `slot_idx` of the region at `region_offset`.
+/// `generation = 1` is a placeholder until the blocks live in allocated
+/// buckets (TODO(ENGINE3)).
+fn slot_block_ref(addressing: DiskAddressing, region_offset: u64, slot_idx: usize) -> Result<BlockRef, IndexError> {
+    let slot_offset = region_offset + (slot_idx as u64) * SLOT_SIZE;
+    Ok(addressing.block_ref(slot_offset, 1)?)
 }
 
 fn flush_extendible_hash<D: BlockDevice>(
     idx: &KvIndex,
     device: &D,
+    addressing: DiskAddressing,
     offset: u64,
 ) -> Result<(), IndexError> {
     let entry_count = idx.entries.len();
@@ -337,7 +341,7 @@ fn flush_extendible_hash<D: BlockDevice>(
     let bitmap_slot_base = 1 + bucket_count;
     for (i, ((tag, value_hash), bm_serde)) in sorted_entries.iter().enumerate() {
         let bitmap_slot = bitmap_slot_base + i;
-        let bitmap_block_ref = slot_block_ref(offset, bitmap_slot, 0);
+        let bitmap_block_ref = slot_block_ref(addressing, offset, bitmap_slot)?;
         let bitmap_byte_offset = offset + (bitmap_slot as u64) * SLOT_SIZE;
         let mut page = crate::tag_bitmap_page::TagBitmapPage::from_bitmap(&bm_serde.0)
             .map_err(|e| IndexError::Roaring(e.to_string()))?;
@@ -369,7 +373,7 @@ fn flush_extendible_hash<D: BlockDevice>(
         .map_err(|e| IndexError::Roaring(e.to_string()))?;
     for bucket_idx in 0..bucket_count {
         let slot_idx = 1 + bucket_idx;
-        let bucket_block_ref = slot_block_ref(offset, slot_idx, 0);
+        let bucket_block_ref = slot_block_ref(addressing, offset, slot_idx)?;
         dir.set_entry(bucket_idx as u32, bucket_block_ref);
     }
     dir.write(device, offset)
@@ -380,6 +384,7 @@ fn flush_extendible_hash<D: BlockDevice>(
 
 fn load_extendible_hash<D: BlockDevice>(
     device: &D,
+    addressing: DiskAddressing,
     offset: u64,
 ) -> Result<KvIndex, IndexError> {
     use crate::{kv_bucket::KvBucketBlock, kv_directory::KvDirectoryBlock, tag_bitmap_page::TagBitmapPage};
@@ -389,31 +394,29 @@ fn load_extendible_hash<D: BlockDevice>(
     let bucket_count = dir.count() as usize;
 
     let mut entries: HashMap<(TagId, u64), RoaringBitmapSerde> = HashMap::new();
-    let mut seen_buckets: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut seen_buckets: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for dir_idx in 0..bucket_count as u32 {
         let bucket_ref = dir.get_entry(dir_idx);
-        let bucket_block_no = { bucket_ref.block_no };
-        if bucket_block_no == 0 {
+        if bucket_ref.is_null() {
             // Unused slot (extendible-hash directory may map multiple
             // entries to fewer buckets pre-R1c-A1's 1:1 layout, but the
             // unused-slot guard catches drift).
             continue;
         }
+        let bucket_byte_offset = addressing.block_offset(&bucket_ref)?;
         // De-dup: when global_depth grows but local_depth lags, multiple
         // dir entries point at the same bucket.
-        if !seen_buckets.insert(bucket_block_no) {
+        if !seen_buckets.insert(bucket_byte_offset) {
             continue;
         }
-        let bucket_byte_offset = (bucket_block_no as u64) * SLOT_SIZE;
         let bucket = KvBucketBlock::read(device, bucket_byte_offset)
             .map_err(|e| IndexError::Roaring(e.to_string()))?;
         for entry in bucket.iter() {
             let bitmap_ref = entry.bitmap_ref;
-            let bitmap_block_no = { bitmap_ref.block_no };
-            if bitmap_block_no == 0 {
+            if bitmap_ref.is_null() {
                 continue;
             }
-            let bitmap_byte_offset = (bitmap_block_no as u64) * SLOT_SIZE;
+            let bitmap_byte_offset = addressing.block_offset(&bitmap_ref)?;
             let page = TagBitmapPage::read(device, bitmap_byte_offset)
                 .map_err(|e| IndexError::Roaring(e.to_string()))?;
             let bm = page
@@ -541,11 +544,25 @@ mod tests {
         (dir, dev)
     }
 
+    /// Disk 0 with 64 KiB buckets, so the 256 KiB region spans four buckets.
+    const TEST_ADDRESSING: DiskAddressing = DiskAddressing {
+        disk_id: 0,
+        bucket_size_log2: 16,
+    };
+
+    fn flush(idx: &KvIndex, dev: &FileBlockDevice) {
+        idx.flush_to_region(dev, TEST_ADDRESSING, 0).unwrap();
+    }
+
+    fn load(dev: &FileBlockDevice) -> KvIndex {
+        KvIndex::load_from_region(dev, TEST_ADDRESSING, 0).unwrap()
+    }
+
     #[test]
     fn region_round_trip_flushed_empty_index() {
         let (_dir, dev) = fresh_device();
-        KvIndex::new().flush_to_region(&dev, 0).unwrap();
-        let back = KvIndex::load_from_region(&dev, 0).unwrap();
+        flush(&KvIndex::new(), &dev);
+        let back = load(&dev);
         assert_eq!(back.entry_count(), 0);
     }
 
@@ -557,8 +574,8 @@ mod tests {
         idx.insert(t(1), &Value::Int(42), 101);
         idx.insert(t(1), &Value::Int(7), 200);
         idx.insert(t(2), &Value::Text("foo".into()), 300);
-        idx.flush_to_region(&dev, 0).unwrap();
-        let back = KvIndex::load_from_region(&dev, 0).unwrap();
+        flush(&idx, &dev);
+        let back = load(&dev);
         assert_eq!(back.entry_count(), 3);
         let bm = back.lookup(t(1), &Value::Int(42));
         assert!(bm.contains(100));
@@ -570,7 +587,7 @@ mod tests {
     #[test]
     fn region_round_trip_empty_returns_default() {
         let (_dir, dev) = fresh_device();
-        let idx = KvIndex::load_from_region(&dev, 0).unwrap();
+        let idx = load(&dev);
         assert_eq!(idx.entry_count(), 0);
     }
 
@@ -587,8 +604,8 @@ mod tests {
             }
         }
         assert_eq!(idx.entry_count(), 50);
-        idx.flush_to_region(&dev, 0).unwrap();
-        let back = KvIndex::load_from_region(&dev, 0).unwrap();
+        flush(&idx, &dev);
+        let back = load(&dev);
         assert_eq!(back.entry_count(), 50);
         for i in 0u32..50 {
             let v = Value::Int(i as i64 * 13 + 1);
@@ -606,13 +623,13 @@ mod tests {
         let mut first = KvIndex::new();
         first.insert(t(1), &Value::Int(1), 11);
         first.insert(t(1), &Value::Int(2), 22);
-        first.flush_to_region(&dev, 0).unwrap();
+        flush(&first, &dev);
 
         let mut second = KvIndex::new();
         second.insert(t(9), &Value::Int(99), 999);
-        second.flush_to_region(&dev, 0).unwrap();
+        flush(&second, &dev);
 
-        let back = KvIndex::load_from_region(&dev, 0).unwrap();
+        let back = load(&dev);
         assert_eq!(back.entry_count(), 1);
         assert!(back.lookup(t(9), &Value::Int(99)).contains(999));
         assert!(back.lookup(t(1), &Value::Int(1)).is_empty());

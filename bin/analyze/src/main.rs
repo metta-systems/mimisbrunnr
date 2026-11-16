@@ -138,7 +138,7 @@ pub struct RootPointerView {
     pub seq: u64,
     pub lsn: u64,
     pub flags: u32,
-    /// `(field_name, "disk_id:block_no@gen")` for each B+ tree root slot.
+    /// `(field_name, "disk_id:bucket_no+sector@gen")` for each B+ tree root slot.
     pub roots: Vec<(&'static str, String)>,
 }
 
@@ -319,11 +319,11 @@ fn superblock_view(sb: &Superblock) -> SuperblockView {
 }
 
 fn root_pointer_view(rp: &RootPointer) -> RootPointerView {
-    let fmt = |b: &mimisbrunnr::storage::BlockRef| -> String {
-        let disk = { b.disk_id };
-        let block = { b.block_no };
-        let gen_ = { b.generation };
-        format!("{disk}:{block}@{gen_}")
+    let fmt = |block_ref: &mimisbrunnr::storage::BlockRef| -> String {
+        format!(
+            "{}:{}+{}@{}",
+            block_ref.disk_id, block_ref.bucket_no, block_ref.sector, block_ref.generation
+        )
     };
     let roots = vec![
         ("object_table_root", fmt(&{ rp.object_table_root })),
@@ -988,7 +988,7 @@ impl AnalyzerApp {
                 draw_kv(ui, "lsn", rp.lsn.to_string());
                 draw_kv(ui, "flags", format!("{:#x}", rp.flags));
                 ui.add_space(4.0);
-                ui.label("B+ tree root slots (disk:block@gen):");
+                ui.label("B+ tree root slots (disk:bucket+sector@gen):");
                 for (name, value) in &rp.roots {
                     ui.label(
                         egui::RichText::new(format!("  {name:<24} {value}"))

@@ -101,7 +101,7 @@ pub fn project_op(op: &OpKind) -> WalOp {
         } => WalOp::WriteBlob(WalWriteBlob {
             oid: oid.to_u64(),
             content_hash: *content_hash,
-            extent: BlockRef::new(0, 0, 0).into(),
+            extent: BlockRef::new(0, 0, 0, 0).into(),
             size: *size,
         }),
     }

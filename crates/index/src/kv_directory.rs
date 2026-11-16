@@ -277,12 +277,7 @@ mod tests {
         let dev = FileBlockDevice::open(&path, 1 << 20).unwrap();
 
         let mut block = KvDirectoryBlock::new(3).unwrap();
-        let r = BlockRef {
-            disk_id: 0,
-            _pad: 0,
-            block_no: 42,
-            generation: 7,
-        };
+        let r = BlockRef::new(0, 42, 5, 7);
         block.set_entry(0, r);
         block.set_entry(7, r);
         block.write(&dev, 0).unwrap();
@@ -290,13 +285,11 @@ mod tests {
         let back = KvDirectoryBlock::read(&dev, 0).unwrap();
         assert_eq!(back.count(), 8);
         let e0 = back.get_entry(0);
-        assert_eq!({ e0.block_no }, 42);
-        assert_eq!({ e0.generation }, 7);
+        assert_eq!((e0.bucket_no, e0.sector, e0.generation), (42, 5, 7));
         let e7 = back.get_entry(7);
-        assert_eq!({ e7.block_no }, 42);
+        assert_eq!(e7, r);
         // Other slots are zero.
-        let e1 = back.get_entry(1);
-        assert_eq!({ e1.block_no }, 0);
+        assert!(back.get_entry(1).is_null());
     }
 
     #[test]

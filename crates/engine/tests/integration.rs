@@ -809,12 +809,7 @@ fn all_five_migrated_indices_round_trip_together() {
     let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
 
     // ChunkIndex (private mutation surface).
-    let blob_ref = mimisbrunnr_storage::BlobRef {
-        disk_id: 0,
-        _pad: 0,
-        block_no: 4242,
-        length: 4096,
-    };
+    let blob_ref = mimisbrunnr_storage::BlobRef::new(0, 4242, 0, 4096);
     de.engine.chunk_index.insert_or_bump([0xc1u8; 32], blob_ref, 4096);
 
     // ForwardIndex / TagIndex / KvIndex / RangeIndex via the public surface.
@@ -860,12 +855,7 @@ fn migrated_indices_persist_across_commit_drop_open() {
     // ChunkIndex inserts go through the in-memory engine directly — no
     // public DiskEngine surface for them yet, but the persistence
     // round-trip must still cover them.
-    let blob_ref = mimisbrunnr_storage::BlobRef {
-        disk_id: 0,
-        _pad: 0,
-        block_no: 1234,
-        length: 4096,
-    };
+    let blob_ref = mimisbrunnr_storage::BlobRef::new(0, 1234, 0, 4096);
     de.engine.chunk_index.insert_or_bump([0xa1u8; 32], blob_ref, 4096);
     de.engine.chunk_index.insert_or_bump([0xa1u8; 32], blob_ref, 4096); // ref_count = 2
     de.engine.chunk_index.insert_or_bump([0xb2u8; 32], blob_ref, 4096);
@@ -1031,12 +1021,7 @@ fn all_ten_migrated_structures_round_trip_together() {
     let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
 
     // ChunkIndex.
-    let blob_ref = mimisbrunnr_storage::BlobRef {
-        disk_id: 0,
-        _pad: 0,
-        block_no: 5050,
-        length: 4096,
-    };
+    let blob_ref = mimisbrunnr_storage::BlobRef::new(0, 5050, 0, 4096);
     de.engine.chunk_index.insert_or_bump([0xc7u8; 32], blob_ref, 4096);
 
     // ObjectTable + ForwardIndex + TagIndex + KvIndex + RangeIndex via
@@ -1215,12 +1200,7 @@ fn all_twelve_migrated_structures_round_trip_together() {
     let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
 
     // ChunkIndex.
-    let blob_ref = mimisbrunnr_storage::BlobRef {
-        disk_id: 0,
-        _pad: 0,
-        block_no: 5050,
-        length: 4096,
-    };
+    let blob_ref = mimisbrunnr_storage::BlobRef::new(0, 5050, 0, 4096);
     de.engine.chunk_index.insert_or_bump([0xc7u8; 32], blob_ref, 4096);
 
     // ObjectTable + ForwardIndex + TagIndex + KvIndex + RangeIndex via
@@ -1300,29 +1280,45 @@ fn rootpointer_slots_populated_post_create() {
     let de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
 
     // The 10 region-backed trees must all have non-zero BlockRefs.
-    let r = de.superblock.active_root_pointer();
-    assert!({ r.chunk_index_root.block_no } != 0, "chunk_index_root");
-    assert!({ r.kv_index_root.block_no } != 0, "kv_index_root");
-    assert!({ r.forward_index_root.block_no } != 0, "forward_index_root");
-    assert!({ r.tag_index_root.block_no } != 0, "tag_index_root");
-    assert!({ r.range_index_root.block_no } != 0, "range_index_root");
-    assert!({ r.object_table_root.block_no } != 0, "object_table_root");
-    assert!({ r.location_table_root.block_no } != 0, "location_table_root");
-    assert!({ r.ontology_root.block_no } != 0, "ontology_root");
-    assert!({ r.subscriptions_root.block_no } != 0, "subscriptions_root");
-    assert!({ r.backpointer_root.block_no } != 0, "backpointer_root");
+    let r = *de.superblock.active_root_pointer();
+    assert!(!r.chunk_index_root.is_null(), "chunk_index_root");
+    assert!(!r.kv_index_root.is_null(), "kv_index_root");
+    assert!(!r.forward_index_root.is_null(), "forward_index_root");
+    assert!(!r.tag_index_root.is_null(), "tag_index_root");
+    assert!(!r.range_index_root.is_null(), "range_index_root");
+    assert!(!r.object_table_root.is_null(), "object_table_root");
+    assert!(!r.location_table_root.is_null(), "location_table_root");
+    assert!(!r.ontology_root.is_null(), "ontology_root");
+    assert!(!r.subscriptions_root.is_null(), "subscriptions_root");
+    assert!(!r.backpointer_root.is_null(), "backpointer_root");
 
     // Each slot's generation is set (1 while trees stay at fixed offsets).
     assert_eq!({ r.chunk_index_root.generation }, 1);
     assert_eq!({ r.kv_index_root.generation }, 1);
 
+    // The slots are bucket-relative, built from the primary disk's bucket
+    // size: the chunk index sits at the index zone's start and the kv
+    // index 256 KiB after it.
+    let bucket_size_log2 = de.superblock.bucket_size_log2;
+    let zone_offset = { de.superblock.index_zone.offset };
+    let chunk_index_root = r.chunk_index_root;
+    let kv_index_root = r.kv_index_root;
+    assert_eq!(chunk_index_root.byte_offset(bucket_size_log2), zone_offset);
+    assert_eq!(kv_index_root.byte_offset(bucket_size_log2), zone_offset + 256 * 1024);
+    assert_eq!(
+        u64::from(chunk_index_root.bucket_no),
+        zone_offset >> bucket_size_log2,
+        "bucket_no counts buckets, not 4 KiB blocks",
+    );
+    assert_eq!(chunk_index_root._reserved, 0);
+
     // Slots that don't yet have engine-side trees (cluster_peers,
     // disks_overflow, placement_rules, reconcile_*, snapshot_chain,
     // value_spill, *_history) stay zero — they're populated by later
     // items (SNAPSHOT1, RECONCILE1, CLUSTER1).
-    assert_eq!({ r.cluster_peers_root.block_no }, 0);
-    assert_eq!({ r.snapshot_chain_root.block_no }, 0);
-    assert_eq!({ r.reconcile_work_root.block_no }, 0);
+    assert!(r.cluster_peers_root.is_null());
+    assert!(r.snapshot_chain_root.is_null());
+    assert!(r.reconcile_work_root.is_null());
 }
 
 #[test]
@@ -1339,13 +1335,13 @@ fn rootpointer_slots_stable_across_commit() {
 
     // Slots stay stable across commits (COW reallocation is ENGINE3).
     assert_eq!(
-        { pre_commit.chunk_index_root.block_no },
-        { post_commit.chunk_index_root.block_no },
+        { pre_commit.chunk_index_root },
+        { post_commit.chunk_index_root },
         "chunk_index_root drifted across commit",
     );
     assert_eq!(
-        { pre_commit.ontology_root.block_no },
-        { post_commit.ontology_root.block_no },
+        { pre_commit.ontology_root },
+        { post_commit.ontology_root },
         "ontology_root drifted across commit",
     );
     // seq + lsn advance.
@@ -1369,9 +1365,8 @@ fn object_table_on_disk_is_a_region_of_records() {
     let oid = de.create_object().unwrap();
     de.commit().unwrap();
 
-    let root = de.superblock.active_root_pointer();
-    let block_no = { root.object_table_root.block_no };
-    let offset = block_no as u64 * 4096;
+    let object_table_root = de.superblock.active_root_pointer().object_table_root;
+    let offset = object_table_root.byte_offset(de.superblock.bucket_size_log2);
     drop(de);
 
     let dev = mimisbrunnr_storage::FileBlockDevice::open_read_only(
@@ -1407,8 +1402,8 @@ fn kv_index_on_disk_uses_native_extendible_hash_layout() {
     let oid = de.create_object().unwrap();
     de.set_attr(oid, key, Value::Int(2025)).unwrap();
     de.commit().unwrap();
-    let root_block_no = { de.superblock.active_root_pointer().kv_index_root.block_no };
-    let kv_dir_offset = root_block_no as u64 * 4096;
+    let kv_index_root = de.superblock.active_root_pointer().kv_index_root;
+    let kv_dir_offset = kv_index_root.byte_offset(de.superblock.bucket_size_log2);
     drop(de);
 
     let dev = mimisbrunnr_storage::FileBlockDevice::open_read_only(
@@ -1454,11 +1449,8 @@ fn rootpointer_survives_open_cycle() {
     let de2 = DiskEngine::open(&cfg_path).unwrap();
     let post_open = *de2.superblock.active_root_pointer();
 
-    // Block_no preserved across drop/open.
-    assert_eq!(
-        { pre_drop.tag_index_root.block_no },
-        { post_open.tag_index_root.block_no },
-    );
+    // The slot is preserved across drop/open.
+    assert_eq!({ pre_drop.tag_index_root }, { post_open.tag_index_root });
     // The tag we registered is still resolvable, proving the load
     // path went through the RootPointer slot.
     assert!(de2.engine.resolve_tag_name("color").is_some());

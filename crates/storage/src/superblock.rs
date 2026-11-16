@@ -12,7 +12,8 @@ use {
 };
 
 use crate::{
-    block::{BLOCK_SIZE, BlockHeader, BlockKind},
+    addressing::MAX_BUCKET_SIZE_LOG2,
+    block::{BLOCK_SIZE, BLOCK_SIZE_LOG2, BlockHeader, BlockKind},
     checksum::checksum64,
     block_device::BlockDevice,
     error::StorageError,
@@ -341,6 +342,12 @@ impl Superblock {
                 trace!("superblock copy@{off} crc fail");
                 continue;
             }
+            // Bucket-relative offsets assume a bucket of at least one block and
+            // at most 2^MAX_BUCKET_SIZE_LOG2 bytes (ENGINE-DESIGN§1.2).
+            if !(BLOCK_SIZE_LOG2..=MAX_BUCKET_SIZE_LOG2).contains(&sb.bucket_size_log2) {
+                trace!("superblock copy@{off} bucket size out of range");
+                continue;
+            }
             let active = sb.active_root_pointer();
             if active.verify_crc().is_err() {
                 // Active root corrupt — try the inactive root before discarding.
@@ -500,6 +507,23 @@ mod tests {
         // Device is all zeros — magic check at all 3 copies fails.
         let err = Superblock::open(&dev).unwrap_err();
         assert!(matches!(err, StorageError::NoValidSuperblock));
+    }
+
+    #[test]
+    fn a_bucket_size_out_of_range_is_refused_at_open() {
+        // A copy whose checksum is valid but whose bucket size would overflow
+        // bucket-relative offsets must not be opened.
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+        let mut sb = fmt_default(&dev);
+        for bad_log2 in [64u8, MAX_BUCKET_SIZE_LOG2 + 1, BLOCK_SIZE_LOG2 - 1] {
+            sb.bucket_size_log2 = bad_log2;
+            sb.recompute_crc();
+            for offset in Superblock::copy_offsets(dev.capacity()) {
+                dev.write_at(offset, bytemuck::bytes_of(&sb)).unwrap();
+            }
+            assert!(matches!(Superblock::open(&dev), Err(StorageError::NoValidSuperblock)));
+        }
     }
 
     #[test]
