@@ -44,7 +44,6 @@ Independent of each other unless an order is given.
 - [SPEC24](specification-implementation-plan.md) — no packed on-disk structs.
 - [POOL1](pool-implementation-plan.md) — one disk-descriptor tree.
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
-- [ONTOLOGY2](ontology-implementation-plan.md) — storage errors.
 - [ONTOLOGY10](ontology-implementation-plan.md) (per-record ontology tree, in the encodings group above), then [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator with ad-hoc tags in `local` — and [ONTOLOGY15](ontology-implementation-plan.md) — tag uids and name resolution; [ONTOLOGY11](ontology-implementation-plan.md) — ontology journal ops, after JOURNAL8.
 
 ### 3. Term index

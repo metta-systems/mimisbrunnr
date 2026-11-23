@@ -874,16 +874,20 @@ impl Region {
         let index_len = core::mem::size_of::<RunHeader>()
             + key_format.encoded_len()
             + block_count * (core::mem::size_of::<RunBlockEntry>() + key_width);
-        if index_len > BLOCK_SIZE || block_count > u16::MAX as usize {
-            return Err(StorageError::RunTooLarge);
-        }
-        let run_blocks = 1 + block_count as u32;
-        if self.next_block + run_blocks > self.total_blocks() {
+        // Room first: entries that cannot fit the region's remaining blocks
+        // fit no split of them either, while a run the index block cannot
+        // describe may still fit as several runs.
+        let run_blocks = 1 + block_count as u64;
+        if self.next_block as u64 + run_blocks > self.total_blocks() as u64 {
             return Err(StorageError::RegionFull {
                 used: self.next_block as u64 * BLOCK_SIZE as u64,
                 size: self.total_blocks() as u64 * BLOCK_SIZE as u64,
             });
         }
+        if index_len > BLOCK_SIZE || block_count > u16::MAX as usize {
+            return Err(StorageError::RunTooLarge);
+        }
+        let run_blocks = run_blocks as u32;
 
         // Data blocks.
         let mut data = vec![0u8; block_count * BLOCK_SIZE];

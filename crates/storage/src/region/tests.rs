@@ -320,6 +320,16 @@ fn a_run_left_by_an_earlier_region_is_not_read_as_this_regions() {
 }
 
 #[test]
+fn a_value_larger_than_the_region_is_reported_as_a_full_region() {
+    let (device, mut region) = fresh(BtreeKind::Ontology);
+    let huge = vec![7u8; REGION_BYTES * 2];
+    assert!(matches!(
+        region.append_entries(&device, 1, &[(0u32, RunEntry::Value(&huge))]),
+        Err(StorageError::RegionFull { .. })
+    ));
+}
+
+#[test]
 fn unsorted_entries_are_refused() {
     let (device, mut region) = fresh(BtreeKind::Forward);
     let result = region.append_run(&device, 1, &[(2u32, RunEntry::Whiteout), (1, RunEntry::Whiteout)]);

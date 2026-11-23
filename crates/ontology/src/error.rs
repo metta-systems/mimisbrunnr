@@ -63,4 +63,8 @@ pub enum OntologyError {
 
     #[error("CBOR error: {0}")]
     Cbor(String),
+
+    /// Reading or writing the ontology's region failed in the storage layer.
+    #[error("storage error: {0}")]
+    Storage(#[from] mimisbrunnr_storage::StorageError),
 }

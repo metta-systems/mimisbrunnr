@@ -527,12 +527,10 @@ impl OntologyState {
         offset: u64,
     ) -> Result<(), OntologyError> {
         let image_bytes = self.serialise()?;
-        let mut region = Region::create_in_place(device, offset, region_params(), &[])
-            .map_err(|e| OntologyError::Cbor(e.to_string()))?;
+        let mut region = Region::create_in_place(device, offset, region_params(), &[])?;
         let entries = [(0u32, RunEntry::Value(&image_bytes))];
-        region
-            .append_entries(device, 0, &entries)
-            .map_err(|e| OntologyError::Cbor(e.to_string()))
+        region.append_entries(device, 0, &entries)?;
+        Ok(())
     }
 
     /// Read the in-memory state from the 256 KiB region at byte
@@ -544,17 +542,12 @@ impl OntologyState {
         offset: u64,
     ) -> Result<Self, OntologyError> {
         let mut probe = [0u8; 8];
-        device
-            .read_at(offset, &mut probe)
-            .map_err(|e| OntologyError::Cbor(e.to_string()))?;
+        device.read_at(offset, &mut probe)?;
         if probe.iter().all(|&b| b == 0) {
             return Ok(Self::default());
         }
-        let region = Region::open(device, offset, BtreeKind::Ontology)
-            .map_err(|e| OntologyError::Cbor(e.to_string()))?;
-        let entries = region
-            .entries::<D, u32>(device)
-            .map_err(|e| OntologyError::Cbor(e.to_string()))?;
+        let region = Region::open(device, offset, BtreeKind::Ontology)?;
+        let entries = region.entries::<D, u32>(device)?;
         // Entries come back in key order: the last is the newest snapshot.
         match entries.last() {
             Some((_snapshot, image_bytes)) => Self::deserialise(image_bytes),
@@ -1098,12 +1091,30 @@ mod tests {
             .append_entries(&dev, 0, &[(0u32, RunEntry::Value(b"not an ontology"))])
             .unwrap();
         let err = OntologyState::load_from_region(&dev, 0).unwrap_err();
-        let expected = mimisbrunnr_storage::StorageError::RegionKindMismatch {
-            expected: BtreeKind::Ontology as u16,
-            actual: BtreeKind::Subscriptions as u16,
-        };
         assert!(
-            matches!(&err, OntologyError::Cbor(message) if *message == expected.to_string()),
+            matches!(
+                err,
+                OntologyError::Storage(mimisbrunnr_storage::StorageError::RegionKindMismatch { expected, actual })
+                    if expected == BtreeKind::Ontology as u16 && actual == BtreeKind::Subscriptions as u16
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_full_region_surfaces_as_a_storage_error() {
+        // An image larger than one region cannot be written.
+        let (_dir, dev) = fresh_device();
+        let mut state = OntologyState::new();
+        let mut alloc = IdAllocator::new();
+        let names: Vec<String> = (0..20_000u32)
+            .map(|index| format!("tag-with-a-long-name-to-fill-the-region-{index:05}"))
+            .collect();
+        let labels = names.iter().map(|name| label(name)).collect();
+        state.install(module("huge", labels, &[]), &mut alloc).unwrap();
+        let err = state.flush_to_region(&dev, 0).unwrap_err();
+        assert!(
+            matches!(err, OntologyError::Storage(mimisbrunnr_storage::StorageError::RegionFull { .. })),
             "unexpected error: {err:?}"
         );
     }
