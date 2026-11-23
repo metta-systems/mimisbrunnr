@@ -12,7 +12,6 @@ fuse = ["dep:fuser"]
 [dependencies]
 mimisbrunnr-index = { workspace = true }
 mimisbrunnr-ontology = { workspace = true }
-mimisbrunnr-query = { workspace = true }
 mimisbrunnr-types = { workspace = true }
 mimisbrunnr-unix = { workspace = true }
 fuser = { workspace = true, optional = true }

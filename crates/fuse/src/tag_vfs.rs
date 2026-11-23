@@ -597,7 +597,7 @@ impl<'a> TagVfs<'a> {
 }
 
 /// Pull the low 32 bits of an [`ObjectId`]'s local sequence — this is the
-/// representation used by [`mimisbrunnr_query`] / [`mimisbrunnr_index`] when
+/// representation used by `mimisbrunnr_query` / [`mimisbrunnr_index`] when
 /// they pack object ids into roaring bitmaps. See `mimisbrunnr_query`'s
 /// module docs for the rationale.
 ///

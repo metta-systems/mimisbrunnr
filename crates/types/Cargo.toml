@@ -11,5 +11,4 @@ bitbybit = { workspace = true }
 ciborium = { workspace = true }
 serde = { workspace = true }
 siphasher = { workspace = true }
-static_assertions = { workspace = true }
 thiserror = { workspace = true }

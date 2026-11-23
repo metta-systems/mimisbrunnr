@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 mimisbrunnr-types = { workspace = true }
 mimisbrunnr-storage = { workspace = true }
-mimisbrunnr-meta = { workspace = true }
 bytemuck = { workspace = true }
 ciborium = { workspace = true }
 log = { workspace = true }

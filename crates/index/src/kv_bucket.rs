@@ -132,11 +132,9 @@ impl KvBucketBlock {
     ) -> Result<(), KvBucketError> {
         let count = self.entry_count as usize;
         // Update in place if present.
-        for i in 0..count.min(KV_BUCKET_MAX_ENTRIES) {
-            if { self.entries[i].tag_id } == tag_id
-                && { self.entries[i].value_hash } == value_hash
-            {
-                self.entries[i].bitmap_ref = bitmap_ref;
+        for entry in self.entries.iter_mut().take(count.min(KV_BUCKET_MAX_ENTRIES)) {
+            if { entry.tag_id } == tag_id && { entry.value_hash } == value_hash {
+                entry.bitmap_ref = bitmap_ref;
                 return Ok(());
             }
         }
