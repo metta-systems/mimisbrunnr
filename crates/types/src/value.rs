@@ -5,11 +5,9 @@
 //! using `serde`'s externally-tagged enum representation.
 //!
 //! Encoding rules (INDEX-DESIGN§1):
-//! - Variants are numbered 0..=5 in the order `Text, Int, Float, Timestamp,
-//!   Blob, Scoped`. The numeric prefix prevents `Int(42)` from colliding with
+//! - Variants are numbered 0..=4 in the order `Text, Int, Float, Timestamp,
+//!   Blob`. The numeric prefix prevents `Int(42)` from colliding with
 //!   `Text("42")` for hashing purposes.
-//! - `Scoped { context, inner }` may *not* directly contain another
-//!   `Scoped` (nested scopes are a format error).
 //! - Encodings ≤ 96 bytes are stored inline in index leaves; longer ones spill
 //!   to a `BlobZone` extent. The threshold const lives here; the spill
 //!   mechanic itself is `mimisbrunnr-storage`'s job.
@@ -19,7 +17,7 @@ use std::hash::Hasher;
 use serde::{Deserialize, Serialize};
 use siphasher::sip::SipHasher24;
 
-use crate::{TypesError, ids::TagId};
+use crate::TypesError;
 
 /// CBOR-encoded `Value`s above this size spill to a `BlobZone` extent;
 /// smaller values inline directly into the index leaf (INDEX-DESIGN§1.1).
@@ -37,7 +35,6 @@ const TYPE_TAG_INT: u8 = 1;
 const TYPE_TAG_FLOAT: u8 = 2;
 const TYPE_TAG_TIMESTAMP: u8 = 3;
 const TYPE_TAG_BLOB: u8 = 4;
-const TYPE_TAG_SCOPED: u8 = 5;
 
 /// Heterogeneous attribute value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,31 +50,9 @@ pub enum Value {
     /// Arbitrary byte string. Encodings >`VALUE_INLINE_THRESHOLD` bytes spill
     /// to a `BlobZone` extent — that bookkeeping happens in storage.
     Blob(Vec<u8>),
-    /// Scoped value: "the inner value applies in the context of tag
-    /// `context`" (INDEX-DESIGN§1.3). Used by e.g. unix-path projections to tie a
-    /// value to a `unix-path-context:*` grouping tag without inflating the
-    /// tag namespace.
-    ///
-    /// Construction goes through [`Value::scoped`] which enforces the
-    /// "inner is not itself `Scoped`" invariant.
-    Scoped {
-        context: TagId,
-        inner: Box<Value>,
-    },
 }
 
 impl Value {
-    /// Construct a [`Value::Scoped`], rejecting nested scopes per INDEX-DESIGN§1.3.
-    pub fn scoped(context: TagId, inner: Value) -> Result<Self, TypesError> {
-        if matches!(inner, Value::Scoped { .. }) {
-            return Err(TypesError::NestedScopedValue);
-        }
-        Ok(Value::Scoped {
-            context,
-            inner: Box::new(inner),
-        })
-    }
-
     /// Borrow as a `&str` if this is a [`Value::Text`].
     pub fn as_text(&self) -> Option<&str> {
         match self {
@@ -126,7 +101,6 @@ impl Value {
             Value::Float(_) => "float",
             Value::Timestamp(_) => "timestamp",
             Value::Blob(_) => "blob",
-            Value::Scoped { .. } => "scoped",
         }
     }
 
@@ -140,20 +114,7 @@ impl Value {
             Value::Float(_) => TYPE_TAG_FLOAT,
             Value::Timestamp(_) => TYPE_TAG_TIMESTAMP,
             Value::Blob(_) => TYPE_TAG_BLOB,
-            Value::Scoped { .. } => TYPE_TAG_SCOPED,
         }
-    }
-
-    /// Round-trip through CBOR + reject any nested `Scoped`. Used both by
-    /// [`decode_cbor`] and by `validate` paths that want to reject a
-    /// constructed-by-hand `Value` before it is stored.
-    pub fn validate(&self) -> Result<(), TypesError> {
-        if let Value::Scoped { inner, .. } = self
-            && matches!(inner.as_ref(), Value::Scoped { .. })
-        {
-            return Err(TypesError::NestedScopedValue);
-        }
-        Ok(())
     }
 
     /// Convenience: encode self to CBOR. See [`encode_cbor`] for the
@@ -177,7 +138,6 @@ impl std::fmt::Display for Value {
             Value::Float(v) => write!(f, "{v}"),
             Value::Timestamp(v) => write!(f, "ts:{v}"),
             Value::Blob(b) => write!(f, "blob[{}]", b.len()),
-            Value::Scoped { context, inner } => write!(f, "scoped({context},{inner})"),
         }
     }
 }
@@ -196,20 +156,16 @@ impl PartialOrd for Value {
 }
 
 /// Encode `value` to CBOR using the deterministic-ish form that `ciborium`
-/// emits by default. Validates `Scoped` nesting before serialising.
+/// emits by default.
 pub fn encode_cbor(value: &Value) -> Result<Vec<u8>, TypesError> {
-    value.validate()?;
     let mut buf = Vec::new();
     ciborium::ser::into_writer(value, &mut buf).map_err(TypesError::cbor_encode)?;
     Ok(buf)
 }
 
-/// Decode CBOR bytes to a [`Value`]. Rejects nested `Scoped` after
-/// deserialisation so untrusted input cannot smuggle in a malformed shape.
+/// Decode CBOR bytes to a [`Value`].
 pub fn decode_cbor(bytes: &[u8]) -> Result<Value, TypesError> {
-    let v: Value = ciborium::de::from_reader(bytes).map_err(TypesError::cbor_decode)?;
-    v.validate()?;
-    Ok(v)
+    ciborium::de::from_reader(bytes).map_err(TypesError::cbor_decode)
 }
 
 /// SipHash-2-4 keyed by a per-pool secret, truncated to 64 bits (INDEX-DESIGN§1.2).
@@ -218,8 +174,7 @@ pub fn decode_cbor(bytes: &[u8]) -> Result<Value, TypesError> {
 ///
 /// 1. The 8-byte domain `"mimir-kv"`,
 /// 2. The single-byte numeric type tag (so `Int(42)` ≠ `Text("42")`),
-/// 3. For [`Value::Scoped`], the 4-byte little-endian `context` `TagId`,
-/// 4. The CBOR encoding of the value (or, for `Scoped`, the inner value).
+/// 3. The CBOR encoding of the value.
 ///
 /// Stable across runs given the same `secret`. The plumbing for *which*
 /// secret to use lives in storage / pool layers — this function takes it as
@@ -231,26 +186,10 @@ pub fn value_hash(value: &Value, secret: &[u8; 16]) -> u64 {
     hasher.write(KV_HASH_DOMAIN);
     hasher.write_u8(value.type_tag());
 
-    match value {
-        Value::Scoped { context, inner } => {
-            hasher.write(&context.raw().to_le_bytes());
-            // Hash the *inner* CBOR encoding so that hashing
-            // `Scoped { ctx, inner }` and a hypothetical "lookup by inner
-            // value under context ctx" match up. Validation guarantees the
-            // inner value is not itself Scoped.
-            let mut inner_buf = Vec::new();
-            ciborium::ser::into_writer(inner.as_ref(), &mut inner_buf)
-                .expect("CBOR encoding of in-memory Value cannot fail");
-            hasher.write(&inner_buf);
-        }
-        _ => {
-            let mut buf = Vec::new();
-            ciborium::ser::into_writer(value, &mut buf)
-                .expect("CBOR encoding of in-memory Value cannot fail");
-            hasher.write(&buf);
-        }
-    }
-
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(value, &mut buf)
+        .expect("CBOR encoding of in-memory Value cannot fail");
+    hasher.write(&buf);
     hasher.finish()
 }
 
@@ -294,55 +233,15 @@ mod tests {
     }
 
     #[test]
-    fn cbor_round_trip_scoped() {
-        let v = Value::scoped(TagId::new(7), Value::Text("/boot/vesper".into())).unwrap();
-        cbor_round_trip(&v);
-    }
-
-    #[test]
-    fn scoped_constructor_rejects_nested_scope() {
-        let inner = Value::scoped(TagId::new(1), Value::Int(0)).unwrap();
-        let err = Value::scoped(TagId::new(2), inner).unwrap_err();
-        assert!(matches!(err, TypesError::NestedScopedValue));
-    }
-
-    #[test]
-    fn validate_rejects_handcrafted_nested_scope() {
-        // Bypass the constructor by building the bad shape directly.
-        let bad = Value::Scoped {
-            context: TagId::new(2),
-            inner: Box::new(Value::Scoped {
-                context: TagId::new(1),
-                inner: Box::new(Value::Int(0)),
-            }),
-        };
-        assert!(matches!(
-            bad.validate(),
-            Err(TypesError::NestedScopedValue)
-        ));
-        assert!(matches!(
-            encode_cbor(&bad),
-            Err(TypesError::NestedScopedValue)
-        ));
-    }
-
-    #[test]
-    fn decode_rejects_nested_scope_payload() {
-        // Hand-build a CBOR payload with nested Scoped using the *internal*
-        // serde representation by bypassing the constructor.
-        let bad = Value::Scoped {
-            context: TagId::new(2),
-            inner: Box::new(Value::Scoped {
-                context: TagId::new(1),
-                inner: Box::new(Value::Int(0)),
-            }),
-        };
-        // Encode skipping our validator — go straight through ciborium so the
-        // bytes exist on the wire.
+    fn decode_rejects_unknown_variant() {
+        // An externally tagged variant the enum does not have.
         let mut buf = Vec::new();
-        ciborium::ser::into_writer(&bad, &mut buf).unwrap();
-        let err = decode_cbor(&buf).unwrap_err();
-        assert!(matches!(err, TypesError::NestedScopedValue));
+        ciborium::ser::into_writer(
+            &std::collections::BTreeMap::from([("Unknown", 0u8)]),
+            &mut buf,
+        )
+        .unwrap();
+        assert!(matches!(decode_cbor(&buf), Err(TypesError::CborDecode(_))));
     }
 
     #[test]
@@ -352,10 +251,6 @@ mod tests {
         assert_eq!(Value::Float(0.0).type_tag(), 2);
         assert_eq!(Value::Timestamp(0).type_tag(), 3);
         assert_eq!(Value::Blob(vec![]).type_tag(), 4);
-        assert_eq!(
-            Value::scoped(TagId::new(0), Value::Int(0)).unwrap().type_tag(),
-            5,
-        );
     }
 
     #[test]
@@ -403,14 +298,6 @@ mod tests {
         let h0 = value_hash(&v, &[0u8; 16]);
         let h1 = value_hash(&v, &[1u8; 16]);
         assert_ne!(h0, h1);
-    }
-
-    #[test]
-    fn scoped_hash_uses_context() {
-        let secret = [0u8; 16];
-        let a = Value::scoped(TagId::new(1), Value::Text("/x".into())).unwrap();
-        let b = Value::scoped(TagId::new(2), Value::Text("/x".into())).unwrap();
-        assert_ne!(value_hash(&a, &secret), value_hash(&b, &secret));
     }
 
     #[test]

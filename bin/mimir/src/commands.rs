@@ -13,14 +13,14 @@ use std::path::Path;
 
 use mimisbrunnr::{
     engine::{DiskEngine, EngineError},
-    ontology::{IdAllocator, OntologyError, OntologyModule},
+    ontology::{OntologyError, OntologyModule},
     query::{QueryParser, explain as explain_query, to_sexpr},
     sql::{SqlEngine, SqlError, SqlOutput, explain as explain_sql},
     types::{
-        Assertion, ChangeInterest, ObjectId, Query, TagDefinition, TagId, TagSemantics, Value,
+        Assertion, ChangeInterest, ObjectId, Query, TagId, TagSemantics, Value,
         value_hash,
     },
-    unix::{Exporter, Importer, build_path_attr},
+    unix::{Importer, build_path_attr},
     watch::Retention,
 };
 
@@ -630,168 +630,65 @@ pub fn run_watch_stream<W: Write>(
 // Path projections.
 // =========================================================================
 
-/// Canonical name of the grouping tag created for path-context `name`.
-pub fn context_tag_name(name: &str) -> String {
-    format!("unix-path-context:{name}")
-}
-
-/// `mimir project create-context <name>`
-pub fn run_project_create_context<W: Write>(
-    engine: &mut DiskEngine,
-    out: &mut W,
-    name: &str,
-) -> CommandResult {
-    let canonical = context_tag_name(name);
-    // Ensure there's a Grouping-semantics tag for the context. If not present,
-    // register one through the ontology directly so we get the correct
-    // semantics (engine.register_tag would default to Label).
-    let tag_id = match engine.engine.ontology.names.get(&canonical) {
-        Some(&existing) => {
-            let def = engine.engine.ontology.tags.get(&existing).cloned();
-            if !matches!(def.map(|d| d.semantics), Some(TagSemantics::Grouping)) {
-                return Err(CommandError::BadArg(format!(
-                    "tag {canonical:?} already exists with non-Grouping semantics"
-                )));
-            }
-            existing
-        }
-        None => {
-            let mut alloc = IdAllocator::starting_at(next_tag_id(engine));
-            let id = alloc.next_id();
-            let def = TagDefinition {
-                id,
-                name: canonical.clone(),
-                semantics: TagSemantics::Grouping,
-                implies: vec![],
-                storage: None,
-            };
-            engine.engine.ontology.dag.add_tag(id);
-            engine
-                .engine
-                .ontology
-                .names
-                .insert(canonical.clone(), id);
-            engine.engine.ontology.tags.insert(id, def);
-            id
-        }
-    };
-
-    engine.engine.path_contexts.create_context(
-        &engine.engine.ontology,
-        tag_id,
-        std::path::PathBuf::from("/"),
-    )?;
-    writeln!(out, "created context={name} tag={canonical} id={tag_id}")?;
-    Ok(())
-}
-
-/// `mimir project list-contexts`
-pub fn run_project_list_contexts<W: Write>(
-    engine: &mut DiskEngine,
-    out: &mut W,
-) -> CommandResult {
-    let mut rows: Vec<(String, TagId, usize)> = Vec::new();
-    for (tag, proj) in &engine.engine.path_contexts.projections {
-        let name = engine
-            .engine
-            .ontology
-            .tags
-            .get(tag)
-            .map(|d| {
-                d.name
-                    .strip_prefix("unix-path-context:")
-                    .unwrap_or(d.name.as_str())
-                    .to_string()
-            })
-            .unwrap_or_else(|| format!("@{}", tag.raw()));
-        rows.push((name, *tag, proj.len()));
-    }
-    rows.sort_by(|a, b| a.0.cmp(&b.0));
-    writeln!(out, "contexts={}", rows.len())?;
-    for (name, tag, count) in &rows {
-        writeln!(out, "name={name} tag={} entries={count}", tag.raw())?;
-    }
-    Ok(())
-}
-
-/// `mimir project set-path obj:<oid> <ctx> <path>`
-pub fn run_project_set_path<W: Write>(
-    engine: &mut DiskEngine,
-    out: &mut W,
-    oid_arg: &str,
-    context: &str,
-    path: &str,
-) -> CommandResult {
-    let oid = parse_oid(oid_arg).map_err(CommandError::BadArg)?;
-    ensure_object(engine, oid)?;
-    let canonical = context_tag_name(context);
-    let context_id = engine
-        .engine
-        .resolve_tag_name(&canonical)
-        .ok_or_else(|| CommandError::NotFound(format!("context {context:?}")))?;
-
-    // Ensure the projection exists (the user might have set-path without
-    // calling create-context first; that's not allowed here).
-    if engine.engine.path_contexts.get(context_id).is_none() {
-        return Err(CommandError::NotFound(format!(
-            "no projection registered for context {context:?}"
-        )));
-    }
-
-    // 1. Update the in-memory projection.
-    let proj = engine
-        .engine
-        .path_contexts
-        .get_mut(context_id)
-        .expect("just checked");
-    proj.add(oid, path.to_string())?;
-
-    // 2. Persist as `Attr(unix-path, Scoped { context, Text(path) })`.
-    let unix_path_id = engine
+/// The `unix-path` key's id, registered if the pool has none yet.
+fn unix_path_tag(engine: &mut DiskEngine) -> TagId {
+    engine
         .engine
         .resolve_tag_name(mimisbrunnr::unix::UNIX_PATH_TAG_NAME)
         .unwrap_or_else(|| {
             engine
                 .engine
                 .register_tag(mimisbrunnr::unix::UNIX_PATH_TAG_NAME)
-        });
-    let assertion = build_path_attr(unix_path_id, context_id, path)?;
+        })
+}
+
+/// `mimir project set-path obj:<oid> <path>`
+pub fn run_project_set_path<W: Write>(
+    engine: &mut DiskEngine,
+    out: &mut W,
+    oid_arg: &str,
+    path: &str,
+) -> CommandResult {
+    let oid = parse_oid(oid_arg).map_err(CommandError::BadArg)?;
+    ensure_object(engine, oid)?;
+
+    // 1. Update the in-memory Unix view.
+    engine.engine.unix_paths.add(oid, path.to_string())?;
+
+    // 2. Persist as `Attr(unix-path, Text(path))`.
+    let unix_path_id = unix_path_tag(engine);
+    let assertion = build_path_attr(unix_path_id, path)?;
     if let Assertion::Attr { key, value } = assertion {
         engine.set_attr(oid, key, value)?;
     }
 
-    writeln!(out, "set-path oid={oid} context={context} path={path:?}")?;
+    writeln!(out, "set-path oid={oid} path={path:?}")?;
     Ok(())
 }
 
-/// `mimir project tree <ctx>`
+/// `mimir project tree [<path>]` — the Unix view, or the subtree under `path`.
 pub fn run_project_tree<W: Write>(
     engine: &mut DiskEngine,
     out: &mut W,
-    context: &str,
+    subtree: Option<&str>,
 ) -> CommandResult {
-    let canonical = context_tag_name(context);
-    let context_id = engine
+    let prefix = subtree.map(|path| format!("{}/", path.trim_end_matches('/')));
+    let mut rows: Vec<(String, ObjectId)> = engine
         .engine
-        .resolve_tag_name(&canonical)
-        .ok_or_else(|| CommandError::NotFound(format!("context {context:?}")))?;
-    let proj = engine
-        .engine
-        .path_contexts
-        .get(context_id)
-        .ok_or_else(|| CommandError::NotFound(format!("projection for {context:?}")))?;
-
-    let mut rows: Vec<(String, ObjectId)> =
-        proj.iter().map(|(oid, p)| (p.to_string(), oid)).collect();
+        .unix_paths
+        .iter()
+        .filter(|(_, path)| prefix.as_deref().is_none_or(|prefix| path.starts_with(prefix)))
+        .map(|(oid, path)| (path.to_string(), oid))
+        .collect();
     rows.sort_by(|a, b| a.0.cmp(&b.0));
-    writeln!(out, "context={context} entries={}", rows.len())?;
+    writeln!(out, "entries={}", rows.len())?;
     for (path, oid) in &rows {
         writeln!(out, "{path}\t{oid}")?;
     }
     Ok(())
 }
 
-/// `mimir project import <dir> --context <ctx>`
+/// `mimir project import <dir>`
 ///
 /// Walks the host tree via [`Importer`] and creates one object
 /// per file with the path attribute attached, but **does not** read file
@@ -800,28 +697,10 @@ pub fn run_project_import<W: Write>(
     engine: &mut DiskEngine,
     out: &mut W,
     dir: &Path,
-    context: &str,
 ) -> CommandResult {
-    let canonical = context_tag_name(context);
-    let context_id = engine
-        .engine
-        .resolve_tag_name(&canonical)
-        .ok_or_else(|| CommandError::NotFound(format!("context {context:?}")))?;
-    if engine.engine.path_contexts.get(context_id).is_none() {
-        return Err(CommandError::NotFound(format!(
-            "no projection registered for context {context:?}"
-        )));
-    }
-    let unix_path_id = engine
-        .engine
-        .resolve_tag_name(mimisbrunnr::unix::UNIX_PATH_TAG_NAME)
-        .unwrap_or_else(|| {
-            engine
-                .engine
-                .register_tag(mimisbrunnr::unix::UNIX_PATH_TAG_NAME)
-        });
+    let unix_path_id = unix_path_tag(engine);
 
-    let importer = Importer::new(dir, context_id);
+    let importer = Importer::new(dir);
     let entries = importer.scan()?;
 
     let mut created = 0usize;
@@ -832,120 +711,20 @@ pub fn run_project_import<W: Write>(
             continue;
         }
         let oid = engine.create_object()?;
-        let assertion = build_path_attr(unix_path_id, context_id, &entry.relative_path)?;
+        let assertion = build_path_attr(unix_path_id, &entry.relative_path)?;
         if let Assertion::Attr { key, value } = assertion {
             engine.set_attr(oid, key, value)?;
         }
-        let proj = engine
+        engine
             .engine
-            .path_contexts
-            .get_mut(context_id)
-            .expect("checked above");
-        proj.add(oid, entry.relative_path.clone())?;
+            .unix_paths
+            .add(oid, entry.relative_path.clone())?;
         created += 1;
     }
     writeln!(
         out,
-        "import dir={} context={context} created={created} skipped={skipped} (blob ingestion deferred)",
+        "import dir={} created={created} skipped={skipped} (blob ingestion deferred)",
         dir.display()
-    )?;
-    Ok(())
-}
-
-/// `mimir project export` — single-object or directory-tree form.
-///
-/// With `oid_arg = Some(_)`, writes the in-memory blob bytes for that oid to
-/// `output`. With `oid_arg = None`, plans an [`Exporter::execute`] over every
-/// oid registered in the context's projection and writes the resulting
-/// directory tree under `output`.
-pub fn run_project_export<W: Write>(
-    engine: &mut DiskEngine,
-    out: &mut W,
-    context: &str,
-    output: &Path,
-    oid_arg: Option<&str>,
-) -> CommandResult {
-    // Validate the context exists, even for the per-oid form — keeps
-    // `mimir project export` semantically scoped.
-    let canonical = context_tag_name(context);
-    let context_id = match engine.engine.ontology.names.get(&canonical) {
-        Some(id) => *id,
-        None => {
-            return Err(CommandError::NotFound(format!(
-                "context '{context}' (use `mimir project create-context` first)"
-            )));
-        }
-    };
-    if engine.engine.path_contexts.get(context_id).is_none() {
-        return Err(CommandError::NotFound(format!(
-            "context '{context}' has no projection registered"
-        )));
-    }
-
-    if let Some(oid_arg) = oid_arg {
-        let oid = parse_oid(oid_arg).map_err(CommandError::BadArg)?;
-        ensure_object(engine, oid)?;
-
-        let bytes = engine
-            .read_blob(oid)?
-            .ok_or_else(|| CommandError::NotFound(format!("no blob for object {oid}")))?;
-
-        if let Some(parent) = output.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(output, &bytes)?;
-        writeln!(
-            out,
-            "wrote {} bytes for {oid} to {}",
-            bytes.len(),
-            output.display()
-        )?;
-        return Ok(());
-    }
-
-    // Directory-tree form: plan against every oid in the projection, then
-    // execute via Exporter.
-    let plan = {
-        let projection = engine
-            .engine
-            .path_contexts
-            .get(context_id)
-            .expect("checked above");
-        let oids: Vec<ObjectId> = projection.iter().map(|(o, _)| o).collect();
-        Exporter::plan(projection, &oids)
-    };
-
-    if plan.is_empty() {
-        std::fs::create_dir_all(output)?;
-        writeln!(
-            out,
-            "exported 0 objects from context {context} to {} (projection is empty)",
-            output.display()
-        )?;
-        return Ok(());
-    }
-
-    // Pre-fetch blobs into a map so the content provider closure doesn't
-    // borrow `engine` mutably.
-    let mut content: std::collections::HashMap<ObjectId, Vec<u8>> =
-        std::collections::HashMap::with_capacity(plan.len());
-    for entry in &plan {
-        if let mimisbrunnr::unix::ExportAction::CreateFile = entry.action
-            && let Some(bytes) = engine.read_blob(entry.oid)?
-        {
-            content.insert(entry.oid, bytes);
-        }
-    }
-    let provider = |oid: ObjectId| -> Option<Vec<u8>> { content.get(&oid).cloned() };
-    Exporter::execute(&plan, output, &provider).map_err(CommandError::Unix)?;
-
-    writeln!(
-        out,
-        "exported {} objects from context {context} to {}",
-        plan.len(),
-        output.display()
     )?;
     Ok(())
 }
@@ -997,18 +776,6 @@ fn sub_id_by_name(engine: &DiskEngine, name: &str) -> Option<u64> {
         .values()
         .find(|s| s.name == name)
         .map(|s| s.id)
-}
-
-fn next_tag_id(engine: &DiskEngine) -> u32 {
-    engine
-        .engine
-        .ontology
-        .tags
-        .keys()
-        .map(|t| t.raw())
-        .max()
-        .map(|m| m + 1)
-        .unwrap_or(1)
 }
 
 // `value_hash` is re-exported in `mimisbrunnr::types`, but not used yet —

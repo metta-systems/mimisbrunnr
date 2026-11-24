@@ -955,9 +955,8 @@ const _: () = assert!(CHUNK_LIST_HEAD_PAYLOAD == 262_048);
 const _: () = assert!(CHUNK_LIST_HEAD_ENTRIES == 6_551);
 const _: () = assert!(CHUNK_LIST_HEAD_ENTRIES == CHUNK_LIST_ENTRIES);  // same as chained
 
-// UNIX-DESIGN§1 — Path projections are encoded as ordinary tag/attribute assertions
-// (Value::Scoped { context, inner }; INDEX-DESIGN§1.3). Nothing here to validate at the
-// layout level; ontology validation handles the type rules.
+// UNIX-DESIGN§1 — Unix paths are encoded as ordinary attribute assertions
+// (`Attr(unix-path, Text)`). Nothing here to validate at the layout level.
 
 // =====================================================================
 // POOL-DESIGN§1 DiskDescriptorOnDisk — 256 B (path: [u8; 192])

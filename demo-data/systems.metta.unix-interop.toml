@@ -7,23 +7,16 @@ name = "Unix Path Ontology"
 "systems.metta.core" = ">=0.1"
 
 [[tags]]
-name = "path-context"
-semantics = "grouping"
-description = "A named Unix filesystem projection"
-# path-context:project-vesper, path-context:install-rpi4, path-context:package-deb
-
-[[tags]]
 name = "unix-path"
 semantics = "attribute"
 value_type = "text"
-description = "Path within a specific unix tree projection. Scoped by path-context."
-# Always paired with a path-context tag
+description = "Where this object appears in the pool's Unix view"
 
 [[tags]]
 name = "unix-mode"
 semantics = "attribute"
 value_type = "int"
-description = "Unix permission bits for this object in the projection"
+description = "Unix permission bits for this object"
 
 [[tags]]
 name = "unix-uid"

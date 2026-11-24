@@ -22,8 +22,6 @@ pub enum VfsEntryKind {
     Root,
     /// `/tags` — root of the tag-navigation tree.
     TagsRoot,
-    /// `/ctx` — root of the path-context projections.
-    CtxRoot,
     /// `/tags/<a>/<b>/<c>` — the matched-set hierarchy.
     ///
     /// `current_tags` is the canonical set of tags the path so far has
@@ -31,16 +29,13 @@ pub enum VfsEntryKind {
     TagDir { current_tags: BTreeSet<TagId> },
     /// `/tags/<…>/<oid>` — a specific matched object.
     TagObject { oid: ObjectId },
-    /// `/ctx/<context>/<sub_path>` — a directory inside a path projection.
+    /// `/paths/<sub_path>` — a directory of the Unix view.
     ///
-    /// `sub_path` is the projection-relative directory the inode points at,
-    /// using `/` separators. The empty string means the projection's root.
-    CtxDir {
-        context: TagId,
-        sub_path: String,
-    },
-    /// `/ctx/<context>/…/<file>` — a leaf object in a path projection.
-    CtxObject { context: TagId, oid: ObjectId },
+    /// `sub_path` is the `unix-path` prefix the inode points at, using `/`
+    /// separators. The empty string is `/paths` itself.
+    PathDir { sub_path: String },
+    /// `/paths/…/<file>` — an object at one of its `unix-path` values.
+    PathObject { oid: ObjectId },
 }
 
 /// One entry in the VFS inode table.

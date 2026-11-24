@@ -371,9 +371,6 @@ fn oid_low32(oid_raw: u64) -> Option<u32> {
 // For `Text` / `Blob` we pick a 13-byte string of `0xFF` and rely on the
 // continuation flag in `NormalisedKey` (byte 14 = 1) to land above any
 // real-world finite-length string.
-//
-// For `Scoped`, we recurse and reuse the inner type's sentinels under the
-// same context tag.
 
 fn type_min(value: &Value) -> Value {
     match value {
@@ -382,10 +379,6 @@ fn type_min(value: &Value) -> Value {
         Value::Timestamp(_) => Value::Timestamp(i64::MIN),
         Value::Text(_) => Value::Text(String::new()),
         Value::Blob(_) => Value::Blob(Vec::new()),
-        Value::Scoped { context, inner } => Value::Scoped {
-            context: *context,
-            inner: Box::new(type_min(inner)),
-        },
     }
 }
 
@@ -402,10 +395,6 @@ fn type_max(value: &Value) -> Value {
         // above any short / unflagged string.
         Value::Text(_) => Value::Text(String::from_utf8_lossy(&[0xFF; 32]).into_owned()),
         Value::Blob(_) => Value::Blob(vec![0xFF; 32]),
-        Value::Scoped { context, inner } => Value::Scoped {
-            context: *context,
-            inner: Box::new(type_max(inner)),
-        },
     }
 }
 

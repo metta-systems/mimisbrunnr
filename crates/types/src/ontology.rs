@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{ids::TagId, storage_policy::StoragePolicy};
 
 /// Permitted value type for an `Attribute` tag (SPECIFICATION-DESIGN§3.1). Maps 1:1 to
-/// the non-`Scoped` variants of [`crate::Value`]; `Scoped` is transparent
-/// to type-checking per INDEX-DESIGN§1.3.
+/// the variants of [`crate::Value`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ValueType {
     Text,
@@ -27,8 +26,7 @@ pub enum TagSemantics {
     Label,
     /// Key-value attribute: `artist = "Aphex Twin"`.
     Attribute { value_type: ValueType },
-    /// Unordered group (also the only legal context for [`crate::Value::Scoped`]
-    /// per INDEX-DESIGN§1.3).
+    /// Unordered group.
     Grouping,
     /// Ordered collection: playlists, albums, recipe books.
     OrderedCollection { element_constraint: Option<TagId> },

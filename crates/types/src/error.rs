@@ -15,11 +15,6 @@ pub enum TypesError {
     /// CBOR decoding failure (truncated input, type mismatch, etc.).
     #[error("CBOR decoding failed: {0}")]
     CborDecode(String),
-
-    /// `Value::Scoped` whose `inner` is itself a `Scoped` — disallowed by
-    /// INDEX-DESIGN§1.3 (nested scopes are a format error).
-    #[error("Value::Scoped may not directly contain another Scoped value")]
-    NestedScopedValue,
 }
 
 impl TypesError {

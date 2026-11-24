@@ -158,11 +158,6 @@ fn push_value(value: &Value, out: &mut String) {
             out.push('"');
         }
         Value::Blob(b) => out.push_str(&format!("blob[{}]", b.len())),
-        Value::Scoped { context, inner } => {
-            out.push_str(&format!("scoped(@{},", context.raw()));
-            push_value(inner, out);
-            out.push(')');
-        }
     }
 }
 

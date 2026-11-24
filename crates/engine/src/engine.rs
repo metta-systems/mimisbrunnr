@@ -18,7 +18,7 @@ use mimisbrunnr_types::{
     Assertion, ChangeInterest, NodeId, ObjectId, ObjectState, Query, SubscriptionId, TagDefinition,
     TagId, TagOrigin, TagSemantics, Value,
 };
-use mimisbrunnr_unix::PathContextManager;
+use mimisbrunnr_unix::PathProjection;
 use mimisbrunnr_watch::{Retention, SubscriptionEngine};
 use roaring::RoaringBitmap;
 
@@ -71,7 +71,7 @@ pub struct Engine {
     pub chunk_index: ChunkIndex,
     pub ontology: OntologyState,
     pub subscriptions: SubscriptionEngine,
-    pub path_contexts: PathContextManager,
+    pub unix_paths: PathProjection,
     pub oplog: OpLog,
     pub clock: HybridClock,
     pub node_id: NodeId,
@@ -115,7 +115,7 @@ impl Engine {
             chunk_index: ChunkIndex::new(),
             ontology: OntologyState::new(),
             subscriptions: SubscriptionEngine::new(),
-            path_contexts: PathContextManager::new(),
+            unix_paths: PathProjection::new(),
             oplog: OpLog::new(DEFAULT_OPLOG_CAPACITY),
             clock: HybridClock::new(node_id),
             node_id,

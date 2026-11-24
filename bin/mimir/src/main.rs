@@ -161,35 +161,13 @@ enum WatchAction {
 
 #[derive(Subcommand, Debug)]
 enum ProjectAction {
-    /// Create a path-context grouping tag and an empty projection.
-    CreateContext { name: String },
-    /// List registered path contexts.
-    ListContexts,
-    /// Record `path` for `oid` under `ctx`.
-    SetPath {
-        oid: String,
-        ctx: String,
-        path: String,
-    },
-    /// Print the projected tree for `ctx`.
-    Tree { ctx: String },
+    /// Record `path` as a `unix-path` of `oid`.
+    SetPath { oid: String, path: String },
+    /// Print the Unix view, or the subtree under `path`.
+    Tree { path: Option<String> },
     /// Walk a host directory and create one object per file. This does
     /// not read file contents into the blob store.
-    Import {
-        dir: PathBuf,
-        #[arg(long)]
-        context: String,
-    },
-    /// Export blob bytes from a context. With `--oid`, writes a single
-    /// object's blob to `--output`; without, the full directory-tree export
-    /// is still deferred.
-    Export {
-        ctx: String,
-        #[arg(short, long)]
-        output: PathBuf,
-        #[arg(long)]
-        oid: Option<String>,
-    },
+    Import { dir: PathBuf },
 }
 
 fn main() -> ExitCode {
@@ -359,29 +337,17 @@ fn run<W: Write>(
         },
 
         Commands::Project { action } => match action {
-            ProjectAction::CreateContext { name } => {
-                commands::run_project_create_context(engine, out, &name)?;
+            ProjectAction::SetPath { oid, path } => {
+                commands::run_project_set_path(engine, out, &oid, &path)?;
                 Ok(true)
             }
-            ProjectAction::ListContexts => {
-                commands::run_project_list_contexts(engine, out)?;
+            ProjectAction::Tree { path } => {
+                commands::run_project_tree(engine, out, path.as_deref())?;
                 Ok(false)
             }
-            ProjectAction::SetPath { oid, ctx, path } => {
-                commands::run_project_set_path(engine, out, &oid, &ctx, &path)?;
+            ProjectAction::Import { dir } => {
+                commands::run_project_import(engine, out, &dir)?;
                 Ok(true)
-            }
-            ProjectAction::Tree { ctx } => {
-                commands::run_project_tree(engine, out, &ctx)?;
-                Ok(false)
-            }
-            ProjectAction::Import { dir, context } => {
-                commands::run_project_import(engine, out, &dir, &context)?;
-                Ok(true)
-            }
-            ProjectAction::Export { ctx, output, oid } => {
-                commands::run_project_export(engine, out, &ctx, &output, oid.as_deref())?;
-                Ok(false)
             }
         },
     }

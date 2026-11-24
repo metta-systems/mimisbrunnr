@@ -1,12 +1,11 @@
 [package]
 name = "mimisbrunnr-unix"
-description = "Unix path projections and import/export for Mímisbrunnr"
+description = "Unix path projections and import for Mímisbrunnr"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-mimisbrunnr-ontology = { workspace = true }
 mimisbrunnr-types = { workspace = true }
 ciborium = { workspace = true }
 log = { workspace = true }

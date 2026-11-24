@@ -1,7 +1,7 @@
 //! `mimisbrunnr-fuse` — FUSE bridge for Mímisbrunnr (SPECIFICATION-DESIGN§12.6, SPECIFICATION-DESIGN§12.7).
 //!
 //! This crate is a *thin reader* over the in-memory mirrors that the engine
-//! holds (tag / kv / forward indices, ontology state, path-context manager).
+//! holds (tag / kv / forward indices, ontology state, Unix view).
 //! It does **not** depend on the engine — the engine is expected to
 //! own a [`TagVfs`] and pass references into [`MimisbrunnrFs`] when mounting.
 //!
@@ -16,10 +16,9 @@
 //! │   │   │   └── 4789
 //! │   │   └── stationary/
 //! │   └── archive/
-//! └── ctx/                        # unix-path projections under context tags
-//!     ├── rpi4-sdcard/
-//!     │   └── boot/
-//!     │       └── vesper          # → ObjectId via PathProjection
+//! └── paths/                      # the Unix view: objects' unix-path values
+//!     ├── boot/
+//!     │   └── vesper              # → ObjectId via PathProjection
 //!     └── …
 //! ```
 //!
@@ -29,9 +28,8 @@
 //! bitmap are shown. Files in a tags-directory are the matched objects, named
 //! by `ObjectId` in decimal.
 //!
-//! Under `/ctx/`, each top-level entry is a path-context tag (a `Grouping`
-//! tag holding a [`mimisbrunnr_unix::PathProjection`]); below it, the
-//! projection's `paths` map drives the directory hierarchy.
+//! Under `/paths/`, the [`mimisbrunnr_unix::PathProjection`]'s `paths` map
+//! drives the directory hierarchy.
 //!
 //! # Inode identity
 //!
@@ -58,7 +56,7 @@ mod mimisbrunnr_fs;
 pub use attr::{VfsAttr, VfsAttrKind};
 pub use entry::{VfsEntry, VfsEntryKind};
 pub use error::FuseError;
-pub use inode::{INODE_CTX_ROOT, INODE_ROOT, INODE_TAGS_ROOT, InodeId};
+pub use inode::{INODE_PATHS_ROOT, INODE_ROOT, INODE_TAGS_ROOT, InodeId};
 pub use tag_vfs::TagVfs;
 
 #[cfg(feature = "fuse")]

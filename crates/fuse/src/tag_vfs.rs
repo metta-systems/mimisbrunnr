@@ -19,12 +19,12 @@ use log::trace;
 use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
 use mimisbrunnr_ontology::OntologyState;
 use mimisbrunnr_types::{ObjectId, TagId};
-use mimisbrunnr_unix::{PathContextManager, PathProjection};
+use mimisbrunnr_unix::PathProjection;
 use roaring::RoaringBitmap;
 
 use crate::attr::VfsAttr;
 use crate::entry::{VfsEntry, VfsEntryKind};
-use crate::inode::{INODE_CTX_ROOT, INODE_FIRST_DYNAMIC, INODE_ROOT, INODE_TAGS_ROOT, InodeId};
+use crate::inode::{INODE_FIRST_DYNAMIC, INODE_PATHS_ROOT, INODE_ROOT, INODE_TAGS_ROOT, InodeId};
 
 /// Read-only tag/path VFS (SPECIFICATION-DESIGN§12.6).
 ///
@@ -40,13 +40,12 @@ pub struct TagVfs<'a> {
     /// in the spec so the engine can reuse the same handle when it adds
     /// attribute-driven views).
     pub kv_index: &'a KvIndex,
-    /// Forward index — used to look up an object's per-context unix path
-    /// when serving `/ctx/<context>/…`.
+    /// Forward index (kept for parity with the engine's handles).
     pub forward_index: &'a ForwardIndex,
     /// Ontology — the source of truth for tag id ↔ name mappings.
     pub ontology: &'a OntologyState,
-    /// Path-context manager — owns the per-context [`PathProjection`]s.
-    pub context_trees: &'a PathContextManager,
+    /// The pool's Unix view, served under `/paths`.
+    pub unix_paths: &'a PathProjection,
 
     // ----- Session-local inode bookkeeping. -----
     entries: Mutex<HashMap<InodeId, VfsEntry>>,
@@ -56,13 +55,13 @@ pub struct TagVfs<'a> {
 
 impl<'a> TagVfs<'a> {
     /// Build a new VFS over the given engine handles. Initialises the three
-    /// well-known inodes (root, `/tags`, `/ctx`).
+    /// well-known inodes (root, `/tags`, `/paths`).
     pub fn new(
         tag_index: &'a TagIndex,
         kv_index: &'a KvIndex,
         forward_index: &'a ForwardIndex,
         ontology: &'a OntologyState,
-        context_trees: &'a PathContextManager,
+        unix_paths: &'a PathProjection,
     ) -> Self {
         let mut entries: HashMap<InodeId, VfsEntry> = HashMap::new();
         entries.insert(
@@ -82,24 +81,26 @@ impl<'a> TagVfs<'a> {
             },
         );
         entries.insert(
-            INODE_CTX_ROOT,
+            INODE_PATHS_ROOT,
             VfsEntry {
-                inode: INODE_CTX_ROOT,
-                kind: VfsEntryKind::CtxRoot,
+                inode: INODE_PATHS_ROOT,
+                kind: VfsEntryKind::PathDir {
+                    sub_path: String::new(),
+                },
                 parent: Some(INODE_ROOT),
             },
         );
 
         let mut lookup_index: HashMap<(InodeId, String), InodeId> = HashMap::new();
         lookup_index.insert((INODE_ROOT, "tags".into()), INODE_TAGS_ROOT);
-        lookup_index.insert((INODE_ROOT, "ctx".into()), INODE_CTX_ROOT);
+        lookup_index.insert((INODE_ROOT, "paths".into()), INODE_PATHS_ROOT);
 
         Self {
             tag_index,
             kv_index,
             forward_index,
             ontology,
-            context_trees,
+            unix_paths,
             entries: Mutex::new(entries),
             lookup_index: Mutex::new(lookup_index),
             next_ino: Mutex::new(INODE_FIRST_DYNAMIC),
@@ -153,14 +154,11 @@ impl<'a> TagVfs<'a> {
         match entry.kind {
             VfsEntryKind::Root => self.readdir_root(),
             VfsEntryKind::TagsRoot => self.readdir_tags_root(inode),
-            VfsEntryKind::CtxRoot => self.readdir_ctx_root(inode),
             VfsEntryKind::TagDir { ref current_tags } => {
                 self.readdir_tag_dir(inode, current_tags)
             }
-            VfsEntryKind::CtxDir { context, ref sub_path } => {
-                self.readdir_ctx_dir(inode, context, sub_path.as_str())
-            }
-            VfsEntryKind::TagObject { .. } | VfsEntryKind::CtxObject { .. } => Vec::new(),
+            VfsEntryKind::PathDir { ref sub_path } => self.readdir_path_dir(inode, sub_path),
+            VfsEntryKind::TagObject { .. } | VfsEntryKind::PathObject { .. } => Vec::new(),
         }
     }
 
@@ -209,27 +207,6 @@ impl<'a> TagVfs<'a> {
             .and_then(|m| m.get(&inode).cloned())
     }
 
-    /// Borrow the projection for a `/ctx/` context inode.
-    fn projection_for(&self, context: TagId) -> Option<&PathProjection> {
-        self.context_trees.get(context)
-    }
-
-    /// Allocate (or fetch the cached) inode for the context-directory of
-    /// `context` rooted under `/ctx/`. Returns `None` if there is no
-    /// projection registered for that tag. Used by [`crate::MountRoot`] to
-    /// re-root a FUSE mount at a single context.
-    pub fn ctx_root_inode(&self, context: TagId) -> Option<InodeId> {
-        if !self.context_trees.projections.contains_key(&context) {
-            return None;
-        }
-        let name = self.ontology.tags.get(&context)?.name.clone();
-        let kind = VfsEntryKind::CtxDir {
-            context,
-            sub_path: String::new(),
-        };
-        Some(self.allocate_inode(kind, INODE_CTX_ROOT, &name))
-    }
-
     // ----------------------------------------------------------------------
     // lookup helpers
     // ----------------------------------------------------------------------
@@ -242,18 +219,17 @@ impl<'a> TagVfs<'a> {
         match parent_kind {
             VfsEntryKind::Root => match name {
                 "tags" => Some(VfsEntryKind::TagsRoot),
-                "ctx" => Some(VfsEntryKind::CtxRoot),
+                "paths" => Some(VfsEntryKind::PathDir {
+                    sub_path: String::new(),
+                }),
                 _ => None,
             },
             VfsEntryKind::TagsRoot => self.derive_child_under_tags_root(name),
             VfsEntryKind::TagDir { current_tags } => {
                 self.derive_child_under_tag_dir(current_tags, name)
             }
-            VfsEntryKind::CtxRoot => self.derive_child_under_ctx_root(name),
-            VfsEntryKind::CtxDir { context, sub_path } => {
-                self.derive_child_under_ctx_dir(*context, sub_path.as_str(), name)
-            }
-            VfsEntryKind::TagObject { .. } | VfsEntryKind::CtxObject { .. } => None,
+            VfsEntryKind::PathDir { sub_path } => self.derive_child_under_path_dir(sub_path, name),
+            VfsEntryKind::TagObject { .. } | VfsEntryKind::PathObject { .. } => None,
         }
     }
 
@@ -300,24 +276,8 @@ impl<'a> TagVfs<'a> {
         Some(VfsEntryKind::TagObject { oid })
     }
 
-    fn derive_child_under_ctx_root(&self, name: &str) -> Option<VfsEntryKind> {
-        let tag_id = *self.ontology.names.get(name)?;
-        if !self.context_trees.projections.contains_key(&tag_id) {
-            return None;
-        }
-        Some(VfsEntryKind::CtxDir {
-            context: tag_id,
-            sub_path: String::new(),
-        })
-    }
-
-    fn derive_child_under_ctx_dir(
-        &self,
-        context: TagId,
-        sub_path: &str,
-        name: &str,
-    ) -> Option<VfsEntryKind> {
-        let projection = self.projection_for(context)?;
+    fn derive_child_under_path_dir(&self, sub_path: &str, name: &str) -> Option<VfsEntryKind> {
+        let projection = self.unix_paths;
         let candidate_path = if sub_path.is_empty() {
             name.to_string()
         } else {
@@ -326,14 +286,13 @@ impl<'a> TagVfs<'a> {
 
         // Is `candidate_path` an exact match (file)?
         if let Some(oid) = projection.reverse_lookup(&candidate_path) {
-            return Some(VfsEntryKind::CtxObject { context, oid });
+            return Some(VfsEntryKind::PathObject { oid });
         }
 
         // Is `candidate_path` a directory prefix of some path?
         let prefix = format!("{candidate_path}/");
         if projection.iter().any(|(_, p)| p.starts_with(&prefix)) {
-            return Some(VfsEntryKind::CtxDir {
-                context,
+            return Some(VfsEntryKind::PathDir {
                 sub_path: candidate_path,
             });
         }
@@ -350,8 +309,8 @@ impl<'a> TagVfs<'a> {
         if let Some(e) = self.entry(INODE_TAGS_ROOT) {
             out.push(("tags".into(), e));
         }
-        if let Some(e) = self.entry(INODE_CTX_ROOT) {
-            out.push(("ctx".into(), e));
+        if let Some(e) = self.entry(INODE_PATHS_ROOT) {
+            out.push(("paths".into(), e));
         }
         out
     }
@@ -458,47 +417,8 @@ impl<'a> TagVfs<'a> {
         out
     }
 
-    fn readdir_ctx_root(&self, parent: InodeId) -> Vec<(String, VfsEntry)> {
-        let mut names: Vec<(String, TagId)> = self
-            .context_trees
-            .projections
-            .keys()
-            .filter_map(|&tag| {
-                self.ontology
-                    .tags
-                    .get(&tag)
-                    .map(|def| (def.name.clone(), tag))
-            })
-            .collect();
-        names.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let mut out = Vec::with_capacity(names.len());
-        for (name, tag) in names {
-            let inode = self.allocate_inode(
-                VfsEntryKind::CtxDir {
-                    context: tag,
-                    sub_path: String::new(),
-                },
-                parent,
-                &name,
-            );
-            if let Some(entry) = self.entry(inode) {
-                out.push((name, entry));
-            }
-        }
-        out
-    }
-
-    fn readdir_ctx_dir(
-        &self,
-        parent: InodeId,
-        context: TagId,
-        sub_path: &str,
-    ) -> Vec<(String, VfsEntry)> {
-        let projection = match self.projection_for(context) {
-            Some(p) => p,
-            None => return Vec::new(),
-        };
+    fn readdir_path_dir(&self, parent: InodeId, sub_path: &str) -> Vec<(String, VfsEntry)> {
+        let projection = self.unix_paths;
 
         // Walk every (oid, path) pair. For each, strip `sub_path/`; the next
         // component is either an immediate file or a sub-directory name.
@@ -542,10 +462,7 @@ impl<'a> TagVfs<'a> {
                 format!("{sub_path}/{name}")
             };
             let inode = self.allocate_inode(
-                VfsEntryKind::CtxDir {
-                    context,
-                    sub_path: next_sub,
-                },
+                VfsEntryKind::PathDir { sub_path: next_sub },
                 parent,
                 &name,
             );
@@ -555,8 +472,7 @@ impl<'a> TagVfs<'a> {
         }
 
         for (name, oid) in files {
-            let inode =
-                self.allocate_inode(VfsEntryKind::CtxObject { context, oid }, parent, &name);
+            let inode = self.allocate_inode(VfsEntryKind::PathObject { oid }, parent, &name);
             if let Some(entry) = self.entry(inode) {
                 out.push((name, entry));
             }
@@ -573,10 +489,9 @@ impl<'a> TagVfs<'a> {
         match kind {
             VfsEntryKind::Root
             | VfsEntryKind::TagsRoot
-            | VfsEntryKind::CtxRoot
             | VfsEntryKind::TagDir { .. }
-            | VfsEntryKind::CtxDir { .. } => VfsAttr::directory(),
-            VfsEntryKind::TagObject { .. } | VfsEntryKind::CtxObject { .. } => {
+            | VfsEntryKind::PathDir { .. } => VfsAttr::directory(),
+            VfsEntryKind::TagObject { .. } | VfsEntryKind::PathObject { .. } => {
                 // We don't know object size at this layer; the engine plumbs
                 // a content provider into MimisbrunnrFs which provides bytes
                 // on `read`. For `getattr` we report 0; the FUSE adapter
@@ -613,12 +528,9 @@ fn low32_of(oid: ObjectId) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
     use mimisbrunnr_ontology::{IdAllocator, OntologyModule, OntologyState};
     use mimisbrunnr_types::{ObjectId, TagDefinition, TagId, TagSemantics};
-    use mimisbrunnr_unix::PathContextManager;
 
     use super::*;
 
@@ -627,16 +539,6 @@ mod tests {
             id: TagId::new(0),
             name: name.into(),
             semantics: TagSemantics::Label,
-            implies: vec![],
-            storage: None,
-        }
-    }
-
-    fn grouping(name: &str) -> TagDefinition {
-        TagDefinition {
-            id: TagId::new(0),
-            name: name.into(),
-            semantics: TagSemantics::Grouping,
             implies: vec![],
             storage: None,
         }
@@ -658,7 +560,7 @@ mod tests {
         TagIndex,
         KvIndex,
         ForwardIndex,
-        PathContextManager,
+        PathProjection,
     ) {
         let mut state = OntologyState::new();
         let mut alloc = IdAllocator::new();
@@ -701,7 +603,7 @@ mod tests {
             tag_index,
             KvIndex::default(),
             ForwardIndex::default(),
-            PathContextManager::new(),
+            PathProjection::new(),
         )
     }
 
@@ -711,7 +613,7 @@ mod tests {
         let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
         assert!(vfs.entry(INODE_ROOT).is_some());
         assert!(vfs.entry(INODE_TAGS_ROOT).is_some());
-        assert!(vfs.entry(INODE_CTX_ROOT).is_some());
+        assert!(vfs.entry(INODE_PATHS_ROOT).is_some());
     }
 
     #[test]
@@ -724,11 +626,11 @@ mod tests {
     }
 
     #[test]
-    fn lookup_root_ctx_returns_ctx_root() {
+    fn lookup_root_paths_returns_paths_root() {
         let (state, tag_index, kv_index, forward_index, ctx) = build_state();
         let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
-        let entry = vfs.lookup(INODE_ROOT, "ctx").unwrap();
-        assert_eq!(entry.inode, INODE_CTX_ROOT);
+        let entry = vfs.lookup(INODE_ROOT, "paths").unwrap();
+        assert_eq!(entry.inode, INODE_PATHS_ROOT);
     }
 
     #[test]
@@ -817,7 +719,7 @@ mod tests {
     fn getattr_on_directories_reports_directory() {
         let (state, tag_index, kv_index, forward_index, ctx) = build_state();
         let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx);
-        for inode in [INODE_ROOT, INODE_TAGS_ROOT, INODE_CTX_ROOT] {
+        for inode in [INODE_ROOT, INODE_TAGS_ROOT, INODE_PATHS_ROOT] {
             let attr = vfs.getattr(inode).unwrap();
             assert_eq!(attr.kind, crate::attr::VfsAttrKind::Directory);
         }
@@ -854,119 +756,51 @@ mod tests {
         }
     }
 
-    // ----- /ctx/ tests -----
+    // ----- /paths/ tests -----
 
-    fn build_state_with_ctx() -> (
-        OntologyState,
-        TagIndex,
-        KvIndex,
-        ForwardIndex,
-        PathContextManager,
-        TagId,
-    ) {
-        let mut state = OntologyState::new();
-        let mut alloc = IdAllocator::new();
-        state
-            .install(
-                OntologyModule {
-                    id: "ctx-test".into(),
-                    version: "0.1.0".into(),
-                    name: "ctx-test".into(),
-                    tags: vec![grouping("rpi4-sdcard"), label("electronic")],
-                    implications: vec![],
-                    relations: vec![],
-                },
-                &mut alloc,
-            )
-            .unwrap();
-
-        let context = state.names["rpi4-sdcard"];
-        let mut ctx = PathContextManager::new();
-        ctx.create_context(&state, context, PathBuf::from("/host/rpi4")).unwrap();
-        let proj = ctx.get_mut(context).unwrap();
-        proj.add(oid(100), "boot/vesper".into()).unwrap();
-        proj.add(oid(101), "boot/config.txt".into()).unwrap();
-        proj.add(oid(102), "etc/fstab".into()).unwrap();
-
+    fn build_state_with_paths() -> (OntologyState, TagIndex, KvIndex, ForwardIndex, PathProjection)
+    {
+        let mut unix_paths = PathProjection::new();
+        unix_paths.add(oid(100), "boot/vesper".into()).unwrap();
+        unix_paths.add(oid(101), "boot/config.txt".into()).unwrap();
+        unix_paths.add(oid(102), "etc/fstab".into()).unwrap();
         (
-            state,
+            OntologyState::new(),
             TagIndex::default(),
             KvIndex::default(),
             ForwardIndex::default(),
-            ctx,
-            context,
+            unix_paths,
         )
     }
 
     #[test]
-    fn ctx_root_lookup_returns_ctx_dir() {
-        let (state, tag_index, kv_index, forward_index, ctx_mgr, _ctx_tag) =
-            build_state_with_ctx();
-        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
-        let dir = vfs.lookup(INODE_CTX_ROOT, "rpi4-sdcard").unwrap();
-        match &dir.kind {
-            VfsEntryKind::CtxDir { sub_path, .. } => assert!(sub_path.is_empty()),
-            other => panic!("expected CtxDir, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn ctx_root_inode_reroots_at_registered_context() {
-        let (state, tag_index, kv_index, forward_index, ctx_mgr, ctx_tag) =
-            build_state_with_ctx();
-        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
-        let context_root = vfs.ctx_root_inode(ctx_tag).unwrap();
-        let names: Vec<String> = vfs.readdir(context_root).into_iter().map(|(name, _)| name).collect();
-        assert!(names.contains(&"boot".to_string()), "{names:?}");
-        assert!(names.contains(&"etc".to_string()), "{names:?}");
-        let electronic = state.names["electronic"];
-        assert_eq!(vfs.ctx_root_inode(electronic), None, "not a context");
-    }
-
-    #[test]
-    fn ctx_root_readdir_lists_contexts() {
-        let (state, tag_index, kv_index, forward_index, ctx_mgr, _ctx_tag) =
-            build_state_with_ctx();
-        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
-        let listing = vfs.readdir(INODE_CTX_ROOT);
-        let names: Vec<&str> = listing.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, vec!["rpi4-sdcard"]);
-    }
-
-    #[test]
-    fn ctx_dir_readdir_lists_first_level_entries() {
-        let (state, tag_index, kv_index, forward_index, ctx_mgr, _ctx_tag) =
-            build_state_with_ctx();
-        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
-        let dir = vfs.lookup(INODE_CTX_ROOT, "rpi4-sdcard").unwrap();
-        let listing = vfs.readdir(dir.inode);
+    fn paths_root_readdir_lists_first_level_entries() {
+        let (state, tag_index, kv_index, forward_index, unix_paths) = build_state_with_paths();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &unix_paths);
+        let listing = vfs.readdir(INODE_PATHS_ROOT);
         let names: Vec<&str> = listing.iter().map(|(n, _)| n.as_str()).collect();
         // boot and etc directories synthesised; no top-level files.
-        assert!(names.contains(&"boot"));
-        assert!(names.contains(&"etc"));
+        assert_eq!(names, vec!["boot", "etc"]);
     }
 
     #[test]
-    fn ctx_dir_lookup_resolves_file() {
-        let (state, tag_index, kv_index, forward_index, ctx_mgr, _ctx_tag) =
-            build_state_with_ctx();
-        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
-        let ctx_dir = vfs.lookup(INODE_CTX_ROOT, "rpi4-sdcard").unwrap();
-        let boot = vfs.lookup(ctx_dir.inode, "boot").unwrap();
+    fn paths_dir_lookup_resolves_file() {
+        let (state, tag_index, kv_index, forward_index, unix_paths) = build_state_with_paths();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &unix_paths);
+        let boot = vfs.lookup(INODE_PATHS_ROOT, "boot").unwrap();
         let vesper = vfs.lookup(boot.inode, "vesper").unwrap();
         match vesper.kind {
-            VfsEntryKind::CtxObject { oid: o, .. } => assert_eq!(o, oid(100)),
-            other => panic!("expected CtxObject, got {other:?}"),
+            VfsEntryKind::PathObject { oid: o } => assert_eq!(o, oid(100)),
+            other => panic!("expected PathObject, got {other:?}"),
         }
+        assert!(vfs.lookup(INODE_PATHS_ROOT, "missing").is_none());
     }
 
     #[test]
-    fn ctx_dir_readdir_subdir_lists_files() {
-        let (state, tag_index, kv_index, forward_index, ctx_mgr, _ctx_tag) =
-            build_state_with_ctx();
-        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &ctx_mgr);
-        let ctx_dir = vfs.lookup(INODE_CTX_ROOT, "rpi4-sdcard").unwrap();
-        let boot = vfs.lookup(ctx_dir.inode, "boot").unwrap();
+    fn paths_dir_readdir_subdir_lists_files() {
+        let (state, tag_index, kv_index, forward_index, unix_paths) = build_state_with_paths();
+        let vfs = TagVfs::new(&tag_index, &kv_index, &forward_index, &state, &unix_paths);
+        let boot = vfs.lookup(INODE_PATHS_ROOT, "boot").unwrap();
         let listing = vfs.readdir(boot.inode);
         let names: Vec<&str> = listing.iter().map(|(n, _)| n.as_str()).collect();
         assert!(names.contains(&"vesper"));

@@ -461,9 +461,6 @@ fn format_value(v: &Value) -> String {
         Value::Float(f) => format!("{f}"),
         Value::Timestamp(t) => format!("ts:{t}"),
         Value::Blob(b) => format!("<{} bytes>", b.len()),
-        Value::Scoped { context, inner } => {
-            format!("scoped(ctx={}, {})", context.raw(), format_value(inner))
-        }
     }
 }
 

@@ -6,7 +6,7 @@
 //! - `status` — show pool health, per-disk capacity / used / state, tier
 //!   breakdown.
 //! - `add-disk <path>` / `remove-disk <id-or-path>` — disk lifecycle.
-//! - `mount <mountpoint>` / `mount-unix --context <ctx> <mountpoint>` —
+//! - `mount <mountpoint>` / `mount-unix <mountpoint>` —
 //!   FUSE mounts (feature-gated behind `--features fuse`).
 //! - `unmount <mountpoint>` — platform-specific unmount.
 
@@ -68,7 +68,7 @@ enum Commands {
         target: String,
     },
 
-    /// Mount the full /tags + /ctx filesystem (feature = "fuse").
+    /// Mount the full /tags + /paths filesystem (feature = "fuse").
     Mount {
         /// Mount point.
         mountpoint: PathBuf,
@@ -79,18 +79,13 @@ enum Commands {
         options: Vec<String>,
     },
 
-    /// Mount a single path-context subtree (feature = "fuse").
+    /// Mount the Unix view (feature = "fuse").
     ///
-    /// The mount root is the context's directory: `<mountpoint>/<path>` is the
-    /// object projected at `<path>` in `<context>` (as created by
-    /// `mimir project create-context <context>`).
+    /// The mount root is the view's root: `<mountpoint>/<path>` is the
+    /// object whose `unix-path` is `<path>`.
     MountUnix {
         /// Mount point.
         mountpoint: PathBuf,
-
-        /// Path-context name to expose.
-        #[arg(long)]
-        context: String,
 
         /// Extra mount option passed to libfuse, e.g. `-o backend=fskit` or
         /// `-o debug` (repeatable).
@@ -124,12 +119,11 @@ fn main() {
         Commands::Mount {
             mountpoint,
             options,
-        } => commands::cmd_mount(&cli.config, &mountpoint, None, &options),
+        } => commands::cmd_mount(&cli.config, &mountpoint, false, &options),
         Commands::MountUnix {
             mountpoint,
-            context,
             options,
-        } => commands::cmd_mount(&cli.config, &mountpoint, Some(&context), &options),
+        } => commands::cmd_mount(&cli.config, &mountpoint, true, &options),
         Commands::Unmount { mountpoint } => commands::cmd_unmount(&mountpoint),
     };
 

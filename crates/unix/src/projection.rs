@@ -1,49 +1,47 @@
-//! [`PathProjection`] — a per-context view of how Mímisbrunnr objects map to
-//! Unix paths under one path context (SPECIFICATION-DESIGN§12.1).
+//! [`PathProjection`] — the pool's Unix view: how Mímisbrunnr objects map to
+//! their `unix-path` values (SPECIFICATION-DESIGN§12.1, UNIX-DESIGN "The Unix view").
 //!
-//! A projection is a pure data structure — no I/O, no engine access. The
-//! engine layer materialises paths into a projection at query time, and
-//! [`Exporter::plan`](crate::Exporter::plan) reads from it to drive an export
-//! plan.
+//! A projection is a pure data structure — no I/O, no engine access.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use mimisbrunnr_types::{ObjectId, TagId};
+use mimisbrunnr_types::ObjectId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::UnixError;
 
-/// Per-context Unix-path view of a set of objects.
+/// In-memory Unix view of the pool's objects.
 ///
-/// `paths` maps each object id to its **relative** path within this context.
-/// `root` is purely informational — it records the host-side directory the
-/// projection was originally rooted at (for export hints) but is not enforced
-/// when looking up paths.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `paths` maps each object id to its **relative** `unix-path`.
+// TODO(UNIX1): replace with resolution through the hierarchical `unix-path`
+// key (UNIX-DESIGN "Selected design"); objects with several paths keep one here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathProjection {
-    /// The `unix-path-context:*` Grouping tag this projection belongs to.
-    pub context: TagId,
-    /// Host-side root directory the projection was associated with at import
-    /// or scan time. Informational; export targets a separately supplied
-    /// directory.
-    pub root: PathBuf,
-    /// Object → relative path mapping within this context.
+    /// Object → relative path mapping.
     pub paths: HashMap<ObjectId, String>,
 }
 
 impl PathProjection {
-    /// Construct an empty projection for `context`, recording `root` as the
-    /// informational host root.
-    pub fn new(context: TagId, root: PathBuf) -> Self {
-        Self {
-            context,
-            root,
-            paths: HashMap::new(),
-        }
+    /// Empty projection.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Register a mapping `oid → path` within this context.
+    /// CBOR-encode for the engine's legacy state blob.
+    pub fn serialise(&self) -> Result<Vec<u8>, UnixError> {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(self, &mut buf)
+            .map_err(|error| UnixError::Cbor(error.to_string()))?;
+        Ok(buf)
+    }
+
+    /// Decode from [`Self::serialise`]'s bytes.
+    pub fn deserialise(bytes: &[u8]) -> Result<Self, UnixError> {
+        ciborium::de::from_reader(bytes).map_err(|error| UnixError::Cbor(error.to_string()))
+    }
+
+    /// Register a mapping `oid → path`.
     ///
     /// `path` must be a relative UTF-8 Unix-style path. It is rejected if it
     /// is empty, absolute (`/...`), contains a `..` traversal component, or
@@ -65,8 +63,6 @@ impl PathProjection {
     }
 
     /// Linear scan: find the first object id whose path matches `path`.
-    // TODO(UNIX1): replace with resolution through the hierarchical
-    // `unix-path` key (UNIX-DESIGN "Selected design").
     pub fn reverse_lookup(&self, path: &str) -> Option<ObjectId> {
         self.paths
             .iter()
@@ -122,7 +118,7 @@ mod tests {
 
     #[test]
     fn add_and_lookup_round_trip() {
-        let mut p = PathProjection::new(TagId::new(7), PathBuf::from("/host/root"));
+        let mut p = PathProjection::new();
         p.add(oid(1), "src/main.rs".into()).unwrap();
         p.add(oid(2), "README.md".into()).unwrap();
         assert_eq!(p.lookup(oid(1)), Some("src/main.rs"));
@@ -133,35 +129,35 @@ mod tests {
 
     #[test]
     fn add_rejects_absolute_path() {
-        let mut p = PathProjection::new(TagId::new(1), PathBuf::from("/r"));
+        let mut p = PathProjection::new();
         let err = p.add(oid(1), "/etc/passwd".into()).unwrap_err();
         assert!(matches!(err, UnixError::AbsolutePath(_)));
     }
 
     #[test]
     fn add_rejects_empty_path() {
-        let mut p = PathProjection::new(TagId::new(1), PathBuf::from("/r"));
+        let mut p = PathProjection::new();
         let err = p.add(oid(1), String::new()).unwrap_err();
         assert!(matches!(err, UnixError::EmptyPath));
     }
 
     #[test]
     fn add_rejects_parent_traversal() {
-        let mut p = PathProjection::new(TagId::new(1), PathBuf::from("/r"));
+        let mut p = PathProjection::new();
         let err = p.add(oid(1), "a/../b".into()).unwrap_err();
         assert!(matches!(err, UnixError::ParentTraversal(_)));
     }
 
     #[test]
     fn add_rejects_nul_byte() {
-        let mut p = PathProjection::new(TagId::new(1), PathBuf::from("/r"));
+        let mut p = PathProjection::new();
         let err = p.add(oid(1), "a\0b".into()).unwrap_err();
         assert!(matches!(err, UnixError::NulInPath(_)));
     }
 
     #[test]
     fn remove_drops_mapping() {
-        let mut p = PathProjection::new(TagId::new(1), PathBuf::from("/r"));
+        let mut p = PathProjection::new();
         p.add(oid(1), "a".into()).unwrap();
         assert!(p.lookup(oid(1)).is_some());
         p.remove(oid(1));
@@ -170,7 +166,7 @@ mod tests {
 
     #[test]
     fn reverse_lookup_finds_oid() {
-        let mut p = PathProjection::new(TagId::new(1), PathBuf::from("/r"));
+        let mut p = PathProjection::new();
         p.add(oid(42), "lib/x.so".into()).unwrap();
         assert_eq!(p.reverse_lookup("lib/x.so"), Some(oid(42)));
         assert_eq!(p.reverse_lookup("nope"), None);
@@ -178,7 +174,7 @@ mod tests {
 
     #[test]
     fn iter_yields_all_pairs() {
-        let mut p = PathProjection::new(TagId::new(1), PathBuf::from("/r"));
+        let mut p = PathProjection::new();
         p.add(oid(1), "a".into()).unwrap();
         p.add(oid(2), "b".into()).unwrap();
         let mut collected: Vec<(ObjectId, String)> =

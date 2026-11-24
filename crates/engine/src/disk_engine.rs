@@ -35,7 +35,7 @@
 //! leaves ~27 MiB for the legacy blob. The 4 MiB minimum index
 //! zone (`FMT_INDEX_ZONE_SIZE` in `mimisbrunnr-pool::tier`) leaves
 //! exactly **1 MiB** for the legacy blob — tight but workable for the
-//! few scalars plus the path-contexts CBOR + oplog + transient blob
+//! few scalars plus the Unix-view CBOR + oplog + transient blob
 //! `HashMap`. If a workload outgrows that, bump
 //! `FMT_INDEX_ZONE_SIZE` to 8 MiB.
 //!
@@ -52,9 +52,8 @@
 //! The legacy blob now carries only:
 //!
 //! - `oplog` (not yet migrated; ENGINE6),
-//! - `path_contexts` (per UNIX-DESIGN§1, no native region — derived from
-//!   forward-index `Attr(unix-path, ...)` at engine boot, see
-//!   `mimisbrunnr-unix::PathContextManager` docs),
+//! - `unix_paths` (the in-memory Unix view, `mimisbrunnr-unix::PathProjection`;
+//!   replaced by the hierarchical `unix-path` key in UNIX1),
 //! - scalar bookkeeping (`next_oid_local`, `next_tag_id`,
 //!   `last_applied_lsn`),
 //! - the transient `blobs: HashMap<u64, Vec<u8>>` (replaced by the real
@@ -109,7 +108,7 @@ pub(crate) const FREESPACE_LRU_REGION_OFFSET: u64 = 2816 * 1024;
 pub(crate) const LEGACY_CBOR_BLOB_OFFSET: u64 = 3072 * 1024;
 /// TagIndex per-tag `TagBitmapPage` chains live in this area.
 /// Sits after the legacy CBOR blob (which is sized for up to ~1 MiB of
-/// path-context / oplog / subscriptions metadata); each 4 KiB slot here
+/// Unix-view / oplog / subscriptions metadata); each 4 KiB slot here
 /// holds one bitmap-page chain link. Sized to [`TAG_BITMAP_AREA_PAGES`]
 /// pages (4 MiB) — comfortably more than smoke-test workloads need.
 pub(crate) const TAG_BITMAP_AREA_OFFSET: u64 = 4 * 1024 * 1024;
@@ -190,7 +189,7 @@ use mimisbrunnr_storage::{
 use mimisbrunnr_types::{
     ChangeInterest, DiskId, ObjectId, Query, SubscriptionId, TagId, Value,
 };
-use mimisbrunnr_unix::PathContextManager;
+use mimisbrunnr_unix::PathProjection;
 use mimisbrunnr_journal::{Checkpoint, Wal, WalOpKind};
 use mimisbrunnr_watch::{Retention, SubscriptionEngine};
 use serde::{Deserialize, Serialize};
@@ -247,7 +246,7 @@ struct IndexBlob {
     // object_table / location_table tables, and the ontology /
     // subscriptions modules live in dedicated 256 KiB BTREE-DESIGN§1
     // B+ tree regions; their bytes are not carried here.
-    path_contexts_bytes: Vec<u8>,
+    unix_paths_bytes: Vec<u8>,
     oplog_bytes: Vec<u8>,
     next_oid_local: u64,
     next_tag_id: u32,
@@ -628,7 +627,7 @@ impl DiskEngine {
             node_id,
         )?;
 
-        // Legacy CBOR blob (oplog + path_contexts + scalars + transient
+        // Legacy CBOR blob (oplog + unix_paths + scalars + transient
         // blob map). Object/location/ontology/subscriptions/backpointer
         // fields already loaded from their dedicated regions; the
         // legacy-blob applier no longer touches them.
@@ -1079,7 +1078,7 @@ fn build_index_blob(
     // every index live in dedicated 256 KiB BTREE-DESIGN§1 B+
     // tree regions; they are not carried in the legacy blob.
     Ok(IndexBlob {
-        path_contexts_bytes: engine.path_contexts.serialise()?,
+        unix_paths_bytes: engine.unix_paths.serialise()?,
         oplog_bytes: engine.oplog.serialise()?,
         next_oid_local: engine.next_oid_local(),
         next_tag_id: index_blob_next_tag_id(engine),
@@ -1141,10 +1140,10 @@ fn apply_index_blob(engine: &mut Engine, blob: IndexBlob) {
     // object_table / location_table / ontology / subscriptions, all live
     // in dedicated B+ tree regions; the engine fields are populated by
     // the per-region loaders in `load_index_state` before this function
-    // runs. The legacy blob carries only path_contexts, oplog, and a
+    // runs. The legacy blob carries only unix_paths, oplog, and a
     // few scalars.
-    if let Ok(p) = PathContextManager::deserialise(&blob.path_contexts_bytes) {
-        engine.path_contexts = p;
+    if let Ok(p) = PathProjection::deserialise(&blob.unix_paths_bytes) {
+        engine.unix_paths = p;
     }
     if let Ok(ol) = OpLog::deserialise(&blob.oplog_bytes) {
         engine.oplog = ol;

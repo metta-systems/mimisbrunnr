@@ -7,7 +7,7 @@
 /// Session-local inode identifier.
 ///
 /// FUSE-side inodes are 64-bit; the kernel uses `1` for the mount root by
-/// convention. The two well-known children of the root (`tags` and `ctx`)
+/// convention. The two well-known children of the root (`tags` and `paths`)
 /// take fixed inodes `2` and `3`. All other inodes are allocated lazily in
 /// strictly increasing order from [`InodeId(4)`](InodeId) onwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -38,8 +38,8 @@ pub const INODE_ROOT: InodeId = InodeId(1);
 /// Inode of `/tags`.
 pub const INODE_TAGS_ROOT: InodeId = InodeId(2);
 
-/// Inode of `/ctx`.
-pub const INODE_CTX_ROOT: InodeId = InodeId(3);
+/// Inode of `/paths`.
+pub const INODE_PATHS_ROOT: InodeId = InodeId(3);
 
 /// First freely-allocatable inode. Reserved values `0..=3` are well-known
 /// (`0` is FUSE's "no inode" sentinel; the others are listed above).

@@ -4,8 +4,8 @@
 //! Side-effect-only operations (filesystem reads); does **not** create
 //! Mímisbrunnr objects, hash blobs, or assert tags. Those concerns live in
 //! the engine. This crate's contribution is shape: deciding which host paths
-//! become which kinds of entry, with what relative path under the chosen
-//! context, and producing the path attribute (via [`build_path_attr`]) for
+//! become which kinds of entry, with what relative path under the import
+//! root, and producing the path attribute (via [`build_path_attr`]) for
 //! the engine to attach.
 //!
 //! Symlinks are recorded as [`ImportKind::Symlink`] by default and are *not*
@@ -53,19 +53,15 @@ pub struct ImportEntry {
 /// Recursive host-tree walker.
 pub struct Importer {
     root: PathBuf,
-    context: TagId,
     include_hidden: bool,
     follow_symlinks: bool,
 }
 
 impl Importer {
-    /// New importer rooted at `root`, tagging entries with `context` (passed
-    /// through unchanged when the engine eventually constructs path
-    /// assertions via [`build_path_attr`]).
-    pub fn new(root: &Path, context: TagId) -> Self {
+    /// New importer rooted at `root`; entries' paths are relative to it.
+    pub fn new(root: &Path) -> Self {
         Self {
             root: root.to_path_buf(),
-            context,
             include_hidden: false,
             follow_symlinks: false,
         }
@@ -82,11 +78,6 @@ impl Importer {
     pub fn with_follow_symlinks(mut self, follow: bool) -> Self {
         self.follow_symlinks = follow;
         self
-    }
-
-    /// The context tag this importer is scoped to.
-    pub fn context(&self) -> TagId {
-        self.context
     }
 
     /// Walk the host tree and return every entry found.
@@ -219,7 +210,7 @@ impl Importer {
         unix_path_tag: TagId,
         entry: &ImportEntry,
     ) -> Result<Vec<Assertion>, UnixError> {
-        let attr = build_path_attr(unix_path_tag, self.context, &entry.relative_path)?;
+        let attr = build_path_attr(unix_path_tag, &entry.relative_path)?;
         Ok(vec![attr])
     }
 }
@@ -232,10 +223,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-
-    fn ctx() -> TagId {
-        TagId::new(7)
-    }
 
     #[cfg(unix)]
     #[test]
@@ -253,7 +240,7 @@ mod tests {
         // 1 symlink (to README.md)
         std::os::unix::fs::symlink("README.md", root.join("link-to-readme")).unwrap();
 
-        let entries = Importer::new(root, ctx()).scan().unwrap();
+        let entries = Importer::new(root).scan().unwrap();
 
         let mut files = 0;
         let mut dirs = 0;
@@ -296,7 +283,7 @@ mod tests {
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join(".git/HEAD"), "ref").unwrap();
 
-        let entries = Importer::new(root, ctx()).scan().unwrap();
+        let entries = Importer::new(root).scan().unwrap();
         assert!(entries.iter().any(|e| e.relative_path == "visible.txt"));
         assert!(entries.iter().all(|e| !e.relative_path.starts_with('.')));
         assert!(
@@ -313,7 +300,7 @@ mod tests {
         fs::write(root.join("visible.txt"), "v").unwrap();
         fs::write(root.join(".hidden"), "h").unwrap();
 
-        let entries = Importer::new(root, ctx())
+        let entries = Importer::new(root)
             .with_hidden(true)
             .scan()
             .unwrap();
@@ -326,26 +313,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         fs::write(root.join("a.txt"), "a").unwrap();
-        let entries = Importer::new(root, ctx()).scan().unwrap();
+        let entries = Importer::new(root).scan().unwrap();
         let entry = entries
             .iter()
             .find(|e| e.relative_path == "a.txt")
             .unwrap();
         let unix_path = TagId::new(11);
         // Build a fresh importer (scan consumes self) to call derive_assertions.
-        let importer = Importer::new(root, ctx());
+        let importer = Importer::new(root);
         let assertions = importer.derive_assertions(unix_path, entry).unwrap();
         assert_eq!(assertions.len(), 1);
         match &assertions[0] {
             Assertion::Attr { key, value } => {
                 assert_eq!(*key, unix_path);
-                match value {
-                    Value::Scoped { context, inner } => {
-                        assert_eq!(*context, ctx());
-                        assert!(matches!(inner.as_ref(), Value::Text(s) if s == "a.txt"));
-                    }
-                    other => panic!("expected Scoped, got {other:?}"),
-                }
+                assert!(matches!(value, Value::Text(s) if s == "a.txt"));
             }
             other => panic!("expected Attr, got {other:?}"),
         }

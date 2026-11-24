@@ -14,11 +14,11 @@ use fuser::{
     ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyWrite, Request, WriteFlags,
 };
 use log::trace;
-use mimisbrunnr_types::{ObjectId, TagId};
+use mimisbrunnr_types::ObjectId;
 
 use crate::attr::{VfsAttr, VfsAttrKind};
 use crate::entry::VfsEntryKind;
-use crate::inode::{INODE_CTX_ROOT, INODE_ROOT, INODE_TAGS_ROOT, InodeId};
+use crate::inode::{INODE_PATHS_ROOT, INODE_ROOT, INODE_TAGS_ROOT, InodeId};
 use crate::tag_vfs::TagVfs;
 
 const TTL: Duration = Duration::from_secs(1);
@@ -30,22 +30,17 @@ pub type ContentProvider<'a> = Box<dyn Fn(ObjectId) -> Option<Vec<u8>> + Send + 
 
 /// What the FUSE mount root (`/`) maps to in the underlying [`TagVfs`].
 ///
-/// - [`MountRoot::Full`] — `/` shows both `/tags` and `/ctx` children
-///   (the original mount layout).
+/// - [`MountRoot::Full`] — `/` shows both `/tags` and `/paths` children.
 /// - [`MountRoot::TagsOnly`] — `/` is the `tags`-root listing.
-/// - [`MountRoot::CtxOnly`] — `/` is the `ctx`-root listing.
-/// - [`MountRoot::SingleContext`] — `/` is the directory of one named
-///   context, i.e. what `<full-mount>/ctx/<context>/` would show.
+/// - [`MountRoot::PathsOnly`] — `/` is the Unix view, what `/paths` shows.
 #[derive(Debug, Clone, Copy)]
 pub enum MountRoot {
-    /// Full layout: `/tags` and `/ctx` directories.
+    /// Full layout: `/tags` and `/paths` directories.
     Full,
     /// Re-root at the tags-root.
     TagsOnly,
-    /// Re-root at the ctx-root.
-    CtxOnly,
-    /// Re-root at `/ctx/<context-tag>`.
-    SingleContext(TagId),
+    /// Re-root at the Unix view.
+    PathsOnly,
 }
 
 /// FUSE adapter — a [`TagVfs`] plus a content-provider callback.
@@ -73,18 +68,12 @@ impl<'a> MimisbrunnrFs<'a> {
         Self::new_with_root(vfs, content, MountRoot::Full)
     }
 
-    /// Construct with an explicit [`MountRoot`]. For
-    /// [`MountRoot::SingleContext`], the requested context must already
-    /// have a registered projection in the underlying [`PathContextManager`];
-    /// otherwise the mount falls back to the full layout (the alternative
-    /// would be returning `Result`, but mounts are configured at the CLI
-    /// boundary where the existence check happens upstream).
+    /// Construct with an explicit [`MountRoot`].
     pub fn new_with_root(vfs: TagVfs<'a>, content: ContentProvider<'a>, root: MountRoot) -> Self {
         let root_inode = match root {
             MountRoot::Full => INODE_ROOT,
             MountRoot::TagsOnly => INODE_TAGS_ROOT,
-            MountRoot::CtxOnly => INODE_CTX_ROOT,
-            MountRoot::SingleContext(tag) => vfs.ctx_root_inode(tag).unwrap_or(INODE_ROOT),
+            MountRoot::PathsOnly => INODE_PATHS_ROOT,
         };
         Self {
             vfs,
@@ -149,7 +138,7 @@ impl<'a> MimisbrunnrFs<'a> {
     fn object_for_inode(&self, inode: InodeId) -> Option<ObjectId> {
         let entry = self.vfs.entry(inode)?;
         match entry.kind {
-            VfsEntryKind::TagObject { oid } | VfsEntryKind::CtxObject { oid, .. } => Some(oid),
+            VfsEntryKind::TagObject { oid } | VfsEntryKind::PathObject { oid } => Some(oid),
             _ => None,
         }
     }
@@ -316,21 +305,15 @@ mod tests {
     use super::*;
     use mimisbrunnr_index::{ForwardIndex, KvIndex, TagIndex};
     use mimisbrunnr_ontology::OntologyState;
-    use mimisbrunnr_unix::PathContextManager;
+    use mimisbrunnr_unix::PathProjection;
 
-    fn empty_vfs() -> (
-        TagIndex,
-        KvIndex,
-        ForwardIndex,
-        OntologyState,
-        PathContextManager,
-    ) {
+    fn empty_vfs() -> (TagIndex, KvIndex, ForwardIndex, OntologyState, PathProjection) {
         (
             TagIndex::new(),
             KvIndex::new(),
             ForwardIndex::new(),
             OntologyState::default(),
-            PathContextManager::new(),
+            PathProjection::new(),
         )
     }
 
@@ -356,25 +339,11 @@ mod tests {
     }
 
     #[test]
-    fn new_with_root_ctx_only_redirects_root_to_ctx() {
+    fn new_with_root_paths_only_redirects_root_to_paths() {
         let (ti, kv, fi, ont, pcm) = empty_vfs();
         let vfs = TagVfs::new(&ti, &kv, &fi, &ont, &pcm);
         let provider: ContentProvider<'_> = Box::new(|_| None);
-        let fs = MimisbrunnrFs::new_with_root(vfs, provider, MountRoot::CtxOnly);
-        assert_eq!(fs.root_inode, INODE_CTX_ROOT);
-    }
-
-    #[test]
-    fn new_with_root_unknown_context_falls_back_to_full() {
-        let (ti, kv, fi, ont, pcm) = empty_vfs();
-        let vfs = TagVfs::new(&ti, &kv, &fi, &ont, &pcm);
-        let provider: ContentProvider<'_> = Box::new(|_| None);
-        let fs = MimisbrunnrFs::new_with_root(
-            vfs,
-            provider,
-            MountRoot::SingleContext(TagId::new(99)),
-        );
-        // Unknown context → fall back to INODE_ROOT.
-        assert_eq!(fs.root_inode, INODE_ROOT);
+        let fs = MimisbrunnrFs::new_with_root(vfs, provider, MountRoot::PathsOnly);
+        assert_eq!(fs.root_inode, INODE_PATHS_ROOT);
     }
 }

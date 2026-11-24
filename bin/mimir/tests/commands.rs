@@ -535,223 +535,62 @@ fn watch_stream_is_unimplemented() {
 // =========================================================================
 
 #[test]
-fn project_create_set_path_and_tree() {
+fn project_set_path_and_tree() {
     let f = Fixture::new();
     let mut engine = f.open();
 
-    commands::run_project_create_context(
-        &mut engine,
-        &mut Cursor::new(Vec::new()),
-        "rpi4-sdcard",
-    )
-    .unwrap();
-
-    let oid = create_one(&mut engine);
-    let oid_arg = format!("obj:{}", oid.local_seq());
+    let kernel = create_one(&mut engine);
+    let kernel_arg = format!("obj:{}", kernel.local_seq());
     commands::run_project_set_path(
         &mut engine,
         &mut Cursor::new(Vec::new()),
-        &oid_arg,
-        "rpi4-sdcard",
+        &kernel_arg,
         "boot/kernel8.img",
+    )
+    .unwrap();
+    let fstab = create_one(&mut engine);
+    commands::run_project_set_path(
+        &mut engine,
+        &mut Cursor::new(Vec::new()),
+        &format!("obj:{}", fstab.local_seq()),
+        "etc/fstab",
     )
     .unwrap();
 
     let tree = capture(|w| {
-        commands::run_project_tree(&mut engine, w, "rpi4-sdcard").unwrap();
+        commands::run_project_tree(&mut engine, w, None).unwrap();
     });
     assert!(tree.contains("boot/kernel8.img"), "{tree}");
-    assert!(tree.contains("entries=1"), "{tree}");
+    assert!(tree.contains("entries=2"), "{tree}");
 
-    // The `unix-path` attribute was attached too.
-    let info = capture(|w| commands::run_info(&mut engine, w, &oid_arg).unwrap());
-    assert!(info.contains("attr=unix-path"), "{info}");
-}
-
-#[test]
-fn project_list_contexts_after_create() {
-    let f = Fixture::new();
-    let mut engine = f.open();
-
-    commands::run_project_create_context(&mut engine, &mut Cursor::new(Vec::new()), "alpha")
-        .unwrap();
-    commands::run_project_create_context(&mut engine, &mut Cursor::new(Vec::new()), "beta")
-        .unwrap();
-
-    let listing = capture(|w| {
-        commands::run_project_list_contexts(&mut engine, w).unwrap();
+    let boot = capture(|w| {
+        commands::run_project_tree(&mut engine, w, Some("boot")).unwrap();
     });
-    assert!(listing.contains("contexts=2"), "{listing}");
-    assert!(listing.contains("name=alpha"), "{listing}");
-    assert!(listing.contains("name=beta"), "{listing}");
+    assert!(boot.contains("boot/kernel8.img"), "{boot}");
+    assert!(!boot.contains("etc/fstab"), "{boot}");
+    assert!(boot.contains("entries=1"), "{boot}");
+
+    // The `unix-path` attribute is a plain text value.
+    let info = capture(|w| commands::run_info(&mut engine, w, &kernel_arg).unwrap());
+    assert!(info.contains("attr=unix-path"), "{info}");
+    assert!(!info.contains("scoped"), "{info}");
 }
 
 #[test]
-fn project_export_directory_form_empty_projection() {
-    // Set up a context with no objects registered — the export should
-    // succeed and create an (empty) target directory.
+fn project_import_records_paths_without_a_context() {
     let f = Fixture::new();
     let mut engine = f.open();
-    commands::run_project_create_context(
-        &mut engine,
-        &mut Cursor::new(Vec::new()),
-        "exp_ctx",
-    )
-    .unwrap();
-    let target = f._tmp.path().join("export_empty");
-    let mut buf = Cursor::new(Vec::new());
-    commands::run_project_export(
-        &mut engine,
-        &mut buf,
-        "exp_ctx",
-        &target,
-        None,
-    )
-    .unwrap();
-    assert!(target.is_dir(), "expected empty export dir to exist");
-    let msg = String::from_utf8(buf.into_inner()).unwrap();
-    assert!(msg.contains("0 objects"), "{msg}");
-}
+    let host_tree = f._tmp.path().join("host-tree");
+    std::fs::create_dir_all(host_tree.join("src")).unwrap();
+    std::fs::write(host_tree.join("src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(host_tree.join("README.md"), "# hi").unwrap();
 
-#[test]
-fn project_export_directory_form_writes_files() {
-    use mimisbrunnr::unix::PathProjection;
-    use std::path::PathBuf;
+    let report = capture(|w| commands::run_project_import(&mut engine, w, &host_tree).unwrap());
+    assert!(report.contains("created=2"), "{report}");
 
-    let f = Fixture::new();
-    let mut engine = f.open();
-    commands::run_project_create_context(
-        &mut engine,
-        &mut Cursor::new(Vec::new()),
-        "tree_ctx",
-    )
-    .unwrap();
-
-    // Resolve the context tag id.
-    let canonical = commands::context_tag_name("tree_ctx");
-    let context_id = engine
-        .engine
-        .resolve_tag_name(&canonical)
-        .expect("context tag");
-
-    // Replace the projection with a fresh one rooted at /unused (the export
-    // target_root supersedes it).
-    {
-        let projections = &mut engine.engine.path_contexts.projections;
-        projections.insert(context_id, PathProjection::new(context_id, PathBuf::from("/unused")));
-    }
-
-    // Mint three objects, register their relative paths in the projection,
-    // and write blobs.
-    let mut oids = Vec::new();
-    let payloads: Vec<&[u8]> = vec![b"alpha", b"beta", b"gamma"];
-    let rel_paths = ["a.txt", "sub/b.txt", "sub/c.txt"];
-    for (i, payload) in payloads.iter().enumerate() {
-        let oid = create_one(&mut engine);
-        engine.write_blob(oid, payload).unwrap();
-        let proj = engine
-            .engine
-            .path_contexts
-            .get_mut(context_id)
-            .expect("projection");
-        proj.add(oid, rel_paths[i].into()).unwrap();
-        oids.push(oid);
-    }
-
-    let target = f._tmp.path().join("export_tree");
-    let mut buf = Cursor::new(Vec::new());
-    commands::run_project_export(
-        &mut engine,
-        &mut buf,
-        "tree_ctx",
-        &target,
-        None,
-    )
-    .unwrap();
-
-    let msg = String::from_utf8(buf.into_inner()).unwrap();
-    assert!(msg.contains("3 objects"), "{msg}");
-    for (i, rel) in rel_paths.iter().enumerate() {
-        let written = std::fs::read(target.join(rel)).unwrap();
-        assert_eq!(written.as_slice(), payloads[i]);
-    }
-}
-
-#[test]
-fn project_export_directory_form_missing_blob_errors() {
-    use mimisbrunnr::unix::PathProjection;
-    use std::path::PathBuf;
-
-    let f = Fixture::new();
-    let mut engine = f.open();
-    commands::run_project_create_context(
-        &mut engine,
-        &mut Cursor::new(Vec::new()),
-        "miss_ctx",
-    )
-    .unwrap();
-
-    let canonical = commands::context_tag_name("miss_ctx");
-    let context_id = engine
-        .engine
-        .resolve_tag_name(&canonical)
-        .expect("context tag");
-    {
-        let projections = &mut engine.engine.path_contexts.projections;
-        projections.insert(context_id, PathProjection::new(context_id, PathBuf::from("/unused")));
-    }
-
-    // Mint an object, register a path, but skip the blob write.
-    let oid = create_one(&mut engine);
-    let proj = engine
-        .engine
-        .path_contexts
-        .get_mut(context_id)
-        .expect("projection");
-    proj.add(oid, "lonely.txt".into()).unwrap();
-
-    let target = f._tmp.path().join("export_missing");
-    let err = commands::run_project_export(
-        &mut engine,
-        &mut Cursor::new(Vec::new()),
-        "miss_ctx",
-        &target,
-        None,
-    )
-    .unwrap_err();
-    // Surfaces as Unix(MissingContent(_)).
-    assert!(matches!(err, CommandError::Unix(_)), "{err}");
-}
-
-#[test]
-fn project_export_single_oid_writes_blob_file() {
-    let f = Fixture::new();
-    let mut engine = f.open();
-    commands::run_project_create_context(
-        &mut engine,
-        &mut Cursor::new(Vec::new()),
-        "ctx2",
-    )
-    .unwrap();
-
-    // Mint an object and write a blob.
-    let oid = create_one(&mut engine);
-    let payload = b"phase R0 export bytes";
-    engine.write_blob(oid, payload).unwrap();
-
-    let out_path = f._tmp.path().join("exported.bin");
-    let mut buf = Cursor::new(Vec::new());
-    commands::run_project_export(
-        &mut engine,
-        &mut buf,
-        "ctx2",
-        &out_path,
-        Some(&oid.to_string()),
-    )
-    .unwrap();
-
-    let written = std::fs::read(&out_path).unwrap();
-    assert_eq!(written.as_slice(), payload);
+    let tree = capture(|w| commands::run_project_tree(&mut engine, w, None).unwrap());
+    assert!(tree.contains("src/main.rs"), "{tree}");
+    assert!(tree.contains("README.md"), "{tree}");
 }
 
 // =========================================================================

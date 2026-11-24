@@ -379,7 +379,7 @@ pub fn cmd_remove_disk(config_path: &Path, target: &str) -> Result<(), BrunnrErr
 pub fn cmd_mount(
     config_path: &Path,
     mountpoint: &Path,
-    context: Option<&str>,
+    unix_view_only: bool,
     mount_options: &[String],
 ) -> Result<(), BrunnrError> {
     use mimisbrunnr_fuse::{ContentProvider, MimisbrunnrFs, MountRoot, TagVfs};
@@ -409,29 +409,12 @@ pub fn cmd_mount(
         &leaked.engine.kv_index,
         &leaked.engine.forward_index,
         &leaked.engine.ontology,
-        &leaked.engine.path_contexts,
+        &leaked.engine.unix_paths,
     );
 
-    let mount_root = if let Some(ctx) = context {
-        // Context membership tags are named `unix-path-context:<name>`
-        // (SPECIFICATION-DESIGN§12.2).
-        let tag_id = leaked
-            .engine
-            .ontology
-            .names
-            .get(&format!("unix-path-context:{ctx}"))
-            .copied()
-            .filter(|tid| leaked.engine.path_contexts.projections.contains_key(tid))
-            .ok_or_else(|| {
-                BrunnrError::Mount(format!(
-                    "context '{ctx}' is not registered in this pool"
-                ))
-            })?;
-        println!(
-            "Mounting context '{ctx}' as the root at {}",
-            mountpoint.display()
-        );
-        MountRoot::SingleContext(tag_id)
+    let mount_root = if unix_view_only {
+        println!("Mounting the Unix view at {}", mountpoint.display());
+        MountRoot::PathsOnly
     } else {
         println!("Mounting filesystem at {}", mountpoint.display());
         MountRoot::Full
@@ -530,7 +513,7 @@ pub fn macfuse_mount_hint(
 pub fn cmd_mount(
     _config_path: &Path,
     _mountpoint: &Path,
-    _context: Option<&str>,
+    _unix_view_only: bool,
     _mount_options: &[String],
 ) -> Result<(), BrunnrError> {
     Err(BrunnrError::FuseNotEnabled)
@@ -848,7 +831,7 @@ mod tests {
             &de.engine.kv_index,
             &de.engine.forward_index,
             &de.engine.ontology,
-            &de.engine.path_contexts,
+            &de.engine.unix_paths,
         );
         let provider: ContentProvider<'_> = Box::new(|_| None);
         let _fs = MimisbrunnrFs::new(tag_vfs, provider);
@@ -858,7 +841,7 @@ mod tests {
     #[test]
     fn mount_without_fuse_feature_errors() {
         let tmp = TempDir::new().unwrap();
-        let err = cmd_mount(tmp.path(), tmp.path(), None, &[]).unwrap_err();
+        let err = cmd_mount(tmp.path(), tmp.path(), false, &[]).unwrap_err();
         assert!(matches!(err, BrunnrError::FuseNotEnabled));
     }
 

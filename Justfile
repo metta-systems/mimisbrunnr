@@ -13,7 +13,6 @@ disk_bytes  := "134217728"  # 128 MiB per disk
 # Importing all of `crates/` overflows the WAL ring before mimir's single
 # commit (no checkpoint cadence yet, JOURNAL4); the types crate fits.
 fuse_dir    := justfile_directory() / "crates" / "types"
-fuse_ctx    := "mimisbrunnr-types-src"
 fuse_mount  := "/tmp/mbrunnr-test" # "/Volumes/mbrunnr-test"
 # Extra mount options, e.g. `just fuse_opts="-o backend=fskit" demo-fuse`.
 fuse_opts   := "" # "-o backend=fskit"
@@ -143,14 +142,13 @@ demo-untag:
 
 # ── Project Import ───────────────────────────────────────────────────
 
-# Import the mimisbrunnr-types source tree as a path projection
+# Import the mimisbrunnr-types source tree into the Unix view
 import-source:
     #!/usr/bin/env bash
     set -euo pipefail
 
     echo "=== Importing source tree ==="
-    {{mimir}} project create-context {{fuse_ctx}}
-    {{mimir}} project import "{{fuse_dir}}" --context {{fuse_ctx}}
+    {{mimir}} project import "{{fuse_dir}}"
 
 # ── Full Demo ────────────────────────────────────────────────────────
 
@@ -185,7 +183,7 @@ demo-fuse: build pool-create ontology-setup populate-objects import-source && de
     # - `RUST_LOG=mimisbrunnr_fuse=trace` — just FUSE calls
     # - `RUST_LOG=mimisbrunnr_storage::file_device=trace` — just physical I/O
     # Mount it as a FUSE filesystem
-    -env RUST_LOG=trace,mimisbrunnr_fuse=info,fuser=info {{brunnr_fuse}} mount-unix "{{fuse_mount}}" --config "{{pool_toml}}" --context {{fuse_ctx}} {{fuse_opts}}
+    -env RUST_LOG=trace,mimisbrunnr_fuse=info,fuser=info {{brunnr_fuse}} mount-unix "{{fuse_mount}}" --config "{{pool_toml}}" {{fuse_opts}}
 
 # Unmount after exiting FUSE driver
 demo-fuse-unmount:

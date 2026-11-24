@@ -1,19 +1,14 @@
 //! Unix interoperability for Mímisbrunnr (SPECIFICATION-DESIGN§12).
 //!
 //! Unix paths are not the source of truth — they are *projections* of
-//! Mímisbrunnr objects onto a Unix-style tree (SPECIFICATION-DESIGN§12.1). The same object
-//! can appear at multiple paths under multiple **path contexts**; a context is
-//! just a `Grouping` tag, and each per-context path is stored as
-//! `Attr(unix-path, Value::Scoped { context, inner: Text(path) })` per
-//! UNIX-DESIGN§1 / INDEX-DESIGN§1.3.
+//! Mímisbrunnr objects onto a Unix-style tree (SPECIFICATION-DESIGN§12.1). An
+//! object's paths are stored as `Attr(unix-path, Value::Text(path))`
+//! (UNIX-DESIGN§1); exports are built by applications from queries
+//! (UNIX-DESIGN "Export").
 //!
 //! This crate is intentionally **side-effect-free where possible**:
-//! [`PathProjection`] / [`PathContextManager`] are pure data structures, the
-//! [`Importer`] only walks the host filesystem and produces [`ImportEntry`]s,
-//! and [`Exporter::plan`] returns an `ExportEntry` plan that the engine layer
-//! actually executes. [`Exporter::execute`] is the one place we touch the
-//! host filesystem on the export path, and even then it takes a content
-//! provider callback so we don't depend on any specific blob source.
+//! [`PathProjection`] is a pure data structure and the [`Importer`] only
+//! walks the host filesystem and produces [`ImportEntry`]s.
 //!
 //! The engine layer calls into this crate; this crate does **not**
 //! depend on the engine.
@@ -21,15 +16,11 @@
 #![forbid(unsafe_code)]
 
 mod error;
-mod export;
 mod import;
-mod manager;
 mod projection;
 mod storage;
 
 pub use error::UnixError;
-pub use export::{ExportAction, ExportEntry, Exporter};
 pub use import::{ImportEntry, ImportKind, Importer};
-pub use manager::PathContextManager;
 pub use projection::PathProjection;
 pub use storage::{UNIX_PATH_TAG_NAME, build_path_attr};

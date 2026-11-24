@@ -32,8 +32,6 @@ const TYPE_TAG_FLOAT: u8 = 2;
 const TYPE_TAG_TIMESTAMP: u8 = 3;
 /// Type-tag byte for [`Value::Blob`].
 const TYPE_TAG_BLOB: u8 = 4;
-/// Type-tag byte for [`Value::Scoped`].
-const TYPE_TAG_SCOPED: u8 = 5;
 
 /// Order-preserving fixed-size encoding of a [`Value`]; the byte-wise
 /// `Ord` matches the spec range-index order.
@@ -90,20 +88,6 @@ impl NormalisedKey {
                 out[14] = if b.len() > 13 { 1 } else { 0 };
                 out[15] = b.len().min(255) as u8;
             }
-            Value::Scoped { context, inner } => {
-                // Scoped: leading type tag, then 4-byte context, then a
-                // truncated 11-byte slice of the inner value's normalised
-                // key payload. This gives prefix scans over a single
-                // context. (Spec INDEX-DESIGN§4.2 covers the analogous range-index
-                // shape; this `NormalisedKey` is a compact in-memory mirror
-                // sufficient for the in-memory `RangeIndex` we ship in this
-                // phase.)
-                out[0] = TYPE_TAG_SCOPED;
-                out[1..5].copy_from_slice(&context.raw().to_be_bytes());
-                let inner_key = NormalisedKey::from_value(inner);
-                // Skip the inner type tag byte; copy [1..12] (11 bytes).
-                out[5..16].copy_from_slice(&inner_key.0[1..12]);
-            }
         }
         NormalisedKey(out)
     }
@@ -117,7 +101,6 @@ impl NormalisedKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mimisbrunnr_types::TagId;
 
     #[test]
     fn int_ordering_preserved() {
@@ -176,18 +159,6 @@ mod tests {
         let early = NormalisedKey::from_value(&Value::Timestamp(100));
         let late = NormalisedKey::from_value(&Value::Timestamp(200));
         assert!(early < late);
-    }
-
-    #[test]
-    fn scoped_keeps_context_prefix() {
-        let inner = Value::Int(42);
-        let scoped =
-            Value::scoped(TagId::new(7), inner.clone()).unwrap();
-        let key = NormalisedKey::from_value(&scoped);
-        assert_eq!(key.0[0], TYPE_TAG_SCOPED);
-        // Context is stored at bytes [1..5] big-endian.
-        let ctx = u32::from_be_bytes(key.0[1..5].try_into().unwrap());
-        assert_eq!(ctx, 7);
     }
 
     #[test]
