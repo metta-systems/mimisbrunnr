@@ -103,6 +103,26 @@ chunking axis (SPECIFICATION-DESIGN§3.5); the format-time default is no chunkin
 **Other pool-state trees** (`placement_rules_root`, `cluster_peers_root`) are root-list entries
 like every other tree (ENGINE-DESIGN§1.2), so one checkpoint advances them all atomically.
 
+### 1.3 Placement and presence rules
+
+`placement_rules_root` roots a `BtreeKind::PlacementRules` tree with one entry per rule, keyed by
+its id from the `PlacementRule` id counter (ENGINE-DESIGN§1.2). Each value is a positional,
+versioned CBOR record (FORMAT-DESIGN§1.6), schema version 1:
+
+```text
+RuleRecord = [version, kind: uint, params…]
+```
+
+`kind` is one byte split by family, so bit 7 alone says which family a rule belongs to and the
+low seven bits are its variant index in that family's enum (SPECIFICATION-DESIGN§8.3):
+
+| `kind` | Family | Variants |
+|---|---|---|
+| `0x00`–`0x7f` | placement: acted on by reconcile | `0x00` Pin, `0x01` Prefer, `0x02` Replicate, `0x03` Colocate, `0x04` AutoTier, `0x05` Chunk; `0x06`–`0x7f` reserved |
+| `0x80`–`0xff` | presence: node-local, never synced | `0x80` KeepLocal, `0x81` Stub, `0x82` Prefetch, `0x83` Evict; `0x84`–`0xff` reserved |
+
+A new rule takes the next free index in its own family. An unassigned `kind` is a decode error.
+
 **Administrative changes commit by checkpoint.** Changes to the pool state record, the disk
 descriptors, placement rules and cluster peers have no journal ops. An administrative command
 applies its change to those trees and forces a checkpoint (JOURNAL-DESIGN§1.5) before it

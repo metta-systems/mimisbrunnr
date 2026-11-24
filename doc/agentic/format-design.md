@@ -117,7 +117,7 @@ enum BtreeKind {
     // Pool and cluster
     PoolState             = 19,  // POOL-DESIGN§1.2 single-entry pool state record
     DiskDescriptors       = 20,  // POOL-DESIGN§1.1 disk descriptors (disk_id → DiskDescriptor)
-    PlacementRules        = 21,  // POOL-DESIGN§1 placement rules (heterogeneous, CBOR values)
+    PlacementRules        = 21,  // POOL-DESIGN§1.3 placement and presence rules (CBOR values)
     ClusterPeers          = 22,  // CLUSTER-DESIGN§2 peer records (NodeId → PeerRecord)
     Transfers             = 23,  // CLUSTER-DESIGN§4 content transfers ((oid, direction, peer) → TransferRecord)
     // Reconcile
