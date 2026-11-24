@@ -408,6 +408,18 @@ Target = [0, tag: TagId] / [1, key: TagId, value: Value]
     // what Implies / ValueImplies derive, both sides of Requires, RelationTarget's needs;
     // in Requires, [0, tag] naming an attribute key matches any value of that key
 
+StoragePolicy = [chunking: bytes(16) / null,      // ChunkParamsRecord (INDEX-DESIGN§4.3)
+                 deduplication: uint / null,      // 0 on, 1 off
+                 compression: Compression / null,
+                 encryption: null]                // reserved for the encryption policy
+                                                  //   (SPECIFICATION-DESIGN§3.5); any other value
+                                                  //   is a decode error
+    // null: the tag does not declare that axis (SPECIFICATION-DESIGN§3.5)
+
+Compression = [0] / [1, level: int] / [2]         // None / Zstd (level 1–22) / Lz4
+
+// Value elements (ValueImplies, Target) are encoded as INDEX-DESIGN§1.1 specifies.
+
 ModuleRecord = [version, uid: bytes(16), id: text, module_version: text, name: text,
                 installers: [text], core: bool, digest: bytes(32),
                 requires: [[module_id: text, version_req: text]]]

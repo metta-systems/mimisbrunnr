@@ -117,23 +117,10 @@ An object's **direct** assertions are the ones a user or application set; its **
 
 ### 2.3 Query Algebra
 
-Queries are set operations over object sets, evaluated bottom-up via bitmap algebra:
-
-```rust
-enum Query {
-    HasTag { tag: TagId, direct: bool },  // direct = false: carries the tag directly or derived —
-                                          //   "vehicle" matches "car", "truck" (§3.3)
-    HasKey(TagId),                        // has any value of the attribute key
-    HasAttr { key: TagId, op: CmpOp, value: Value },
-    Under { key: TagId, path: Value },    // hierarchical keys: the value or anything below it
-    Related { predicate: TagId, target: ObjectId },
-    And(Vec<Query>),
-    Or(Vec<Query>),
-    Not(Box<Query>),                      // complement within the live objects
-}
-
-enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge, Prefix, Contains }
-```
+Queries are set operations over object sets, evaluated bottom-up via bitmap algebra. The
+operators are `HasTag { tag, direct }`, `HasKey`, `HasAttr { key, op, value }` with `CmpOp` one
+of `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, `Prefix`, `Contains`, `Under` over hierarchical keys,
+`Related`, `And`, `Or` and `Not`; their definitions and stored form are QUERY-DESIGN§1.
 
 - **Derived terms make `IsA` unnecessary:** postings hold every object a rule derives a tag
   for, so `HasTag` already answers the ontology-aware question; `direct: true` restricts the
@@ -151,7 +138,7 @@ enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge, Prefix, Contains }
   them as inputs, so `created-month = 2026-11` or `size-class = 1-10MiB` are derived, indexed
   terms (ONTOLOGY-DESIGN "Rules and constraints").
 - **Stored and compiled forms.** A query that is persisted — a subscription, a placement rule —
-  names tags by `TagUid` so it survives renames and travels between nodes. Before evaluation it
+  names tags by `TagUid` so it survives renames and travels between nodes (QUERY-DESIGN§1.2). Before evaluation it
   is compiled into `TermId`s and dictionary ranges, and recompiled only when the ontology's
   `rules_epoch` advances or a term it references changes (QUERY-DESIGN "Evaluation").
 

@@ -32,6 +32,87 @@ The superblock no longer counts mounts or records the last mount time, since it 
 
 To decide: the counter set, the event kinds, N, and whether `brunnr status` reports from it.
 
+## POOL-D7 — Encoding of placement and presence rules
+
+**Context.** `RootPointer.placement_rules_root` roots one `BtreeKind::PlacementRules` tree, one
+entry per rule keyed by its id from the `PlacementRule` counter (POOL-DESIGN§1.1, [POOL5](pool-implementation-plan.md)). It holds two rule
+families (SPECIFICATION-DESIGN§8.3): **placement** rules (`Pin`, `Prefer`, `Replicate`,
+`Colocate`, `AutoTier`, `Chunk`), which reconcile acts on, and **presence** rules (`KeepLocal`,
+`Stub`, `Prefetch`, `Evict`), which drive inbound transfers and eviction and are never synced
+([POOL9](pool-implementation-plan.md)). Every rule is loaded at mount and registered as a watcher in the match index, so no
+reader ever scans the tree for one family. Both are committed by checkpoint, a handful to a few
+hundred records per pool. The value is a top-level positional CBOR record (FORMAT-DESIGN§1.6):
+element 0 is the schema version, and the record must say which rule it is.
+
+```mermaid
+flowchart LR
+    root["placement_rules_root"] --> tree["PlacementRules tree<br/>key: rule_id u64"]
+    tree --> record["value: rule record"]
+    record --> placement["placement family<br/>Pin · Prefer · Replicate · Colocate · AutoTier · Chunk"]
+    record --> presence["presence family<br/>KeepLocal · Stub · Prefetch · Evict"]
+    placement --> reconcile["reconcile: tier, replicas, chunking"]
+    presence --> transfers["inbound transfers, eviction<br/>(node-local, never synced)"]
+```
+
+**(a) One flat numbering.** `RuleRecord = [version, kind, params…]`, `kind` 0–5 placement and
+6–9 presence; a new rule of either family takes the next free number.
+
+```text
+[1, 0, query, tier]                  // Pin
+[1, 2, query, min_replicas, across]  // Replicate
+[1, 6, query]                        // KeepLocal
+[1, 7, query, prefix_bytes]          // Stub
+```
+
+```mermaid
+flowchart LR
+    bytes["[version, kind, params…]"] --> match{"kind"}
+    match -->|"0–5"| placement["PlacementRule::…"]
+    match -->|"6–9"| presence["PresenceRule::…"]
+    match -->|"10+ (later)"| either["either family, by table"]
+```
+
+- Decode is one `match` on `kind`; a record is one element shorter than in (b).
+- The family is a property of the number, so it needs a table. Kinds added later interleave: a
+  seventh placement rule would be 10, after the presence rules, and every family test
+  (`is_presence(kind)`) grows with it.
+- The two Rust enums of SPECIFICATION-DESIGN§8.3 no longer map 1:1 onto their indices
+  (`KeepLocal` is variant 0 of `PresenceRule` but kind 6 on disk), so the codec carries an
+  offset or a merged enum.
+
+**(b) Family, then that family's own index.** `RuleRecord = [version, family, rule]`, `family`
+0 placement, 1 presence; `rule = [variant, params…]` indexed within its family from 0.
+
+```text
+[1, 0, [0, query, tier]]                  // placement Pin
+[1, 0, [2, query, min_replicas, across]]  // placement Replicate
+[1, 1, [0, query]]                        // presence KeepLocal
+[1, 1, [1, query, prefix_bytes]]          // presence Stub
+```
+
+```mermaid
+flowchart LR
+    bytes["[version, family, rule]"] --> family{"family"}
+    family -->|0| placement_variant{"variant"} --> placement["PlacementRule 0–5"]
+    family -->|1| presence_variant{"variant"} --> presence["PresenceRule 0–3"]
+```
+
+- Each family's variant index is its Rust enum's position, so each enum has its own small codec
+  and grows independently (a new placement rule is placement variant 6, whatever presence adds).
+- "Is this a presence rule?" is one element, which is what the never-synced filter and POOL9's
+  registration need.
+- Two bytes more per record (the family and the inner array head); a two-level `match`.
+
+**Cost.** Both are about the same code: two hand-written codecs of 6 and 4 variants over the
+QUERY-DESIGN§1.2 query codec, and the same tests (fixed bytes per variant, unknown index
+rejected). Space is negligible either way at a few hundred records. The difference is
+evolution: (a) is flatter today and interleaves families as rules are added; (b) keeps each
+family's numbering dense and its own. A third shape, the family in the key
+(`(family: u8, rule_id: u64)`), behaves like (b) for decoding but makes the family part of every
+lookup; since all rules are loaded at mount, it buys nothing. Recommendation: (b).
+
+Shapes [SPEC25](specification-implementation-plan.md), [POOL5](pool-implementation-plan.md) and [POOL9](pool-implementation-plan.md).
+
 ## Future work
 
 - None recorded.

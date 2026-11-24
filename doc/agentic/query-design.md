@@ -1,7 +1,7 @@
 # Query and SQL — design
 
 Scope: `crates/query` (`QueryExecutor`, `QueryParser`, `FacetedExplorer`), `crates/sql` (parser, planner, executor), `mimir query` / `mimir sql`.
-Governing spec: SPECIFICATION-DESIGN§2.3 (query algebra), SPECIFICATION-DESIGN§5.6 (faceted exploration); the SQL layer is specified here.
+Governing spec: SPECIFICATION-DESIGN§2.3 (query algebra), SPECIFICATION-DESIGN§5.6 (faceted exploration); the `Query` definition, its stored form and the SQL layer are specified here.
 
 Plan: [query-implementation-plan.md](query-implementation-plan.md) · Open decisions: [query-decisions.md](query-decisions.md) · Completed: [query-completed.md](query-completed.md) · Order: [operations-plan.md](operations-plan.md)
 
@@ -145,3 +145,58 @@ How relation traversal, closure, collection order and faceting are spelled in SQ
 - **An `IsA` operator** (and SQL `isa()`) distinct from `HasTag`. Derived terms are posted, so `HasTag` already matches implied tags; `direct` covers the narrower question.
 - **Record fields as attribute terms** (`size = 4096` interned per object). Millions of distinct sizes and times would become terms; fields are columns, and `Bucket` rules index coarse classes of them.
 - **A separate physical-plan tree** (`PhysicalOp` with `TagBitmap`, `Intersect`, `Difference`, …) between planner and executor. The `Query` algebra is the pushed-down plan; only post-operations sit outside it.
+
+## Format specification
+
+The numbered sections below are the normative on-disk and algorithmic specification for this scope; [format-design.md](format-design.md) lists every scope's sections in format order.
+
+## 1. Stored queries
+
+### 1.1 The query algebra
+
+```rust
+enum Query {
+    HasTag { tag: TagId, direct: bool },  // direct = false: carries the tag directly or derived —
+                                          //   "vehicle" matches "car", "truck" (SPECIFICATION-DESIGN§3.3)
+    HasKey(TagId),                        // has any value of the attribute key
+    HasAttr { key: TagId, op: CmpOp, value: Value },
+    Under { key: TagId, path: Value },    // hierarchical keys: the value or anything below it
+    Related { predicate: TagId, target: ObjectId },
+    And(Vec<Query>),
+    Or(Vec<Query>),
+    Not(Box<Query>),                      // complement within the live objects
+}
+
+enum CmpOp { Eq, Ne, Lt, Le, Gt, Ge, Prefix, Contains }
+```
+
+The semantics of each operator are SPECIFICATION-DESIGN§2.3; how each is evaluated is "Selected
+design" above.
+
+### 1.2 Stored form
+
+A query that reaches the disk — inside a subscription record (SUBSCRIPTIONS-DESIGN§1) or a
+placement rule (POOL-DESIGN§1) — is positional CBOR (FORMAT-DESIGN§1.6). Tags are named by their
+16-byte `TagUid` so the query survives renames and travels between nodes; the in-memory form
+names them by `TagId` and is compiled from the stored form at load.
+
+```text
+Query = [0, tag: bytes(16), direct: bool]                 // HasTag
+      / [1, key: bytes(16)]                               // HasKey
+      / [2, key: bytes(16), op: CmpOp, value: Value]      // HasAttr
+      / [3, key: bytes(16), path: Value]                  // Under
+      / [4, predicate: bytes(16), target: uint]           // Related; target: the ObjectId as u64
+      / [5, operands: [Query]]                            // And
+      / [6, operands: [Query]]                            // Or
+      / [7, operand: Query]                               // Not
+
+CmpOp = uint   // 0 Eq, 1 Ne, 2 Lt, 3 Le, 4 Gt, 5 Ge, 6 Prefix, 7 Contains
+```
+
+- `Value` operands are encoded as INDEX-DESIGN§1.1 specifies.
+- A query is nested inside a record and carries no schema version of its own; the record's
+  version governs it. New operators take the next variant index.
+- A variant index or `CmpOp` above those listed, a `TagUid` of the wrong length, or an element
+  count other than the variant's is a decode error. A `TagUid` the ontology does not know leaves
+  the query loadable but unmatchable until the tag exists (`HasTag` / `HasKey` / `HasAttr` /
+  `Under` match nothing; `Not` of them matches every live object).

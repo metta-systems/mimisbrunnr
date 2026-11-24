@@ -221,7 +221,7 @@ BTREE-DESIGN§1.6), schema version 1:
 ```text
 SubscriptionRecord = [version,
                       name: text,
-                      query: Query,          // stored form: tags by TagUid (SPECIFICATION-DESIGN§2.3)
+                      query: Query,          // stored form, QUERY-DESIGN§1.2
                       interest: uint,        // ChangeInterest bits
                       cursor: uint,          // LSN of the last acknowledged event
                       cursor_ns: int,        // time of that journal entry

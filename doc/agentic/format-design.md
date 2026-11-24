@@ -225,6 +225,11 @@ Specified in [UNIX-DESIGN§1](unix-design.md#1-unix-paths).
 
 Specified in [POOL-DESIGN§1](pool-design.md#1-pool-state).
 
+### 10.5 Stored queries
+
+The query form inside subscription records and placement rules is specified in
+[QUERY-DESIGN§1](query-design.md#1-stored-queries).
+
 ## 11. Snapshots and Cluster Sync
 
 Specified in [SNAPSHOTS-DESIGN§1](snapshots-design.md#1-snapshots).
