@@ -1,5 +1,4 @@
-//! WAL entry header, on-disk `HybridTimestamp`, framing constants, and the
-//! binary payload record of every op.
+//! On-disk `HybridTimestamp` and the binary payload record of every op.
 //!
 //! Implements JOURNAL-DESIGN§1.2 and JOURNAL-DESIGN§1.3.
 
@@ -15,49 +14,13 @@ use crate::{
     payload::{Field, PayloadReader, PayloadWriter, op, record},
 };
 
-// ---------- Constants ----------
-
-/// `WALR` — entry-header magic. JOURNAL-DESIGN§1.2.
-pub const WAL_ENTRY_MAGIC: [u8; 4] = *b"WALR";
-
-/// Entry-header `format_version` for this build.
-pub const WAL_ENTRY_FORMAT_VERSION: u8 = 1;
-
-/// Sector / block size — entries never cross this boundary. (Mirrors
-/// `mimisbrunnr_storage::BLOCK_SIZE`; redeclared here for clarity at framing
-/// sites.)
-pub const WAL_SECTOR_SIZE: usize = 4096;
-
-/// Trailing framing checksum, low 32 bits of `checksum64` (4 B), appended after every entry.
-pub const WAL_FRAMING_CRC_LEN: usize = 4;
-
-/// AES-256-GCM authentication-tag length in encrypted framing.
-pub const WAL_GCM_TAG_LEN: usize = 16;
-
-/// Plaintext-payload cap. JOURNAL-DESIGN§1.2:
-/// `4096 - WalEntryHeader (40) - framing CRC (4) = 4052`.
-pub const WAL_MAX_PAYLOAD_PLAINTEXT: usize =
-    WAL_SECTOR_SIZE - core::mem::size_of::<WalEntryHeader>() - WAL_FRAMING_CRC_LEN;
-
-/// Encrypted-payload cap (ciphertext bytes).
-/// `4052 - 16 = 4036`. JOURNAL-DESIGN§1.2.
-pub const WAL_MAX_PAYLOAD_ENCRYPTED: usize = WAL_MAX_PAYLOAD_PLAINTEXT - WAL_GCM_TAG_LEN;
-
-// ---------- Flag bits ----------
-
-/// Payload encrypted with AES-256-GCM. JOURNAL-DESIGN§1.2.
-pub const WAL_ENTRY_FLAG_ENCRYPTED: u16 = 1 << 0;
-
-/// Payload zstd-compressed before optional encryption. JOURNAL-DESIGN§1.2.
-pub const WAL_ENTRY_FLAG_COMPRESSED: u16 = 1 << 1;
-
 // ---------- HybridTimestamp on-disk wire form ----------
 
 /// On-disk wire form of [`mimisbrunnr_types::HybridTimestamp`]. JOURNAL-DESIGN§1.2 / POOL-DESIGN§1.
 ///
 /// The logical type lives in `mimisbrunnr-types` (per operations-design.md "Type ownership"); this
 /// 16-byte `#[repr(C)]` struct is the on-disk wire form embedded in
-/// every [`WalEntryHeader`]. Field ordering is total: `physical_ns → logical →
+/// every `JsetHeader`. Field ordering is total: `physical_ns → logical →
 /// node_id` (matches the spec exactly).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Eq, PartialEq, Default)]
@@ -87,60 +50,6 @@ impl WalHybridTimestampWire {
             physical_ns: self.physical_ns,
             logical: self.logical,
             node_id: self.node_id as NodeId,
-        }
-    }
-}
-
-// ---------- WalEntryHeader ----------
-
-/// 40-byte entry header. JOURNAL-DESIGN§1.2.
-// TODO(JOURNAL9): the 8-byte `EntryHead` inside journal sets replaces it.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug)]
-pub struct WalEntryHeader {
-    pub magic: [u8; 4],                    // [0..4]   "WALR"
-    pub op_kind: u8,                       // [4..5]   WalOpKind discriminant
-    pub format_version: u8,                // [5..6]
-    pub flags: u16,                        // [6..8]   WAL_ENTRY_FLAG_*
-    pub lsn: u64,                          // [8..16]
-    pub timestamp: WalHybridTimestampWire, // [16..32] 16 B
-    pub payload_length: u32,               // [32..36]
-    pub payload_crc: u32,                  // [36..40] low 32 bits of checksum64(payload)
-}
-
-const_assert_eq!(core::mem::size_of::<WalEntryHeader>(), 40);
-
-impl WalEntryHeader {
-    /// Build a fresh header. `payload_crc` is left zero — fill it after
-    /// computing the CRC over the actual payload bytes.
-    pub fn new(
-        op_kind: WalOpKind,
-        flags: u16,
-        lsn: u64,
-        timestamp: LogicalHybridTimestamp,
-        payload_length: u32,
-    ) -> Self {
-        Self {
-            magic: WAL_ENTRY_MAGIC,
-            op_kind: op_kind as u8,
-            format_version: WAL_ENTRY_FORMAT_VERSION,
-            flags,
-            lsn,
-            timestamp: WalHybridTimestampWire::from_logical(timestamp),
-            payload_length,
-            payload_crc: 0,
-        }
-    }
-
-    /// Validate the magic field.
-    pub fn check_magic(&self) -> Result<(), WalError> {
-        if self.magic == WAL_ENTRY_MAGIC {
-            Ok(())
-        } else {
-            Err(WalError::InvalidMagic {
-                expected: WAL_ENTRY_MAGIC,
-                actual: self.magic,
-            })
         }
     }
 }
@@ -532,7 +441,7 @@ op_kinds! {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn block_ref(bucket_no: u32) -> BlockRef {
@@ -549,7 +458,7 @@ mod tests {
         }
     }
 
-    fn chunk_spec(index: u32) -> ChunkSpec {
+    pub(crate) fn chunk_spec(index: u32) -> ChunkSpec {
         ChunkSpec {
             hash: [index as u8; 32],
             length: 64 * 1024,
@@ -794,19 +703,8 @@ mod tests {
     }
 
     #[test]
-    fn entry_header_size_is_forty() {
-        assert_eq!(core::mem::size_of::<WalEntryHeader>(), 40);
-    }
-
-    #[test]
     fn timestamp_wire_size_is_sixteen() {
         assert_eq!(core::mem::size_of::<WalHybridTimestampWire>(), 16);
-    }
-
-    #[test]
-    fn payload_caps_match_spec() {
-        assert_eq!(WAL_MAX_PAYLOAD_PLAINTEXT, 4052);
-        assert_eq!(WAL_MAX_PAYLOAD_ENCRYPTED, 4036);
     }
 
     #[test]

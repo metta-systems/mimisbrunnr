@@ -279,11 +279,12 @@ impl DiskEngine {
 
         // 3. Read the superblock written by `PoolManager::create`.
         let mut superblock = Superblock::open(primary_dev.as_ref())?;
-        let wal_offset = superblock.wal_offset;
-        let wal_size = superblock.wal_size;
-
-        // 4. Format the WAL ring.
-        let wal = Wal::format(primary_dev.as_ref(), wal_offset, wal_size)?;
+        // 4. Start the journal in the superblock's journal buckets.
+        let wal = Wal::format(
+            primary_dev.as_ref(),
+            superblock.bucket_size_log2,
+            superblock.journal_buckets(),
+        )?;
 
         // 5. Build empty engine.
         let engine = Engine::new(config.node_id);
@@ -307,7 +308,7 @@ impl DiskEngine {
         let active = *superblock.active_root_pointer();
         let mut new_root = active;
         new_root.seq = active.seq.saturating_add(1);
-        new_root.lsn = wal.next_lsn();
+        new_root.lsn = 0; // no journal entry is reflected yet: replay takes every one
         seed_root_pointer(&mut new_root, primary_addressing(&superblock), zone_offset)?;
         superblock.commit_root(primary_dev.as_ref(), new_root)?;
 
@@ -345,9 +346,11 @@ impl DiskEngine {
             .clone();
 
         let superblock = Superblock::open(primary_dev.as_ref())?;
-        let wal_offset = superblock.wal_offset;
-        let wal_size = superblock.wal_size;
-        let wal = Wal::open(primary_dev.as_ref(), wal_offset, wal_size)?;
+        let wal = Wal::open(
+            primary_dev.as_ref(),
+            superblock.bucket_size_log2,
+            superblock.journal_buckets(),
+        )?;
 
         let mut engine = Engine::new(config.node_id);
 
@@ -392,7 +395,7 @@ impl DiskEngine {
     /// Open the pool for **read-only** inspection.
     ///
     /// The primary device is opened via
-    /// [`FileBlockDevice::open_read_only`] and the WAL ring via
+    /// [`FileBlockDevice::open_read_only`] and the journal via
     /// [`Wal::open_read_only`], so any stray write attempts fail at the device
     /// or WAL layer with the corresponding `ReadOnly` error.
     ///
@@ -431,9 +434,11 @@ impl DiskEngine {
             Arc::new(FileBlockDevice::open_read_only(&primary_entry.path)?);
 
         let superblock = Superblock::open(primary_dev.as_ref())?;
-        let wal_offset = superblock.wal_offset;
-        let wal_size = superblock.wal_size;
-        let wal = Wal::open_read_only(primary_dev.as_ref(), wal_offset, wal_size)?;
+        let wal = Wal::open_read_only(
+            primary_dev.as_ref(),
+            superblock.bucket_size_log2,
+            superblock.journal_buckets(),
+        )?;
 
         let mut engine = Engine::new(config.node_id);
 
@@ -640,17 +645,15 @@ impl DiskEngine {
         Ok(())
     }
 
-    /// Replay every WAL entry past `last_applied_lsn` against the engine.
+    /// Replay every journal entry after the committed root's LSN (JOURNAL-DESIGN§1.5) and past
+    /// `last_applied_lsn` against the engine.
     fn replay_wal(&mut self) -> Result<(), EngineError> {
-        let start = self.engine.last_applied_lsn.saturating_add(1);
-        let entries: Vec<_> = self
-            .wal
-            .iter_from(self.primary_device.as_ref(), start)
-            .collect();
+        let root_lsn = self.superblock.active_root_pointer().lsn;
+        let start = self.engine.last_applied_lsn.max(root_lsn).saturating_add(1);
+        let entries = self.wal.entries_from(self.primary_device.as_ref(), start)?;
         for entry in entries {
-            let entry = entry?;
-            let kind = WalOpKind::from_u8(entry.header.op_kind)?;
-            let lsn = entry.header.lsn;
+            let kind = WalOpKind::from_u8(entry.op_kind)?;
+            let lsn = entry.lsn;
             // Engine-only ops; checkpoint and others are handled separately.
             if matches!(kind, WalOpKind::Checkpoint) {
                 continue;
@@ -670,7 +673,7 @@ impl DiskEngine {
     ///
     /// 1. Save index state to the index zone.
     /// 2. Append a `Checkpoint` WAL entry recording the new root.
-    /// 3. Trim the WAL ring up to the new checkpoint LSN.
+    /// 3. Name the checkpoint's jset as the journal's trim point.
     /// 4. Flip the active root in all 3 superblock copies.
     /// 5. fsync.
     pub fn commit(&mut self) -> Result<(), EngineError> {
@@ -714,8 +717,8 @@ impl DiskEngine {
             self.engine.clock.now(),
         )?;
 
-        // 4. Trim the WAL up to and including `lsn`.
-        self.wal.checkpoint(self.primary_device.as_ref(), lsn)?;
+        // 4. Later jsets name this checkpoint's as the oldest replay needs.
+        self.wal.checkpoint(lsn)?;
 
         // 5. Flip the active root.
         // The root we wrote referenced `next_lsn`, but the actual checkpoint
@@ -966,15 +969,7 @@ impl DiskEngine {
 
     fn append_wal(&mut self, op: &OpKind) -> Result<u64, EngineError> {
         let wal_op = project_op(op);
-        let (kind, payload) = wal_op.encode()?;
-        let lsn = self.wal.append_raw(
-            self.primary_device.as_ref(),
-            kind,
-            &payload,
-            self.engine.clock.now(),
-            0,
-        )?;
-        Ok(lsn)
+        Ok(self.wal.append(self.primary_device.as_ref(), &wal_op, self.engine.clock.now())?)
     }
 }
 

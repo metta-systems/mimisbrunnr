@@ -755,6 +755,44 @@ fn fresh_pool_open_before_first_commit_sees_empty_r1b2_indices() {
 }
 
 #[test]
+fn recovery_after_10_000_journal_commits_across_buckets_reproduces_the_state() {
+    // Every mutation commits one jset; the 4-bucket journal holds 1 024 single-entry sets,
+    // so 10 000 of them wrap it several times, reusing buckets freed by checkpoints.
+    let tmp = TempDir::new().unwrap();
+    let (cfg, cfg_path) = small_pool(&tmp);
+    let mut de = DiskEngine::create(cfg, cfg_path.clone()).unwrap();
+    let seen = de.engine.register_tag("seen");
+    let objects: Vec<ObjectId> = (0..100).map(|_| de.create_object().unwrap()).collect();
+    // Rounds of 100 mutations alternately tag and untag every object; round 100 tags
+    // the even objects only.
+    for step in 0..10_050 {
+        let (round, oid) = (step / 100, objects[step % 100]);
+        if round % 2 == 0 {
+            de.add_tag(oid, seen).unwrap();
+        } else {
+            de.remove_tag(oid, seen).unwrap();
+        }
+        if step % 500 == 499 && step < 9_500 {
+            de.commit().unwrap();
+        }
+    }
+    assert!(de.wal.next_lsn() >> 16 > 10_000);
+    assert!(de.wal.live_bucket_count() >= 2, "the uncommitted tail spans buckets");
+    let tagged: Vec<bool> = objects.iter().map(|&oid| de.engine.tag_index.contains(seen, oid)).collect();
+    assert_eq!(tagged.iter().filter(|&&is_tagged| is_tagged).count(), 50);
+    let object_count = de.engine.object_count();
+    drop(de); // no commit: the last 550 mutations exist only in the journal
+
+    let de = DiskEngine::open(&cfg_path).unwrap();
+    assert_eq!(de.engine.object_count(), object_count);
+    let seen = de.engine.resolve_tag_name("seen").unwrap();
+    for (&oid, &is_tagged) in objects.iter().zip(&tagged) {
+        assert_eq!(de.engine.tag_index.contains(seen, oid), is_tagged, "{oid:?}");
+        assert_eq!(de.engine.forward_index.assertions_of(oid).len(), is_tagged as usize, "{oid:?}");
+    }
+}
+
+#[test]
 fn r1b2_forward_tag_range_persist_across_commit_drop_open() {
     let tmp = TempDir::new().unwrap();
     let (cfg, cfg_path) = small_pool(&tmp);

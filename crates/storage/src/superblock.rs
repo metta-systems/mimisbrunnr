@@ -98,9 +98,8 @@ pub struct Superblock {
     pub active_root: u8,                      // [928..929]   0 = a, 1 = b
     pub _pad2: [u8; 7],                       // [929..936]
 
-    pub wal_offset: u64,                      // [936..944]
-    pub wal_size: u64,                        // [944..952]
-    pub bucket_size_log2: u8,                 // [952..953]
+    pub _reserved0: [u8; 16],                 // [936..952]
+    pub bucket_size_log2: u8,                // [952..953]
     pub copygc_reserve_pct: u8,               // [953..954]
     pub btree_node_size_log2: u8,             // [954..955]
     pub _pad3: [u8; 5],                       // [955..960]
@@ -123,11 +122,21 @@ pub struct Superblock {
     pub default_chunking_threshold: u64,      // [1112..1120]
     pub default_chunking: ChunkParamsRecord,  // [1120..1136]
 
-    pub _reserved: [u8; 2956],                // [1136..4092]
+    // Journal location (JOURNAL-DESIGN§1.1). TODO(ENGINE12): at the ENGINE-DESIGN§1.1 offsets.
+    pub journal_bucket_count: u16,            // [1136..1138] 0 = this disk carries no journal
+    pub _pad5: [u8; 6],                       // [1138..1144]
+    pub journal_buckets: [u32; JOURNAL_BUCKETS_MAX], // [1144..2168] bucket numbers in journal order;
+                                              //             the first journal_bucket_count are valid
+    pub _reserved: [u8; 1924],                // [2168..4092]
     pub crc: u32,                             // [4092..4096]
 }
 
+/// Slots in `Superblock.journal_buckets`.
+pub const JOURNAL_BUCKETS_MAX: usize = 256;
+
 const_assert_eq!(core::mem::size_of::<Superblock>(), 4096);
+const_assert_eq!(core::mem::offset_of!(Superblock, journal_bucket_count), 1136);
+const_assert_eq!(core::mem::offset_of!(Superblock, journal_buckets), 1144);
 
 /// CRC-slot offset within the 4 KiB block.
 const SUPERBLOCK_CRC_OFFSET: usize = 4092;
@@ -146,13 +155,13 @@ impl Superblock {
         bucket_size_log2: u8,
         btree_node_size_log2: u8,
         bootstrap_buckets: u32,
-        wal_offset: u64,
-        wal_size: u64,
+        journal_buckets: &[u32],
         index_zone: ZoneExtent,
         metadata_zone: ZoneExtent,
         blob_zone: ZoneExtent,
         format_version: u16,
     ) -> Self {
+        debug_assert!(journal_buckets.len() <= JOURNAL_BUCKETS_MAX);
         let mut sb: Self = bytemuck::Zeroable::zeroed();
         sb.header = BlockHeader::new(
             BlockKind::Superblock,
@@ -170,8 +179,8 @@ impl Superblock {
         sb.bucket_size_log2 = bucket_size_log2;
         sb.btree_node_size_log2 = btree_node_size_log2;
         sb.bootstrap_buckets = bootstrap_buckets;
-        sb.wal_offset = wal_offset;
-        sb.wal_size = wal_size;
+        sb.journal_bucket_count = journal_buckets.len() as u16;
+        sb.journal_buckets[..journal_buckets.len()].copy_from_slice(journal_buckets);
         sb.index_zone = index_zone;
         sb.metadata_zone = metadata_zone;
         sb.blob_zone = blob_zone;
@@ -183,6 +192,11 @@ impl Superblock {
         sb.root_b.recompute_crc();
         sb.recompute_crc();
         sb
+    }
+
+    /// The journal's buckets on this disk, in journal order (JOURNAL-DESIGN§1.1).
+    pub fn journal_buckets(&self) -> &[u32] {
+        &self.journal_buckets[..(self.journal_bucket_count as usize).min(JOURNAL_BUCKETS_MAX)]
     }
 
     /// Decode the raw `media_type` byte into a logical [`MediaType`].
@@ -274,13 +288,15 @@ impl Superblock {
         bucket_size_log2: u8,
         btree_node_size_log2: u8,
         bootstrap_buckets: u32,
-        wal_offset: u64,
-        wal_size: u64,
+        journal_buckets: &[u32],
         index_zone: ZoneExtent,
         metadata_zone: ZoneExtent,
         blob_zone: ZoneExtent,
         format_version: u16,
     ) -> Result<Self, StorageError> {
+        if journal_buckets.len() > JOURNAL_BUCKETS_MAX {
+            return Err(StorageError::JournalBucketListTooLong(journal_buckets.len()));
+        }
         let capacity = device.capacity();
         if capacity < (BLOCK_SIZE as u64) * 3 {
             return Err(StorageError::DeviceTooSmall {
@@ -298,8 +314,7 @@ impl Superblock {
             bucket_size_log2,
             btree_node_size_log2,
             bootstrap_buckets,
-            wal_offset,
-            wal_size,
+            journal_buckets,
             index_zone,
             metadata_zone,
             blob_zone,
@@ -392,7 +407,7 @@ impl Superblock {
     ///
     /// 5. Write the new pointer into the **inactive** slot of all 3 superblock
     ///    copies, flip `active_root`, recompute CRC, write all 3, fsync.
-    /// 6. (Caller's job: advance WAL `read_cursor` once this returns Ok.)
+    /// 6. (Caller's job: later jsets carry the checkpoint's seq as `last_seq`.)
     ///
     /// Steps 1–4 (quiesce, flush dirty pages, append `Checkpoint` WAL entry,
     /// fsync the WAL) live in the WAL/engine crates and run before this call.
@@ -443,14 +458,29 @@ mod tests {
             20,
             18,
             64,
-            0x1_0000,
-            0x10_0000,
+            &[1, 2, 3],
             dummy_extent(0x100_0000, 0x10_0000),
             dummy_extent(0x110_0000, 0x10_0000),
             dummy_extent(0x120_0000, 0x10_0000),
             1,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn journal_bucket_list_round_trips() {
+        let tmp = NamedTempFile::new().unwrap();
+        let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
+        fmt_default(&dev);
+        assert_eq!(Superblock::open(&dev).unwrap().journal_buckets(), [1, 2, 3]);
+        let too_many = vec![1u32; JOURNAL_BUCKETS_MAX + 1];
+        assert!(matches!(
+            Superblock::format(
+                &dev, [0; 16], 1, 2, MediaType::NVMe, StorageTier::Hot, 20, 18, 64, &too_many,
+                dummy_extent(0, 0), dummy_extent(0, 0), dummy_extent(0, 0), 1,
+            ),
+            Err(StorageError::JournalBucketListTooLong(257))
+        ));
     }
 
     #[test]
@@ -605,8 +635,7 @@ mod tests {
             20,
             18,
             64,
-            0x1_0000,
-            0x10_0000,
+            &[1],
             dummy_extent(0x100_0000, 0x10_0000),
             dummy_extent(0x110_0000, 0x10_0000),
             dummy_extent(0x120_0000, 0x10_0000),

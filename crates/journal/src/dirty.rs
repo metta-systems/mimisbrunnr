@@ -9,7 +9,7 @@ use mimisbrunnr_storage::BlockRef;
 ///
 /// JOURNAL-DESIGN§1.4: each in-memory dirty btree node carries a journal pin — the LSN
 /// of the oldest WAL entry whose update has not yet been merged into the
-/// on-disk node. Reclaim of the WAL ring is gated on
+/// on-disk node. The journal's trim point is gated on
 /// `min(all_dirty_nodes.pending_lsn_min)`.
 ///
 /// `in_memory` deliberately stays opaque — the `meta` and `index` crates
@@ -18,8 +18,8 @@ use mimisbrunnr_storage::BlockRef;
 //
 // TODO(JOURNAL4): journal-reclaim driver — choose flush victims by
 // (pending_lsn_max - pending_lsn_min) * pending_count and rewrite via the
-// COW path described in JOURNAL-DESIGN§1.4. This is the thread that advances
-// `WalHeader.read_cursor` past flushed pages.
+// COW path described in JOURNAL-DESIGN§1.4, advancing the jsets' `last_seq`
+// past flushed pages.
 #[derive(Debug, Clone)]
 pub struct DirtyNode {
     /// On-disk location of the node.

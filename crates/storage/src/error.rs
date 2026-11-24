@@ -69,6 +69,9 @@ pub enum StorageError {
     #[error("device too small: need {need} bytes, have {have}")]
     DeviceTooSmall { need: u64, have: u64 },
 
+    #[error("journal bucket list of {0} buckets exceeds the superblock's 256 slots")]
+    JournalBucketListTooLong(usize),
+
     #[error(
         "offset {offset} + length {length} exceeds device capacity {capacity}"
     )]

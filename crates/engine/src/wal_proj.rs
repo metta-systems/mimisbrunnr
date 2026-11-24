@@ -1,7 +1,7 @@
 //! Engine `OpKind` ↔ WAL `WalOp` projection.
 //!
 //! The engine keeps an in-memory [`crate::OpKind`] log; each entry is also
-//! projected to a [`mimisbrunnr_journal::WalOp`] at append time so the WAL ring
+//! projected to a [`mimisbrunnr_journal::WalOp`] at append time so the journal
 //! gets a durable record. Replay reverses the projection.
 //!
 //! ## Mapping table

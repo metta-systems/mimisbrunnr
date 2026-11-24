@@ -63,6 +63,6 @@ pub use {
         MAGIC_SUPERBLOCK, Preamble, Structure,
     },
     root_pointer::{BlobRef, BlockRef, RootPointer},
-    superblock::{ChunkParamsRecord, SUPERBLOCK_MAGIC_FULL, Superblock},
+    superblock::{ChunkParamsRecord, JOURNAL_BUCKETS_MAX, SUPERBLOCK_MAGIC_FULL, Superblock},
     zone_map::{ZoneExtent, ZoneMap, ZoneMapEntry},
 };

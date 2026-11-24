@@ -29,9 +29,7 @@ pub const BLOCK_FLAG_CONTINUATION: u32 = 1 << 1;
 pub const BLOCK_KIND_SUPERBLOCK:        u16 = 0;
 pub const BLOCK_KIND_ZONE_MAP:          u16 = 1;
 pub const BLOCK_KIND_POOL_STATE_ROOT:   u16 = 2;
-// WAL framing
-pub const BLOCK_KIND_WAL_SEGMENT:       u16 = 3;
-pub const BLOCK_KIND_CHECKPOINT:        u16 = 4;
+// 3 and 4 are free: journal sets carry their own "JRNL" preamble (JOURNAL-DESIGN§1.2)
 // Tag-store pages
 pub const BLOCK_KIND_TAG_BITMAP_PAGE:   u16 = 5;
 pub const BLOCK_KIND_SEQUENCE_PAGE:     u16 = 6;   // INDEX-DESIGN§3.3 OrderedStore page
@@ -42,7 +40,7 @@ pub const BLOCK_KIND_KV_HASH_BUCKET:    u16 = 9;
 // Per-object metadata overflow
 pub const BLOCK_KIND_OVERFLOW_RECORD:   u16 = 10;
 pub const BLOCK_KIND_COUNT:             u16 = 11;
-// Sanity: every BlockKind must be unique and densely numbered from 0.
+// Sanity: every BlockKind is numbered below BLOCK_KIND_COUNT.
 const _: () = assert!(BLOCK_KIND_OVERFLOW_RECORD + 1 == BLOCK_KIND_COUNT);
 
 // BtreeKind (Preamble.kind of a "BREG" region), FORMAT-DESIGN§1.3 — contiguous 0–26
@@ -124,9 +122,10 @@ pub const BTREE_NODE_FLAG_HEAD_OF_CHAIN: u8 = 1 << 1;  // first region of a posi
 pub const FIELD_FORMAT_FLAG_SIGNED:    u8 = 1 << 0;
 pub const FIELD_FORMAT_FLAG_MSB_FIRST: u8 = 1 << 1;
 
-// WalEntryHeader.flags
-pub const WAL_ENTRY_FLAG_ENCRYPTED:  u16 = 1 << 0;
-pub const WAL_ENTRY_FLAG_COMPRESSED: u16 = 1 << 1;
+// JsetHeader.flags and EntryHead.flags (JOURNAL-DESIGN§1.2)
+pub const JSET_FLAG_ENCRYPTED:      u16 = 1 << 0;
+pub const JSET_FLAG_COMPRESSED:     u16 = 1 << 1;
+pub const ENTRY_FLAG_HLC_EXPLICIT:  u8  = 1 << 0;
 
 // ObjectRecord.flags
 pub const OBJECT_FLAG_HAS_OVERFLOW: u8 = 1 << 0;
@@ -477,8 +476,7 @@ pub struct Superblock {
     pub root_b: RootPointer,                    // [520..928]
     pub active_root: u8,                        // [928..929]
     pub _pad2: [u8; 7],                         // [929..936]
-    pub wal_offset: u64,                        // [936..944]
-    pub wal_size: u64,                          // [944..952]
+    pub _reserved0: [u8; 16],                   // [936..952]
     pub bucket_size_log2: u8,                   // [952..953]
     pub copygc_reserve_pct: u8,                 // [953..954]
     pub btree_node_size_log2: u8,               // [954..955]
@@ -499,35 +497,19 @@ pub struct Superblock {
     // SPECIFICATION-DESIGN§3.5 / SPECIFICATION-DESIGN§8.3 default storage policy
     pub default_chunking_threshold: u64,        // [1112..1120]
     pub default_chunking: ChunkParamsRecord,    // [1120..1136]
-    pub _reserved: [u8; 2956],                  // [1136..4092]
+    // JOURNAL-DESIGN§1.1 journal location
+    pub journal_bucket_count: u16,              // [1136..1138]
+    pub _pad5: [u8; 6],                         // [1138..1144]
+    pub journal_buckets: [u32; 256],            // [1144..2168]
+    pub _reserved: [u8; 1924],                  // [2168..4092]
     pub trailing_crc: u32,                      // [4092..4096]
 }
 const _: () = assert!(size_of::<Superblock>() == 4096);
+const _: () = assert!(std::mem::offset_of!(Superblock, journal_bucket_count) == 1136);
+const _: () = assert!(std::mem::offset_of!(Superblock, journal_buckets) == 1144);
 
 // =====================================================================
-// JOURNAL-DESIGN§1.1 WalHeader — 4096 B (one block; A/B-alternated using
-// BlockHeader.generation, no separate seq field)
-// =====================================================================
-#[repr(C)]
-pub struct WalHeader {
-    pub header: BlockHeader,            //   32
-    pub next_lsn: u64,                  //    8
-    pub write_cursor: u64,              //    8
-    pub read_cursor: u64,               //    8
-    pub used_bytes: u64,                //    8
-    pub last_checkpoint_lsn: u64,       //    8  newest Checkpoint entry's LSN;
-                                        //       no separate physical pointer — recovery
-                                        //       scans forward from this LSN.
-    pub segment_size: u32,              //    4
-    pub _pad: u32,                      //    4
-    pub encryption_keyid: [u8; 16],     //   16
-    pub _reserved: [u8; 3996],          // 3996
-    pub trailing_crc: u32,              //    4
-}
-const _: () = assert!(size_of::<WalHeader>() == 4096);
-
-// =====================================================================
-// JOURNAL-DESIGN§1.2 WalEntryHeader — 40 B
+// JOURNAL-DESIGN§1.2 journal sets: JsetHeader (64 B), EntryHead (8 B).
 // HybridTimestamp uses ns resolution (matches every other *_ns field on disk)
 // and u16 node_id (matches Superblock.node_id). Sort order: physical_ns →
 // logical → node_id (SPECIFICATION-DESIGN§10.4).
@@ -545,46 +527,45 @@ const _: () = assert!(std::mem::offset_of!(HybridTimestamp, logical) == 8);
 const _: () = assert!(std::mem::offset_of!(HybridTimestamp, node_id) == 10);
 
 #[repr(C)]
-pub struct WalEntryHeader {
-    pub magic: u32,
-    pub op_kind: u8,
-    pub format_version: u8,
-    pub flags: u16,
-    pub lsn: u64,
-    pub timestamp: HybridTimestamp,
-    pub payload_length: u32,
-    pub payload_crc: u32,
+pub struct JsetHeader {
+    pub pre: Preamble,                 //  [0..8]   "JRNL", version, kind 0
+    pub seq: u64,                      //  [8..16]
+    pub last_seq: u64,                 // [16..24]
+    pub hlc_base: HybridTimestamp,     // [24..40]
+    pub payload_len: u32,              // [40..44]
+    pub entry_count: u32,              // [44..48]
+    pub plain_len: u32,                // [48..52]
+    pub flags: u16,                    // [52..54]
+    pub _pad: u16,                     // [54..56]
+    pub checksum: u64,                 // [56..64]
 }
-const _: () = assert!(size_of::<WalEntryHeader>() == 40);
+const _: () = assert!(size_of::<JsetHeader>() == 64);
+const _: () = assert!(std::mem::offset_of!(JsetHeader, hlc_base) == 24);
+const _: () = assert!(std::mem::offset_of!(JsetHeader, payload_len) == 40);
+const _: () = assert!(std::mem::offset_of!(JsetHeader, flags) == 52);
+const _: () = assert!(std::mem::offset_of!(JsetHeader, checksum) == 56);
 
-// JOURNAL-DESIGN§1.2 / ENCRYPTION-DESIGN§1 — encrypted WAL entry framing.
-// Plaintext entry overhead = WalEntryHeader (40) + framing checksum (4, low half of checksum64) = 44 B.
-// Encrypted entry overhead = header (40) + GCM tag (16) + framing checksum (4, low half of checksum64) = 60 B.
-// The GCM tag does NOT replace `payload_crc` (4 B is too narrow for a 16 B tag);
-// it sits between the ciphertext and the trailing framing CRC.
-pub const WAL_FRAMING_CRC_BYTES: usize = 4;
-pub const WAL_GCM_TAG_BYTES:     usize = 16;          // AES-256-GCM standard tag
-pub const WAL_GCM_NONCE_BYTES:   usize = 12;          // 96-bit nonce (LSN || 0)
-pub const WAL_GCM_AAD_BYTES:     usize =
-    size_of::<WalEntryHeader>() - size_of::<u32>();   // header[0..36] excludes payload_crc
-const _: () = assert!(WAL_GCM_AAD_BYTES == 36);
+#[repr(C)]
+pub struct EntryHead {
+    pub op_kind: u8,                   // [0..1]
+    pub flags: u8,                     // [1..2]
+    pub len: u16,                      // [2..4]  payload words
+    pub hlc_delta: u32,                // [4..8]
+}
+const _: () = assert!(size_of::<EntryHead>() == 8);
 
-pub const WAL_ENTRY_PLAINTEXT_OVERHEAD: usize =
-    size_of::<WalEntryHeader>() + WAL_FRAMING_CRC_BYTES;
-pub const WAL_ENTRY_ENCRYPTED_OVERHEAD: usize =
-    size_of::<WalEntryHeader>() + WAL_GCM_TAG_BYTES + WAL_FRAMING_CRC_BYTES;
-const _: () = assert!(WAL_ENTRY_PLAINTEXT_OVERHEAD == 44);
-const _: () = assert!(WAL_ENTRY_ENCRYPTED_OVERHEAD == 60);
-
-// AES-GCM is length-preserving: payload_length counts ciphertext bytes,
-// equal to plaintext bytes. The encrypted layout adds exactly tag-bytes
-// of overhead beyond plaintext.
-const _: () = assert!(
-    WAL_ENTRY_ENCRYPTED_OVERHEAD - WAL_ENTRY_PLAINTEXT_OVERHEAD == WAL_GCM_TAG_BYTES
-);
-
-// Nonce derivation: 64-bit LSN || 32-bit zero = 96 bits = 12 B.
-const _: () = assert!(size_of::<u64>() + size_of::<u32>() == WAL_GCM_NONCE_BYTES);
+// A jset is at most 256 KiB and padded to 4 KiB; `EntryHead.len` in words reaches 512 KiB, so
+// one entry is bounded by its jset. An AddTag (16-byte payload) costs 8 + 16 = 24 bytes.
+pub const JSET_MAX_SIZE: usize = 256 * 1024;
+pub const AEAD_TAG_BYTES: usize = 16;          // after the entries when JSET_FLAG_ENCRYPTED
+const _: () = assert!(u16::MAX as usize * 8 >= JSET_MAX_SIZE);
+const _: () = assert!(size_of::<EntryHead>() + 16 == 24);
+// A 2 000-chunk AppendChunks (32-byte head + 128-byte ChunkSpecs) fits one jset.
+const _: () = assert!(size_of::<JsetHeader>() + size_of::<EntryHead>() + 32 + 2_000 * 128 <= JSET_MAX_SIZE);
+// LSN = seq << 16 | index: a jset holds at most 2¹⁶ entries.
+const _: () = assert!(JSET_MAX_SIZE / size_of::<EntryHead>() <= 1 << 16);
+// Nonce: 64-bit seq || 32 zero bits = 96 bits (ENCRYPTION-DESIGN§1).
+const _: () = assert!(size_of::<u64>() + size_of::<u32>() == 12);
 
 // =====================================================================
 // METADATA-DESIGN§1.1 ObjectRecord — 128 B
@@ -1184,163 +1165,12 @@ const _: () = assert!(FWD_LEAVES_10M_4 * REGION / MIB == 537);       // "~0.5 Gi
 const _: () = assert!(entries_per_block(4, 56, false) == 67);
 const _: () = assert!(entries_per_leaf(4, 56, false) == 4_154);
 
-// =====================================================================
-// JOURNAL-DESIGN§1.2 hard cap: a single WAL op fits in one 4 KiB sector. No continuation
-// framing — bulk data goes through the blob zone (INDEX-DESIGN§1.1) and is referenced
-// by hash. Sector-aligned framing keeps recovery trivial: a torn 4 KiB
-// write loses at most one entry, and replay never reassembles fragments.
-//   plaintext bound : 4096 − WalEntryHeader (40) − framing CRC (4)        = 4052
-//   encrypted bound : plaintext − GCM tag (16)                            = 4036
-// `WAL_OP_MAX_PAYLOAD` is the conservative cap producers must enforce
-// (works in both modes; debug_assert! in the appender catches violations).
-// =====================================================================
 pub const BLOCK_SIZE: usize = 4096;
-pub const WAL_MAX_PAYLOAD_PLAINTEXT: usize = BLOCK_SIZE - WAL_ENTRY_PLAINTEXT_OVERHEAD;
-pub const WAL_MAX_PAYLOAD_ENCRYPTED: usize = BLOCK_SIZE - WAL_ENTRY_ENCRYPTED_OVERHEAD;
-pub const WAL_OP_MAX_PAYLOAD:        usize = WAL_MAX_PAYLOAD_ENCRYPTED;
-const _: () = assert!(WAL_MAX_PAYLOAD_PLAINTEXT == 4_052);
-const _: () = assert!(WAL_MAX_PAYLOAD_ENCRYPTED == 4_036);
-const _: () = assert!(WAL_OP_MAX_PAYLOAD == 4_036);
 
-// JOURNAL-DESIGN§1.3 variable-length op-field caps that keep every op under WAL_OP_MAX_PAYLOAD
-// even with CBOR overhead. Sized so the largest op (Checkpoint with a 408 B
-// RootPointer plus ~20 B CBOR framing, or SnapshotCreate with a 256 B label)
-// stays comfortably below the sector bound. owner_key is naturally bounded
-// by METADATA-DESIGN§2.2's 16 B BackpointerValue.
+// JOURNAL-DESIGN§1.3 variable-part caps: SnapshotCreate.label and owner_key
+// (METADATA-DESIGN§2.2 BackpointerValue.owner_key).
 pub const WAL_LABEL_MAX_BYTES:      usize = 256;
-pub const WAL_CURSOR_KEY_MAX_BYTES: usize = 256;
-pub const WAL_OWNER_KEY_BYTES:      usize = 16;     // METADATA-DESIGN§2.2 BackpointerValue.owner_key
-const _: () = assert!(WAL_LABEL_MAX_BYTES      < WAL_OP_MAX_PAYLOAD);
-const _: () = assert!(WAL_CURSOR_KEY_MAX_BYTES < WAL_OP_MAX_PAYLOAD);
-
-// =====================================================================
-// JOURNAL-DESIGN§1.3.1 Chunked-object WAL ops (INDEX-DESIGN§4.3).
-// Per-entry sizes (raw, unpacked):
-//   ChunkInsertBatch entry: chunk_hash (32) + extent: BlockRef (16) + length (4) = 52 B
-//   ChunkListReplace hash:  32 B
-// CBOR adds ~4 B framing per array + ~3 B per record. We allow generous slack so the
-// producer can pick any N that fits, capped by these constants — debug_assert! in the
-// appender catches CBOR overflow.
-// =====================================================================
-pub const CHUNK_INSERT_ENTRY_BYTES:  usize = 32 + 16 + 4;     // 52 B
-pub const CHUNK_INSERT_FRAMING_SLACK: usize = 64;             // op-kind + array prefix + per-entry CBOR overhead
-pub const CHUNK_INSERT_BATCH_MAX:    usize =
-    (WAL_OP_MAX_PAYLOAD - CHUNK_INSERT_FRAMING_SLACK) / CHUNK_INSERT_ENTRY_BYTES;
-// (4036 − 64) / 52 = 76 entries — producer picks any N in 1..=76.
-const _: () = assert!(CHUNK_INSERT_BATCH_MAX == 76);
-const _: () = assert!(
-    CHUNK_INSERT_FRAMING_SLACK
-        + CHUNK_INSERT_BATCH_MAX * CHUNK_INSERT_ENTRY_BYTES
-        <= WAL_OP_MAX_PAYLOAD
-);
-
-pub const CHUNK_LIST_REPLACE_HASH_BYTES: usize = 32;
-pub const CHUNK_LIST_REPLACE_FRAMING_SLACK: usize = 32;        // oid + position + array prefix + CBOR
-pub const CHUNK_LIST_REPLACE_MAX_HASHES: usize =
-    (WAL_OP_MAX_PAYLOAD - CHUNK_LIST_REPLACE_FRAMING_SLACK) / CHUNK_LIST_REPLACE_HASH_BYTES;
-// (4036 − 32) / 32 = 125 hashes per op.
-const _: () = assert!(CHUNK_LIST_REPLACE_MAX_HASHES == 125);
-
-// JOURNAL-DESIGN§1.3.1 throughput-model constants. Five regimes (4 KiB → 8 MiB) span FastCDC's
-// real-world parameter range and pin every figure in the doc's spectrum table.
-// All compute over a 32 GiB bulk write with no dedup.
-pub const CHUNK_LIST_ENTRIES_PER_REGION: usize = CHUNK_LIST_ENTRIES;        // 6_551
-
-const _: () = assert!(CHUNK_LIST_ENTRIES_PER_REGION == 6_551);
-
-pub const CHUNK_BULK_WRITE_BYTES:        usize = 32 * 1024 * 1024 * 1024;   // 32 GiB
-pub const WAL_RING_BYTES_DEFAULT:        usize = 64 * 1024 * 1024;          // JOURNAL-DESIGN§1 default
-
-const fn chunks_for(avg: usize) -> usize { CHUNK_BULK_WRITE_BYTES / avg }
-const fn insert_ops_for(avg: usize) -> usize {
-    chunks_for(avg).div_ceil(CHUNK_INSERT_BATCH_MAX)
-}
-const fn list_ops_for(avg: usize) -> usize {
-    chunks_for(avg).div_ceil(CHUNK_LIST_ENTRIES_PER_REGION)
-}
-// Worst-case WAL bytes: one full 4 KiB sector per op (real ChunkListAppend is ~50 B,
-// real ChunkInsertBatch fills the sector — pinning the upper bound is the honest
-// way to assert "WAL traffic is bounded, ring is circular, reclaim drains it").
-const fn wal_bytes_for(avg: usize) -> usize {
-    (insert_ops_for(avg) + list_ops_for(avg)) * BLOCK_SIZE
-}
-
-// --- 4 KiB extreme (small-chunk / fine-grained-edit regime) -------------
-pub const CHUNK_AVG_4KIB:               usize = 4 * 1024;
-pub const CHUNK_4KIB_CHUNKS:            usize = chunks_for(CHUNK_AVG_4KIB);
-pub const CHUNK_4KIB_INSERT_OPS:        usize = insert_ops_for(CHUNK_AVG_4KIB);
-pub const CHUNK_4KIB_LIST_OPS:          usize = list_ops_for(CHUNK_AVG_4KIB);
-pub const CHUNK_4KIB_WAL_BYTES_MAX:     usize = wal_bytes_for(CHUNK_AVG_4KIB);
-const _: () = assert!(CHUNK_4KIB_CHUNKS    == 8_388_608);                    // 8 M
-const _: () = assert!(CHUNK_4KIB_INSERT_OPS == 110_377);                     // ~110 K
-const _: () = assert!(CHUNK_4KIB_LIST_OPS   == 1_281);                       // ~1.28 K
-// ~436 MiB worst-case — exceeds 64 MiB ring by ~6.8×; ring cycles continuously.
-const _: () = assert!(CHUNK_4KIB_WAL_BYTES_MAX > 6 * WAL_RING_BYTES_DEFAULT);
-const _: () = assert!(CHUNK_4KIB_WAL_BYTES_MAX < 7 * WAL_RING_BYTES_DEFAULT);
-
-// --- 16 KiB (VM / database canonical workload) -------------------------
-pub const CHUNK_AVG_16KIB:              usize = 16 * 1024;
-pub const CHUNK_16KIB_CHUNKS:           usize = chunks_for(CHUNK_AVG_16KIB);
-pub const CHUNK_16KIB_INSERT_OPS:       usize = insert_ops_for(CHUNK_AVG_16KIB);
-pub const CHUNK_16KIB_LIST_OPS:         usize = list_ops_for(CHUNK_AVG_16KIB);
-pub const CHUNK_16KIB_WAL_BYTES_MAX:    usize = wal_bytes_for(CHUNK_AVG_16KIB);
-const _: () = assert!(CHUNK_16KIB_CHUNKS    == 2_097_152);                   // ~2 M
-const _: () = assert!(CHUNK_16KIB_INSERT_OPS == 27_595);                     // ~28 K
-const _: () = assert!(CHUNK_16KIB_LIST_OPS   == 321);
-// ~115 MiB worst-case — exceeds ring by ~1.8×; ring cycles ~2× over the write.
-const _: () = assert!(CHUNK_16KIB_WAL_BYTES_MAX > WAL_RING_BYTES_DEFAULT);
-const _: () = assert!(CHUNK_16KIB_WAL_BYTES_MAX < 2 * WAL_RING_BYTES_DEFAULT);
-
-// --- 256 KiB (generic FastCDC default) ---------------------------------
-pub const CHUNK_AVG_256KIB:             usize = 256 * 1024;
-pub const CHUNK_256KIB_CHUNKS:          usize = chunks_for(CHUNK_AVG_256KIB);
-pub const CHUNK_256KIB_INSERT_OPS:      usize = insert_ops_for(CHUNK_AVG_256KIB);
-pub const CHUNK_256KIB_LIST_OPS:        usize = list_ops_for(CHUNK_AVG_256KIB);
-pub const CHUNK_256KIB_WAL_BYTES_MAX:   usize = wal_bytes_for(CHUNK_AVG_256KIB);
-const _: () = assert!(CHUNK_256KIB_CHUNKS    == 131_072);                    // ~131 K
-const _: () = assert!(CHUNK_256KIB_INSERT_OPS == 1_725);
-const _: () = assert!(CHUNK_256KIB_LIST_OPS   == 21);
-// ~7 MiB — fits inside the ring with room to spare.
-const _: () = assert!(CHUNK_256KIB_WAL_BYTES_MAX < WAL_RING_BYTES_DEFAULT / 8);
-
-// --- 1 MiB (backup-tool default, restic-class) -------------------------
-pub const CHUNK_AVG_1MIB:               usize = 1024 * 1024;
-pub const CHUNK_1MIB_CHUNKS:            usize = chunks_for(CHUNK_AVG_1MIB);
-pub const CHUNK_1MIB_INSERT_OPS:        usize = insert_ops_for(CHUNK_AVG_1MIB);
-pub const CHUNK_1MIB_LIST_OPS:          usize = list_ops_for(CHUNK_AVG_1MIB);
-pub const CHUNK_1MIB_WAL_BYTES_MAX:     usize = wal_bytes_for(CHUNK_AVG_1MIB);
-const _: () = assert!(CHUNK_1MIB_CHUNKS    == 32_768);
-const _: () = assert!(CHUNK_1MIB_INSERT_OPS == 432);
-const _: () = assert!(CHUNK_1MIB_LIST_OPS   == 6);
-// ~1.8 MiB total.
-
-// --- 8 MiB extreme (large-chunk / resumability regime) -----------------
-pub const CHUNK_AVG_8MIB:               usize = 8 * 1024 * 1024;
-pub const CHUNK_8MIB_CHUNKS:            usize = chunks_for(CHUNK_AVG_8MIB);
-pub const CHUNK_8MIB_INSERT_OPS:        usize = insert_ops_for(CHUNK_AVG_8MIB);
-pub const CHUNK_8MIB_LIST_OPS:          usize = list_ops_for(CHUNK_AVG_8MIB);
-pub const CHUNK_8MIB_WAL_BYTES_MAX:     usize = wal_bytes_for(CHUNK_AVG_8MIB);
-const _: () = assert!(CHUNK_8MIB_CHUNKS    == 4_096);
-const _: () = assert!(CHUNK_8MIB_INSERT_OPS == 54);
-const _: () = assert!(CHUNK_8MIB_LIST_OPS   == 1);                           // single region
-// ~220 KiB total — bookkeeping overhead negligible vs 32 GiB plaintext.
-const _: () = assert!(CHUNK_8MIB_WAL_BYTES_MAX < 256 * 1024);
-
-// Spread across regimes: ~2 000× on every axis. Pin the magnitude.
-const _: () = assert!(CHUNK_4KIB_CHUNKS / CHUNK_8MIB_CHUNKS == 2_048);
-const _: () =
-    assert!(CHUNK_4KIB_WAL_BYTES_MAX / CHUNK_8MIB_WAL_BYTES_MAX > 1_500);
-const _: () =
-    assert!(CHUNK_4KIB_WAL_BYTES_MAX / CHUNK_8MIB_WAL_BYTES_MAX < 2_500);
-
-// Per-object ChunkList footprint (in 256 KiB regions) at the extremes.
-// 4 KiB: 1 281 regions × 256 KiB ≈ 320 MiB ChunkList per object (~1 % of plaintext).
-// 8 MiB: 1 region × 256 KiB = 256 KiB ChunkList per object.
-pub const CHUNK_4KIB_LIST_FOOTPRINT_BYTES: usize = CHUNK_4KIB_LIST_OPS * REGION;
-pub const CHUNK_8MIB_LIST_FOOTPRINT_BYTES: usize = CHUNK_8MIB_LIST_OPS * REGION;
-const _: () = assert!(CHUNK_4KIB_LIST_FOOTPRINT_BYTES > 300 * 1024 * 1024);
-const _: () = assert!(CHUNK_4KIB_LIST_FOOTPRINT_BYTES < 340 * 1024 * 1024);
-const _: () = assert!(CHUNK_8MIB_LIST_FOOTPRINT_BYTES == REGION);            // 256 KiB
+pub const WAL_OWNER_KEY_BYTES:      usize = 16;
 
 // =====================================================================
 // INDEX-DESIGN§2.2 ForwardOverflow region: positional PackedAssertion array minus

@@ -112,8 +112,7 @@ pub enum BlockKind {
     Superblock = 0,
     ZoneMap = 1,
     PoolStateRoot = 2,
-    WalSegment = 3,
-    Checkpoint = 4,
+    // 3 and 4 are free: journal sets carry their own preamble (JOURNAL-DESIGN§1.2).
     TagBitmapPage = 5,
     SequencePage = 6,
     RankedPage = 7,
@@ -130,8 +129,6 @@ impl BlockKind {
             0 => Self::Superblock,
             1 => Self::ZoneMap,
             2 => Self::PoolStateRoot,
-            3 => Self::WalSegment,
-            4 => Self::Checkpoint,
             5 => Self::TagBitmapPage,
             6 => Self::SequencePage,
             7 => Self::RankedPage,
@@ -254,11 +251,13 @@ mod tests {
 
     #[test]
     fn block_kind_round_trips() {
-        for raw in 0u16..=10 {
+        for raw in (0u16..=2).chain(5..=10) {
             let k = BlockKind::from_u16(raw).unwrap();
             assert_eq!(k as u16, raw);
         }
-        assert!(BlockKind::from_u16(99).is_err());
+        for raw in [3, 4, 99] {
+            assert!(BlockKind::from_u16(raw).is_err());
+        }
     }
 
     #[test]

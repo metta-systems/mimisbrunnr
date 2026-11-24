@@ -40,7 +40,7 @@ Each fixes a layout that later steps write; decide them first.
 
 Independent of each other unless an order is given.
 
-- **Encodings** (FORMAT-DESIGN§1.6): [JOURNAL9](journal-implementation-plan.md) (journal buckets and journal sets), [QUERY11](query-implementation-plan.md) and [ONTOLOGY10](ontology-implementation-plan.md); after QUERY11, [SUBSCRIPTION7](subscriptions-implementation-plan.md) and [POOL5](pool-implementation-plan.md) (native placement-rules tree).
+- **Encodings** (FORMAT-DESIGN§1.6): [QUERY11](query-implementation-plan.md) and [ONTOLOGY10](ontology-implementation-plan.md); after QUERY11, [SUBSCRIPTION7](subscriptions-implementation-plan.md) and [POOL5](pool-implementation-plan.md) (native placement-rules tree).
 - [SPEC26](specification-implementation-plan.md) — borrow on-disk structs in place.
 - [POOL1](pool-implementation-plan.md) — one disk-descriptor tree.
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
@@ -104,7 +104,7 @@ The term dictionary, postings and forward index replace every index structure, s
 
 These touch disjoint code and can run whenever their prerequisites hold:
 
-- **Encryption:** [ENCRYPTION1](encryption-implementation-plan.md) and [ENCRYPTION2](encryption-implementation-plan.md) as their decisions resolve; [ENCRYPTION3](encryption-implementation-plan.md) after JOURNAL9; [ENCRYPTION4](encryption-implementation-plan.md) after ENCRYPTION-D6; [ENCRYPTION5](encryption-implementation-plan.md) after BLOB1 and ENCRYPTION-D6.
+- **Encryption:** [ENCRYPTION1](encryption-implementation-plan.md) and [ENCRYPTION2](encryption-implementation-plan.md) as their decisions resolve; [ENCRYPTION3](encryption-implementation-plan.md); [ENCRYPTION4](encryption-implementation-plan.md) after ENCRYPTION-D6; [ENCRYPTION5](encryption-implementation-plan.md) after BLOB1 and ENCRYPTION-D6.
 - **Journal flags:** [JOURNAL5](journal-implementation-plan.md), [JOURNAL6](journal-implementation-plan.md).
 - **Query and SQL:** [QUERY13](query-implementation-plan.md) (after INDEX14, ONTOLOGY16 and ONTOLOGY17), then [QUERY14](query-implementation-plan.md) (after INDEX16), then [QUERY16](query-implementation-plan.md) — the per-object evaluator, before SUBSCRIPTION3 and POOL4; [QUERY15](query-implementation-plan.md) after METADATA7; [QUERY1](query-implementation-plan.md)–[QUERY10](query-implementation-plan.md), [QUERY12](query-implementation-plan.md) (QUERY1–QUERY3 after INDEX12, QUERY1's n-gram path after INDEX19; QUERY12 after INDEX18 and QUERY1; QUERY4 after INDEX13; QUERY5 after INDEX15; QUERY6 and QUERY9 after QUERY7; QUERY10 after QUERY4 and QUERY-D2); [QUERY17](query-implementation-plan.md) — predicate properties in `Related` and traversal, after QUERY4, ONTOLOGY21 and INDEX20.
 - **Subscriptions:** [SUBSCRIPTION3](subscriptions-implementation-plan.md) (after QUERY14), then [SUBSCRIPTION8](subscriptions-implementation-plan.md) (after SUBSCRIPTION1), then [SUBSCRIPTION4](subscriptions-implementation-plan.md)–[SUBSCRIPTION6](subscriptions-implementation-plan.md), then [SUBSCRIPTION9](subscriptions-implementation-plan.md).

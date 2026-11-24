@@ -84,7 +84,7 @@ pub struct PoolSnapshot {
     pub oplog: Vec<OpLogEntryView>,
     /// Recent WAL entries, newest first; lifted from the primary disk's WAL.
     pub wal_entries: Vec<WalEntryView>,
-    /// Header summary for the primary disk's WAL ring.
+    /// State of the primary disk's journal.
     pub wal_header: WalHeaderView,
     /// Installed ontology modules.
     pub modules: Vec<ModuleSnapshot>,
@@ -121,8 +121,7 @@ pub struct SuperblockView {
     pub mount_count: u64,
     pub bucket_size_log2: u8,
     pub btree_node_size_log2: u8,
-    pub wal_offset: u64,
-    pub wal_size: u64,
+    pub journal_buckets: Vec<u32>,
     pub index_zone_offset: u64,
     pub index_zone_length: u64,
     pub metadata_zone_offset: u64,
@@ -142,14 +141,13 @@ pub struct RootPointerView {
     pub roots: Vec<(&'static str, String)>,
 }
 
-/// Snapshot of the WAL header.
+/// Snapshot of the journal's state.
 #[derive(Debug, Clone, Default)]
 pub struct WalHeaderView {
     pub next_lsn: u64,
-    pub write_cursor: u64,
-    pub read_cursor: u64,
-    pub used_bytes: u64,
-    pub data_capacity: u64,
+    /// Journal buckets holding jsets replay may still need.
+    pub live_buckets: usize,
+    pub bucket_count: usize,
     pub last_checkpoint_lsn: u64,
 }
 
@@ -214,7 +212,7 @@ pub struct OpLogEntryView {
 
 /// Build a [`PoolSnapshot`] from a live `DiskEngine`.
 ///
-/// Reads the primary device's superblock + WAL ring straight from disk (read
+/// Reads the primary device's superblock + journal straight from disk (read
 /// path only) and walks the in-memory engine mirrors for the rest.
 pub fn build_snapshot(engine: &DiskEngine) -> PoolSnapshot {
     let pool_config = engine.config.clone();
@@ -306,8 +304,7 @@ fn superblock_view(sb: &Superblock) -> SuperblockView {
         mount_count: sb.mount_count,
         bucket_size_log2: sb.bucket_size_log2,
         btree_node_size_log2: sb.btree_node_size_log2,
-        wal_offset: sb.wal_offset,
-        wal_size: sb.wal_size,
+        journal_buckets: sb.journal_buckets().to_vec(),
         index_zone_offset: sb.index_zone.offset,
         index_zone_length: sb.index_zone.length,
         metadata_zone_offset: sb.metadata_zone.offset,
@@ -525,25 +522,17 @@ fn opkind_summary(op: &OpKind) -> String {
 fn wal_header_view(wal: &Wal) -> WalHeaderView {
     WalHeaderView {
         next_lsn: wal.next_lsn(),
-        write_cursor: wal.write_cursor(),
-        read_cursor: wal.read_cursor(),
-        used_bytes: wal.used_bytes(),
-        data_capacity: wal.data_capacity(),
+        live_buckets: wal.live_bucket_count(),
+        bucket_count: wal.bucket_count(),
         last_checkpoint_lsn: wal.last_checkpoint_lsn(),
     }
 }
 
-/// Walk the WAL ring (read-only) and capture every entry currently live.
-/// The newest entries land first in the result.
+/// Read every entry the journal still holds. The newest entries land first in the result; a
+/// journal that fails to read shows as empty history, not a hard error.
 fn collect_wal_entries(wal: &Wal, device: &dyn BlockDevice) -> Vec<WalEntryView> {
-    let mut out = Vec::new();
-    for result in wal.iter_from(device, 0) {
-        let entry = match result {
-            Ok(e) => e,
-            Err(_) => break, // surface as truncated history; not a hard error
-        };
-        out.push(decode_wal_entry(&entry));
-    }
+    let mut out: Vec<WalEntryView> =
+        wal.entries_from(device, 0).unwrap_or_default().iter().map(decode_wal_entry).collect();
     out.reverse();
     // Cap to a sensible upper bound for the GUI table.
     out.truncate(512);
@@ -551,10 +540,10 @@ fn collect_wal_entries(wal: &Wal, device: &dyn BlockDevice) -> Vec<WalEntryView>
 }
 
 fn decode_wal_entry(entry: &WalEntry) -> WalEntryView {
-    let op_kind_raw = entry.header.op_kind;
-    let lsn = entry.header.lsn;
-    let payload_length = entry.header.payload_length;
-    let timestamp_ns = entry.header.timestamp.physical_ns;
+    let op_kind_raw = entry.op_kind;
+    let lsn = entry.lsn;
+    let payload_length = entry.payload.len() as u32;
+    let timestamp_ns = entry.timestamp.physical_ns;
     let (kind_name, payload_preview) = match WalOpKind::from_u8(op_kind_raw) {
         Ok(kind) => match WalOp::decode(kind, &entry.payload) {
             Ok(op) => (format!("{kind:?}"), format!("{op:?}")),
@@ -610,9 +599,9 @@ pub fn render_dump(snap: &PoolSnapshot) -> String {
     out.push_str(&format!("oplog_entries:  {}\n", snap.oplog.len()));
     out.push_str(&format!("wal_next_lsn:   {}\n", snap.wal_header.next_lsn));
     out.push_str(&format!(
-        "wal_used:       {} / {} ({}%)\n",
-        snap.wal_header.used_bytes,
-        snap.wal_header.data_capacity,
+        "wal_used:       {} / {} buckets ({}%)\n",
+        snap.wal_header.live_buckets,
+        snap.wal_header.bucket_count,
         wal_used_percent(&snap.wal_header)
     ));
 
@@ -685,8 +674,8 @@ pub fn render_json(snap: &PoolSnapshot) -> String {
         snap.wal_header.next_lsn
     ));
     out.push_str(&format!(
-        "  \"wal_used_bytes\": {},\n",
-        snap.wal_header.used_bytes
+        "  \"wal_live_buckets\": {},\n",
+        snap.wal_header.live_buckets
     ));
     out.push_str("  \"disks\": [\n");
     for (i, d) in snap.disks.iter().enumerate() {
@@ -723,10 +712,7 @@ pub fn render_json(snap: &PoolSnapshot) -> String {
 }
 
 fn wal_used_percent(h: &WalHeaderView) -> u64 {
-    h.used_bytes
-        .saturating_mul(100)
-        .checked_div(h.data_capacity)
-        .unwrap_or(0)
+    (h.live_buckets * 100).checked_div(h.bucket_count).unwrap_or(0) as u64
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -943,8 +929,8 @@ impl AnalyzerApp {
                 );
                 draw_kv(
                     ui,
-                    "wal_offset/size",
-                    format!("{:#x} / {}", sb.wal_offset, format_bytes(sb.wal_size)),
+                    "journal_buckets",
+                    format!("{:?}", sb.journal_buckets),
                 );
                 draw_kv(
                     ui,
@@ -996,20 +982,13 @@ impl AnalyzerApp {
             }
 
             ui.add_space(8.0);
-            ui.strong("WAL ring (primary disk)");
+            ui.strong("Journal (primary disk)");
             let h = &self.snap.wal_header;
             draw_kv(ui, "next_lsn", h.next_lsn.to_string());
-            draw_kv(ui, "write_cursor", format!("{:#x}", h.write_cursor));
-            draw_kv(ui, "read_cursor", format!("{:#x}", h.read_cursor));
             draw_kv(
                 ui,
-                "used_bytes",
-                format!(
-                    "{} / {} ({}%)",
-                    format_bytes(h.used_bytes),
-                    format_bytes(h.data_capacity),
-                    wal_used_percent(h)
-                ),
+                "live_buckets",
+                format!("{} / {} ({}%)", h.live_buckets, h.bucket_count, wal_used_percent(h)),
             );
             draw_kv(
                 ui,
@@ -1021,7 +1000,7 @@ impl AnalyzerApp {
 
     fn draw_wal_tab(&mut self, ui: &mut egui::Ui) {
         if self.snap.wal_entries.is_empty() {
-            ui.label("WAL ring is empty.");
+            ui.label("Journal is empty.");
             return;
         }
         let available = ui.available_size();
@@ -1282,7 +1261,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Open a pool read-only via [`DiskEngine::open_read_only`]. The primary
-/// device, the WAL ring, and every mutation method on `DiskEngine` all reject
+/// device, the journal, and every mutation method on `DiskEngine` all reject
 /// writes — the analyze tool itself never tries.
 fn open_pool_read_only(config_path: &Path) -> Result<DiskEngine, Box<dyn std::error::Error>> {
     Ok(DiskEngine::open_read_only(config_path)?)

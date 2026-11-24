@@ -45,48 +45,36 @@ pub enum WalError {
     #[error("value: {0}")]
     Value(#[from] mimisbrunnr_types::TypesError),
 
-    /// Magic mismatch on a parse.
-    #[error("invalid magic: expected {expected:?}, got {actual:?}")]
-    InvalidMagic { expected: [u8; 4], actual: [u8; 4] },
-
-    /// CRC mismatch (header, payload, or framing CRC).
-    #[error("crc mismatch: expected {expected:#010x}, got {actual:#010x}")]
-    CrcMismatch { expected: u32, actual: u32 },
-
     /// Unknown WAL op kind discriminant.
     #[error("invalid wal op kind: {0}")]
     InvalidOpKind(u8),
 
-    /// Payload too large to fit in a single 4 KiB sector.
+    /// An entry too large for one 256 KiB journal set.
     #[error("payload too large: {size} bytes (max {max})")]
     PayloadTooLarge { size: usize, max: usize },
 
-    /// WAL ring is full — appending would overwrite unreclaimed entries.
-    #[error("wal ring full: used {used}, capacity {capacity}")]
-    RingFull { used: u64, capacity: u64 },
+    /// Every journal bucket still holds jsets replay may need.
+    #[error("journal full: all {buckets} buckets hold jsets newer than the trim point")]
+    JournalFull { buckets: usize },
 
-    /// `next_lsn` overflow — should never happen in practice (ENCRYPTION-DESIGN§1).
+    /// A checksummed jset whose entries do not parse.
+    #[error("journal set {seq} malformed: {reason}")]
+    JsetMalformed { seq: u64, reason: &'static str },
+
+    /// `seq` past 2⁴⁸, where LSNs would overflow.
     #[error("lsn overflow")]
     LsnOverflow,
 
-    /// Neither A nor B WAL header copy was usable.
-    #[error("no valid wal header copy found")]
-    NoValidHeader,
+    /// A journal bucket list or bucket size the journal cannot use.
+    #[error("invalid journal geometry: {0}")]
+    InvalidGeometry(&'static str),
 
-    /// Unsupported format version.
-    #[error("unsupported wal format version: {0}")]
-    UnsupportedFormatVersion(u16),
-
-    /// Configuration error.
-    #[error("invalid wal size: {0}")]
-    InvalidSize(u64),
-
-    /// Encrypted entry support is not yet implemented in this phase.
-    #[error("encrypted wal entries not yet supported")]
+    /// An encrypted journal set (ENCRYPTION3).
+    #[error("encrypted journal sets not yet supported")]
     EncryptionUnsupported,
 
-    /// Compressed entry support is not yet implemented in this phase.
-    #[error("compressed wal entries not yet supported")]
+    /// A compressed journal set (JOURNAL5).
+    #[error("compressed journal sets not yet supported")]
     CompressionUnsupported,
 
     /// Mutating call attempted on a WAL opened read-only.

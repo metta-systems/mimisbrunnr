@@ -47,9 +47,10 @@ pub const POOL_STATE_ROOT_OFFSET: u64 = (BLOCK_SIZE as u64) * 4;
 const FMT_BUCKET_SIZE_LOG2: u8 = 20; // 1 MiB buckets
 const FMT_BTREE_NODE_LOG2: u8 = 18; // 256 KiB nodes
 const FMT_BOOTSTRAP_BUCKETS: u32 = 64;
-const FMT_WAL_OFFSET: u64 = 64 * 1024; // 64 KiB
-const FMT_WAL_SIZE: u64 = 1024 * 1024; // 1 MiB
-const FMT_INDEX_ZONE_OFFSET: u64 = FMT_WAL_OFFSET + FMT_WAL_SIZE; // ~1.0625 MiB
+/// The primary disk's journal (JOURNAL-DESIGN§1.1): buckets 1–4, right after the superblock's.
+// TODO(ENGINE4): the allocator places journal buckets as `Journal` buckets.
+const FMT_JOURNAL_BUCKETS: [u32; 4] = [1, 2, 3, 4];
+const FMT_INDEX_ZONE_OFFSET: u64 = (FMT_JOURNAL_BUCKETS.len() as u64 + 1) << FMT_BUCKET_SIZE_LOG2; // 5 MiB
 // 32 MiB — fits the fixed-offset index-zone layout (3 MiB of fixed-offset directory
 // regions + 1 MiB legacy CBOR blob + 4 MiB tag bitmap area + 8 MiB
 // forward-overflow area + comfort margin).
@@ -145,8 +146,11 @@ impl PoolManager {
         }
 
         let mut disks: BTreeMap<DiskId, DiskRuntime> = BTreeMap::new();
+        let primary_id = config.primary().map(|primary| primary.id);
         for entry in &config.disks {
-            let (dev, sb) = Self::open_or_format_disk(entry, config.node_id, true)?;
+            let journal_buckets: &[u32] =
+                if Some(entry.id) == primary_id { &FMT_JOURNAL_BUCKETS } else { &[] };
+            let (dev, sb) = Self::open_or_format_disk(entry, config.node_id, true, journal_buckets)?;
             disks.insert(
                 entry.id,
                 DiskRuntime {
@@ -178,7 +182,7 @@ impl PoolManager {
 
         let mut disks: BTreeMap<DiskId, DiskRuntime> = BTreeMap::new();
         for entry in &config.disks {
-            let (dev, sb) = Self::open_or_format_disk(entry, config.node_id, false)?;
+            let (dev, sb) = Self::open_or_format_disk(entry, config.node_id, false, &[])?;
             disks.insert(
                 entry.id,
                 DiskRuntime {
@@ -211,10 +215,13 @@ impl PoolManager {
         Ok(mgr)
     }
 
+    /// Open `entry`'s disk, or format it first when `format`; a formatted disk carries the
+    /// journal in `journal_buckets` (empty for none).
     fn open_or_format_disk(
         entry: &DiskConfigEntry,
         node_id: NodeId,
         format: bool,
+        journal_buckets: &[u32],
     ) -> Result<(Arc<FileBlockDevice>, Superblock), PoolError> {
         trace!(
             "open_or_format_disk id={} path={} format={}",
@@ -238,8 +245,7 @@ impl PoolManager {
                 FMT_BUCKET_SIZE_LOG2,
                 FMT_BTREE_NODE_LOG2,
                 FMT_BOOTSTRAP_BUCKETS,
-                FMT_WAL_OFFSET,
-                FMT_WAL_SIZE,
+                journal_buckets,
                 ZoneExtent {
                     offset: FMT_INDEX_ZONE_OFFSET,
                     length: FMT_INDEX_ZONE_SIZE,
@@ -300,7 +306,7 @@ impl PoolManager {
                 max: POOL_STATE_ROOT_INLINE_DISKS as u32,
             });
         }
-        let (dev, sb) = Self::open_or_format_disk(&entry, self.config.node_id, true)?;
+        let (dev, sb) = Self::open_or_format_disk(&entry, self.config.node_id, true, &[])?;
         let id = entry.id;
         self.config.disks.push(entry.clone());
         self.disks.insert(
