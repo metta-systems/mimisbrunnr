@@ -58,7 +58,7 @@ const_assert_eq!(core::mem::offset_of!(BlobRef, length), 8);
 ///
 /// Holds two scalars (`seq`, `lsn`), 24 `BlockRef` slots, a `flags` word and
 /// a trailing checksum (low 32 bits of `checksum64`) over bytes `[0..404]`.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
 pub struct RootPointer {
     pub seq: u64, // [0..8]   monotonic; larger seq wins
@@ -110,7 +110,7 @@ impl RootPointer {
     /// Validate the stored CRC. Returns the captured `(expected, actual)` on
     /// mismatch.
     pub fn verify_crc(&self) -> Result<(), StorageError> {
-        let expected = { self.crc };
+        let expected = self.crc;
         let mut copy = *self;
         copy.crc = 0;
         let actual = crate::checksum::checksum64(&bytemuck::bytes_of(&copy)[..Self::CRC_OFFSET]) as u32;
@@ -153,8 +153,7 @@ impl BlockRef {
         bucket_relative_byte_offset(self.bucket_no, self.sector, bucket_size_log2)
     }
 
-    /// Whether this is the all-zero reference, used as "no block". Takes
-    /// `self` by value so it reads a field of a packed struct directly.
+    /// Whether this is the all-zero reference, used as "no block".
     pub fn is_null(self) -> bool {
         self == Self::zeroed()
     }

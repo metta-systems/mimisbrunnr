@@ -54,7 +54,7 @@ const_assert_eq!(BITMAP_BYTES_OFFSET, 52);
 const_assert_eq!(PAD_OFFSET, 4088);
 const_assert_eq!(CRC_OFFSET, 4092);
 
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct TagBitmapPage {
     pub header: BlockHeader,                           // [0..32]
@@ -136,7 +136,7 @@ impl TagBitmapPage {
     /// `TagIndex`'s chain reader, which concatenates each page's
     /// `bitmap_bytes[..bitmap_len]` slice before deserialising.
     pub fn to_bitmap(&self) -> Result<RoaringBitmap, TagBitmapPageError> {
-        let len = { self.bitmap_len } as usize;
+        let len = self.bitmap_len as usize;
         if len > TAG_BITMAP_PAGE_MAX_BYTES {
             return Err(TagBitmapPageError::Oversize { got: len });
         }
@@ -146,7 +146,7 @@ impl TagBitmapPage {
 
     /// Borrow this page's carried bitmap-byte slice.
     pub fn bitmap_slice(&self) -> &[u8] {
-        let len = { self.bitmap_len } as usize;
+        let len = self.bitmap_len as usize;
         &self.bitmap_bytes[..len.min(TAG_BITMAP_PAGE_MAX_BYTES)]
     }
 
@@ -162,7 +162,7 @@ impl TagBitmapPage {
     }
 
     pub fn verify_crc(&self) -> Result<(), TagBitmapPageError> {
-        let expected = { self.crc };
+        let expected = self.crc;
         let mut copy = *self;
         copy.crc = 0;
         let actual = checksum64(&bytemuck::bytes_of(&copy)[..CRC_OFFSET]) as u32;
@@ -174,15 +174,15 @@ impl TagBitmapPage {
     }
 
     fn validate(&self) -> Result<(), TagBitmapPageError> {
-        let magic = { self.header.pre.magic };
+        let magic = self.header.pre.magic;
         if magic != BLOCK_PREAMBLE_MAGIC_BLOCK {
             return Err(TagBitmapPageError::InvalidMagic { actual: magic });
         }
-        let kind_raw = { self.header.pre.kind };
+        let kind_raw = self.header.pre.kind;
         if kind_raw != BlockKind::TagBitmapPage as u16 {
             return Err(TagBitmapPageError::InvalidBlockKind(kind_raw));
         }
-        let version = { self.header.pre.format_version };
+        let version = self.header.pre.format_version;
         if version != TAG_BITMAP_PAGE_FORMAT_VERSION {
             return Err(TagBitmapPageError::InvalidFormatVersion(version));
         }
@@ -209,8 +209,7 @@ impl TagBitmapPage {
         device
             .read_at(offset, &mut buf)
             .map_err(|_| TagBitmapPageError::Io)?;
-        let block: &Self = bytemuck::from_bytes(&buf);
-        let block = *block;
+        let block: Self = bytemuck::pod_read_unaligned(&buf);
         block.validate()?;
         block.verify_crc()?;
         Ok(block)

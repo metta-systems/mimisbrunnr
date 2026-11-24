@@ -56,7 +56,7 @@ pub const CHUNK_INDEX_LEAF_ENTRY_SIZE: usize = 56;
 /// [36..40] length      u32        (plaintext byte count)
 /// [40..56] blob        BlobRef    (16 B; physical extent in the blob zone)
 /// ```
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct ChunkIndexLeafEntry {
     pub chunk_hash: [u8; 32], // [0..32]
@@ -140,7 +140,7 @@ pub const CHUNK_INDEX_VALUE_SIZE: usize = 24;
 /// [4..8]   length    u32
 /// [8..24]  blob_ref  BlobRef   (disk_id u16 | sector u16 | bucket_no u32 | length u64)
 /// ```
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct ChunkIndexValue {
     ref_count: u32, // [0..4]
@@ -160,7 +160,7 @@ impl ChunkIndexValue {
         }
     }
 
-    /// Copy the [`BlobRef`] out (works around `#[repr(packed)]` alignment).
+    /// The entry's [`BlobRef`].
     pub fn blob_ref(&self) -> BlobRef {
         self.blob_ref
     }

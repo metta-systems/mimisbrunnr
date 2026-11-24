@@ -17,7 +17,7 @@ pub const WAL_HEADER_FORMAT_VERSION: u16 = 1;
 const WAL_HEADER_RESERVED_LEN: usize = 3996;
 
 /// 4 KiB on-disk WAL header. JOURNAL-DESIGN§1.1.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct WalHeader {
     pub header: BlockHeader,                       // [0..32]
@@ -68,7 +68,7 @@ impl WalHeader {
     /// Validate the stored CRC. Returns `Err(WalError::CrcMismatch)` on
     /// mismatch.
     pub fn verify_crc(&self) -> Result<(), WalError> {
-        let expected = { self.crc };
+        let expected = self.crc;
         let mut copy = *self;
         copy.crc = 0;
         let bytes = bytemuck::bytes_of(&copy);
@@ -83,7 +83,7 @@ impl WalHeader {
     /// Verify that the inner [`BlockHeader`] declares `BlockKind::WalSegment`
     /// and a supported format version.
     pub fn verify_kind(&self) -> Result<(), WalError> {
-        let kind_raw = { self.header.pre.kind };
+        let kind_raw = self.header.pre.kind;
         let kind = mimisbrunnr_storage::BlockKind::from_u16(kind_raw)?;
         if kind != BlockKind::WalSegment {
             return Err(WalError::InvalidMagic {
@@ -91,7 +91,7 @@ impl WalHeader {
                 actual: [0; 4],
             });
         }
-        let version = { self.header.pre.format_version };
+        let version = self.header.pre.format_version;
         if version != WAL_HEADER_FORMAT_VERSION {
             return Err(WalError::UnsupportedFormatVersion(version));
         }

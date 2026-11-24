@@ -5,8 +5,8 @@
 //! global B+ tree (`BtreeKind::Backpointer`) is a later phase; this module
 //! provides:
 //!
-//! - The on-disk [`BackpointerKey`] (8 B, packed) and [`BackpointerValue`]
-//!   (24 B, packed) struct definitions, sized exactly per spec.
+//! - The on-disk [`BackpointerKey`] (8 B) and [`BackpointerValue`]
+//!   (24 B) struct definitions, sized exactly per spec.
 //! - The [`OwnerKind`] u8 enum with discriminants pinned per METADATA-DESIGN§2.2.
 //! - A [`BackpointerTable`] in-memory placeholder backed by a `BTreeMap`,
 //!   with a `range_in_bucket` helper that exercises the prefix-scan
@@ -27,7 +27,7 @@ use {
 
 use crate::error::MetaError;
 
-// ---------------- BackpointerKey (8 B, packed) ----------------
+// ---------------- BackpointerKey (8 B) ----------------
 
 /// Physical-location key for the backpointer table (METADATA-DESIGN§2.2).
 ///
@@ -41,13 +41,14 @@ use crate::error::MetaError;
 /// Total = 8 bytes. In a region the key is three unsigned fields
 /// (BTREE-DESIGN§1.6) in `(disk_id, bucket_no, sector_offset)` order — the
 /// order the bucket-prefix range scan relies on.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
 pub struct BackpointerKey {
     /// `[0..2]` disk id.
     pub disk_id: u16,
-    /// `[2..6]` bucket index within the disk.
-    pub bucket_no: u32,
+    /// `[2..6]` bucket index within the disk: little-endian `u32` at a
+    /// 2-aligned offset; see [`Self::bucket_no`].
+    pub bucket_no: [u8; 4],
     /// `[6..8]` 4 KiB sector index within the bucket.
     pub sector_offset: u16,
 }
@@ -59,20 +60,26 @@ impl BackpointerKey {
     pub const fn new(disk_id: u16, bucket_no: u32, sector_offset: u16) -> Self {
         Self {
             disk_id,
-            bucket_no,
+            bucket_no: bucket_no.to_le_bytes(),
             sector_offset,
         }
     }
+
+    pub const fn bucket_no(&self) -> u32 {
+        u32::from_le_bytes(self.bucket_no)
+    }
+
+    /// `(disk_id, bucket_no, sector_offset)`, the key's sort order.
+    fn fields(&self) -> (u16, u32, u16) {
+        (self.disk_id, self.bucket_no(), self.sector_offset)
+    }
 }
 
-// `#[repr(C, packed)]` disables auto-derived comparison/hash because the
-// fields are unaligned. Implement them explicitly using copied locals.
+// Comparison and hashing go through the numeric fields: the byte array
+// `bucket_no` would compare in the wrong order.
 impl PartialEq for BackpointerKey {
     fn eq(&self, other: &Self) -> bool {
-        let (a_disk, a_bucket, a_sector) = (self.disk_id, self.bucket_no, self.sector_offset);
-        let (b_disk, b_bucket, b_sector) =
-            (other.disk_id, other.bucket_no, other.sector_offset);
-        a_disk == b_disk && a_bucket == b_bucket && a_sector == b_sector
+        self.fields() == other.fields()
     }
 }
 
@@ -86,19 +93,13 @@ impl PartialOrd for BackpointerKey {
 
 impl Ord for BackpointerKey {
     fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        let (a_disk, a_bucket, a_sector) = (self.disk_id, self.bucket_no, self.sector_offset);
-        let (b_disk, b_bucket, b_sector) =
-            (other.disk_id, other.bucket_no, other.sector_offset);
-        (a_disk, a_bucket, a_sector).cmp(&(b_disk, b_bucket, b_sector))
+        self.fields().cmp(&other.fields())
     }
 }
 
 impl core::hash::Hash for BackpointerKey {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
-        let (disk, bucket, sector) = (self.disk_id, self.bucket_no, self.sector_offset);
-        disk.hash(state);
-        bucket.hash(state);
-        sector.hash(state);
+        self.fields().hash(state);
     }
 }
 
@@ -107,17 +108,17 @@ impl RegionKey for BackpointerKey {
 
     fn field_values(&self, out: &mut [u64]) {
         out[0] = self.disk_id as u64;
-        out[1] = self.bucket_no as u64;
+        out[1] = self.bucket_no() as u64;
         out[2] = self.sector_offset as u64;
     }
 
     fn from_field_values(fields: &[u64]) -> Result<Self, StorageError> {
         let out_of_range = |_| StorageError::RegionCorrupt("backpointer key field out of range");
-        Ok(Self {
-            disk_id: u16::try_from(fields[0]).map_err(out_of_range)?,
-            bucket_no: u32::try_from(fields[1]).map_err(out_of_range)?,
-            sector_offset: u16::try_from(fields[2]).map_err(out_of_range)?,
-        })
+        Ok(Self::new(
+            u16::try_from(fields[0]).map_err(out_of_range)?,
+            u32::try_from(fields[1]).map_err(out_of_range)?,
+            u16::try_from(fields[2]).map_err(out_of_range)?,
+        ))
     }
 }
 
@@ -158,7 +159,7 @@ impl OwnerKind {
     }
 }
 
-// ---------------- BackpointerValue (24 B, packed) ----------------
+// ---------------- BackpointerValue (24 B) ----------------
 
 /// Value stored under a [`BackpointerKey`] (METADATA-DESIGN§2.2).
 ///
@@ -173,7 +174,7 @@ impl OwnerKind {
 ///
 /// Equality is byte-wise over the full 16-byte `owner_key` (METADATA-DESIGN§2.2
 /// "owner_key padding"), so writers must zero unused trailing bytes.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
 pub struct BackpointerValue {
     /// `[0..1]` `OwnerKind` discriminator.
@@ -345,13 +346,13 @@ mod tests {
 
     #[test]
     fn key_size_is_8() {
-        // u16 + u32 + u16 = 8 bytes packed (multiple of 8 — no extra _pad needed).
+        // u16 + [u8; 4] + u16 = 8 bytes, no padding.
         assert_eq!(core::mem::size_of::<BackpointerKey>(), 8);
     }
 
     #[test]
     fn value_size_is_24() {
-        // u8 + u8 + u16 + u32 + [u8;16] = 1+1+2+4+16 = 24 bytes packed.
+        // u8 + u8 + u16 + u32 + [u8;16] = 1+1+2+4+16 = 24 bytes, no padding.
         assert_eq!(core::mem::size_of::<BackpointerValue>(), 24);
     }
 
@@ -435,7 +436,7 @@ mod tests {
         let hits: Vec<_> = t.range_in_bucket(1, 10).map(|(k, _)| *k).collect();
         assert_eq!(hits.len(), 3);
         for k in &hits {
-            let (disk, bucket) = (k.disk_id, k.bucket_no);
+            let (disk, bucket) = (k.disk_id, k.bucket_no());
             assert_eq!(disk, 1);
             assert_eq!(bucket, 10);
         }
@@ -487,9 +488,9 @@ mod tests {
 
         let bytes = bytemuck::bytes_of(&v).to_vec();
         assert_eq!(bytes.len(), 24);
-        let v2: &BackpointerValue = bytemuck::from_bytes(&bytes);
-        assert_eq!({ v2.length_sectors }, 4);
-        assert_eq!({ v2.bucket_gen }, 0xdead_beef);
+        let v2: &BackpointerValue = &bytemuck::pod_read_unaligned(&bytes);
+        assert_eq!(v2.length_sectors, 4);
+        assert_eq!(v2.bucket_gen, 0xdead_beef);
         assert_eq!(v2.owner_key, [9u8; 16]);
     }
 
@@ -498,7 +499,7 @@ mod tests {
         let k = BackpointerKey::new(0xabcd, 0x1234_5678, 0xaabb);
         let bytes = bytemuck::bytes_of(&k).to_vec();
         assert_eq!(bytes.len(), 8);
-        let k2: &BackpointerKey = bytemuck::from_bytes(&bytes);
+        let k2: &BackpointerKey = &bytemuck::pod_read_unaligned(&bytes);
         assert_eq!(*k2, k);
     }
 
@@ -581,7 +582,7 @@ mod tests {
         assert_eq!(back.len(), 1);
         let got = back.get(&k).unwrap();
         assert_eq!(got.owner_kind, OwnerKind::Chunk as u8);
-        assert_eq!({ got.bucket_gen }, 700);
+        assert_eq!(got.bucket_gen, 700);
     }
 
     #[test]

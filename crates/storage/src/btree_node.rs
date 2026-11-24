@@ -18,7 +18,7 @@ use crate::{
 pub const BTREE_NODE_FLAG_HEAD_OF_CHAIN: u8 = 1 << 1;
 
 /// 64-byte header at offset 0 of a legacy positional region.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct BtreeNodeHeader {
     pub pre: BlockPreamble,             // [0..8]   magic = "MIMB", kind ∈ BtreeKind
@@ -65,8 +65,8 @@ impl BtreeNodeHeader {
             });
         }
         let header_bytes = &bytes[..core::mem::size_of::<Self>()];
-        let header: Self = *bytemuck::from_bytes(header_bytes);
-        let magic = { header.pre.magic };
+        let header: Self = bytemuck::pod_read_unaligned(header_bytes);
+        let magic = header.pre.magic;
         if magic != BLOCK_PREAMBLE_MAGIC_BTREE {
             return Err(StorageError::InvalidMagic {
                 expected: BLOCK_PREAMBLE_MAGIC_BTREE,
@@ -97,7 +97,7 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(h.as_bytes());
         let parsed = BtreeNodeHeader::parse(&bytes).unwrap();
-        assert_eq!({ parsed.region_size_log2 }, 18);
+        assert_eq!(parsed.region_size_log2, 18);
 
         // Corrupt the magic.
         bytes[0] = b'X';

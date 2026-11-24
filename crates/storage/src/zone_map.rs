@@ -9,7 +9,7 @@ use {
 use crate::block::{BLOCK_SIZE, BlockHeader, BlockKind};
 
 /// 24-byte extent descriptor: `(offset, length, flags, _pad)`.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default, Eq, PartialEq)]
 pub struct ZoneExtent {
     pub offset: u64, // [0..8]   byte offset on the device
@@ -21,7 +21,7 @@ pub struct ZoneExtent {
 const_assert_eq!(core::mem::size_of::<ZoneExtent>(), 24);
 
 /// A single entry in the [`ZoneMap`] continuation block.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default, Eq, PartialEq)]
 pub struct ZoneMapEntry {
     pub zone_kind: u8,        // [0..1]   0 = index, 1 = metadata, 2 = blob
@@ -33,7 +33,7 @@ const_assert_eq!(core::mem::size_of::<ZoneMapEntry>(), 32);
 
 /// Continuation block listing additional (non-contiguous) zone extents.
 /// Written when [`super::Superblock::zone_map_offset`] is non-zero.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct ZoneMap {
     pub header: BlockHeader,                // [0..32]   kind = ZoneMap

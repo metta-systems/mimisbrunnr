@@ -1,5 +1,6 @@
 # Specification documents — completed
 
+- SPEC24: no `#[repr(C, packed)]` in `crates/` or `validation/`; the legacy structs whose numbers sit off their natural alignment (`BlockHeader` `generation`/`lsn`, `KvBucketEntry::value_hash`, `KvBucketBlock`/`KvHashBucketHeader` `entry_count`, `BackpointerKey::bucket_no`) hold them as little-endian byte arrays behind accessors, byte images and size assertions unchanged; readers borrow fields instead of `{ … }` copies. Reads still copy through `bytemuck::pod_read_unaligned` until SPEC26.
 - BTREE-DESIGN§1.6 specifies inline prefix bytes and `FIXED` / `VARINT` value sizes in `SortedRunKeyFormat`.
 - ONTOLOGY-DESIGN§1 specifies the ontology as one image per snapshot.
 - SUBSCRIPTIONS-DESIGN§1 specifies the per-record subscription tree and boot-derived `next_id`.

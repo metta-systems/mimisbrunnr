@@ -54,10 +54,10 @@ pub const WAL_ENTRY_FLAG_COMPRESSED: u16 = 1 << 1;
 /// On-disk wire form of [`mimisbrunnr_types::HybridTimestamp`]. JOURNAL-DESIGN§1.2 / POOL-DESIGN§1.
 ///
 /// The logical type lives in `mimisbrunnr-types` (per operations-design.md "Type ownership"); this
-/// 16-byte `#[repr(C, packed)]` struct is the on-disk wire form embedded in
+/// 16-byte `#[repr(C)]` struct is the on-disk wire form embedded in
 /// every [`WalEntryHeader`]. Field ordering is total: `physical_ns → logical →
 /// node_id` (matches the spec exactly).
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Eq, PartialEq, Default)]
 pub struct WalHybridTimestampWire {
     pub physical_ns: i64, // [0..8]
@@ -82,9 +82,9 @@ impl WalHybridTimestampWire {
     /// Convert back to the logical type.
     pub fn to_logical(self) -> LogicalHybridTimestamp {
         LogicalHybridTimestamp {
-            physical_ns: { self.physical_ns },
-            logical: { self.logical },
-            node_id: { self.node_id } as NodeId,
+            physical_ns: self.physical_ns,
+            logical: self.logical,
+            node_id: self.node_id as NodeId,
         }
     }
 }
@@ -92,7 +92,7 @@ impl WalHybridTimestampWire {
 // ---------- WalEntryHeader ----------
 
 /// 40-byte entry header. JOURNAL-DESIGN§1.2.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct WalEntryHeader {
     pub magic: [u8; 4],                    // [0..4]   "WALR"
@@ -986,7 +986,7 @@ mod tests {
         rp.recompute_crc();
         let cp = Checkpoint::from_root(&rp, 16);
         let recovered = cp.root_pointer().unwrap();
-        assert_eq!({ recovered.seq }, 9);
-        assert_eq!({ recovered.lsn }, 42);
+        assert_eq!(recovered.seq, 9);
+        assert_eq!(recovered.lsn, 42);
     }
 }

@@ -27,7 +27,7 @@ pub const BLOCK_PREAMBLE_MAGIC_BTREE: [u8; 4] = *b"MIMB";
 
 /// 8-byte common preamble shared by [`BlockHeader`] (4 KiB blocks) and
 /// `BtreeNodeHeader` (256 KiB regions). FORMAT-DESIGN§1.3.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct BlockPreamble {
     /// `"MIMR"` for 4 KiB blocks, `"MIMB"` for 256 KiB regions.
@@ -49,20 +49,21 @@ pub const BLOCK_FLAG_CONTINUATION: u32 = 1 << 1;
 
 /// 32-byte header that prefixes every persistent 4 KiB block.
 ///
-/// TODO(ENGINE4): `BlockHeader`, `BlockKind` and the packed `BlockPreamble`
+/// TODO(ENGINE4): `BlockHeader`, `BlockKind` and `BlockPreamble`
 /// go with their last users; every header begins with the aligned
 /// [`crate::Preamble`] and ends with a 64-bit checksum slot (FORMAT-DESIGN§1.3–1.4).
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct BlockHeader {
     /// 8-byte common preamble.
     pub pre: BlockPreamble, // [0..8]
     /// Bytes following the header (excl. trailing CRC). For 4 KiB blocks, < 4096.
     pub payload_length: u32, // [8..12]
-    /// Monotonic per-block generation, for COW.
-    pub generation: u64, // [12..20]
-    /// WAL LSN that produced this block.
-    pub lsn: u64, // [20..28]
+    /// Monotonic per-block generation, for COW; little-endian `u64` at a
+    /// 4-aligned offset.
+    pub generation: [u8; 8], // [12..20]
+    /// WAL LSN that produced this block; little-endian `u64`.
+    pub lsn: [u8; 8], // [20..28]
     /// `BLOCK_FLAG_*` bits.
     pub flags: u32, // [28..32]
 }
@@ -80,10 +81,24 @@ impl BlockHeader {
                 format_version,
             },
             payload_length,
-            generation: 0,
-            lsn: 0,
+            generation: [0; 8],
+            lsn: [0; 8],
             flags: 0,
         }
+    }
+
+    /// The LSN that produced this block.
+    pub fn lsn(&self) -> u64 {
+        u64::from_le_bytes(self.lsn)
+    }
+
+    /// The block's copy-on-write generation.
+    pub fn generation(&self) -> u64 {
+        u64::from_le_bytes(self.generation)
+    }
+
+    pub fn set_generation(&mut self, generation: u64) {
+        self.generation = generation.to_le_bytes();
     }
 }
 

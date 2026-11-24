@@ -181,11 +181,11 @@ pub fn run_info<W: Write>(
         out,
         "state={:?} blob_length={} stored_size={} tag_count={} attr_count={} relation_count={}",
         rec.state().unwrap_or(mimisbrunnr::types::ObjectState::Active),
-        { rec.blob_length },
-        { rec.stored_size },
-        { rec.tag_count },
-        { rec.attr_count },
-        { rec.relation_count },
+        rec.blob_length,
+        rec.stored_size,
+        rec.tag_count,
+        rec.attr_count,
+        rec.relation_count,
     )?;
 
     // Snapshot assertions for this oid.

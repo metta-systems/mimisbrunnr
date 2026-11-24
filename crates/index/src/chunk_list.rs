@@ -42,7 +42,7 @@ pub const CHUNK_PARAMS_RECORD_SIZE: usize = 16;
 /// [8..12]  avg_size  u32
 /// [12..16] max_size  u32
 /// ```
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct ChunkParamsRecord {
     pub algo: u8,       // [0..1]   ChunkingAlgo discriminant
@@ -117,7 +117,7 @@ impl ChunkParamsRecord {
                 have: bytes.len(),
             });
         }
-        Ok(*bytemuck::from_bytes(&bytes[..CHUNK_PARAMS_RECORD_SIZE]))
+        Ok(bytemuck::pod_read_unaligned(&bytes[..CHUNK_PARAMS_RECORD_SIZE]))
     }
 }
 
@@ -135,7 +135,7 @@ pub const CHUNK_LIST_ENTRY_SIZE: usize = 40;
 /// [32..36] length      u32        (plaintext length of this chunk)
 /// [36..40] flags       u32        (reserved — e.g. inline-tiny-chunk hint)
 /// ```
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct ChunkListEntry {
     pub chunk_hash: [u8; 32], // [0..32]
@@ -177,9 +177,9 @@ mod tests {
         let r = ChunkParamsRecord::fast_cdc(1024, 4096, 16384);
         let bytes = r.as_bytes();
         let parsed = ChunkParamsRecord::parse(bytes).unwrap();
-        assert_eq!({ parsed.algo }, CHUNKING_ALGO_FAST_CDC);
-        assert_eq!({ parsed.min_size }, 1024);
-        assert_eq!({ parsed.avg_size }, 4096);
-        assert_eq!({ parsed.max_size }, 16384);
+        assert_eq!(parsed.algo, CHUNKING_ALGO_FAST_CDC);
+        assert_eq!(parsed.min_size, 1024);
+        assert_eq!(parsed.avg_size, 4096);
+        assert_eq!(parsed.max_size, 16384);
     }
 }

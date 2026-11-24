@@ -44,14 +44,12 @@ pub const OVERFLOW_ATTR_FLAG_SPILL: u8 = 1 << 0;
 ///  [48..56]  next_overflow    u64   block_no of next overflow block, 0 if last
 /// ```
 ///
-/// `#[repr(C, packed)]` matches the spec convention (FORMAT-DESIGN§1.1) and keeps
-/// the layout deterministic across compilers; readers must use
-/// `let v = { hdr.field };` to copy aligned locals before use (see
-/// `doc/agentic/operations-design.md`, on-disk struct discipline rule 7).
+/// `#[repr(C)]` matches the spec convention (FORMAT-DESIGN§1.1) and keeps
+/// the layout deterministic across compilers.
 //
 // TODO(METADATA7): overflow records are removed — an object's assertions
 // live only in its forward entry (METADATA-DESIGN "Rejected alternatives").
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct OverflowHeader {
     /// `[0..32]` standard 4 KiB block header (kind = `OverflowRecord`).
@@ -103,12 +101,11 @@ mod tests {
         let bytes = bytemuck::bytes_of(&hdr).to_vec();
         assert_eq!(bytes.len(), OVERFLOW_HEADER_SIZE);
 
-        let hdr2: &OverflowHeader = bytemuck::from_bytes(&bytes);
-        // Copy out packed fields before comparing.
-        assert_eq!({ hdr2.object_id }, 0xdead_beef_cafe_babe);
-        assert_eq!({ hdr2.tag_count }, 17);
-        assert_eq!({ hdr2.attr_count }, 3);
-        assert_eq!({ hdr2.relation_count }, 5);
-        assert_eq!({ hdr2.next_overflow }, 0x1234_5678);
+        let hdr2: &OverflowHeader = &bytemuck::pod_read_unaligned(&bytes);
+        assert_eq!(hdr2.object_id, 0xdead_beef_cafe_babe);
+        assert_eq!(hdr2.tag_count, 17);
+        assert_eq!(hdr2.attr_count, 3);
+        assert_eq!(hdr2.relation_count, 5);
+        assert_eq!(hdr2.next_overflow, 0x1234_5678);
     }
 }

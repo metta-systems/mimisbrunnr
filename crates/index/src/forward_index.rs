@@ -75,7 +75,7 @@ pub const PACKED_ASSERTION_SIZE: usize = 16;
 /// [4..8]   a — tag id (Tag/Attr) or predicate (Relation)
 /// [8..16]  b — value_hash (Attr), target oid (Relation), 0 (Tag)
 /// ```
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct PackedAssertion {
     pub kind: u8,   // [0..1]
@@ -132,7 +132,7 @@ impl PackedAssertion {
     /// value (`Value` for `Attr`, `ObjectId` for `Relation`); see
     /// [`PackedAssertion::to_logical`] for a convenience that accepts those.
     pub fn origin(&self) -> Result<TagOrigin, IndexError> {
-        let raw = { self.origin };
+        let raw = self.origin;
         match raw {
             PACKED_ASSERTION_ORIGIN_DIRECT => Ok(TagOrigin::Direct),
             PACKED_ASSERTION_ORIGIN_MATERIALIZED => Ok(TagOrigin::Materialized),
@@ -152,9 +152,9 @@ impl PackedAssertion {
         attr_value: Option<Value>,
     ) -> Result<(Assertion, TagOrigin), IndexError> {
         let origin = self.origin()?;
-        let kind = { self.kind };
-        let a = { self.a };
-        let b = { self.b };
+        let kind = self.kind;
+        let a = self.a;
+        let b = self.b;
         let assertion = match kind {
             PACKED_ASSERTION_KIND_TAG => Assertion::Tag(TagId::new(a)),
             PACKED_ASSERTION_KIND_ATTR => Assertion::Attr {
@@ -357,7 +357,7 @@ impl LeafEntry {
             for i in 0..(total as usize) {
                 let off = 14 + i * PACKED_ASSERTION_SIZE;
                 let pa: PackedAssertion =
-                    *bytemuck::from_bytes(&bytes[off..off + PACKED_ASSERTION_SIZE]);
+                    bytemuck::pod_read_unaligned(&bytes[off..off + PACKED_ASSERTION_SIZE]);
                 asserts.push(pa);
             }
             Ok((
@@ -630,7 +630,7 @@ impl ForwardIndex {
                 (0..total)
                     .map(|i| {
                         let off = i * PACKED_ASSERTION_SIZE;
-                        *bytemuck::from_bytes::<PackedAssertion>(
+                        bytemuck::pod_read_unaligned::<PackedAssertion>(
                             &body[off..off + PACKED_ASSERTION_SIZE],
                         )
                     })
@@ -764,13 +764,13 @@ fn read_overflow_chain<D: BlockDevice>(
         device.read_at(offset, &mut buf)?;
 
         let header = BtreeNodeHeader::parse(&buf)?;
-        let header_kind = { header.pre.kind };
+        let header_kind = header.pre.kind;
         if header_kind != BtreeKind::ForwardOverflow as u16 {
             return Err(IndexError::CorruptOverflowChain(
                 "non-ForwardOverflow region in chain",
             ));
         }
-        let payload_used = { header.payload_used } as usize;
+        let payload_used = header.payload_used as usize;
         if !payload_used.is_multiple_of(PACKED_ASSERTION_SIZE) {
             return Err(IndexError::CorruptOverflowChain(
                 "payload_used not a multiple of PackedAssertion size",
@@ -785,7 +785,7 @@ fn read_overflow_chain<D: BlockDevice>(
         for i in 0..live_count {
             let off = FORWARD_OVERFLOW_ENTRIES_OFFSET + i * PACKED_ASSERTION_SIZE;
             let pa: PackedAssertion =
-                *bytemuck::from_bytes(&buf[off..off + PACKED_ASSERTION_SIZE]);
+                bytemuck::pod_read_unaligned(&buf[off..off + PACKED_ASSERTION_SIZE]);
             out.push(pa);
         }
 
@@ -864,8 +864,8 @@ mod tests {
     fn packed_assertion_round_trip_tag() {
         let a = Assertion::Tag(tag(42));
         let pa = PackedAssertion::from_logical(&a, TagOrigin::Direct, 0);
-        assert_eq!({ pa.kind }, PACKED_ASSERTION_KIND_TAG);
-        assert_eq!({ pa.a }, 42);
+        assert_eq!(pa.kind, PACKED_ASSERTION_KIND_TAG);
+        assert_eq!(pa.a, 42);
         let (back, origin) = pa.to_logical(None).unwrap();
         assert_eq!(back, a);
         assert_eq!(origin, TagOrigin::Direct);
@@ -880,10 +880,10 @@ mod tests {
             value: v.clone(),
         };
         let pa = PackedAssertion::from_logical(&a, TagOrigin::Materialized, h);
-        assert_eq!({ pa.kind }, PACKED_ASSERTION_KIND_ATTR);
-        assert_eq!({ pa.a }, 7);
+        assert_eq!(pa.kind, PACKED_ASSERTION_KIND_ATTR);
+        assert_eq!(pa.a, 7);
         // Full 64-bit value_hash preserved.
-        assert_eq!({ pa.b }, h);
+        assert_eq!(pa.b, h);
         let (back, origin) = pa.to_logical(Some(v.clone())).unwrap();
         if let Assertion::Attr { key, value } = back {
             assert_eq!(key, tag(7));
@@ -904,10 +904,10 @@ mod tests {
             target,
         };
         let pa = PackedAssertion::from_logical(&a, TagOrigin::Direct, 0);
-        assert_eq!({ pa.kind }, PACKED_ASSERTION_KIND_RELATION);
-        assert_eq!({ pa.a }, 13);
+        assert_eq!(pa.kind, PACKED_ASSERTION_KIND_RELATION);
+        assert_eq!(pa.a, 13);
         // Full 64-bit target oid preserved.
-        assert_eq!({ pa.b }, target.to_u64());
+        assert_eq!(pa.b, target.to_u64());
         let (back, origin) = pa.to_logical(None).unwrap();
         assert_eq!(back, a);
         assert_eq!(origin, TagOrigin::Direct);

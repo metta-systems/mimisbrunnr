@@ -280,8 +280,8 @@ impl DiskEngine {
 
         // 3. Read the superblock written by `PoolManager::create`.
         let mut superblock = Superblock::open(primary_dev.as_ref())?;
-        let wal_offset = { superblock.wal_offset };
-        let wal_size = { superblock.wal_size };
+        let wal_offset = superblock.wal_offset;
+        let wal_size = superblock.wal_size;
 
         // 4. Format the WAL ring.
         let wal = Wal::format(primary_dev.as_ref(), wal_offset, wal_size)?;
@@ -304,10 +304,10 @@ impl DiskEngine {
         // are populated only when the pool exceeds 12 disks
         // (disks_overflow). The reconcile (RECONCILE1), snapshot (SNAPSHOT1),
         // value_spill (INDEX7) and *_history (SNAPSHOT3) slots stay zero too.
-        let zone_offset = { superblock.index_zone.offset };
+        let zone_offset = superblock.index_zone.offset;
         let active = *superblock.active_root_pointer();
         let mut new_root = active;
-        new_root.seq = { active.seq }.saturating_add(1);
+        new_root.seq = active.seq.saturating_add(1);
         new_root.lsn = wal.next_lsn();
         seed_root_pointer(&mut new_root, primary_addressing(&superblock), zone_offset)?;
         superblock.commit_root(primary_dev.as_ref(), new_root)?;
@@ -346,13 +346,13 @@ impl DiskEngine {
             .clone();
 
         let superblock = Superblock::open(primary_dev.as_ref())?;
-        let wal_offset = { superblock.wal_offset };
-        let wal_size = { superblock.wal_size };
+        let wal_offset = superblock.wal_offset;
+        let wal_size = superblock.wal_size;
         let wal = Wal::open(primary_dev.as_ref(), wal_offset, wal_size)?;
 
         let mut engine = Engine::new(config.node_id);
 
-        let zone_offset = { superblock.index_zone.offset };
+        let zone_offset = superblock.index_zone.offset;
 
         // 1a. Migrated indices and tables: dedicated 256 KiB BTREE-DESIGN§1 B+
         // tree regions at fixed slot offsets.
@@ -432,13 +432,13 @@ impl DiskEngine {
             Arc::new(FileBlockDevice::open_read_only(&primary_entry.path)?);
 
         let superblock = Superblock::open(primary_dev.as_ref())?;
-        let wal_offset = { superblock.wal_offset };
-        let wal_size = { superblock.wal_size };
+        let wal_offset = superblock.wal_offset;
+        let wal_size = superblock.wal_size;
         let wal = Wal::open_read_only(primary_dev.as_ref(), wal_offset, wal_size)?;
 
         let mut engine = Engine::new(config.node_id);
 
-        let zone_offset = { superblock.index_zone.offset };
+        let zone_offset = superblock.index_zone.offset;
 
         // Migrated indices and tables live in dedicated regions at
         // fixed slot offsets.
@@ -498,8 +498,8 @@ impl DiskEngine {
             return Err(EngineError::ReadOnly);
         }
 
-        let zone_offset = { self.superblock.index_zone.offset };
-        let zone_length = { self.superblock.index_zone.length };
+        let zone_offset = self.superblock.index_zone.offset;
+        let zone_length = self.superblock.index_zone.length;
 
         // Sanity-check zone is large enough for the layout: the
         // forward-overflow area follows the tag bitmap area, so
@@ -614,7 +614,7 @@ impl DiskEngine {
 
     /// Reload the index state from disk (overwrites in-memory state).
     pub fn load_index_state(&mut self) -> Result<(), EngineError> {
-        let zone_offset = { self.superblock.index_zone.offset };
+        let zone_offset = self.superblock.index_zone.offset;
         let root = *self.superblock.active_root_pointer();
         let node_id = self.config.node_id;
 
@@ -651,7 +651,7 @@ impl DiskEngine {
         for entry in entries {
             let entry = entry?;
             let kind = WalOpKind::from_u8(entry.header.op_kind)?;
-            let lsn = { entry.header.lsn };
+            let lsn = entry.header.lsn;
             // Engine-only ops; checkpoint and others are handled separately.
             if matches!(kind, WalOpKind::Checkpoint) {
                 continue;
@@ -694,13 +694,13 @@ impl DiskEngine {
         // zeroed until ALLOCATION4 / ALLOCATION5 split the trees per disk.
         let next_lsn = self.wal.next_lsn();
         let mut new_root = *self.superblock.active_root_pointer();
-        new_root.seq = { new_root.seq }.saturating_add(1);
+        new_root.seq = new_root.seq.saturating_add(1);
         new_root.lsn = next_lsn;
         // Keep `RootPointer.*_root` slots populated. Trees stay at their
         // existing fixed offsets across commits (TODO(ENGINE3): fresh
         // region per commit); re-seeding each commit also heals a pool
         // created before the slots were populated.
-        let zone_offset = { self.superblock.index_zone.offset };
+        let zone_offset = self.superblock.index_zone.offset;
         seed_root_pointer(&mut new_root, primary_addressing(&self.superblock), zone_offset)?;
         new_root.recompute_crc();
 
@@ -1106,8 +1106,8 @@ fn read_index_blob(
     device: &dyn BlockDevice,
     superblock: &Superblock,
 ) -> Result<Option<IndexBlob>, EngineError> {
-    let zone_offset = { superblock.index_zone.offset };
-    let zone_length = { superblock.index_zone.length };
+    let zone_offset = superblock.index_zone.offset;
+    let zone_length = superblock.index_zone.length;
     if zone_length < LEGACY_CBOR_BLOB_OFFSET + 8 {
         return Ok(None);
     }

@@ -41,7 +41,7 @@ Each fixes a layout that later steps write; decide them first.
 Independent of each other unless an order is given.
 
 - **Encodings** (FORMAT-DESIGN§1.6): [SPEC25](specification-implementation-plan.md) and [INDEX9](index-implementation-plan.md) first; then [JOURNAL8](journal-implementation-plan.md) (binary payloads, then [JOURNAL9](journal-implementation-plan.md): journal buckets and journal sets, after JOURNAL7), [QUERY11](query-implementation-plan.md) and [ONTOLOGY10](ontology-implementation-plan.md); after QUERY11, [SUBSCRIPTION7](subscriptions-implementation-plan.md) and [POOL5](pool-implementation-plan.md) (native placement-rules tree).
-- [SPEC24](specification-implementation-plan.md) — no packed on-disk structs.
+- [SPEC26](specification-implementation-plan.md) — borrow on-disk structs in place.
 - [POOL1](pool-implementation-plan.md) — one disk-descriptor tree.
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
 - [ONTOLOGY10](ontology-implementation-plan.md) (per-record ontology tree, in the encodings group above), then [ONTOLOGY1](ontology-implementation-plan.md) — single tag-id allocator with ad-hoc tags in `local` — and [ONTOLOGY15](ontology-implementation-plan.md) — tag uids and name resolution; [ONTOLOGY11](ontology-implementation-plan.md) — ontology journal ops, after JOURNAL8.

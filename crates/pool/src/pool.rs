@@ -46,7 +46,7 @@ const POOL_STATE_ROOT_CRC_OFFSET: usize = POOL_STATE_ROOT_SIZE - 4; // 4092
 const POOL_STATE_ROOT_FORMAT_VERSION: u16 = 1;
 
 /// 4 KiB on-disk pool state block. POOL-DESIGN§1 lines 2125–2132.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct PoolStateRoot {
     pub header: BlockHeader,        // [0..32]    kind = PoolStateRoot
@@ -86,7 +86,7 @@ impl PoolStateRoot {
 
     /// Validate the trailing CRC.
     pub fn verify_crc(&self) -> Result<(), PoolError> {
-        let expected = { self.crc };
+        let expected = self.crc;
         let mut copy = *self;
         copy.crc = 0;
         let actual = checksum64(&bytemuck::bytes_of(&copy)[..POOL_STATE_ROOT_CRC_OFFSET]) as u32;
@@ -101,7 +101,7 @@ impl PoolStateRoot {
     /// Disks beyond the inline cap live in the overflow B+ tree (not yet
     /// implemented in this phase).
     pub fn inline_disk_count(&self) -> usize {
-        let raw = { self.disk_count } as usize;
+        let raw = self.disk_count as usize;
         raw.min(POOL_STATE_ROOT_INLINE_DISKS)
     }
 
@@ -132,13 +132,13 @@ impl PoolStateRoot {
 
     /// Validate the block header's magic and kind.
     fn validate_header(&self) -> Result<(), PoolError> {
-        let magic = { self.header.pre.magic };
+        let magic = self.header.pre.magic;
         if magic != BLOCK_PREAMBLE_MAGIC_BLOCK {
             return Err(PoolError::InvalidPayload(format!(
                 "bad block preamble magic: {magic:?}"
             )));
         }
-        let kind_raw = { self.header.pre.kind };
+        let kind_raw = self.header.pre.kind;
         if kind_raw != BlockKind::PoolStateRoot as u16 {
             return Err(PoolError::InvalidBlockKind(kind_raw));
         }
@@ -159,9 +159,8 @@ impl PoolStateRoot {
         trace!("PoolStateRoot::read offset={offset}");
         let mut buf = vec![0u8; POOL_STATE_ROOT_SIZE];
         device.read_at(offset, &mut buf)?;
-        let psr: &Self = bytemuck::try_from_bytes(&buf)
+        let psr: Self = bytemuck::try_pod_read_unaligned(&buf)
             .map_err(|e| PoolError::InvalidPayload(format!("pod cast failed: {e}")))?;
-        let psr = *psr;
         psr.validate_header()?;
         psr.verify_crc()?;
         Ok(psr)
@@ -274,8 +273,8 @@ mod tests {
             .unwrap();
         psr.recompute_crc();
         let bytes = bytemuck::bytes_of(&psr).to_vec();
-        let back: &PoolStateRoot = bytemuck::from_bytes(&bytes);
-        assert_eq!({ back.disk_count }, 2);
+        let back: &PoolStateRoot = &bytemuck::pod_read_unaligned(&bytes);
+        assert_eq!(back.disk_count, 2);
         back.verify_crc().unwrap();
     }
 
@@ -291,8 +290,8 @@ mod tests {
         psr.write(&dev, 0).unwrap();
 
         let back = PoolStateRoot::read(&dev, 0).unwrap();
-        assert_eq!({ back.disk_count }, 2);
-        assert_eq!({ back.cluster_node_count }, 1);
+        assert_eq!(back.disk_count, 2);
+        assert_eq!(back.cluster_node_count, 1);
         let names: Vec<_> = back
             .inline_iter()
             .map(|d| d.path_str().unwrap().to_string())
@@ -392,7 +391,7 @@ mod tests {
         let back = load_disks_overflow_from_region(&dev, 0).unwrap();
         assert_eq!(back.len(), 4);
         for (i, d) in back.iter().enumerate() {
-            assert_eq!({ d.disk_id }, 12 + i as u16);
+            assert_eq!(d.disk_id, 12 + i as u16);
             assert_eq!(d.path_str().unwrap(), format!("/disk{}", 12 + i));
         }
     }

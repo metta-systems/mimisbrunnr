@@ -287,8 +287,8 @@ fn write_blob_updates_object_record_metadata() {
     let res = e.write_blob(oid, b"hello world").unwrap();
     assert_eq!(res.original_size, 11);
     let rec = e.object_table.get(oid.to_u64()).unwrap();
-    assert_eq!({ rec.blob_length }, 11);
-    assert_eq!({ rec.stored_size }, 11);
+    assert_eq!(rec.blob_length, 11);
+    assert_eq!(rec.stored_size, 11);
     assert_eq!(rec.content_hash, res.content_hash);
 }
 
@@ -923,9 +923,9 @@ fn r1b3_object_table_persists_across_commit_drop_open() {
     let de2 = DiskEngine::open(&cfg_path).unwrap();
     assert_eq!(de2.engine.object_table.len(), pre_objects);
     let r1 = de2.engine.object_table.get(oid1.to_u64()).expect("oid1 missing");
-    assert_eq!({ r1.id }, oid1.to_u64());
+    assert_eq!(r1.id, oid1.to_u64());
     let r2 = de2.engine.object_table.get(oid2.to_u64()).expect("oid2 missing");
-    assert_eq!({ r2.id }, oid2.to_u64());
+    assert_eq!(r2.id, oid2.to_u64());
 }
 
 #[test]
@@ -957,7 +957,7 @@ fn r1b3_location_table_persists_across_commit_drop_open() {
         .get(oid.to_u64())
         .expect("location missing after round-trip");
     assert_eq!(got.header.replica_count, 1);
-    assert_eq!({ got.header.extent_length }, 0x4000);
+    assert_eq!(got.header.extent_length, 0x4000);
     assert_eq!(got.active_replicas()[0].bucket_no, 42);
 }
 
@@ -1001,7 +1001,7 @@ fn r1b3_backpointer_table_persists_across_commit_drop_open() {
             .get(k)
             .expect("backpointer missing after round-trip");
         assert_eq!(got.owner_kind, v.owner_kind);
-        assert_eq!({ got.bucket_gen }, { v.bucket_gen });
+        assert_eq!(got.bucket_gen, v.bucket_gen);
         assert_eq!(got.owner_key, v.owner_key);
     }
     // Bucket-prefix scan still works.
@@ -1293,14 +1293,14 @@ fn rootpointer_slots_populated_post_create() {
     assert!(!r.backpointer_root.is_null(), "backpointer_root");
 
     // Each slot's generation is set (1 while trees stay at fixed offsets).
-    assert_eq!({ r.chunk_index_root.generation }, 1);
-    assert_eq!({ r.kv_index_root.generation }, 1);
+    assert_eq!(r.chunk_index_root.generation, 1);
+    assert_eq!(r.kv_index_root.generation, 1);
 
     // The slots are bucket-relative, built from the primary disk's bucket
     // size: the chunk index sits at the index zone's start and the kv
     // index 256 KiB after it.
     let bucket_size_log2 = de.superblock.bucket_size_log2;
-    let zone_offset = { de.superblock.index_zone.offset };
+    let zone_offset = de.superblock.index_zone.offset;
     let chunk_index_root = r.chunk_index_root;
     let kv_index_root = r.kv_index_root;
     assert_eq!(chunk_index_root.byte_offset(bucket_size_log2), zone_offset);
@@ -1335,18 +1335,18 @@ fn rootpointer_slots_stable_across_commit() {
 
     // Slots stay stable across commits (COW reallocation is ENGINE3).
     assert_eq!(
-        { pre_commit.chunk_index_root },
-        { post_commit.chunk_index_root },
+        pre_commit.chunk_index_root,
+        post_commit.chunk_index_root,
         "chunk_index_root drifted across commit",
     );
     assert_eq!(
-        { pre_commit.ontology_root },
-        { post_commit.ontology_root },
+        pre_commit.ontology_root,
+        post_commit.ontology_root,
         "ontology_root drifted across commit",
     );
     // seq + lsn advance.
-    assert!({ post_commit.seq } > { pre_commit.seq });
-    assert!({ post_commit.lsn } >= { pre_commit.lsn });
+    assert!(post_commit.seq > pre_commit.seq);
+    assert!(post_commit.lsn >= pre_commit.lsn);
 }
 
 // ----- the object table is a write-once region of keyed runs -----
@@ -1380,7 +1380,7 @@ fn object_table_on_disk_is_a_region_of_records() {
         .unwrap()
         .expect("the record is stored under its oid");
     let record: ObjectRecord = bytemuck::pod_read_unaligned(value.as_bytes());
-    assert_eq!({ record.id }, oid.to_u64());
+    assert_eq!(record.id, oid.to_u64());
 }
 
 fn small_pool_disk_path(tmp: &TempDir) -> std::path::PathBuf {
@@ -1414,26 +1414,23 @@ fn kv_index_on_disk_uses_native_extendible_hash_layout() {
     // Directory header.
     let mut header = [0u8; 8];
     dev.read_at(kv_dir_offset, &mut header).unwrap();
-    let preamble: &mimisbrunnr_storage::BlockPreamble =
-        bytemuck::from_bytes(&header);
-    assert_eq!({ preamble.magic }, BLOCK_PREAMBLE_MAGIC_BLOCK);
-    assert_eq!({ preamble.kind }, BlockKind::KvHashDirectory as u16);
+    let preamble: mimisbrunnr_storage::BlockPreamble = bytemuck::pod_read_unaligned(&header);
+    assert_eq!(preamble.magic, BLOCK_PREAMBLE_MAGIC_BLOCK);
+    assert_eq!(preamble.kind, BlockKind::KvHashDirectory as u16);
 
     // Bucket 0 sits at kv_dir_offset + 4 KiB.
     let bucket_offset = kv_dir_offset + 4096;
     let mut bheader = [0u8; 8];
     dev.read_at(bucket_offset, &mut bheader).unwrap();
-    let bpreamble: &mimisbrunnr_storage::BlockPreamble =
-        bytemuck::from_bytes(&bheader);
-    assert_eq!({ bpreamble.kind }, BlockKind::KvHashBucket as u16);
+    let bpreamble: mimisbrunnr_storage::BlockPreamble = bytemuck::pod_read_unaligned(&bheader);
+    assert_eq!(bpreamble.kind, BlockKind::KvHashBucket as u16);
 
     // Bitmap page sits at kv_dir_offset + 2 × 4 KiB.
     let bitmap_offset = kv_dir_offset + 8192;
     let mut bmh = [0u8; 8];
     dev.read_at(bitmap_offset, &mut bmh).unwrap();
-    let bm_preamble: &mimisbrunnr_storage::BlockPreamble =
-        bytemuck::from_bytes(&bmh);
-    assert_eq!({ bm_preamble.kind }, BlockKind::TagBitmapPage as u16);
+    let bm_preamble: mimisbrunnr_storage::BlockPreamble = bytemuck::pod_read_unaligned(&bmh);
+    assert_eq!(bm_preamble.kind, BlockKind::TagBitmapPage as u16);
 }
 
 #[test]
@@ -1450,7 +1447,7 @@ fn rootpointer_survives_open_cycle() {
     let post_open = *de2.superblock.active_root_pointer();
 
     // The slot is preserved across drop/open.
-    assert_eq!({ pre_drop.tag_index_root }, { post_open.tag_index_root });
+    assert_eq!(pre_drop.tag_index_root, post_open.tag_index_root);
     // The tag we registered is still resolvable, proving the load
     // path went through the RootPointer slot.
     assert!(de2.engine.resolve_tag_name("color").is_some());

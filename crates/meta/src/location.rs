@@ -158,7 +158,7 @@ impl ObjectLocation {
                 got: bytes.len(),
             });
         }
-        let header: LocationHeader = *bytemuck::from_bytes(&bytes[..LOCATION_HEADER_SIZE]);
+        let header: LocationHeader = bytemuck::pod_read_unaligned(&bytes[..LOCATION_HEADER_SIZE]);
         let replica_count = header.replica_count;
         if replica_count as usize > MAX_INLINE_REPLICAS {
             return Err(MetaError::InvalidReplicaCount(replica_count));
@@ -231,7 +231,7 @@ impl<'de> Deserialize<'de> for ObjectLocation {
         }
         let mut buf = [0u8; OBJECT_LOCATION_SIZE];
         buf.copy_from_slice(&bytes);
-        Ok(*bytemuck::from_bytes::<Self>(&buf))
+        Ok(bytemuck::pod_read_unaligned::<Self>(&buf))
     }
 }
 

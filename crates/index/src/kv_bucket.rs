@@ -33,12 +33,19 @@ pub const KV_BUCKET_MAX_ENTRIES: usize = 144;
 pub const KV_BUCKET_FORMAT_VERSION: u16 = 1;
 
 /// Single entry inside a `KvBucket` (28 B).
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
 pub struct KvBucketEntry {
     pub tag_id: u32,             // [0..4]
-    pub value_hash: u64,         // [4..12]
+    /// Little-endian `u64` at a 4-aligned offset; see [`Self::value_hash`].
+    pub value_hash: [u8; 8],     // [4..12]
     pub bitmap_ref: BlockRef,    // [12..28]
+}
+
+impl KvBucketEntry {
+    pub fn value_hash(&self) -> u64 {
+        u64::from_le_bytes(self.value_hash)
+    }
 }
 
 const_assert_eq!(core::mem::size_of::<KvBucketEntry>(), 28);
@@ -55,12 +62,13 @@ const_assert_eq!(CRC_OFFSET, 4092);
 
 // ---------- KvBucketBlock ----------
 
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct KvBucketBlock {
     pub header: BlockHeader,                                   // [0..32]
     pub local_depth: u8,                                        // [32..33]
-    pub entry_count: u16,                                       // [33..35]
+    /// Little-endian `u16` at an odd offset; see [`Self::entry_count`].
+    pub entry_count: [u8; 2],                                   // [33..35]
     pub _pad: u8,                                               // [35..36]
     pub entries: [KvBucketEntry; KV_BUCKET_MAX_ENTRIES],        // [36..4068]
     pub _pad_tail: [u8; 24],                                    // [4068..4092]
@@ -101,7 +109,7 @@ impl KvBucketBlock {
         Self {
             header,
             local_depth,
-            entry_count: 0,
+            entry_count: [0; 2],
             _pad: 0,
             entries: [KvBucketEntry::default(); KV_BUCKET_MAX_ENTRIES],
             _pad_tail: [0; 24],
@@ -112,9 +120,8 @@ impl KvBucketBlock {
     /// Look up `(tag_id, value_hash)`. Returns `Some(bitmap_ref)` if
     /// found, `None` otherwise.
     pub fn lookup(&self, tag_id: u32, value_hash: u64) -> Option<BlockRef> {
-        let count = self.entry_count as usize;
-        for entry in self.entries.iter().take(count.min(KV_BUCKET_MAX_ENTRIES)) {
-            if { entry.tag_id } == tag_id && { entry.value_hash } == value_hash {
+        for entry in self.iter() {
+            if entry.tag_id == tag_id && entry.value_hash() == value_hash {
                 return Some(entry.bitmap_ref);
             }
         }
@@ -130,10 +137,10 @@ impl KvBucketBlock {
         value_hash: u64,
         bitmap_ref: BlockRef,
     ) -> Result<(), KvBucketError> {
-        let count = self.entry_count as usize;
+        let count = self.len();
         // Update in place if present.
-        for entry in self.entries.iter_mut().take(count.min(KV_BUCKET_MAX_ENTRIES)) {
-            if { entry.tag_id } == tag_id && { entry.value_hash } == value_hash {
+        for entry in self.entries.iter_mut().take(count) {
+            if entry.tag_id == tag_id && entry.value_hash() == value_hash {
                 entry.bitmap_ref = bitmap_ref;
                 return Ok(());
             }
@@ -144,26 +151,31 @@ impl KvBucketBlock {
         }
         self.entries[count] = KvBucketEntry {
             tag_id,
-            value_hash,
+            value_hash: value_hash.to_le_bytes(),
             bitmap_ref,
         };
-        self.entry_count += 1;
+        self.entry_count = (count as u16 + 1).to_le_bytes();
         Ok(())
+    }
+
+    /// The raw `entry_count` field, unclamped.
+    pub fn entry_count(&self) -> u16 {
+        u16::from_le_bytes(self.entry_count)
     }
 
     /// Number of entries currently held.
     pub fn len(&self) -> usize {
-        (self.entry_count as usize).min(KV_BUCKET_MAX_ENTRIES)
+        (self.entry_count() as usize).min(KV_BUCKET_MAX_ENTRIES)
     }
 
     /// `true` if the bucket has zero entries.
     pub fn is_empty(&self) -> bool {
-        self.entry_count == 0
+        self.entry_count() == 0
     }
 
     /// `true` if the bucket has no room for a new entry.
     pub fn is_full(&self) -> bool {
-        self.entry_count as usize >= KV_BUCKET_MAX_ENTRIES
+        self.entry_count() as usize >= KV_BUCKET_MAX_ENTRIES
     }
 
     /// Iterator over occupied entries.
@@ -181,7 +193,7 @@ impl KvBucketBlock {
 
     /// Validate the trailing CRC.
     pub fn verify_crc(&self) -> Result<(), KvBucketError> {
-        let expected = { self.crc };
+        let expected = self.crc;
         let mut copy = *self;
         copy.crc = 0;
         let actual = checksum64(&bytemuck::bytes_of(&copy)[..CRC_OFFSET]) as u32;
@@ -193,19 +205,19 @@ impl KvBucketBlock {
     }
 
     fn validate(&self) -> Result<(), KvBucketError> {
-        let magic = { self.header.pre.magic };
+        let magic = self.header.pre.magic;
         if magic != BLOCK_PREAMBLE_MAGIC_BLOCK {
             return Err(KvBucketError::InvalidMagic { actual: magic });
         }
-        let kind_raw = { self.header.pre.kind };
+        let kind_raw = self.header.pre.kind;
         if kind_raw != BlockKind::KvHashBucket as u16 {
             return Err(KvBucketError::InvalidBlockKind(kind_raw));
         }
-        let version = { self.header.pre.format_version };
+        let version = self.header.pre.format_version;
         if version != KV_BUCKET_FORMAT_VERSION {
             return Err(KvBucketError::InvalidFormatVersion(version));
         }
-        let count = self.entry_count;
+        let count = self.entry_count();
         if count as usize > KV_BUCKET_MAX_ENTRIES {
             return Err(KvBucketError::OverCapacity(count));
         }
@@ -237,8 +249,7 @@ impl KvBucketBlock {
                 expected: 0,
                 actual: 0,
             })?;
-        let block: &Self = bytemuck::from_bytes(&buf);
-        let block = *block;
+        let block: Self = bytemuck::pod_read_unaligned(&buf);
         block.validate()?;
         block.verify_crc()?;
         Ok(block)

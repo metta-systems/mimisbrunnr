@@ -504,7 +504,7 @@ impl PoolManager {
         for d in psr.inline_iter() {
             let id = d.disk_id_typed();
             let state = d.state_typed()?;
-            let used = { d.used_bytes };
+            let used = d.used_bytes;
             if let Some(rt) = self.disks.get_mut(&id) {
                 rt.state = state;
                 rt.used_bytes = used;

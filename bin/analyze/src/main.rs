@@ -295,26 +295,26 @@ fn collect_disks(engine: &DiskEngine, cfg: &PoolConfig) -> Vec<DiskSummary> {
 
 fn superblock_view(sb: &Superblock) -> SuperblockView {
     SuperblockView {
-        fs_uuid: { sb.fs_uuid },
-        node_id: { sb.node_id },
-        disk_id: { sb.disk_id },
+        fs_uuid: sb.fs_uuid,
+        node_id: sb.node_id,
+        disk_id: sb.disk_id,
         media_type: sb.media_type().unwrap_or(MediaType::Ssd),
         tier: sb.tier().unwrap_or(StorageTier::Hot),
-        device_capacity: { sb.device_capacity },
-        creation_timestamp_ns: { sb.creation_timestamp_ns },
-        last_mount_timestamp_ns: { sb.last_mount_timestamp_ns },
-        mount_count: { sb.mount_count },
-        bucket_size_log2: { sb.bucket_size_log2 },
-        btree_node_size_log2: { sb.btree_node_size_log2 },
-        wal_offset: { sb.wal_offset },
-        wal_size: { sb.wal_size },
-        index_zone_offset: { sb.index_zone.offset },
-        index_zone_length: { sb.index_zone.length },
-        metadata_zone_offset: { sb.metadata_zone.offset },
-        metadata_zone_length: { sb.metadata_zone.length },
-        blob_zone_offset: { sb.blob_zone.offset },
-        blob_zone_length: { sb.blob_zone.length },
-        fs_format_version: { sb.fs_format_version },
+        device_capacity: sb.device_capacity,
+        creation_timestamp_ns: sb.creation_timestamp_ns,
+        last_mount_timestamp_ns: sb.last_mount_timestamp_ns,
+        mount_count: sb.mount_count,
+        bucket_size_log2: sb.bucket_size_log2,
+        btree_node_size_log2: sb.btree_node_size_log2,
+        wal_offset: sb.wal_offset,
+        wal_size: sb.wal_size,
+        index_zone_offset: sb.index_zone.offset,
+        index_zone_length: sb.index_zone.length,
+        metadata_zone_offset: sb.metadata_zone.offset,
+        metadata_zone_length: sb.metadata_zone.length,
+        blob_zone_offset: sb.blob_zone.offset,
+        blob_zone_length: sb.blob_zone.length,
+        fs_format_version: sb.fs_format_version,
     }
 }
 
@@ -326,28 +326,28 @@ fn root_pointer_view(rp: &RootPointer) -> RootPointerView {
         )
     };
     let roots = vec![
-        ("object_table_root", fmt(&{ rp.object_table_root })),
-        ("object_history_root", fmt(&{ rp.object_history_root })),
-        ("location_table_root", fmt(&{ rp.location_table_root })),
-        ("location_history_root", fmt(&{ rp.location_history_root })),
-        ("forward_index_root", fmt(&{ rp.forward_index_root })),
-        ("tag_index_root", fmt(&{ rp.tag_index_root })),
-        ("kv_index_root", fmt(&{ rp.kv_index_root })),
-        ("range_index_root", fmt(&{ rp.range_index_root })),
-        ("chunk_index_root", fmt(&{ rp.chunk_index_root })),
-        ("value_spill_root", fmt(&{ rp.value_spill_root })),
-        ("backpointer_root", fmt(&{ rp.backpointer_root })),
-        ("ontology_root", fmt(&{ rp.ontology_root })),
-        ("subscriptions_root", fmt(&{ rp.subscriptions_root })),
-        ("pool_state_root", fmt(&{ rp.pool_state_root })),
-        ("snapshot_chain_root", fmt(&{ rp.snapshot_chain_root })),
-        ("placement_rules_root", fmt(&{ rp.placement_rules_root })),
-        ("cluster_peers_root", fmt(&{ rp.cluster_peers_root })),
+        ("object_table_root", fmt(&rp.object_table_root)),
+        ("object_history_root", fmt(&rp.object_history_root)),
+        ("location_table_root", fmt(&rp.location_table_root)),
+        ("location_history_root", fmt(&rp.location_history_root)),
+        ("forward_index_root", fmt(&rp.forward_index_root)),
+        ("tag_index_root", fmt(&rp.tag_index_root)),
+        ("kv_index_root", fmt(&rp.kv_index_root)),
+        ("range_index_root", fmt(&rp.range_index_root)),
+        ("chunk_index_root", fmt(&rp.chunk_index_root)),
+        ("value_spill_root", fmt(&rp.value_spill_root)),
+        ("backpointer_root", fmt(&rp.backpointer_root)),
+        ("ontology_root", fmt(&rp.ontology_root)),
+        ("subscriptions_root", fmt(&rp.subscriptions_root)),
+        ("pool_state_root", fmt(&rp.pool_state_root)),
+        ("snapshot_chain_root", fmt(&rp.snapshot_chain_root)),
+        ("placement_rules_root", fmt(&rp.placement_rules_root)),
+        ("cluster_peers_root", fmt(&rp.cluster_peers_root)),
     ];
     RootPointerView {
-        seq: { rp.seq },
-        lsn: { rp.lsn },
-        flags: { rp.flags },
+        seq: rp.seq,
+        lsn: rp.lsn,
+        flags: rp.flags,
         roots,
     }
 }
@@ -441,9 +441,9 @@ fn collect_objects(engine: &DiskEngine) -> Vec<ObjectSnapshot> {
             oid,
             state,
             compression,
-            blob_length: { rec.blob_length },
-            stored_size: { rec.stored_size },
-            generation: { rec.generation },
+            blob_length: rec.blob_length,
+            stored_size: rec.stored_size,
+            generation: rec.generation,
             direct_tags,
             materialized_tags,
             attrs,
@@ -554,10 +554,10 @@ fn collect_wal_entries(wal: &Wal, device: &dyn BlockDevice) -> Vec<WalEntryView>
 }
 
 fn decode_wal_entry(entry: &WalEntry) -> WalEntryView {
-    let op_kind_raw = { entry.header.op_kind };
-    let lsn = { entry.header.lsn };
-    let payload_length = { entry.header.payload_length };
-    let timestamp_ns = { entry.header.timestamp.physical_ns };
+    let op_kind_raw = entry.header.op_kind;
+    let lsn = entry.header.lsn;
+    let payload_length = entry.header.payload_length;
+    let timestamp_ns = entry.header.timestamp.physical_ns;
     let (kind_name, payload_preview) = match WalOpKind::from_u8(op_kind_raw) {
         Ok(kind) => match WalOp::decode(kind, &entry.payload) {
             Ok(op) => (format!("{kind:?}"), format!("{op:?}")),

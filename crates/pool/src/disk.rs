@@ -108,7 +108,7 @@ pub(crate) fn disk_state_from_u8(v: u8) -> Result<DiskState, PoolError> {
 /// | `[32..48]`  | `buckets_root: BlockRef` |
 /// | `[48..64]`  | `freespace_root: BlockRef` |
 /// | `[64..256]` | `path[192]`            |
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct DiskDescriptorOnDisk {
     pub disk_id: u16,         // [0..2]
@@ -134,7 +134,7 @@ const_assert_eq!(
 
 // ---------- Serialize / Deserialize via bytemuck ----------
 //
-// `DiskDescriptorOnDisk` is `#[repr(C, packed)] Pod` with a spec-pinned
+// `DiskDescriptorOnDisk` is `#[repr(C)] Pod` with a spec-pinned
 // 256 B layout (POOL-DESIGN§1). Round-trip the byte image rather than
 // per-field tags so the CBOR wire form mirrors the on-disk POD layout
 // exactly. Used by the `disks_overflow_root` sorted-run path.
@@ -177,7 +177,7 @@ impl<'de> Deserialize<'de> for DiskDescriptorOnDisk {
         }
         let mut buf = [0u8; DISK_DESCRIPTOR_ON_DISK_SIZE];
         buf.copy_from_slice(&bytes);
-        Ok(*bytemuck::from_bytes::<Self>(&buf))
+        Ok(bytemuck::pod_read_unaligned::<Self>(&buf))
     }
 }
 
@@ -226,7 +226,7 @@ impl DiskDescriptorOnDisk {
     /// [`PoolError::InvalidDiskPathUtf8`] on bad UTF-8 and
     /// [`PoolError::DiskPathTooLong`] if `path_len` exceeds the inline cap.
     pub fn path_str(&self) -> Result<&str, PoolError> {
-        let len = { self.path_len } as usize;
+        let len = self.path_len as usize;
         if len > DISK_PATH_INLINE_LEN {
             return Err(PoolError::DiskPathTooLong {
                 len,
@@ -243,7 +243,7 @@ impl DiskDescriptorOnDisk {
 
     /// Logical tier for this descriptor.
     pub fn tier_typed(&self) -> Result<StorageTier, PoolError> {
-        let raw = { self.tier };
+        let raw = self.tier;
         StorageTier::from_u8(raw).ok_or(PoolError::InvalidStorageTier(raw))
     }
 
@@ -254,7 +254,7 @@ impl DiskDescriptorOnDisk {
 
     /// Strongly-typed `disk_id`.
     pub fn disk_id_typed(&self) -> DiskId {
-        let raw = { self.disk_id };
+        let raw = self.disk_id;
         raw as DiskId
     }
 }
@@ -286,8 +286,8 @@ mod tests {
         let bytes = bytemuck::bytes_of(&d).to_vec();
         assert_eq!(bytes.len(), DISK_DESCRIPTOR_ON_DISK_SIZE);
 
-        let back: &DiskDescriptorOnDisk = bytemuck::from_bytes(&bytes);
-        let back_id = { back.disk_id };
+        let back: &DiskDescriptorOnDisk = &bytemuck::pod_read_unaligned(&bytes);
+        let back_id = back.disk_id;
         assert_eq!(back_id, 7);
         assert_eq!(back.path_str().unwrap(), "/var/mimir/disk7.img");
         assert_eq!(back.media_type_typed().unwrap(), MediaType::Hdd);

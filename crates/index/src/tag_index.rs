@@ -95,12 +95,7 @@ pub const TAG_INDEX_LEAF_ENTRY_SIZE: usize = 48;
 /// [40..41] store_kind             u8
 /// [41..48] _pad                   [u8; 7]
 /// ```
-///
-/// `#[repr(C, packed)]` per operations-design.md "On-disk struct discipline" (despite INDEX-DESIGN§3.1
-/// favouring `#[repr(C)]` for hot-path access — the contract pins the
-/// packed form for "every fixed-size on-disk struct"; the size and field
-/// offsets are unchanged either way).
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct TagIndexLeafEntry {
     pub last_modify_lsn: u64, // [0..8]
@@ -140,7 +135,7 @@ pub const TAG_INDEX_VALUE_SIZE: usize = 40;
 /// [32..33] store_kind      u8
 /// [33..40] _pad            [u8; 7]
 /// ```
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct TagIndexValue {
     pub last_modify_lsn: u64, // [0..8]
@@ -892,8 +887,8 @@ mod tests {
         let key = TagIndexKey { tag_id: 2, snapshot: 0 };
         let value = region.lookup(&dev, &key).unwrap().unwrap();
         let value = TagIndexValue::from_bytes(value.as_bytes()).unwrap();
-        assert_eq!({ value.cardinality }, 2);
-        assert_eq!({ value.store_kind }, TagStoreKind::Simple as u8);
+        assert_eq!(value.cardinality, 2);
+        assert_eq!(value.store_kind, TagStoreKind::Simple as u8);
         assert!(region.lookup(&dev, &TagIndexKey { tag_id: 3, snapshot: 0 }).unwrap().is_none());
     }
 

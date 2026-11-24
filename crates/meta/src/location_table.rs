@@ -269,7 +269,7 @@ mod tests {
         assert_eq!(value.as_bytes(), bytemuck::bytes_of(t.get(5).unwrap()));
         let back = LocationTable::load_from_region(&dev, 0, 0).unwrap();
         let loaded = back.get(5).unwrap();
-        assert_eq!({ loaded.header.extent_length }, 0xdead);
+        assert_eq!(loaded.header.extent_length, 0xdead);
         assert_eq!(loaded.active_replicas(), &[r]);
     }
 
@@ -300,7 +300,7 @@ mod tests {
         for i in 1u64..=50 {
             let got = back.get(i).expect("oid missing");
             assert_eq!(got.header.replica_count, 1);
-            assert_eq!({ got.header.extent_length }, i * 0x1000);
+            assert_eq!(got.header.extent_length, i * 0x1000);
             assert_eq!(got.active_replicas()[0].disk_id, (i & 0xff) as u16);
         }
         let big = back.get(99).unwrap();
@@ -331,7 +331,7 @@ mod tests {
         let back = LocationTable::load_from_region(&dev, 0, 0).unwrap();
         assert_eq!(back.len(), 1);
         let got = back.get(7).unwrap();
-        assert_eq!({ got.header.extent_length }, 0x4000);
+        assert_eq!(got.header.extent_length, 0x4000);
         assert_eq!(got.active_replicas()[0].bucket_no, 3);
     }
 

@@ -41,7 +41,7 @@ pub const KV_HASH_DIRECTORY_HEADER_SIZE: usize = 8;
 
 /// Header following the standard `BlockHeader` inside a 4 KiB
 /// `BlockKind::KvHashDirectory` block. INDEX-DESIGN§4.1.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct KvHashDirectoryHeader {
     pub global_depth: u8, // [0..1]
@@ -69,11 +69,12 @@ pub const KV_HASH_BUCKET_HEADER_SIZE: usize = 4;
 
 /// Header following the standard `BlockHeader` inside a 4 KiB
 /// `BlockKind::KvHashBucket` block. INDEX-DESIGN§4.1.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct KvHashBucketHeader {
     pub local_depth: u8, // [0..1]
-    pub entry_count: u16, // [1..3]
+    /// Little-endian `u16` at an odd offset.
+    pub entry_count: [u8; 2], // [1..3]
     pub _pad: u8,        // [3..4]
 }
 
@@ -422,8 +423,8 @@ fn load_extendible_hash<D: BlockDevice>(
             let bm = page
                 .to_bitmap()
                 .map_err(|e| IndexError::Roaring(e.to_string()))?;
-            let tag_id = { entry.tag_id };
-            let value_hash = { entry.value_hash };
+            let tag_id = entry.tag_id;
+            let value_hash = entry.value_hash();
             entries.insert((TagId::new(tag_id), value_hash), RoaringBitmapSerde(bm));
         }
     }

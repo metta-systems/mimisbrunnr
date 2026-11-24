@@ -287,25 +287,25 @@ mod tests {
         let rec2 = *ObjectRecord::ref_from_bytes(&bytes);
         // Field-by-field comparison (struct doesn't derive PartialEq because
         // bytemuck-zeroed fields have no inherent equality semantics).
-        assert_eq!({ rec2.id }, rec.id);
-        assert_eq!({ rec2.generation }, rec.generation);
+        assert_eq!(rec2.id, rec.id);
+        assert_eq!(rec2.generation, rec.generation);
         assert_eq!(rec2.state, rec.state);
         assert_eq!(rec2.flags, rec.flags);
-        assert_eq!({ rec2.record_version }, rec.record_version);
+        assert_eq!(rec2.record_version, rec.record_version);
         assert_eq!(rec2.content_hash, rec.content_hash);
-        assert_eq!({ rec2.blob_offset }, rec.blob_offset);
-        assert_eq!({ rec2.blob_length }, rec.blob_length);
-        assert_eq!({ rec2.created_ns }, rec.created_ns);
-        assert_eq!({ rec2.modified_ns }, rec.modified_ns);
-        assert_eq!({ rec2.tag_count }, rec.tag_count);
-        assert_eq!({ rec2.attr_count }, rec.attr_count);
+        assert_eq!(rec2.blob_offset, rec.blob_offset);
+        assert_eq!(rec2.blob_length, rec.blob_length);
+        assert_eq!(rec2.created_ns, rec.created_ns);
+        assert_eq!(rec2.modified_ns, rec.modified_ns);
+        assert_eq!(rec2.tag_count, rec.tag_count);
+        assert_eq!(rec2.attr_count, rec.attr_count);
         assert_eq!(rec2.compression, rec.compression);
         assert_eq!(rec2.encryption, rec.encryption);
-        assert_eq!({ rec2.relation_count }, rec.relation_count);
+        assert_eq!(rec2.relation_count, rec.relation_count);
         assert_eq!(rec2.inline_tags, rec.inline_tags);
-        assert_eq!({ rec2.overflow_offset }, rec.overflow_offset);
-        assert_eq!({ rec2.stored_size }, rec.stored_size);
-        assert_eq!({ rec2.last_modify_lsn }, rec.last_modify_lsn);
+        assert_eq!(rec2.overflow_offset, rec.overflow_offset);
+        assert_eq!(rec2.stored_size, rec.stored_size);
+        assert_eq!(rec2.last_modify_lsn, rec.last_modify_lsn);
     }
 
     #[test]

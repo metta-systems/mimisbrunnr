@@ -62,7 +62,7 @@ pub const SUPERBLOCK_MAGIC_FULL: [u8; 16] = *b"MIMISBRUNNR\0\0\0\0\0";
 /// 16-byte placeholder for the inline `ChunkParamsRecord`. The full struct
 /// is owned by INDEX-DESIGN§4.3 in a later phase; we store the bytes opaquely so the
 /// Superblock layout remains stable.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug, Default, Eq, PartialEq)]
 pub struct ChunkParamsRecord {
     pub bytes: [u8; 16],
@@ -75,7 +75,7 @@ const_assert_eq!(core::mem::size_of::<ChunkParamsRecord>(), 16);
 /// **Active-root selection** uses the `seq` / `lsn` of the *active* root
 /// (`active_root` field), so corrupting one copy and not its pair still
 /// allows recovery via the inactive root.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct Superblock {
     pub header: BlockHeader,                  // [0..32]    kind = Superblock
@@ -190,26 +190,26 @@ impl Superblock {
     /// Returns [`StorageError::InvalidMediaType`] if the on-disk byte does not
     /// match any known variant.
     pub fn media_type(&self) -> Result<MediaType, StorageError> {
-        let raw = { self.media_type };
+        let raw = self.media_type;
         media_type_from_u8(raw)
     }
 
     /// Decode the raw `tier` byte into a logical [`StorageTier`].
     pub fn tier(&self) -> Result<StorageTier, StorageError> {
-        let raw = { self.tier };
+        let raw = self.tier;
         StorageTier::from_u8(raw).ok_or(StorageError::InvalidStorageTier(raw))
     }
 
     /// Strongly-typed accessor for the `node_id` field. Just a typed alias
     /// for the underlying `u16`, but keeps read-side call sites self-documenting.
     pub fn node_id(&self) -> NodeId {
-        let raw = { self.node_id };
+        let raw = self.node_id;
         raw as NodeId
     }
 
     /// Strongly-typed accessor for the `disk_id` field.
     pub fn disk_id(&self) -> DiskId {
-        let raw = { self.disk_id };
+        let raw = self.disk_id;
         raw as DiskId
     }
 
@@ -235,7 +235,7 @@ impl Superblock {
 
     /// Validate the trailing CRC.
     pub fn verify_crc(&self) -> Result<(), StorageError> {
-        let expected = { self.crc };
+        let expected = self.crc;
         let mut copy = *self;
         copy.crc = 0;
         let actual = checksum64(&bytemuck::bytes_of(&copy)[..SUPERBLOCK_CRC_OFFSET]) as u32;
@@ -330,8 +330,8 @@ impl Superblock {
             if device.read_at(off, &mut buf).is_err() {
                 continue;
             }
-            let sb: Superblock = match bytemuck::try_from_bytes::<Superblock>(&buf) {
-                Ok(s) => *s,
+            let sb: Superblock = match bytemuck::try_pod_read_unaligned::<Superblock>(&buf) {
+                Ok(superblock) => superblock,
                 Err(_) => continue,
             };
             if sb.magic_full != SUPERBLOCK_MAGIC_FULL {
@@ -360,8 +360,8 @@ impl Superblock {
                 let mut healed = sb;
                 healed.active_root ^= 1;
                 healed.recompute_crc();
-                let key_seq = { inactive.seq };
-                let key_lsn = { inactive.lsn };
+                let key_seq = inactive.seq;
+                let key_lsn = inactive.lsn;
                 trace!(
                     "superblock copy@{off} healed via inactive root seq={key_seq} lsn={key_lsn}"
                 );
@@ -374,8 +374,8 @@ impl Superblock {
                 }
                 continue;
             }
-            let key_seq = { active.seq };
-            let key_lsn = { active.lsn };
+            let key_seq = active.seq;
+            let key_lsn = active.lsn;
             let cand = (key_seq, key_lsn, sb);
             if best
                 .as_ref()
@@ -464,11 +464,11 @@ mod tests {
         let dev = FileBlockDevice::open(tmp.path(), 1 << 20).unwrap();
         let sb_w = fmt_default(&dev);
         let sb_r = Superblock::open(&dev).unwrap();
-        let w_node = { sb_w.node_id };
-        let r_node = { sb_r.node_id };
+        let w_node = sb_w.node_id;
+        let r_node = sb_r.node_id;
         assert_eq!(w_node, r_node);
-        let w_disk = { sb_w.disk_id };
-        let r_disk = { sb_r.disk_id };
+        let w_disk = sb_w.disk_id;
+        let r_disk = sb_r.disk_id;
         assert_eq!(w_disk, r_disk);
     }
 
@@ -494,8 +494,8 @@ mod tests {
         // Re-open: active root must be the seq=7 one.
         let opened = Superblock::open(&dev).unwrap();
         let active = opened.active_root_pointer();
-        let s = { active.seq };
-        let l = { active.lsn };
+        let s = active.seq;
+        let l = active.lsn;
         assert_eq!(s, 7);
         assert_eq!(l, 70);
     }
@@ -650,7 +650,7 @@ mod tests {
         buf[SUPERBLOCK_CRC_OFFSET..SUPERBLOCK_CRC_OFFSET + 4]
             .copy_from_slice(&new_crc.to_le_bytes());
 
-        let sb: Superblock = *bytemuck::from_bytes::<Superblock>(&buf);
+        let sb: Superblock = bytemuck::pod_read_unaligned::<Superblock>(&buf);
         sb.verify_crc().unwrap();
         match sb.media_type() {
             Err(StorageError::InvalidMediaType(99)) => {}

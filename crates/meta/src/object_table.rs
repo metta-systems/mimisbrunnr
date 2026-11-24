@@ -204,9 +204,9 @@ mod tests {
         t.insert(r);
         assert_eq!(t.len(), 1);
         let got = t.get(r.id).unwrap();
-        assert_eq!({ got.id }, r.id);
+        assert_eq!(got.id, r.id);
         let removed = t.remove(r.id).unwrap();
-        assert_eq!({ removed.id }, r.id);
+        assert_eq!(removed.id, r.id);
         assert!(t.is_empty());
     }
 

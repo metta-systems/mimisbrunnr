@@ -111,7 +111,7 @@ impl Wal {
         }
 
         let mut header = WalHeader::default();
-        header.header.generation = 1;
+        header.header.set_generation(1);
         header.next_lsn = 1;
         header.write_cursor = 0;
         header.read_cursor = 0;
@@ -132,7 +132,7 @@ impl Wal {
         // Mirror to slot B with a slightly older generation so future commits
         // always overtake it cleanly.
         let mut mirror = wal.header;
-        mirror.header.generation = 0;
+        mirror.header.set_generation(0);
         mirror.recompute_crc();
         let mirror_bytes = bytemuck::bytes_of(&mirror);
         device.write_at(wal.header_slot_offset(HEADER_SLOT_B), mirror_bytes)?;
@@ -159,16 +159,16 @@ impl Wal {
         device.read_at(offset, &mut buf_a)?;
         device.read_at(offset + BLOCK_SIZE as u64, &mut buf_b)?;
 
-        let cand_a: &WalHeader = bytemuck::from_bytes(&buf_a);
-        let cand_b: &WalHeader = bytemuck::from_bytes(&buf_b);
+        let cand_a: &WalHeader = &bytemuck::pod_read_unaligned(&buf_a);
+        let cand_b: &WalHeader = &bytemuck::pod_read_unaligned(&buf_b);
 
         let a_ok = cand_a.verify_kind().is_ok() && cand_a.verify_crc().is_ok();
         let b_ok = cand_b.verify_kind().is_ok() && cand_b.verify_crc().is_ok();
 
         let (header, slot) = match (a_ok, b_ok) {
             (true, true) => {
-                let gen_a = { cand_a.header.generation };
-                let gen_b = { cand_b.header.generation };
+                let gen_a = cand_a.header.generation();
+                let gen_b = cand_b.header.generation();
                 if gen_b > gen_a {
                     (*cand_b, HEADER_SLOT_B)
                 } else {
@@ -221,10 +221,13 @@ impl Wal {
         } else {
             HEADER_SLOT_A
         };
-        let new_gen = { self.header.header.generation }
+        let new_gen = self
+            .header
+            .header
+            .generation()
             .checked_add(1)
             .ok_or(WalError::LsnOverflow)?;
-        self.header.header.generation = new_gen;
+        self.header.header.set_generation(new_gen);
         self.header.recompute_crc();
         self.write_header_to(device, next_slot)?;
         self.active_slot = next_slot;
@@ -322,7 +325,7 @@ impl Wal {
         debug_assert!(frame_len <= WAL_SECTOR_SIZE);
 
         let data_cap = self.data_capacity();
-        let used = { self.header.used_bytes };
+        let used = self.header.used_bytes;
         let sector_cap = BLOCK_SIZE as u64;
         if used + sector_cap > data_cap {
             return Err(WalError::RingFull {
@@ -331,7 +334,7 @@ impl Wal {
             });
         }
 
-        let lsn = { self.header.next_lsn };
+        let lsn = self.header.next_lsn;
         // ENCRYPTION-DESIGN§1: panic on LSN overflow.
         let next_lsn = lsn.checked_add(1).expect("WAL next_lsn overflow");
 
@@ -352,7 +355,7 @@ impl Wal {
             .copy_from_slice(&frame_crc.to_le_bytes());
 
         // Write the sector at the current cursor.
-        let cursor = { self.header.write_cursor };
+        let cursor = self.header.write_cursor;
         let abs_offset = self.data_offset() + cursor;
         device.write_at(abs_offset, &sector)?;
 
@@ -411,18 +414,18 @@ impl Wal {
             if self.header.used_bytes == 0 {
                 break;
             }
-            let cursor = { self.header.read_cursor };
+            let cursor = self.header.read_cursor;
             let abs = self.data_offset() + cursor;
             let mut sector = [0u8; WAL_SECTOR_SIZE];
             device.read_at(abs, &mut sector)?;
             let hdr: &WalEntryHeader =
-                bytemuck::from_bytes(&sector[..core::mem::size_of::<WalEntryHeader>()]);
+                &bytemuck::pod_read_unaligned(&sector[..core::mem::size_of::<WalEntryHeader>()]);
             // If the slot is empty / never written, we wouldn't expect to see
             // it inside `used_bytes`. Treat as end-of-window defensively.
             if hdr.check_magic().is_err() {
                 break;
             }
-            let entry_lsn = { hdr.lsn };
+            let entry_lsn = hdr.lsn;
             if entry_lsn > last_checkpoint_lsn {
                 break;
             }
@@ -482,12 +485,12 @@ impl Iterator for WalIter<'_> {
 
             // Decode header.
             let hdr_size = core::mem::size_of::<WalEntryHeader>();
-            let hdr: &WalEntryHeader = bytemuck::from_bytes(&sector[..hdr_size]);
+            let hdr: &WalEntryHeader = &bytemuck::pod_read_unaligned(&sector[..hdr_size]);
             if let Err(e) = hdr.check_magic() {
                 self.done = true;
                 return Some(Err(e));
             }
-            let payload_len = { hdr.payload_length } as usize;
+            let payload_len = hdr.payload_length as usize;
             if hdr_size + payload_len + WAL_FRAMING_CRC_LEN > WAL_SECTOR_SIZE {
                 self.done = true;
                 return Some(Err(WalError::PayloadTooLarge {
@@ -515,7 +518,7 @@ impl Iterator for WalIter<'_> {
 
             // Verify payload CRC (computed over plaintext payload bytes).
             let payload_slice = &sector[hdr_size..hdr_size + payload_len];
-            let stored_payload_crc = { hdr.payload_crc };
+            let stored_payload_crc = hdr.payload_crc;
             let computed_payload_crc = checksum64(payload_slice) as u32;
             if stored_payload_crc != computed_payload_crc {
                 self.done = true;
@@ -526,7 +529,7 @@ impl Iterator for WalIter<'_> {
             }
 
             // Until ENCRYPTION3 / JOURNAL5: reject encrypted/compressed payloads explicitly.
-            let flags = { hdr.flags };
+            let flags = hdr.flags;
             if flags & WAL_ENTRY_FLAG_ENCRYPTED != 0 {
                 self.done = true;
                 return Some(Err(WalError::EncryptionUnsupported));
@@ -537,7 +540,7 @@ impl Iterator for WalIter<'_> {
             }
 
             // Skip entries below start_lsn (still consume the sector).
-            let entry_lsn = { hdr.lsn };
+            let entry_lsn = hdr.lsn;
             if entry_lsn < self.start_lsn {
                 continue;
             }
@@ -685,11 +688,11 @@ mod tests {
         let (_tmp, dev) = open_test_dev(size);
         // Hand-craft two headers: A with generation=5, B with generation=7.
         let mut a = WalHeader::default();
-        a.header.generation = 5;
+        a.header.set_generation(5);
         a.next_lsn = 100;
         a.recompute_crc();
         let mut b = WalHeader::default();
-        b.header.generation = 7;
+        b.header.set_generation(7);
         b.next_lsn = 200;
         b.recompute_crc();
         dev.write_at(0, bytemuck::bytes_of(&a)).unwrap();

@@ -222,7 +222,7 @@ const _: () = assert!(node_ptr_size(MAX_METADATA_REPLICAS) == 64);
 // =====================================================================
 // FORMAT-DESIGN§1.3 BlockPreamble — 8 B (shared by BlockHeader and BtreeNodeHeader)
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct BlockPreamble {
     pub magic: [u8; 4],          // "MIMR" (4 KiB block) or "MIMB" (256 KiB region)
     pub kind: u16,               // BlockKind or BtreeKind, scoped by magic
@@ -233,12 +233,12 @@ const _: () = assert!(size_of::<BlockPreamble>() == 8);
 // =====================================================================
 // FORMAT-DESIGN§1.3 BlockHeader — 32 B
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct BlockHeader {
     pub pre: BlockPreamble,
     pub payload_length: u32,
-    pub generation: u64,
-    pub lsn: u64,
+    pub generation: [u8; 8],     // little-endian u64 at offset 12
+    pub lsn: [u8; 8],            // little-endian u64 at offset 20
     pub flags: u32,
 }
 const _: () = assert!(size_of::<BlockHeader>() == 32);
@@ -358,7 +358,7 @@ pub const RUN_ENTRY_FLAG_LARGE:    u8 = 1 << 1;
 // =====================================================================
 // Legacy region header, still used by the forward-overflow chain (TODO(INDEX14)).
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct BtreeNodeHeader {
     pub pre: BlockPreamble,
     pub seq: u64,
@@ -380,7 +380,7 @@ const _: () = assert!(std::mem::offset_of!(BtreeNodeHeader, pre) == 0);
 // =====================================================================
 // ENGINE-DESIGN§1.1 ZoneExtent — 24 B
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct ZoneExtent {
     pub offset: u64,
     pub length: u64,
@@ -394,7 +394,7 @@ const _: () = assert!(size_of::<ZoneExtent>() == 24);
 // ZoneMapEntry embeds the full 24 B ZoneExtent so each entry carries
 // `flags` for future per-extent hints.
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct ZoneMapEntry {
     pub zone_kind: u8,                  //  [0..1]
     pub _pad: [u8; 7],                  //  [1..8]   align embedded extent to u64
@@ -402,7 +402,7 @@ pub struct ZoneMapEntry {
 }
 const _: () = assert!(size_of::<ZoneMapEntry>() == 32);
 
-#[repr(C, packed)]
+#[repr(C)]
 pub struct ZoneMap {
     pub header: BlockHeader,            //   32
     pub extent_count: u16,              //    2
@@ -418,7 +418,7 @@ const _: () = assert!(size_of::<ZoneMap>() == 4096);
 // Anchors every persistent btree root atomically (one COW commit flips
 // the active superblock root; every tree advances together).
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct RootPointer {
     pub seq: u64,                                // 8
     pub lsn: u64,                                // 8
@@ -457,7 +457,7 @@ const _: () = assert!(size_of::<RootPointer>() == 408);
 // the trailing _reserved region absorbs whatever space remains after
 // the static layout fields.
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct Superblock {
     pub header: BlockHeader,                    // [0..32]
     pub magic_full: [u8; 16],                   // [32..48]
@@ -508,7 +508,7 @@ const _: () = assert!(size_of::<Superblock>() == 4096);
 // JOURNAL-DESIGN§1.1 WalHeader — 4096 B (one block; A/B-alternated using
 // BlockHeader.generation, no separate seq field)
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct WalHeader {
     pub header: BlockHeader,            //   32
     pub next_lsn: u64,                  //    8
@@ -532,7 +532,7 @@ const _: () = assert!(size_of::<WalHeader>() == 4096);
 // and u16 node_id (matches Superblock.node_id). Sort order: physical_ns →
 // logical → node_id (SPECIFICATION-DESIGN§10.4).
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct HybridTimestamp {
     pub physical_ns: i64,    // [0..8]   monotonic wall-clock nanoseconds
     pub logical: u16,        // [8..10]  same-tick disambiguation
@@ -544,7 +544,7 @@ const _: () = assert!(std::mem::offset_of!(HybridTimestamp, physical_ns) == 0);
 const _: () = assert!(std::mem::offset_of!(HybridTimestamp, logical) == 8);
 const _: () = assert!(std::mem::offset_of!(HybridTimestamp, node_id) == 10);
 
-#[repr(C, packed)]
+#[repr(C)]
 pub struct WalEntryHeader {
     pub magic: u32,
     pub op_kind: u8,
@@ -708,15 +708,15 @@ const _: () = assert!(size_of::<ObjectLocation>() == 48);
 // =====================================================================
 // METADATA-DESIGN§2.2 BackpointerKey — 8 B, BackpointerValue — 24 B
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct BackpointerKey {
     pub disk_id: u16,
-    pub bucket_no: u32,
+    pub bucket_no: [u8; 4],      // little-endian u32 at offset 2
     pub sector_offset: u16,
 }
 const _: () = assert!(size_of::<BackpointerKey>() == 8);
 
-#[repr(C, packed)]
+#[repr(C)]
 pub struct BackpointerValue {
     pub owner_kind: u8,
     pub _pad: u8,
@@ -729,7 +729,7 @@ const _: () = assert!(size_of::<BackpointerValue>() == 24);
 // =====================================================================
 // INDEX-DESIGN§2.1 PackedAssertion — 16 B
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct PackedAssertion {
     pub kind: u8,
     pub origin: u8,
@@ -773,7 +773,7 @@ const _: () = assert!(std::mem::offset_of!(TagIndexLeafEntry, tag_id) == 24);
 // Capacity: 252 entries; supports global_depth ≤ 7 (128 active buckets).
 // Larger pools spill via spillover_root (next-level BTREE-DESIGN§1 region).
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct KvDirectory {
     pub header: BlockHeader,                    //  32
     pub global_depth: u8,                       //   1
@@ -789,10 +789,10 @@ const _: () = assert!(size_of::<KvDirectory>() == 4096);
 // =====================================================================
 // INDEX-DESIGN§4.1 KvBucket — 4096 B
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct KvBucketEntry {
     pub tag_id: u32,
-    pub value_hash: u64,
+    pub value_hash: [u8; 8],     // little-endian u64 at offset 4
     pub bitmap_ref: BlockRef,
 }
 const _: () = assert!(size_of::<KvBucketEntry>() == 28);
@@ -800,11 +800,11 @@ const _: () = assert!(size_of::<KvBucketEntry>() == 28);
 // 4096 - 32 (header) - 1 (local_depth) - 2 (entry_count) - 1 (_pad) - 4 (trailing CRC) = 4056
 // 4056 / 28 = 144 entries
 // Let's use 144 to maximise.
-#[repr(C, packed)]
+#[repr(C)]
 pub struct KvBucket {
     pub header: BlockHeader,                    //  32
     pub local_depth: u8,                        //   1
-    pub entry_count: u16,                       //   2
+    pub entry_count: [u8; 2],                   //   2  little-endian u16 at offset 33
     pub _pad: u8,                               //   1
     pub entries: [KvBucketEntry; 144],          // 144*28 = 4032
     pub _pad_tail: [u8; 24],                    //  24
@@ -818,7 +818,7 @@ const _: () = assert!(size_of::<KvBucket>() == 4096);
 // with a trailing `next: BlockRef` slot (zero on the tail page) forming
 // a singly-linked chain.
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct SequencePage {
     pub header: BlockHeader,                 //   32
     pub entry_count: u16,                    //    2
@@ -830,7 +830,7 @@ pub struct SequencePage {
 }
 const _: () = assert!(size_of::<SequencePage>() == 4096);
 
-#[repr(C, packed)]
+#[repr(C)]
 pub struct RankedEntry {                     // 16 B
     pub oid: u64,
     pub score: f32,
@@ -838,7 +838,7 @@ pub struct RankedEntry {                     // 16 B
 }
 const _: () = assert!(size_of::<RankedEntry>() == 16);
 
-#[repr(C, packed)]
+#[repr(C)]
 pub struct RankedPage {
     pub header: BlockHeader,                 //   32
     pub entry_count: u16,                    //    2
@@ -895,7 +895,7 @@ const _: () = assert!(
 // counter. The leaf entry duplicates the chunk's plaintext length in
 // `length: u32` for fast iteration without dereferencing the BlobRef.
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct ChunkIndexLeafEntry {
     pub chunk_hash: [u8; 32],
     pub ref_count: u32,
@@ -909,7 +909,7 @@ const _: () = assert!(size_of::<ChunkIndexLeafEntry>() == 56);
 // Region capacity: (262 144 − 64 − 16) / 40 = 6 551 entries before chaining
 // through the trailing BlockRef slot.
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct ChunkListEntry {
     pub chunk_hash: [u8; 32],   // [0..32]   BLAKE3 of plaintext, indexes ChunkIndex
     pub length: u32,            // [32..36]  plaintext length of this chunk
@@ -923,7 +923,7 @@ const _: () = assert!(size_of::<ChunkListEntry>() == 40);
 // resolved at write time (SPECIFICATION-DESIGN§3.5). Reconcile compares this against
 // the currently-resolved policy and re-chunks on mismatch (RECONCILE-DESIGN§1.1).
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct ChunkParamsRecord {
     pub algo: u8,                            // [0..1]   ChunkingAlgo discriminant
     pub flags: u8,                           // [1..2]   reserved
@@ -965,7 +965,7 @@ const _: () = assert!(CHUNK_LIST_HEAD_ENTRIES == CHUNK_LIST_ENTRIES);  // same a
 // 192 B path covers full /dev/disk/by-id/... names, NVMe-oF discovery URLs,
 // long S3/HTTP endpoints, etc.
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct DiskDescriptorOnDisk {
     pub disk_id: u16,
     pub media_type: u8,
@@ -994,7 +994,7 @@ const _: () = assert!(size_of::<DiskDescriptorOnDisk>() == 256);
 //                    inline_disks[] is unused. Crossing the threshold
 //                    migrates the inline contents into the tree.
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct PoolStateRoot {
     pub header: BlockHeader,                        //   32 B
     pub disk_count: u32,                            //    4 B
@@ -1012,7 +1012,7 @@ const _: () = assert!(size_of::<PoolStateRoot>() == 4096);
 // `ancestor_bitmap: u128` is placed at offset 16 so the u128 hits its
 // natural alignment on the hot ancestry-check path.
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct SnapshotNode {
     pub id: u32,                // [0..4]
     pub parent: u32,            // [4..8]
@@ -1046,7 +1046,7 @@ const _: () = assert!(std::mem::offset_of!(BucketAllocEntry, live_sectors) == 5)
 // =====================================================================
 // RECONCILE-DESIGN§1.2 WorkItem — 48 B
 // =====================================================================
-#[repr(C, packed)]
+#[repr(C)]
 pub struct WorkItem {
     pub target_kind: u8,
     pub work_kind: u8,

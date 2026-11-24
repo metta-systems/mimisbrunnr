@@ -67,7 +67,7 @@ const_assert_eq!(CRC_OFFSET, 4092);
 // ---------- KvDirectoryBlock ----------
 
 /// 4 KiB on-disk KV directory block.
-#[repr(C, packed)]
+#[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct KvDirectoryBlock {
     pub header: BlockHeader,                   // [0..32]
@@ -142,7 +142,7 @@ impl KvDirectoryBlock {
     /// responsible for ensuring `idx < bucket_count`; out-of-bounds is
     /// silently no-op'd (caller bug).
     pub fn set_entry(&mut self, idx: u32, block_ref: BlockRef) {
-        let count = { self.bucket_count } as usize;
+        let count = self.bucket_count as usize;
         if (idx as usize) < count.min(KV_DIRECTORY_INLINE_ENTRIES) {
             self.entries[idx as usize] = block_ref;
         }
@@ -151,7 +151,7 @@ impl KvDirectoryBlock {
     /// Read the directory entry at `idx`. Returns
     /// `BlockRef::default()` for out-of-bounds.
     pub fn get_entry(&self, idx: u32) -> BlockRef {
-        let count = { self.bucket_count } as usize;
+        let count = self.bucket_count as usize;
         if (idx as usize) < count.min(KV_DIRECTORY_INLINE_ENTRIES) {
             self.entries[idx as usize]
         } else {
@@ -168,7 +168,7 @@ impl KvDirectoryBlock {
 
     /// Validate the trailing CRC.
     pub fn verify_crc(&self) -> Result<(), KvDirectoryError> {
-        let expected = { self.crc };
+        let expected = self.crc;
         let mut copy = *self;
         copy.crc = 0;
         let actual = checksum64(&bytemuck::bytes_of(&copy)[..CRC_OFFSET]) as u32;
@@ -180,15 +180,15 @@ impl KvDirectoryBlock {
     }
 
     fn validate(&self) -> Result<(), KvDirectoryError> {
-        let magic = { self.header.pre.magic };
+        let magic = self.header.pre.magic;
         if magic != BLOCK_PREAMBLE_MAGIC_BLOCK {
             return Err(KvDirectoryError::InvalidMagic { actual: magic });
         }
-        let kind_raw = { self.header.pre.kind };
+        let kind_raw = self.header.pre.kind;
         if kind_raw != BlockKind::KvHashDirectory as u16 {
             return Err(KvDirectoryError::InvalidBlockKind(kind_raw));
         }
-        let version = { self.header.pre.format_version };
+        let version = self.header.pre.format_version;
         if version != KV_DIRECTORY_FORMAT_VERSION {
             return Err(KvDirectoryError::InvalidFormatVersion(version));
         }
@@ -196,7 +196,7 @@ impl KvDirectoryBlock {
         if depth > KV_DIRECTORY_MAX_INLINE_DEPTH {
             return Err(KvDirectoryError::SpilloverUnsupported(depth));
         }
-        let count = { self.bucket_count };
+        let count = self.bucket_count;
         let expected_count = 1u32 << depth;
         if count != expected_count {
             return Err(KvDirectoryError::InconsistentBucketCount {
@@ -234,8 +234,7 @@ impl KvDirectoryBlock {
                 expected: 0,
                 actual: 0,
             })?;
-        let block: &Self = bytemuck::from_bytes(&buf);
-        let block = *block;
+        let block: Self = bytemuck::pod_read_unaligned(&buf);
         block.validate()?;
         block.verify_crc()?;
         Ok(block)
@@ -255,7 +254,7 @@ mod tests {
     fn new_at_depth_zero_has_one_bucket() {
         let dir = KvDirectoryBlock::new(0).unwrap();
         assert_eq!(dir.count(), 1);
-        assert_eq!({ dir.global_depth }, 0);
+        assert_eq!(dir.global_depth, 0);
     }
 
     #[test]
