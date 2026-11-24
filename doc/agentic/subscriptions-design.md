@@ -138,11 +138,16 @@ ack(sub, lsn)                                         // everything up to lsn is
 A crash between `poll` and `ack` redelivers the same events with the same LSNs; consumers
 deduplicate by LSN. `Buffered` durability (JOURNAL-DESIGN§1.5) applies to acks like any mutation.
 
-**Bound.** A subscription's `retention` (SUBSCRIPTION-D2) bounds its pending events. When a new
+**Bound.** A subscription's `retention` bounds its pending events. When a new
 event would exceed it, the subscription becomes `Overflowed`: its pending events are dropped
 and it stops being evaluated. The next `poll` returns the result-set diff (below) and resumes
 it. A subscriber that never acknowledges costs only its own bounded events; the journal trims
 at its own pace (JOURNAL-DESIGN§1.6).
+
+**Expiry.** A subscription whose consumer has not polled or acknowledged within its expiry
+period is removed with its pending events and membership, at mount and periodically in `step`.
+The bound caps what a stale subscription can accumulate; expiry clears the record and membership
+nobody returns to.
 
 **Head switches.** Switching the pool's head to another snapshot (SNAPSHOTS-DESIGN§1.8) changes
 the visible state of every object that differs between the two without running the mutation
@@ -226,7 +231,7 @@ SubscriptionRecord = [version,
                       cursor: uint,          // LSN of the last acknowledged event
                       cursor_ns: int,        // time of that journal entry
                       state: uint,           // 0 Active, 1 Dormant, 2 Overflowed
-                      retention: Retention,  // SUBSCRIPTION-D2: the bound on pending events
+                      retention: Retention,  // the bound on pending events
                       debounce_ms: uint,
                       pending_count: uint,   // pending events (bulk entries count their objects)
                       switched_to: uint]     // Overflowed by a head switch: the snapshot switched

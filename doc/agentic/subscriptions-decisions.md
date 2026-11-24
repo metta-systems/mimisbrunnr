@@ -6,9 +6,16 @@ Design: [subscriptions-design.md](subscriptions-design.md) · Plan: [subscriptio
 
 A streaming watch needs a long-running loop in the CLI. The workspace contract is sync-only (no async runtime); `std::thread` is allowed. With pull delivery (SUBSCRIPTIONS-DESIGN "Delivery") one candidate is a loop of `poll`, print, `ack`, waiting between empty polls; others are a helper thread driving the engine's `step` and delivering to the CLI, or waiting for a Metta-native event interface. Decide which, and how the loop waits (fixed interval, or a wake-up when the engine buffers an event). Blocks [SUBSCRIPTION5](subscriptions-implementation-plan.md).
 
-## SUBSCRIPTION-D2 — What `retention` means
+## SUBSCRIPTION-D5 — Encoding of the event bound and expiry
 
-One reading of `retention` (SPECIFICATION-DESIGN§11.7) is an expiry duration: a dormant subscription whose consumer has not returned within it is garbage-collected (at boot and periodically). SUBSCRIPTIONS-DESIGN§1 and `crates/watch` use `retention: Retention` (`AtMostOnce` / `Bounded { max_events }` / `Unlimited`) for the pending-event queue instead, and nothing expires dormant subscriptions. Options: (a) keep both, adding an expiry duration and a last-active time to `SubscriptionRecord` (format change); (b) keep only the queue policy and drop expiry from the system design; (c) keep only expiry. With persisted pending events (SUBSCRIPTIONS-DESIGN "Delivery") the queue policy is the bound past which a subscription overflows to the result-set diff, and a dormant subscription costs only its own bounded events, never journal history; expiry would then only clear records nobody returns to. Shapes [SUBSCRIPTION6](subscriptions-implementation-plan.md).
+A subscription has a bound on its pending-event count and an expiry period since its consumer was last active (SUBSCRIPTIONS-DESIGN "Delivery"); `crates/watch` still has `Retention { AtMostOnce, Bounded { max_events }, Unlimited }` with ring-buffer semantics (oldest dropped) instead of overflow, and no expiry. To decide:
+
+- **Bound:** `max_events: uint` replacing `retention` (bulk entries count their objects, as `pending_count` does), at least 1, default 1024; `AtMostOnce` is a bound of 1, `Unlimited` goes.
+- **Expiry period:** (a) per subscription, `expire_after_s: uint` (0 never) in the record, default 90 days at creation; (b) one pool-wide tunable in the pool state record (POOL-DESIGN§1.2).
+- **Activity:** `last_active_ns: int` in the record, set by `ack` (already a record write) and by `poll`, which otherwise writes nothing; rewriting the record at most once per day per subscription keeps poll nearly read-only. A consumer whose query never matches never acknowledges, so `ack` alone would expire live consumers.
+- **Membership after overflow:** (a) kept until expiry, so the returning consumer gets a diff; (b) dropped on overflow, and the next poll returns a reset marker and the full result as `Entered`, so an overflowed subscription costs only its record.
+
+Recommendation: per-subscription period (a), membership kept (a). Shapes [SPEC25](specification-implementation-plan.md), [SUBSCRIPTION8](subscriptions-implementation-plan.md) and [SUBSCRIPTION9](subscriptions-implementation-plan.md).
 
 ## SUBSCRIPTION-D3 — Batch parameters in the record
 
@@ -16,7 +23,7 @@ SPECIFICATION-DESIGN§11.6 configures batching by debounce, maximum delay since 
 
 ## SUBSCRIPTION-D4 — `mimir watch` command surface
 
-`bin/mimir` has `register <name> <query>`, `list`, `drain`, `unsubscribe`, `stream <name>`. SPECIFICATION-DESIGN Appendix A uses `mimir watch "<query>" --name <n>`, `list`, `catch-up <name>`, `stream "<query>" --format json`. Candidate additions: `--interest content-changed,created,…` and `--retention 30d` on creation; cursor lag (entries and age) in `list`; `catch-up` reporting the strategy used and event counts; `since <name>` summarising changes by kind; `remove`. Decide names and flags. Shapes [SUBSCRIPTION5](subscriptions-implementation-plan.md) and [SUBSCRIPTION6](subscriptions-implementation-plan.md).
+`bin/mimir` has `register <name> <query>`, `list`, `drain`, `unsubscribe`, `stream <name>`. SPECIFICATION-DESIGN Appendix A uses `mimir watch "<query>" --name <n>`, `list`, `catch-up <name>`, `stream "<query>" --format json`. Candidate additions: `--interest content-changed,created,…` and `--max-events <n>` and `--expire-after 90d` on creation; cursor lag (entries and age) in `list`; `catch-up` reporting the strategy used and event counts; `since <name>` summarising changes by kind; `remove`. Decide names and flags. Shapes [SUBSCRIPTION5](subscriptions-implementation-plan.md) and [SUBSCRIPTION6](subscriptions-implementation-plan.md).
 
 ## Future work
 
