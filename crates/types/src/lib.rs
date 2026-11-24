@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 mod assertion;
+pub mod cbor;
 mod disk;
 mod error;
 mod timestamp;

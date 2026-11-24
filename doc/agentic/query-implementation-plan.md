@@ -17,7 +17,7 @@ Design: [query-design.md](query-design.md) · Decisions: [query-decisions.md](qu
 
 ## Encoding
 
-- [ ] **QUERY11 — Positional `Query` encoding.** The stored form of `Query` and `CmpOp` encodes as QUERY-DESIGN§1.2 pins (variant index first, tags by `TagUid`, `Value` operands through INDEX9), replacing the derived `Serialize` wherever a query reaches the disk; until QUERY13 removes `IsA`, it is written as `HasTag { direct: false }`. Prerequisite: [INDEX9](index-implementation-plan.md). Acceptance: fixed expected bytes for one query of every variant; decode rejects an unknown variant index with a defined error.
+- [ ] **QUERY11 — Positional `Query` encoding.** The stored form of `Query` and `CmpOp` encodes as QUERY-DESIGN§1.2 pins (variant index first, tags by `TagUid`, `Value` operands through `Value::encode`, with the `crates/types::cbor` helpers), replacing the derived `Serialize` wherever a query reaches the disk; until QUERY13 removes `IsA`, it is written as `HasTag { direct: false }`. Acceptance: fixed expected bytes for one query of every variant; decode rejects an unknown variant index with a defined error.
 
 ## SQL
 

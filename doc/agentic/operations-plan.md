@@ -40,7 +40,7 @@ Each fixes a layout that later steps write; decide them first.
 
 Independent of each other unless an order is given.
 
-- **Encodings** (FORMAT-DESIGN§1.6): [SPEC25](specification-implementation-plan.md) and [INDEX9](index-implementation-plan.md) first; then [JOURNAL8](journal-implementation-plan.md) (binary payloads, then [JOURNAL9](journal-implementation-plan.md): journal buckets and journal sets, after JOURNAL7), [QUERY11](query-implementation-plan.md) and [ONTOLOGY10](ontology-implementation-plan.md); after QUERY11, [SUBSCRIPTION7](subscriptions-implementation-plan.md) and [POOL5](pool-implementation-plan.md) (native placement-rules tree).
+- **Encodings** (FORMAT-DESIGN§1.6): [SPEC25](specification-implementation-plan.md) first; then [JOURNAL8](journal-implementation-plan.md) (binary payloads, then [JOURNAL9](journal-implementation-plan.md): journal buckets and journal sets, after JOURNAL7), [QUERY11](query-implementation-plan.md) and [ONTOLOGY10](ontology-implementation-plan.md); after QUERY11, [SUBSCRIPTION7](subscriptions-implementation-plan.md) and [POOL5](pool-implementation-plan.md) (native placement-rules tree).
 - [SPEC26](specification-implementation-plan.md) — borrow on-disk structs in place.
 - [POOL1](pool-implementation-plan.md) — one disk-descriptor tree.
 - [METADATA3](metadata-implementation-plan.md) — packed-key backpointer table.
@@ -50,7 +50,7 @@ Independent of each other unless an order is given.
 
 The term dictionary, postings and forward index replace every index structure, so they land before the tree machinery that writes them (INDEX-DESIGN).
 
-1. [INDEX12](index-implementation-plan.md) — term dictionary, term table and interning (after INDEX9).
+1. [INDEX12](index-implementation-plan.md) — term dictionary, term table and interning.
 2. [INDEX13](index-implementation-plan.md) — postings containers; then [INDEX14](index-implementation-plan.md) — forward index by `TermId`, direct terms only.
 3. [INDEX15](index-implementation-plan.md) — sequences; [INDEX16](index-implementation-plan.md) — queries, faceting, FUSE and watch over containers.
 4. [ONTOLOGY16](ontology-implementation-plan.md) — attribute flavours and key options (after INDEX15); then [INDEX18](index-implementation-plan.md) — hierarchy tries with roll-ups — and [INDEX19](index-implementation-plan.md) — n-gram postings over distinct values.
