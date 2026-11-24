@@ -14,7 +14,7 @@ A subscription is a saved query plus a cursor into the journal. A consumer polls
 - **Term-indexed evaluation.** Subscriptions are indexed by the terms and keys of their compiled queries (QUERY-DESIGN "Evaluation"). A mutation looks up the subscriptions of every term that entered or left the object's closure, so derived changes — a tag that implies one a query names, a value rule, a rule install — reach the subscriptions they affect.
 - **Per-object evaluation.** Whether an object matches is decided against its own terms — forward entry plus closure — without reading postings.
 - **Persisted pending events.** Every event a mutation produces for a subscription is stored in the subscription's pending-event tree, keyed `(subscription, lsn, index)`, until acknowledged; bulk membership changes (a rule install) are stored as one container per id window. Restart and catch-up read them back in order; the journal is never held back for a subscriber.
-- **Membership as of the acknowledged cursor** is stored as posting containers in a snapshot-agnostic tree of its own; `ack` applies the acknowledged events to it. It is the baseline for the result-set diff a subscription falls back to when its pending events exceed its `retention` bound.
+- **Membership as of the acknowledged cursor** is stored as posting containers in a snapshot-agnostic tree of its own; `ack` applies the acknowledged events to it. It is the baseline for the result-set diff a subscription falls back to when its pending events exceed its `max_events` bound.
 - **Not snapshot-aware.** Subscriptions watch the head. Creating, deleting or rolling back a snapshot never moves a consumer's cursor, membership or pending events.
 - **Pull and acknowledge.** `poll(sub, max)` returns pending events in order, tagged with their LSN; `ack(lsn)` removes them and advances the persisted cursor. Delivery is at least once; consumers deduplicate by LSN. Debouncing and wake-ups run in the engine's `step` (ENGINE-DESIGN "Selected design"); no thread is needed.
 - **Ids are never reused**: they come from the pool's `Subscription` id counter (ENGINE-DESIGN§1.2).
@@ -138,7 +138,8 @@ ack(sub, lsn)                                         // everything up to lsn is
 A crash between `poll` and `ack` redelivers the same events with the same LSNs; consumers
 deduplicate by LSN. `Buffered` durability (JOURNAL-DESIGN§1.5) applies to acks like any mutation.
 
-**Bound.** A subscription's `retention` bounds its pending events. When a new
+**Bound.** A subscription's `max_events` bounds its pending events, counted as `pending_count`
+counts them (a bulk entry counts its objects). When a new
 event would exceed it, the subscription becomes `Overflowed`: its pending events are dropped
 and it stops being evaluated. The next `poll` returns the result-set diff (below) and resumes
 it. A subscriber that never acknowledges costs only its own bounded events; the journal trims
@@ -147,7 +148,9 @@ at its own pace (JOURNAL-DESIGN§1.6).
 **Expiry.** Each subscription has its own expiry period, `expire_after_s` (0: never; 90 days
 unless set at creation). A subscription whose consumer has not polled or acknowledged within it
 (`last_active_ns`) is removed with its pending events and membership, at mount and periodically
-in `step`. An overflowed subscription keeps its membership until then, so a returning consumer
+in `step`. `ack` sets `last_active_ns` with the record write it already makes; `poll` rewrites
+the record only when the stored `last_active_ns` is more than a day old, so expiry is accurate
+to a day and polling stays read-only otherwise. An overflowed subscription keeps its membership until then, so a returning consumer
 always gets the diff. The bound caps what a stale subscription can accumulate; expiry clears the
 record and membership nobody returns to.
 
@@ -233,7 +236,7 @@ SubscriptionRecord = [version,
                       cursor: uint,          // LSN of the last acknowledged event
                       cursor_ns: int,        // time of that journal entry
                       state: uint,           // 0 Active, 1 Dormant, 2 Overflowed
-                      retention: Retention,  // the bound on pending events
+                      max_events: uint,      // bound on pending events, ≥ 1; default 1024
                       debounce_ms: uint,
                       pending_count: uint,   // pending events (bulk entries count their objects)
                       switched_to: uint,     // Overflowed by a head switch: the snapshot switched

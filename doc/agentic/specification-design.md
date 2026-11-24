@@ -1159,7 +1159,8 @@ struct Subscription {
     cursor: u64,                    // journal LSN of the last acknowledged event
     cursor_ns: i64,                 // time of that journal entry
     state: SubscriptionState,       // Active or Dormant
-    retention: Retention,           // bound on pending events; past it, Overflowed
+    max_events: u64,                // bound on pending events; past it, Overflowed
+    expire_after_s: u64,            // removed after this long without poll or ack; 0 never
     // membership: posting containers in their own tree (SUBSCRIPTIONS-DESIGN§1)
 }
 
@@ -1229,7 +1230,7 @@ SUBSCRIBE → ACTIVE (poll / ack) → DORMANT (agent offline, events accumulate)
           agent returns: poll pending events, or the diff if overflowed → ACTIVE
 ```
 
-Subscriptions persist across reboots (in the subscription trees, SUBSCRIPTIONS-DESIGN§1). A subscription's retention bounds its pending events; one whose consumer has not returned within its expiry period is removed (SUBSCRIPTIONS-DESIGN "Delivery").
+Subscriptions persist across reboots (in the subscription trees, SUBSCRIPTIONS-DESIGN§1). A subscription's `max_events` bounds its pending events; one whose consumer has not returned within its expiry period is removed (SUBSCRIPTIONS-DESIGN "Delivery").
 
 ### 11.8 Ontology-Aware Subscriptions
 
