@@ -144,10 +144,12 @@ and it stops being evaluated. The next `poll` returns the result-set diff (below
 it. A subscriber that never acknowledges costs only its own bounded events; the journal trims
 at its own pace (JOURNAL-DESIGN§1.6).
 
-**Expiry.** A subscription whose consumer has not polled or acknowledged within its expiry
-period is removed with its pending events and membership, at mount and periodically in `step`.
-The bound caps what a stale subscription can accumulate; expiry clears the record and membership
-nobody returns to.
+**Expiry.** Each subscription has its own expiry period, `expire_after_s` (0: never; 90 days
+unless set at creation). A subscription whose consumer has not polled or acknowledged within it
+(`last_active_ns`) is removed with its pending events and membership, at mount and periodically
+in `step`. An overflowed subscription keeps its membership until then, so a returning consumer
+always gets the diff. The bound caps what a stale subscription can accumulate; expiry clears the
+record and membership nobody returns to.
 
 **Head switches.** Switching the pool's head to another snapshot (SNAPSHOTS-DESIGN§1.8) changes
 the visible state of every object that differs between the two without running the mutation
@@ -234,8 +236,10 @@ SubscriptionRecord = [version,
                       retention: Retention,  // the bound on pending events
                       debounce_ms: uint,
                       pending_count: uint,   // pending events (bulk entries count their objects)
-                      switched_to: uint]     // Overflowed by a head switch: the snapshot switched
+                      switched_to: uint,     // Overflowed by a head switch: the snapshot switched
                                              //   to (SNAPSHOTS-DESIGN§1.8); 0 otherwise
+                      expire_after_s: uint,  // expiry period; 0 never, 7 776 000 (90 days) default
+                      last_active_ns: int]   // last poll or ack by the consumer
 ```
 
 **Ids.** Ids are allocated from 1 and never reused, from the `Subscription` id counter in the root

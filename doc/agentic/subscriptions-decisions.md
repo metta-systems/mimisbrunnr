@@ -6,16 +6,14 @@ Design: [subscriptions-design.md](subscriptions-design.md) · Plan: [subscriptio
 
 A streaming watch needs a long-running loop in the CLI. The workspace contract is sync-only (no async runtime); `std::thread` is allowed. With pull delivery (SUBSCRIPTIONS-DESIGN "Delivery") one candidate is a loop of `poll`, print, `ack`, waiting between empty polls; others are a helper thread driving the engine's `step` and delivering to the CLI, or waiting for a Metta-native event interface. Decide which, and how the loop waits (fixed interval, or a wake-up when the engine buffers an event). Blocks [SUBSCRIPTION5](subscriptions-implementation-plan.md).
 
-## SUBSCRIPTION-D5 — Encoding of the event bound and expiry
+## SUBSCRIPTION-D5 — Encoding of the event bound; activity writes
 
-A subscription has a bound on its pending-event count and an expiry period since its consumer was last active (SUBSCRIPTIONS-DESIGN "Delivery"); `crates/watch` still has `Retention { AtMostOnce, Bounded { max_events }, Unlimited }` with ring-buffer semantics (oldest dropped) instead of overflow, and no expiry. To decide:
+The record's `retention` bounds the pending-event count (SUBSCRIPTIONS-DESIGN "Delivery"); `crates/watch` still has `Retention { AtMostOnce, Bounded { max_events }, Unlimited }` with ring-buffer semantics (oldest dropped) instead of overflow. To decide:
 
-- **Bound:** `max_events: uint` replacing `retention` (bulk entries count their objects, as `pending_count` does), at least 1, default 1024; `AtMostOnce` is a bound of 1, `Unlimited` goes.
-- **Expiry period:** (a) per subscription, `expire_after_s: uint` (0 never) in the record, default 90 days at creation; (b) one pool-wide tunable in the pool state record (POOL-DESIGN§1.2).
-- **Activity:** `last_active_ns: int` in the record, set by `ack` (already a record write) and by `poll`, which otherwise writes nothing; rewriting the record at most once per day per subscription keeps poll nearly read-only. A consumer whose query never matches never acknowledges, so `ack` alone would expire live consumers.
-- **Membership after overflow:** (a) kept until expiry, so the returning consumer gets a diff; (b) dropped on overflow, and the next poll returns a reset marker and the full result as `Entered`, so an overflowed subscription costs only its record.
+- **Bound:** (a) `max_events: uint` replacing `retention` (bulk entries count their objects, as `pending_count` does), at least 1, default 1024; `AtMostOnce` is a bound of 1 and `Unlimited` goes; (b) keep a `Retention` variant array (`[0, max_events]`, room for other bound kinds).
+- **Activity writes:** `last_active_ns` is set by `ack` (already a record write) and by `poll`, which otherwise writes nothing. (a) `poll` rewrites the record at most once per day per subscription, so expiry is accurate to a day; (b) on every poll that returns nothing new. A consumer whose query never matches never acknowledges, so `ack` alone would expire live consumers.
 
-Recommendation: per-subscription period (a), membership kept (a). Shapes [SPEC25](specification-implementation-plan.md), [SUBSCRIPTION8](subscriptions-implementation-plan.md) and [SUBSCRIPTION9](subscriptions-implementation-plan.md).
+Recommendation: (a), (a). Shapes [SPEC25](specification-implementation-plan.md), [SUBSCRIPTION8](subscriptions-implementation-plan.md) and [SUBSCRIPTION9](subscriptions-implementation-plan.md).
 
 ## SUBSCRIPTION-D3 — Batch parameters in the record
 
