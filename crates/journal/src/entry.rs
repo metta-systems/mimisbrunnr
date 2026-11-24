@@ -1,17 +1,19 @@
-//! WAL entry header, on-disk `HybridTimestamp`, framing constants, and
-//! per-op CBOR payload schemas.
+//! WAL entry header, on-disk `HybridTimestamp`, framing constants, and the
+//! binary payload record of every op.
 //!
 //! Implements JOURNAL-DESIGN§1.2 and JOURNAL-DESIGN§1.3.
 
 use {
     bytemuck::{Pod, Zeroable},
-    mimisbrunnr_storage::{BlockRef, RootPointer},
+    mimisbrunnr_storage::{BlockRef, ChunkParamsRecord, RootPointer},
     mimisbrunnr_types::{HybridTimestamp as LogicalHybridTimestamp, NodeId, Value},
-    serde::{Deserialize, Serialize},
     static_assertions::const_assert_eq,
 };
 
-use crate::error::WalError;
+use crate::{
+    error::WalError,
+    payload::{Field, PayloadReader, PayloadWriter, op, record},
+};
 
 // ---------- Constants ----------
 
@@ -92,6 +94,7 @@ impl WalHybridTimestampWire {
 // ---------- WalEntryHeader ----------
 
 /// 40-byte entry header. JOURNAL-DESIGN§1.2.
+// TODO(JOURNAL9): the 8-byte `EntryHead` inside journal sets replaces it.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Debug)]
 pub struct WalEntryHeader {
@@ -142,598 +145,653 @@ impl WalEntryHeader {
     }
 }
 
-// ---------- WalOpKind ----------
+// ---------- Shared records (JOURNAL-DESIGN§1.3) ----------
 
-/// All WAL operation kinds. **Discriminants are pinned by SPECIFICATION-DESIGN§6.4 — never
-/// renumber. Insertions append, never reorder.**
-///
-/// The numeric value is the on-disk `op_kind` byte in [`WalEntryHeader`].
-///
-/// TODO(JOURNAL8): take the contiguous values 0–43 of the JOURNAL-DESIGN§1.3 op-kind
-/// table; `TagBitmapGrow`, `TagBitmapShrink`,
-/// `BackpointerInsert` and `BackpointerRemove` go, and the chunk-list ops and
-/// `ExtendObject` become the chunk ops (`AppendChunks`, `ReplaceChunks`,
-/// `TruncateChunks`) over fixed 128-byte `ChunkSpec`s.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub enum WalOpKind {
-    /// Object lifecycle.
-    CreateObject = 0,
-    DeleteObject = 1,
-    AddTag = 2,
-    RemoveTag = 3,
-    SetAttr = 4,
-    RemoveAttr = 5,
-    AddRelation = 6,
-    RemoveRelation = 7,
-    /// Non-chunked blob write.
-    WriteBlob = 8,
-    /// Chunked-object flow (SPECIFICATION-DESIGN§9.6 / JOURNAL-DESIGN§1.3.1).
-    ChunkInsertBatch = 9,
-    ChunkListAppend = 10,
-    ChunkListReplace = 11,
-    ChunkListShrink = 12,
-    // TODO(JOURNAL14): becomes `FinalizeObject` (any object, with chunk params).
-    ChunkObjectFinalize = 13,
-    /// Bucket lifecycle (METADATA-DESIGN§2.1 / ALLOCATION-DESIGN§1).
-    BucketAlloc = 14,
-    // 15 unassigned: live sectors are derived, not journaled (ALLOCATION-DESIGN§1.2).
-    BucketGenBump = 16,
-    BucketDiscard = 17,
-    /// Backpointers (METADATA-DESIGN§2.2).
-    BackpointerInsert = 18,
-    BackpointerRemove = 19,
-    /// Tag bitmap allocation lifecycle (INDEX-DESIGN§3.1, INDEX-DESIGN§3.2).
-    TagBitmapGrow = 20,
-    TagBitmapShrink = 21,
-    /// Snapshot lifecycle (SNAPSHOTS-DESIGN§1).
-    SnapshotCreate = 22,
-    SnapshotDelete = 23,
-    SnapshotUnlink = 24,
-    SnapshotDepthUpdate = 25,
-    /// Reconcile worker (RECONCILE-DESIGN§1).
-    ReconcileEnqueue = 26,
-    ReconcileDequeue = 27,
-    ReconcileMove = 28,
-    ReconcileScanStep = 29,
-    // 30 unassigned: each run fixes its own key format (BTREE-DESIGN§1.6).
-    /// Atomic root-pointer flip + GC reservation.
-    Checkpoint = 31,
+/// No cap on a variable part beyond the jset's size.
+const UNBOUNDED: usize = u32::MAX as usize;
+/// `owner_key` cap (METADATA-DESIGN§2.2).
+pub const OWNER_KEY_MAX: usize = 16;
+/// `SnapshotCreate.label` cap.
+pub const SNAPSHOT_LABEL_MAX: usize = 256;
+/// Replicas a `ReplicaSet` holds.
+pub const REPLICA_SET_SLOTS: usize = 4;
+
+/// The copies of one extent or block written together (72 bytes, METADATA-DESIGN§2.1):
+/// `replica_count`, 7 bytes of padding, four `BlockRef`s with slots past the count zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReplicaSet {
+    pub replica_count: u8,
+    pub replicas: [BlockRef; REPLICA_SET_SLOTS],
 }
 
-impl WalOpKind {
-    /// Decode a raw u8 discriminant.
-    pub fn from_u8(v: u8) -> Result<Self, WalError> {
-        Ok(match v {
-            0 => Self::CreateObject,
-            1 => Self::DeleteObject,
-            2 => Self::AddTag,
-            3 => Self::RemoveTag,
-            4 => Self::SetAttr,
-            5 => Self::RemoveAttr,
-            6 => Self::AddRelation,
-            7 => Self::RemoveRelation,
-            8 => Self::WriteBlob,
-            9 => Self::ChunkInsertBatch,
-            10 => Self::ChunkListAppend,
-            11 => Self::ChunkListReplace,
-            12 => Self::ChunkListShrink,
-            13 => Self::ChunkObjectFinalize,
-            14 => Self::BucketAlloc,
-            16 => Self::BucketGenBump,
-            17 => Self::BucketDiscard,
-            18 => Self::BackpointerInsert,
-            19 => Self::BackpointerRemove,
-            20 => Self::TagBitmapGrow,
-            21 => Self::TagBitmapShrink,
-            22 => Self::SnapshotCreate,
-            23 => Self::SnapshotDelete,
-            24 => Self::SnapshotUnlink,
-            25 => Self::SnapshotDepthUpdate,
-            26 => Self::ReconcileEnqueue,
-            27 => Self::ReconcileDequeue,
-            28 => Self::ReconcileMove,
-            29 => Self::ReconcileScanStep,
-            31 => Self::Checkpoint,
-            other => return Err(WalError::InvalidOpKind(other)),
+impl Field for ReplicaSet {
+    const ALIGN: usize = 8;
+    fn write(&self, writer: &mut PayloadWriter) {
+        writer.pad_to(Self::ALIGN);
+        self.replica_count.write(writer);
+        writer.pad_to(Self::ALIGN);
+        for replica in &self.replicas {
+            replica.write(writer);
+        }
+    }
+    fn read(reader: &mut PayloadReader<'_>) -> Result<Self, WalError> {
+        reader.skip_to(Self::ALIGN)?;
+        let replica_count = u8::read(reader)?;
+        reader.skip_to(Self::ALIGN)?;
+        let mut replicas = [BlockRef::default(); REPLICA_SET_SLOTS];
+        for replica in &mut replicas {
+            *replica = BlockRef::read(reader)?;
+        }
+        let used = usize::from(replica_count);
+        if used > REPLICA_SET_SLOTS || replicas[used..].iter().any(|r| *r != BlockRef::default())
+        {
+            return Err(WalError::PayloadFieldInvalid {
+                field: "ReplicaSet.replica_count",
+            });
+        }
+        Ok(Self {
+            replica_count,
+            replicas,
         })
     }
 }
 
-// ---------- BlockRef wire helper for CBOR ----------
+/// `ChunkSpec.spec_flags`: the replicas are another entry's (deduplicated), not written now.
+pub const CHUNK_SPEC_EXISTING: u8 = 1 << 0;
 
-/// CBOR-friendly mirror of [`mimisbrunnr_storage::BlockRef`]
-/// (ENGINE-DESIGN§1.2). The on-disk `BlockRef` is a 16 B `#[repr(C)]` struct
-/// and not directly serde-compatible without a deterministic schema; we
-/// surface its fields explicitly so CBOR carries the same shape every build.
-/// The reserved word is always zero and is not carried.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BlockRefWire {
-    pub disk_id: u16,
-    pub sector: u16,
-    pub bucket_no: u32,
-    pub generation: u32,
+record! {
+    /// One chunk of an `AppendChunks` / `ReplaceChunks` (128 bytes, JOURNAL-DESIGN§1.3).
+    ChunkSpec {
+        hash: [u8; 32],
+        /// Plaintext bytes.
+        length: u32,
+        stored_length: u32,
+        /// `CHUNK_FLAG_*` of the content-map entry.
+        flags: u8,
+        /// `CHUNK_SPEC_*`.
+        spec_flags: u8,
+        /// 0 when `CHUNK_SPEC_EXISTING`.
+        extent_sum: u64,
+        replicas: ReplicaSet,
+    }
 }
 
-impl From<BlockRef> for BlockRefWire {
-    fn from(block_ref: BlockRef) -> Self {
-        Self {
-            disk_id: block_ref.disk_id,
-            sector: block_ref.sector,
-            bucket_no: block_ref.bucket_no,
-            generation: block_ref.generation,
+record! {
+    /// One object packed into a small-object block (16 bytes).
+    PackedSlot {
+        oid: u64,
+        /// Slot address (layout per BLOB-D4).
+        slot: [u8; 8],
+    }
+}
+
+record! {
+    /// `ReconcileWork` / `ReconcilePending` key (12 bytes, RECONCILE-DESIGN§1.2).
+    WorkKey {
+        priority: u8,
+        disk_id: u16,
+        bucket_no: u32,
+        sector: u16,
+        work_kind: u8,
+    }
+}
+
+record! {
+    /// Reconcile work value (24 bytes, RECONCILE-DESIGN§1.2).
+    WorkValue {
+        /// `OwnerKind` (METADATA-DESIGN§2.2).
+        owner_kind: u8,
+        attempt_count: u8,
+        /// 0 = none.
+        last_error: u16,
+        enqueued_lsn: u64,
+        owner_key: [u8; 8],
+    }
+}
+
+// ---------- Op payloads (JOURNAL-DESIGN§1.3) ----------
+
+op! {
+    /// Commits a root (JOURNAL-DESIGN§1.5).
+    Checkpoint {
+        gc_reserve_buckets: u32,
+        // TODO(ENGINE12): `roots: RootList` (RootListHead + RootEntry × N).
+        root_pointer: RootPointer,
+    }
+}
+
+op! {
+    /// Creates an object; `state` is `Active` or `Writing`.
+    CreateObject { oid: u64, created_ns: i64, state: u8 }
+}
+
+op! { DeleteObject { oid: u64, lsn: u64 } }
+
+op! {
+    /// A direct tag (INDEX-DESIGN§2.4).
+    AddTag { oid: u64, tag: u32 }
+}
+
+op! { RemoveTag { oid: u64, tag: u32 } }
+
+op! { SetAttr { oid: u64, key: u32; value: Value, max UNBOUNDED } }
+
+op! {
+    /// Removes one attribute value.
+    // TODO(INDEX12): `{ oid, term_id: u64 }`, the attribute term (INDEX-DESIGN§1.2).
+    RemoveAttr { oid: u64, key: u32, value_hash: u64 }
+}
+
+op! { AddRelation { oid: u64, predicate: u32, target: u64 } }
+
+op! { RemoveRelation { oid: u64, predicate: u32, target: u64 } }
+
+op! {
+    /// Sets an existing edge's annotation; `None` clears it.
+    SetRelationAnnotation { oid: u64, predicate: u32, target: u64; value: Option<Value>, max UNBOUNDED }
+}
+
+op! { SetOrder { oid: u64, term_id: u64, order: u64 } }
+
+op! { RenumberSequence { term_id: u64 } }
+
+op! {
+    /// One-chunk object with every replica written (METADATA-DESIGN§1.2).
+    WriteBlob { oid: u64, content_hash: [u8; 32], size: u64, extent_sum: u64, replicas: ReplicaSet }
+}
+
+op! {
+    /// A whole object of at most `INLINE_WRITE_MAX` bytes (JOURNAL-DESIGN§1.8).
+    WriteInline { oid: u64, content_hash: [u8; 32]; data: Vec<u8>, max UNBOUNDED }
+}
+
+op! {
+    AppendChunks { oid: u64, start_offset: u64, new_length: u64; chunks: Vec<ChunkSpec>, max UNBOUNDED }
+}
+
+op! {
+    ReplaceChunks { oid: u64, start_offset: u64, end_offset: u64; chunks: Vec<ChunkSpec>, max UNBOUNDED }
+}
+
+op! { TruncateChunks { oid: u64, new_length: u64 } }
+
+op! { PackObjects { block: ReplicaSet; slots: Vec<PackedSlot>, max UNBOUNDED } }
+
+op! {
+    FinalizeObject {
+        oid: u64,
+        content_hash: [u8; 32],
+        total_length: u64,
+        chunk_params: ChunkParamsRecord,
+    }
+}
+
+op! { ReclaimTerms { ; term_ids: Vec<u64>, max UNBOUNDED } }
+
+op! {
+    /// One ontology record (positional CBOR, ONTOLOGY-DESIGN§1).
+    OntologyPut { record_kind: u8, a: u64, b: u64; record: Vec<u8>, max UNBOUNDED }
+}
+
+op! { OntologyDelete { record_kind: u8, a: u64, b: u64 } }
+
+op! {
+    /// One `SubscriptionRecord` (positional CBOR, SUBSCRIPTIONS-DESIGN§1).
+    SubscriptionPut { id: u64; record: Vec<u8>, max UNBOUNDED }
+}
+
+op! { SubscriptionDelete { id: u64 } }
+
+op! { SubscriptionAck { id: u64, lsn: u64, cursor_ns: i64 } }
+
+op! {
+    /// One `PeerRecord` (positional CBOR, CLUSTER-DESIGN§2).
+    PeerPut { node_id: u16; record: Vec<u8>, max UNBOUNDED }
+}
+
+op! { PeerDelete { node_id: u16 } }
+
+op! {
+    /// One `TransferRecord` (CLUSTER-DESIGN§4).
+    TransferPut { oid: u64, direction: u8, peer: u16; record: Vec<u8>, max UNBOUNDED }
+}
+
+op! { TransferDelete { oid: u64, direction: u8, peer: u16 } }
+
+op! {
+    StageVerified {
+        oid: u64,
+        peer: u16,
+        chunk_end: u64,
+        level: u8,
+        index: u64,
+        hash: [u8; 32],
+        extent_sum: u64,
+    }
+}
+
+op! {
+    /// Bucket opened, or with `kind` = Bad marked bad (ALLOCATION-DESIGN§1.2).
+    BucketAlloc { disk_id: u16, bucket_no: u32, kind: u8, generation: u32 }
+}
+
+op! { BucketGenBump { disk_id: u16, bucket_no: u32, new_generation: u32 } }
+
+op! { BucketDiscard { disk_id: u16, bucket_no: u32 } }
+
+op! {
+    SnapshotCreate {
+        new_id: u32,
+        parent_id: u32,
+        current_replacement: u32;
+        label: Option<String>, max SNAPSHOT_LABEL_MAX
+    }
+}
+
+op! { SnapshotSwitch { target: u32, new_head: u32 } }
+
+op! { SnapshotDelete { id: u32 } }
+
+op! { SnapshotUnlink { id: u32, parent: u32, prev_sibling: u32 } }
+
+op! {
+    SnapshotDepthUpdate {
+        id: u32,
+        new_depth: u16,
+        new_skiplist: [u32; 3],
+        new_ancestor_bitmap: u128,
+    }
+}
+
+op! {
+    /// Into `ReconcileWork`, or `ReconcilePending` when `pending`.
+    ReconcileEnqueue { key: WorkKey, value: WorkValue, pending: bool }
+}
+
+op! { ReconcileDequeue { key: WorkKey, pending: bool } }
+
+op! {
+    ReconcileMove { from_loc: BlockRef, to_loc: BlockRef; owner_key: Vec<u8>, max OWNER_KEY_MAX }
+}
+
+op! {
+    ReconcileReplicate { existing: BlockRef, new_loc: BlockRef; owner_key: Vec<u8>, max OWNER_KEY_MAX }
+}
+
+op! { ReconcileDropReplica { loc: BlockRef; owner_key: Vec<u8>, max OWNER_KEY_MAX } }
+
+op! {
+    /// A scan started, advanced or finished (empty record); `record` is a `ScanRecord`
+    /// (positional CBOR, RECONCILE-DESIGN§1.3).
+    ReconcileScanStep { scan_id: u64; record: Vec<u8>, max UNBOUNDED }
+}
+
+// ---------- Op kinds ----------
+
+/// Declares `WalOpKind` with the JOURNAL-DESIGN§1.3 op-kind values and the `WalOp`
+/// enum over the payload records.
+macro_rules! op_kinds {
+    ($($name:ident = $value:literal),* $(,)?) => {
+        /// `EntryHead.op_kind`: the values of the JOURNAL-DESIGN§1.3 op-kind table.
+        #[repr(u8)]
+        #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+        pub enum WalOpKind {
+            $($name = $value,)*
         }
-    }
-}
 
-impl From<BlockRefWire> for BlockRef {
-    fn from(wire: BlockRefWire) -> Self {
-        BlockRef::new(wire.disk_id, wire.bucket_no, wire.sector, wire.generation)
-    }
-}
-
-// ---------- Per-op CBOR payload structs ----------
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CreateObject {
-    pub oid: u64,
-    pub generation: u32,
-    pub created_ns: i64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DeleteObject {
-    pub oid: u64,
-    pub lsn: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AddTag {
-    pub oid: u64,
-    pub tag: u32,
-    /// `TagOrigin` discriminant.
-    pub origin: u8,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RemoveTag {
-    pub oid: u64,
-    pub tag: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SetAttr {
-    pub oid: u64,
-    pub key: u32,
-    pub value: Value,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RemoveAttr {
-    pub oid: u64,
-    pub key: u32,
-    pub value_hash: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct AddRelation {
-    pub oid: u64,
-    pub predicate: u32,
-    pub target: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RemoveRelation {
-    pub oid: u64,
-    pub predicate: u32,
-    pub target: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct WriteBlob {
-    pub oid: u64,
-    pub content_hash: [u8; 32],
-    pub extent: BlockRefWire,
-    pub size: u64,
-}
-
-// --- Chunked-object flow (JOURNAL-DESIGN§1.3.1) ---
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ChunkInsertEntry {
-    pub chunk_hash: [u8; 32],
-    pub extent: BlockRefWire,
-    pub length: u32,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ChunkInsertBatch {
-    pub chunks: Vec<ChunkInsertEntry>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ChunkListAppend {
-    pub oid: u64,
-    pub position_start: u64,
-    pub region: BlockRefWire,
-    pub count: u32,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ChunkListReplace {
-    pub oid: u64,
-    pub position: u64,
-    pub new_hashes: Vec<[u8; 32]>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ChunkListShrink {
-    pub oid: u64,
-    pub new_length: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ChunkObjectFinalize {
-    pub oid: u64,
-    pub content_hash: [u8; 32],
-    pub total_length: u64,
-    pub list_head: BlockRefWire,
-}
-
-// --- Bucket lifecycle (ALLOCATION-DESIGN§1) ---
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BucketAlloc {
-    pub disk_id: u16,
-    pub bucket_no: u32,
-    pub data_type: u8,
-    pub generation: u32,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BucketGenBump {
-    pub disk_id: u16,
-    pub bucket_no: u32,
-    pub new_generation: u32,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BucketDiscard {
-    pub disk_id: u16,
-    pub bucket_no: u32,
-}
-
-// --- Backpointers (METADATA-DESIGN§2.2) ---
-//
-// The richer typed wrappers (`BackpointerKey`, `BackpointerValue`) live in the
-// `meta` crate. The WAL only needs to carry the CBOR shape — both
-// sides agree on the wire form via these byte-buffer-ish types.
-
-/// Neutral wire form for the METADATA-DESIGN§2.2 backpointer key. `meta` will re-encode this
-/// into its richer typed wrapper. The `bytes` field carries the canonical
-/// little-endian packed key (variable length per `target_kind`).
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BackpointerKeyWire {
-    pub bytes: Vec<u8>,
-}
-
-/// Neutral wire form for the METADATA-DESIGN§2.2 backpointer value.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BackpointerValueWire {
-    pub bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BackpointerInsert {
-    pub key: BackpointerKeyWire,
-    pub value: BackpointerValueWire,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BackpointerRemove {
-    pub key: BackpointerKeyWire,
-}
-
-// --- Tag bitmap (INDEX-DESIGN§3.1, INDEX-DESIGN§3.2) ---
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TagBitmapGrow {
-    pub tag_id: u32,
-    pub snapshot: u32,
-    pub store_kind: u8,
-    pub new_root: BlockRefWire,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct TagBitmapShrink {
-    pub tag_id: u32,
-    pub snapshot: u32,
-}
-
-// --- Snapshot (SNAPSHOTS-DESIGN§1) ---
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotCreate {
-    pub new_id: u32,
-    pub parent_id: u32,
-    pub current_replacement: u32,
-    pub label: Option<String>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotDelete {
-    pub id: u32,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotUnlink {
-    pub id: u32,
-    pub parent: u32,
-    pub prev_sibling: u32,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotDepthUpdate {
-    pub id: u32,
-    pub new_depth: u16,
-    pub new_skiplist: [u32; 3],
-    /// `u128` is encoded as 16 raw bytes for portability across platforms /
-    /// CBOR encoders that can't natively represent 128-bit ints.
-    pub new_ancestor_bitmap: [u8; 16],
-}
-
-// --- Reconcile (RECONCILE-DESIGN§1) ---
-
-/// Reconcile work item. RECONCILE-DESIGN§1.2. Kept small, byte-CBOR friendly.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct WorkItem {
-    pub target_kind: u8,
-    pub work_kind: u8,
-    pub priority: u8,
-    /// Caller-defined opaque key (capped at 16 B per METADATA-DESIGN§2.2).
-    pub owner_key: Vec<u8>,
-    /// Optional cursor / scan resumption blob.
-    pub cursor: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ReconcileEnqueue {
-    pub work: WorkItem,
-    pub high_prio: bool,
-    pub phys_index: bool,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ReconcileDequeue {
-    pub target_kind: u8,
-    pub owner_key: Vec<u8>,
-    pub work_kind: u8,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ReconcileMove {
-    pub from_loc: BlockRefWire,
-    pub to_loc: BlockRefWire,
-    pub owner_key: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ReconcileScanStep {
-    pub scan_id: u64,
-    /// `BtreeKind` discriminant (encoded as u16).
-    pub btree: u16,
-    pub cursor_key: Vec<u8>,
-}
-
-// --- Checkpoint ---
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Checkpoint {
-    /// `RootPointer` is a 408-byte POD; CBOR serialise it as raw bytes.
-    pub new_root: Vec<u8>,
-    pub gc_reserve_buckets: u32,
-}
-
-impl Checkpoint {
-    /// Helper: build from a [`RootPointer`].
-    pub fn from_root(rp: &RootPointer, gc_reserve_buckets: u32) -> Self {
-        Self {
-            new_root: bytemuck::bytes_of(rp).to_vec(),
-            gc_reserve_buckets,
+        impl WalOpKind {
+            /// Decode a raw `op_kind`; any value outside the table is rejected.
+            pub fn from_u8(value: u8) -> Result<Self, WalError> {
+                match value {
+                    $($value => Ok(Self::$name),)*
+                    other => Err(WalError::InvalidOpKind(other)),
+                }
+            }
         }
-    }
 
-    /// Helper: parse the root pointer back out, validating its size.
-    pub fn root_pointer(&self) -> Result<RootPointer, WalError> {
-        if self.new_root.len() != core::mem::size_of::<RootPointer>() {
-            return Err(WalError::CborDecode(format!(
-                "checkpoint root_pointer size {}, expected {}",
-                self.new_root.len(),
-                core::mem::size_of::<RootPointer>()
-            )));
+        /// A decoded journal op: its kind and its payload record.
+        // Ops are decoded one at a time, so the 412-byte `Checkpoint` costs nothing.
+        #[allow(clippy::large_enum_variant)]
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum WalOp {
+            $($name($name),)*
         }
-        let mut rp = RootPointer::default();
-        bytemuck::bytes_of_mut(&mut rp).copy_from_slice(&self.new_root);
-        Ok(rp)
-    }
+
+        impl WalOp {
+            /// The op's kind.
+            pub fn kind(&self) -> WalOpKind {
+                match self {
+                    $(Self::$name(_) => WalOpKind::$name,)*
+                }
+            }
+
+            /// The op's kind and payload record, a multiple of 8 bytes.
+            pub fn encode(&self) -> Result<(WalOpKind, Vec<u8>), WalError> {
+                let payload = match self {
+                    $(Self::$name(record) => record.encode()?,)*
+                };
+                Ok((self.kind(), payload))
+            }
+
+            /// Decode a payload of `EntryHead.len × 8` bytes given its kind.
+            pub fn decode(kind: WalOpKind, payload: &[u8]) -> Result<Self, WalError> {
+                let reader = PayloadReader::new(kind as u8, payload)?;
+                Ok(match kind {
+                    $(WalOpKind::$name => Self::$name($name::decode(reader)?),)*
+                })
+            }
+        }
+    };
 }
 
-// ---------- Unified WalOp enum ----------
-
-/// A decoded WAL op carrying both its discriminant and its payload struct.
-#[derive(Debug, Clone, PartialEq)]
-pub enum WalOp {
-    CreateObject(CreateObject),
-    DeleteObject(DeleteObject),
-    AddTag(AddTag),
-    RemoveTag(RemoveTag),
-    SetAttr(SetAttr),
-    RemoveAttr(RemoveAttr),
-    AddRelation(AddRelation),
-    RemoveRelation(RemoveRelation),
-    WriteBlob(WriteBlob),
-    ChunkInsertBatch(ChunkInsertBatch),
-    ChunkListAppend(ChunkListAppend),
-    ChunkListReplace(ChunkListReplace),
-    ChunkListShrink(ChunkListShrink),
-    ChunkObjectFinalize(ChunkObjectFinalize),
-    BucketAlloc(BucketAlloc),
-    BucketGenBump(BucketGenBump),
-    BucketDiscard(BucketDiscard),
-    BackpointerInsert(BackpointerInsert),
-    BackpointerRemove(BackpointerRemove),
-    TagBitmapGrow(TagBitmapGrow),
-    TagBitmapShrink(TagBitmapShrink),
-    SnapshotCreate(SnapshotCreate),
-    SnapshotDelete(SnapshotDelete),
-    SnapshotUnlink(SnapshotUnlink),
-    SnapshotDepthUpdate(SnapshotDepthUpdate),
-    ReconcileEnqueue(ReconcileEnqueue),
-    ReconcileDequeue(ReconcileDequeue),
-    ReconcileMove(ReconcileMove),
-    ReconcileScanStep(ReconcileScanStep),
-    Checkpoint(Checkpoint),
-}
-
-impl WalOp {
-    /// The `WalOpKind` discriminant for this op.
-    pub fn kind(&self) -> WalOpKind {
-        match self {
-            Self::CreateObject(_) => WalOpKind::CreateObject,
-            Self::DeleteObject(_) => WalOpKind::DeleteObject,
-            Self::AddTag(_) => WalOpKind::AddTag,
-            Self::RemoveTag(_) => WalOpKind::RemoveTag,
-            Self::SetAttr(_) => WalOpKind::SetAttr,
-            Self::RemoveAttr(_) => WalOpKind::RemoveAttr,
-            Self::AddRelation(_) => WalOpKind::AddRelation,
-            Self::RemoveRelation(_) => WalOpKind::RemoveRelation,
-            Self::WriteBlob(_) => WalOpKind::WriteBlob,
-            Self::ChunkInsertBatch(_) => WalOpKind::ChunkInsertBatch,
-            Self::ChunkListAppend(_) => WalOpKind::ChunkListAppend,
-            Self::ChunkListReplace(_) => WalOpKind::ChunkListReplace,
-            Self::ChunkListShrink(_) => WalOpKind::ChunkListShrink,
-            Self::ChunkObjectFinalize(_) => WalOpKind::ChunkObjectFinalize,
-            Self::BucketAlloc(_) => WalOpKind::BucketAlloc,
-            Self::BucketGenBump(_) => WalOpKind::BucketGenBump,
-            Self::BucketDiscard(_) => WalOpKind::BucketDiscard,
-            Self::BackpointerInsert(_) => WalOpKind::BackpointerInsert,
-            Self::BackpointerRemove(_) => WalOpKind::BackpointerRemove,
-            Self::TagBitmapGrow(_) => WalOpKind::TagBitmapGrow,
-            Self::TagBitmapShrink(_) => WalOpKind::TagBitmapShrink,
-            Self::SnapshotCreate(_) => WalOpKind::SnapshotCreate,
-            Self::SnapshotDelete(_) => WalOpKind::SnapshotDelete,
-            Self::SnapshotUnlink(_) => WalOpKind::SnapshotUnlink,
-            Self::SnapshotDepthUpdate(_) => WalOpKind::SnapshotDepthUpdate,
-            Self::ReconcileEnqueue(_) => WalOpKind::ReconcileEnqueue,
-            Self::ReconcileDequeue(_) => WalOpKind::ReconcileDequeue,
-            Self::ReconcileMove(_) => WalOpKind::ReconcileMove,
-            Self::ReconcileScanStep(_) => WalOpKind::ReconcileScanStep,
-            Self::Checkpoint(_) => WalOpKind::Checkpoint,
-        }
-    }
-
-    /// CBOR-encode the payload. Returns `(kind, bytes)`.
-    pub fn encode(&self) -> Result<(WalOpKind, Vec<u8>), WalError> {
-        let mut buf = Vec::new();
-        match self {
-            Self::CreateObject(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::DeleteObject(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::AddTag(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::RemoveTag(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::SetAttr(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::RemoveAttr(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::AddRelation(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::RemoveRelation(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::WriteBlob(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::ChunkInsertBatch(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::ChunkListAppend(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::ChunkListReplace(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::ChunkListShrink(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::ChunkObjectFinalize(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::BucketAlloc(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::BucketGenBump(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::BucketDiscard(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::BackpointerInsert(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::BackpointerRemove(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::TagBitmapGrow(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::TagBitmapShrink(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::SnapshotCreate(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::SnapshotDelete(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::SnapshotUnlink(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::SnapshotDepthUpdate(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::ReconcileEnqueue(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::ReconcileDequeue(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::ReconcileMove(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::ReconcileScanStep(p) => ciborium::ser::into_writer(p, &mut buf)?,
-            Self::Checkpoint(p) => ciborium::ser::into_writer(p, &mut buf)?,
-        }
-        Ok((self.kind(), buf))
-    }
-
-    /// CBOR-decode a payload given its op kind.
-    pub fn decode(kind: WalOpKind, payload: &[u8]) -> Result<Self, WalError> {
-        Ok(match kind {
-            WalOpKind::CreateObject => Self::CreateObject(ciborium::de::from_reader(payload)?),
-            WalOpKind::DeleteObject => Self::DeleteObject(ciborium::de::from_reader(payload)?),
-            WalOpKind::AddTag => Self::AddTag(ciborium::de::from_reader(payload)?),
-            WalOpKind::RemoveTag => Self::RemoveTag(ciborium::de::from_reader(payload)?),
-            WalOpKind::SetAttr => Self::SetAttr(ciborium::de::from_reader(payload)?),
-            WalOpKind::RemoveAttr => Self::RemoveAttr(ciborium::de::from_reader(payload)?),
-            WalOpKind::AddRelation => Self::AddRelation(ciborium::de::from_reader(payload)?),
-            WalOpKind::RemoveRelation => Self::RemoveRelation(ciborium::de::from_reader(payload)?),
-            WalOpKind::WriteBlob => Self::WriteBlob(ciborium::de::from_reader(payload)?),
-            WalOpKind::ChunkInsertBatch => {
-                Self::ChunkInsertBatch(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::ChunkListAppend => {
-                Self::ChunkListAppend(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::ChunkListReplace => {
-                Self::ChunkListReplace(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::ChunkListShrink => {
-                Self::ChunkListShrink(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::ChunkObjectFinalize => {
-                Self::ChunkObjectFinalize(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::BucketAlloc => Self::BucketAlloc(ciborium::de::from_reader(payload)?),
-            WalOpKind::BucketGenBump => Self::BucketGenBump(ciborium::de::from_reader(payload)?),
-            WalOpKind::BucketDiscard => Self::BucketDiscard(ciborium::de::from_reader(payload)?),
-            WalOpKind::BackpointerInsert => {
-                Self::BackpointerInsert(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::BackpointerRemove => {
-                Self::BackpointerRemove(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::TagBitmapGrow => Self::TagBitmapGrow(ciborium::de::from_reader(payload)?),
-            WalOpKind::TagBitmapShrink => {
-                Self::TagBitmapShrink(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::SnapshotCreate => Self::SnapshotCreate(ciborium::de::from_reader(payload)?),
-            WalOpKind::SnapshotDelete => Self::SnapshotDelete(ciborium::de::from_reader(payload)?),
-            WalOpKind::SnapshotUnlink => Self::SnapshotUnlink(ciborium::de::from_reader(payload)?),
-            WalOpKind::SnapshotDepthUpdate => {
-                Self::SnapshotDepthUpdate(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::ReconcileEnqueue => {
-                Self::ReconcileEnqueue(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::ReconcileDequeue => {
-                Self::ReconcileDequeue(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::ReconcileMove => Self::ReconcileMove(ciborium::de::from_reader(payload)?),
-            WalOpKind::ReconcileScanStep => {
-                Self::ReconcileScanStep(ciborium::de::from_reader(payload)?)
-            }
-            WalOpKind::Checkpoint => Self::Checkpoint(ciborium::de::from_reader(payload)?),
-        })
-    }
+op_kinds! {
+    Checkpoint = 0,
+    CreateObject = 1,
+    DeleteObject = 2,
+    AddTag = 3,
+    RemoveTag = 4,
+    SetAttr = 5,
+    RemoveAttr = 6,
+    AddRelation = 7,
+    RemoveRelation = 8,
+    SetRelationAnnotation = 9,
+    SetOrder = 10,
+    RenumberSequence = 11,
+    WriteBlob = 12,
+    WriteInline = 13,
+    AppendChunks = 14,
+    ReplaceChunks = 15,
+    TruncateChunks = 16,
+    PackObjects = 17,
+    FinalizeObject = 18,
+    ReclaimTerms = 19,
+    OntologyPut = 20,
+    OntologyDelete = 21,
+    SubscriptionPut = 22,
+    SubscriptionDelete = 23,
+    SubscriptionAck = 24,
+    PeerPut = 25,
+    PeerDelete = 26,
+    TransferPut = 27,
+    TransferDelete = 28,
+    StageVerified = 29,
+    BucketAlloc = 30,
+    BucketGenBump = 31,
+    BucketDiscard = 32,
+    SnapshotCreate = 33,
+    SnapshotSwitch = 34,
+    SnapshotDelete = 35,
+    SnapshotUnlink = 36,
+    SnapshotDepthUpdate = 37,
+    ReconcileEnqueue = 38,
+    ReconcileDequeue = 39,
+    ReconcileMove = 40,
+    ReconcileReplicate = 41,
+    ReconcileDropReplica = 42,
+    ReconcileScanStep = 43,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn block_ref(bucket_no: u32) -> BlockRef {
+        BlockRef::new(1, bucket_no, 3, 9)
+    }
+
+    fn replica_set() -> ReplicaSet {
+        let mut replicas = [BlockRef::default(); REPLICA_SET_SLOTS];
+        replicas[0] = block_ref(10);
+        replicas[1] = block_ref(11);
+        ReplicaSet {
+            replica_count: 2,
+            replicas,
+        }
+    }
+
+    fn chunk_spec(index: u32) -> ChunkSpec {
+        ChunkSpec {
+            hash: [index as u8; 32],
+            length: 64 * 1024,
+            stored_length: 60_000 + index,
+            flags: 1,
+            spec_flags: 0,
+            extent_sum: 0x1234_5678_9abc_def0 ^ u64::from(index),
+            replicas: replica_set(),
+        }
+    }
+
+    fn work_key() -> WorkKey {
+        WorkKey {
+            priority: 2,
+            disk_id: 1,
+            bucket_no: 77,
+            sector: 5,
+            work_kind: 10,
+        }
+    }
+
+    /// One op of every kind, in op-kind order.
+    fn every_op() -> Vec<WalOp> {
+        let mut root_pointer = RootPointer {
+            seq: 9,
+            lsn: 42,
+            ..Default::default()
+        };
+        root_pointer.recompute_crc();
+        vec![
+            WalOp::Checkpoint(Checkpoint {
+                gc_reserve_buckets: 8,
+                root_pointer,
+            }),
+            WalOp::CreateObject(CreateObject {
+                oid: 0xdead_beef,
+                created_ns: -5,
+                state: 0,
+            }),
+            WalOp::DeleteObject(DeleteObject { oid: 2, lsn: 100 }),
+            WalOp::AddTag(AddTag { oid: 3, tag: 4 }),
+            WalOp::RemoveTag(RemoveTag { oid: 3, tag: 4 }),
+            WalOp::SetAttr(SetAttr {
+                oid: 5,
+                key: 6,
+                value: Value::Text("hello".into()),
+            }),
+            WalOp::RemoveAttr(RemoveAttr {
+                oid: 5,
+                key: 6,
+                value_hash: 7,
+            }),
+            WalOp::AddRelation(AddRelation {
+                oid: 1,
+                predicate: 2,
+                target: 3,
+            }),
+            WalOp::RemoveRelation(RemoveRelation {
+                oid: 1,
+                predicate: 2,
+                target: 3,
+            }),
+            WalOp::SetRelationAnnotation(SetRelationAnnotation {
+                oid: 1,
+                predicate: 2,
+                target: 3,
+                value: Some(Value::Blob(vec![7; 32])),
+            }),
+            WalOp::SetOrder(SetOrder {
+                oid: 1,
+                term_id: 1 << 32,
+                order: 1 << 40,
+            }),
+            WalOp::RenumberSequence(RenumberSequence { term_id: 1 << 33 }),
+            WalOp::WriteBlob(WriteBlob {
+                oid: 1,
+                content_hash: [0xab; 32],
+                size: 4096,
+                extent_sum: 99,
+                replicas: replica_set(),
+            }),
+            WalOp::WriteInline(WriteInline {
+                oid: 1,
+                content_hash: [0xcd; 32],
+                data: b"tiny file".to_vec(),
+            }),
+            WalOp::AppendChunks(AppendChunks {
+                oid: 1,
+                start_offset: 0,
+                new_length: 128 * 1024,
+                chunks: vec![chunk_spec(0), chunk_spec(1)],
+            }),
+            WalOp::ReplaceChunks(ReplaceChunks {
+                oid: 1,
+                start_offset: 64 * 1024,
+                end_offset: 128 * 1024,
+                chunks: vec![chunk_spec(2)],
+            }),
+            WalOp::TruncateChunks(TruncateChunks {
+                oid: 1,
+                new_length: 0,
+            }),
+            WalOp::PackObjects(PackObjects {
+                block: replica_set(),
+                slots: vec![
+                    PackedSlot {
+                        oid: 4,
+                        slot: [1; 8],
+                    },
+                    PackedSlot {
+                        oid: 5,
+                        slot: [2; 8],
+                    },
+                ],
+            }),
+            WalOp::FinalizeObject(FinalizeObject {
+                oid: 1,
+                content_hash: [9; 32],
+                total_length: 100,
+                chunk_params: ChunkParamsRecord { bytes: [3; 16] },
+            }),
+            WalOp::ReclaimTerms(ReclaimTerms {
+                term_ids: vec![1 << 32, (1 << 32) + 1],
+            }),
+            WalOp::OntologyPut(OntologyPut {
+                record_kind: 1,
+                a: 2,
+                b: 3,
+                record: vec![0x83, 0x01, 0x02, 0x03],
+            }),
+            WalOp::OntologyDelete(OntologyDelete {
+                record_kind: 1,
+                a: 2,
+                b: 3,
+            }),
+            WalOp::SubscriptionPut(SubscriptionPut {
+                id: 7,
+                record: vec![0x81, 0x00],
+            }),
+            WalOp::SubscriptionDelete(SubscriptionDelete { id: 7 }),
+            WalOp::SubscriptionAck(SubscriptionAck {
+                id: 7,
+                lsn: 1000,
+                cursor_ns: 123,
+            }),
+            WalOp::PeerPut(PeerPut {
+                node_id: 2,
+                record: vec![0x80],
+            }),
+            WalOp::PeerDelete(PeerDelete { node_id: 2 }),
+            WalOp::TransferPut(TransferPut {
+                oid: 1,
+                direction: 1,
+                peer: 2,
+                record: vec![0x80; 3],
+            }),
+            WalOp::TransferDelete(TransferDelete {
+                oid: 1,
+                direction: 1,
+                peer: 2,
+            }),
+            WalOp::StageVerified(StageVerified {
+                oid: 1,
+                peer: 2,
+                chunk_end: 1 << 20,
+                level: 3,
+                index: 4,
+                hash: [5; 32],
+                extent_sum: 6,
+            }),
+            WalOp::BucketAlloc(BucketAlloc {
+                disk_id: 0,
+                bucket_no: 1,
+                kind: 2,
+                generation: 1,
+            }),
+            WalOp::BucketGenBump(BucketGenBump {
+                disk_id: 0,
+                bucket_no: 1,
+                new_generation: 2,
+            }),
+            WalOp::BucketDiscard(BucketDiscard {
+                disk_id: 0,
+                bucket_no: 1,
+            }),
+            WalOp::SnapshotCreate(SnapshotCreate {
+                new_id: 1,
+                parent_id: 0,
+                current_replacement: 2,
+                label: Some("snap-1".into()),
+            }),
+            WalOp::SnapshotSwitch(SnapshotSwitch {
+                target: 1,
+                new_head: 3,
+            }),
+            WalOp::SnapshotDelete(SnapshotDelete { id: 1 }),
+            WalOp::SnapshotUnlink(SnapshotUnlink {
+                id: 1,
+                parent: 0,
+                prev_sibling: 0,
+            }),
+            WalOp::SnapshotDepthUpdate(SnapshotDepthUpdate {
+                id: 1,
+                new_depth: 2,
+                new_skiplist: [0, 1, 2],
+                new_ancestor_bitmap: (1 << 100) | 1,
+            }),
+            WalOp::ReconcileEnqueue(ReconcileEnqueue {
+                key: work_key(),
+                value: WorkValue {
+                    owner_kind: 1,
+                    attempt_count: 2,
+                    last_error: 3,
+                    enqueued_lsn: 4,
+                    owner_key: [5; 8],
+                },
+                pending: true,
+            }),
+            WalOp::ReconcileDequeue(ReconcileDequeue {
+                key: work_key(),
+                pending: false,
+            }),
+            WalOp::ReconcileMove(ReconcileMove {
+                from_loc: block_ref(1),
+                to_loc: block_ref(2),
+                owner_key: vec![1; 16],
+            }),
+            WalOp::ReconcileReplicate(ReconcileReplicate {
+                existing: block_ref(1),
+                new_loc: block_ref(3),
+                owner_key: vec![2; 8],
+            }),
+            WalOp::ReconcileDropReplica(ReconcileDropReplica {
+                loc: block_ref(1),
+                owner_key: vec![3; 8],
+            }),
+            WalOp::ReconcileScanStep(ReconcileScanStep {
+                scan_id: 1,
+                record: Vec::new(),
+            }),
+        ]
+    }
 
     #[test]
     fn entry_header_size_is_forty() {
@@ -752,37 +810,6 @@ mod tests {
     }
 
     #[test]
-    fn op_kind_round_trip_full_range() {
-        for v in (0u8..=31).filter(|&v| v != 15 && v != 30) {
-            let k = WalOpKind::from_u8(v).unwrap();
-            assert_eq!(k as u8, v);
-        }
-        // 15 was BucketWrite; live sectors are derived (ALLOCATION-DESIGN§1.2).
-        assert!(WalOpKind::from_u8(15).is_err());
-        // 30 was FormatPromote; each run fixes its own key format (BTREE-DESIGN§1.6).
-        assert!(WalOpKind::from_u8(30).is_err());
-        assert!(WalOpKind::from_u8(32).is_err());
-        assert!(WalOpKind::from_u8(255).is_err());
-    }
-
-    #[test]
-    fn op_kind_pinned_discriminants() {
-        // Lock the wire numbers — these must never change.
-        assert_eq!(WalOpKind::CreateObject as u8, 0);
-        assert_eq!(WalOpKind::DeleteObject as u8, 1);
-        assert_eq!(WalOpKind::AddTag as u8, 2);
-        assert_eq!(WalOpKind::RemoveTag as u8, 3);
-        assert_eq!(WalOpKind::SetAttr as u8, 4);
-        assert_eq!(WalOpKind::RemoveAttr as u8, 5);
-        assert_eq!(WalOpKind::AddRelation as u8, 6);
-        assert_eq!(WalOpKind::RemoveRelation as u8, 7);
-        assert_eq!(WalOpKind::WriteBlob as u8, 8);
-        assert_eq!(WalOpKind::ChunkInsertBatch as u8, 9);
-        assert_eq!(WalOpKind::ChunkListAppend as u8, 10);
-        assert_eq!(WalOpKind::Checkpoint as u8, 31);
-    }
-
-    #[test]
     fn timestamp_wire_round_trip() {
         let logical = LogicalHybridTimestamp::new(1_700_000_000_000_000_000, 7, 42);
         let wire = WalHybridTimestampWire::from_logical(logical);
@@ -790,203 +817,283 @@ mod tests {
     }
 
     #[test]
-    fn block_ref_wire_round_trip() {
-        let raw = BlockRef::new(3, u32::MAX, 17, 99);
-        let wire: BlockRefWire = raw.into();
-        assert_eq!(
-            wire,
-            BlockRefWire {
-                disk_id: 3,
-                sector: 17,
-                bucket_no: u32::MAX,
-                generation: 99,
-            }
-        );
-        let back: BlockRef = wire.into();
-        assert_eq!(back, raw);
-    }
-
-    #[test]
-    fn create_object_cbor_round_trip() {
-        let op = WalOp::CreateObject(CreateObject {
-            oid: 0xdead_beef,
-            generation: 7,
-            created_ns: 12345,
-        });
-        let (kind, bytes) = op.encode().unwrap();
-        assert_eq!(kind, WalOpKind::CreateObject);
-        let back = WalOp::decode(kind, &bytes).unwrap();
-        assert_eq!(op, back);
-    }
-
-    #[test]
-    fn all_payload_variants_round_trip() {
-        let cases: Vec<WalOp> = vec![
-            WalOp::CreateObject(CreateObject {
-                oid: 1,
-                generation: 0,
-                created_ns: 0,
-            }),
-            WalOp::DeleteObject(DeleteObject { oid: 2, lsn: 100 }),
-            WalOp::AddTag(AddTag {
-                oid: 3,
-                tag: 4,
-                origin: 0,
-            }),
-            WalOp::RemoveTag(RemoveTag { oid: 3, tag: 4 }),
-            WalOp::SetAttr(SetAttr {
-                oid: 5,
-                key: 6,
-                value: Value::Int(42),
-            }),
-            WalOp::RemoveAttr(RemoveAttr {
-                oid: 5,
-                key: 6,
-                value_hash: 7,
-            }),
-            WalOp::AddRelation(AddRelation {
-                oid: 1,
-                predicate: 2,
-                target: 3,
-            }),
-            WalOp::RemoveRelation(RemoveRelation {
-                oid: 1,
-                predicate: 2,
-                target: 3,
-            }),
-            WalOp::WriteBlob(WriteBlob {
-                oid: 1,
-                content_hash: [0xab; 32],
-                extent: BlockRef::new(0, 100, 0, 1).into(),
-                size: 4096,
-            }),
-            WalOp::ChunkInsertBatch(ChunkInsertBatch {
-                chunks: vec![ChunkInsertEntry {
-                    chunk_hash: [0xcd; 32],
-                    extent: BlockRef::new(0, 200, 0, 1).into(),
-                    length: 64 * 1024,
-                }],
-            }),
-            WalOp::ChunkListAppend(ChunkListAppend {
-                oid: 1,
-                position_start: 0,
-                region: BlockRef::new(0, 300, 0, 1).into(),
-                count: 1024,
-            }),
-            WalOp::ChunkListReplace(ChunkListReplace {
-                oid: 1,
-                position: 5,
-                new_hashes: vec![[1u8; 32]],
-            }),
-            WalOp::ChunkListShrink(ChunkListShrink {
-                oid: 1,
-                new_length: 0,
-            }),
-            WalOp::ChunkObjectFinalize(ChunkObjectFinalize {
-                oid: 1,
-                content_hash: [9u8; 32],
-                total_length: 100,
-                list_head: BlockRef::new(0, 1, 0, 1).into(),
-            }),
-            WalOp::BucketAlloc(BucketAlloc {
-                disk_id: 0,
-                bucket_no: 1,
-                data_type: 0,
-                generation: 1,
-            }),
-            WalOp::BucketGenBump(BucketGenBump {
-                disk_id: 0,
-                bucket_no: 1,
-                new_generation: 2,
-            }),
-            WalOp::BucketDiscard(BucketDiscard {
-                disk_id: 0,
-                bucket_no: 1,
-            }),
-            WalOp::BackpointerInsert(BackpointerInsert {
-                key: BackpointerKeyWire { bytes: vec![1, 2] },
-                value: BackpointerValueWire {
-                    bytes: vec![3, 4, 5],
-                },
-            }),
-            WalOp::BackpointerRemove(BackpointerRemove {
-                key: BackpointerKeyWire { bytes: vec![1, 2] },
-            }),
-            WalOp::TagBitmapGrow(TagBitmapGrow {
-                tag_id: 1,
-                snapshot: 0,
-                store_kind: 0,
-                new_root: BlockRef::new(0, 1, 0, 1).into(),
-            }),
-            WalOp::TagBitmapShrink(TagBitmapShrink {
-                tag_id: 1,
-                snapshot: 0,
-            }),
-            WalOp::SnapshotCreate(SnapshotCreate {
-                new_id: 1,
-                parent_id: 0,
-                current_replacement: 2,
-                label: Some("snap-1".into()),
-            }),
-            WalOp::SnapshotDelete(SnapshotDelete { id: 1 }),
-            WalOp::SnapshotUnlink(SnapshotUnlink {
-                id: 1,
-                parent: 0,
-                prev_sibling: 0,
-            }),
-            WalOp::SnapshotDepthUpdate(SnapshotDepthUpdate {
-                id: 1,
-                new_depth: 2,
-                new_skiplist: [0, 1, 2],
-                new_ancestor_bitmap: [0; 16],
-            }),
-            WalOp::ReconcileEnqueue(ReconcileEnqueue {
-                work: WorkItem {
-                    target_kind: 0,
-                    work_kind: 0,
-                    priority: 0,
-                    owner_key: vec![1; 16],
-                    cursor: vec![],
-                },
-                high_prio: false,
-                phys_index: false,
-            }),
-            WalOp::ReconcileDequeue(ReconcileDequeue {
-                target_kind: 0,
-                owner_key: vec![1; 16],
-                work_kind: 0,
-            }),
-            WalOp::ReconcileMove(ReconcileMove {
-                from_loc: BlockRef::new(0, 1, 0, 1).into(),
-                to_loc: BlockRef::new(0, 2, 0, 1).into(),
-                owner_key: vec![1; 16],
-            }),
-            WalOp::ReconcileScanStep(ReconcileScanStep {
-                scan_id: 1,
-                btree: 6,
-                cursor_key: vec![1, 2, 3],
-            }),
-            WalOp::Checkpoint(Checkpoint::from_root(&RootPointer::default(), 8)),
-        ];
-
-        for op in cases {
-            let (kind, bytes) = op.encode().unwrap();
-            let back = WalOp::decode(kind, &bytes).unwrap();
-            assert_eq!(op, back, "round-trip failed for {:?}", kind);
+    fn op_kinds_are_0_to_43_contiguous_in_table_order() {
+        let ops = every_op();
+        assert_eq!(ops.len(), 44);
+        for (value, op) in ops.iter().enumerate() {
+            assert_eq!(op.kind() as u8 as usize, value, "{:?}", op.kind());
+            assert_eq!(WalOpKind::from_u8(value as u8).unwrap(), op.kind());
+        }
+        for value in 44..=u8::MAX {
+            assert!(matches!(
+                WalOpKind::from_u8(value),
+                Err(WalError::InvalidOpKind(v)) if v == value
+            ));
         }
     }
 
     #[test]
-    fn checkpoint_round_trip_recovers_root_pointer() {
-        let mut rp = RootPointer {
-            seq: 9,
-            lsn: 42,
-            ..Default::default()
+    fn every_op_kind_round_trips() {
+        for op in every_op() {
+            let (kind, payload) = op.encode().unwrap();
+            assert_eq!(payload.len() % 8, 0, "{kind:?}");
+            assert_eq!(WalOp::decode(kind, &payload).unwrap(), op, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn add_tag_is_12_bytes_padded_to_16() {
+        let (_, payload) = WalOp::AddTag(AddTag {
+            oid: 0x0102_0304_0506_0708,
+            tag: 0x0a0b_0c0d,
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            payload,
+            [8, 7, 6, 5, 4, 3, 2, 1, 0x0d, 0x0c, 0x0b, 0x0a, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn records_have_their_listed_sizes() {
+        let size = |op: WalOp| op.encode().unwrap().1.len();
+        assert_eq!(
+            size(WalOp::WriteBlob(WriteBlob {
+                oid: 0,
+                content_hash: [0; 32],
+                size: 0,
+                extent_sum: 0,
+                replicas: ReplicaSet::default(),
+            })),
+            128
+        );
+        // A 32-byte head, then the 128-byte specs.
+        let append = |count: u32| {
+            size(WalOp::AppendChunks(AppendChunks {
+                oid: 0,
+                start_offset: 0,
+                new_length: 0,
+                chunks: (0..count).map(chunk_spec).collect(),
+            }))
         };
-        rp.recompute_crc();
-        let cp = Checkpoint::from_root(&rp, 16);
-        let recovered = cp.root_pointer().unwrap();
-        assert_eq!(recovered.seq, 9);
-        assert_eq!(recovered.lsn, 42);
+        assert_eq!(append(0), 32);
+        assert_eq!(append(3), 32 + 3 * 128);
+        // u128 at its natural 16-byte alignment.
+        assert_eq!(
+            size(WalOp::SnapshotDepthUpdate(SnapshotDepthUpdate {
+                id: 0,
+                new_depth: 0,
+                new_skiplist: [0; 3],
+                new_ancestor_bitmap: 0,
+            })),
+            48
+        );
+        // WorkKey (12) + pad, WorkValue (24), pending.
+        assert_eq!(
+            size(WalOp::ReconcileEnqueue(ReconcileEnqueue {
+                key: work_key(),
+                value: WorkValue {
+                    owner_kind: 0,
+                    attempt_count: 0,
+                    last_error: 0,
+                    enqueued_lsn: 0,
+                    owner_key: [0; 8],
+                },
+                pending: false,
+            })),
+            48
+        );
+    }
+
+    #[test]
+    fn snapshot_label_none_and_value_tail_bytes() {
+        let (_, payload) = WalOp::SnapshotCreate(SnapshotCreate {
+            new_id: 1,
+            parent_id: 2,
+            current_replacement: 3,
+            label: None,
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(payload, [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0xff, 0xff, 0, 0]);
+
+        // SetAttr: oid, key, u32 length 4, then [1, 42] as CBOR, zero-padded.
+        let (_, payload) = WalOp::SetAttr(SetAttr {
+            oid: 1,
+            key: 2,
+            value: Value::Int(42),
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            payload,
+            [
+                1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, //
+                0x82, 0x01, 0x18, 0x2a, 0, 0, 0, 0
+            ]
+        );
+    }
+
+    #[test]
+    fn a_2000_chunk_append_is_one_payload() {
+        let op = WalOp::AppendChunks(AppendChunks {
+            oid: 1,
+            start_offset: 0,
+            new_length: 2000 * 64 * 1024,
+            chunks: (0..2000).map(chunk_spec).collect(),
+        });
+        let (kind, payload) = op.encode().unwrap();
+        assert_eq!(payload.len(), 32 + 2000 * 128); // about 250 KiB
+        assert_eq!(WalOp::decode(kind, &payload).unwrap(), op);
+    }
+
+    #[test]
+    fn lengths_past_the_payload_are_rejected() {
+        let (kind, mut payload) = WalOp::WriteInline(WriteInline {
+            oid: 1,
+            content_hash: [0; 32],
+            data: vec![1; 8],
+        })
+        .encode()
+        .unwrap();
+        // Claim 9 bytes of data: the 8-byte tail ends the payload.
+        payload[40] = 9;
+        assert!(matches!(
+            WalOp::decode(kind, &payload),
+            Err(WalError::PayloadTruncated { .. })
+        ));
+
+        let (kind, mut payload) = WalOp::AppendChunks(AppendChunks {
+            oid: 1,
+            start_offset: 0,
+            new_length: 0,
+            chunks: vec![chunk_spec(0)],
+        })
+        .encode()
+        .unwrap();
+        payload[24] = 2;
+        assert!(matches!(
+            WalOp::decode(kind, &payload),
+            Err(WalError::PayloadTruncated { .. })
+        ));
+
+        // A head cut short.
+        assert!(matches!(
+            WalOp::decode(WalOpKind::AddRelation, &[0; 16]),
+            Err(WalError::PayloadTruncated { .. })
+        ));
+    }
+
+    #[test]
+    fn non_zero_padding_is_rejected() {
+        let (kind, payload) = WalOp::AddTag(AddTag { oid: 1, tag: 2 }).encode().unwrap();
+        // Trailing padding.
+        let mut trailing = payload.clone();
+        trailing[13] = 1;
+        assert!(matches!(
+            WalOp::decode(kind, &trailing),
+            Err(WalError::PayloadPaddingNotZero { offset: 13, .. })
+        ));
+        // A whole extra word is allowed only when zero.
+        let mut longer = payload.clone();
+        longer.extend_from_slice(&[0; 8]);
+        assert!(WalOp::decode(kind, &longer).is_ok());
+        longer[20] = 1;
+        assert!(matches!(
+            WalOp::decode(kind, &longer),
+            Err(WalError::PayloadPaddingNotZero { offset: 20, .. })
+        ));
+        // Padding between fields (after CreateObject.state there is none; use BucketAlloc's
+        // pad after disk_id).
+        let (kind, mut payload) = WalOp::BucketAlloc(BucketAlloc {
+            disk_id: 1,
+            bucket_no: 2,
+            kind: 3,
+            generation: 4,
+        })
+        .encode()
+        .unwrap();
+        payload[2] = 1;
+        assert!(matches!(
+            WalOp::decode(kind, &payload),
+            Err(WalError::PayloadPaddingNotZero { offset: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn malformed_fields_are_rejected() {
+        // A payload that is not whole words.
+        assert!(matches!(
+            WalOp::decode(WalOpKind::AddTag, &[0; 12]),
+            Err(WalError::PayloadNotWordAligned { length: 12, .. })
+        ));
+        // A bool other than 0 or 1.
+        let (kind, mut payload) = WalOp::ReconcileDequeue(ReconcileDequeue {
+            key: work_key(),
+            pending: true,
+        })
+        .encode()
+        .unwrap();
+        payload[12] = 2;
+        assert!(matches!(
+            WalOp::decode(kind, &payload),
+            Err(WalError::PayloadFieldInvalid { field: "bool" })
+        ));
+        // An owner key over 16 bytes, both ways.
+        let too_long = WalOp::ReconcileDropReplica(ReconcileDropReplica {
+            loc: block_ref(1),
+            owner_key: vec![0; 17],
+        });
+        assert!(matches!(
+            too_long.encode(),
+            Err(WalError::PayloadFieldTooLong { max: 16, .. })
+        ));
+        // A replica count past the set, and a used slot past the count.
+        let (kind, payload) = WalOp::WriteBlob(WriteBlob {
+            oid: 0,
+            content_hash: [0; 32],
+            size: 0,
+            extent_sum: 0,
+            replicas: replica_set(),
+        })
+        .encode()
+        .unwrap();
+        let mut bad_count = payload.clone();
+        bad_count[56] = 5;
+        assert!(matches!(
+            WalOp::decode(kind, &bad_count),
+            Err(WalError::PayloadFieldInvalid { .. })
+        ));
+        let mut short_count = payload.clone();
+        short_count[56] = 1;
+        assert!(matches!(
+            WalOp::decode(kind, &short_count),
+            Err(WalError::PayloadFieldInvalid { .. })
+        ));
+        // A NaN value cannot be written.
+        assert!(matches!(
+            WalOp::SetAttr(SetAttr {
+                oid: 1,
+                key: 2,
+                value: Value::Float(f64::NAN),
+            })
+            .encode(),
+            Err(WalError::Value(_))
+        ));
+        // Invalid UTF-8 in a label.
+        let (kind, mut payload) = WalOp::SnapshotCreate(SnapshotCreate {
+            new_id: 1,
+            parent_id: 0,
+            current_replacement: 0,
+            label: Some("ab".into()),
+        })
+        .encode()
+        .unwrap();
+        payload[16] = 0xff;
+        assert!(matches!(
+            WalOp::decode(kind, &payload),
+            Err(WalError::PayloadFieldInvalid { field: "label" })
+        ));
     }
 }

@@ -18,14 +18,13 @@
 //! | `RemoveRelation`       | `RemoveRelation`       |
 //! | `WriteBlob`            | `WriteBlob`            |
 //!
-//! The wider WAL universe (chunked-flow ops, snapshot lifecycle, bucket
-//! lifecycle, backpointers, reconcile, format-promote) is **not** generated
+//! The rest of the JOURNAL-DESIGN§1.3 ops (chunks, snapshots, buckets,
+//! reconcile, ontology, subscriptions, cluster support) are **not** generated
 //! by the current engine projection — those ops are written directly by their
 //! respective subsystems when they land. Replay nevertheless tolerates them
 //! by ignoring entries whose kind has no engine analogue.
 
-use mimisbrunnr_storage::BlockRef;
-use mimisbrunnr_types::{ObjectId, TagId, value_hash};
+use mimisbrunnr_types::{ObjectId, ObjectState, TagId, value_hash};
 use mimisbrunnr_journal::{
     AddRelation as WalAddRelation, AddTag as WalAddTag, CreateObject as WalCreateObject,
     DeleteObject as WalDeleteObject, RemoveAttr as WalRemoveAttr,
@@ -35,19 +34,15 @@ use mimisbrunnr_journal::{
 
 use crate::{Engine, EngineError, OpKind};
 
-/// Origin byte for the `Direct` provenance — matches JOURNAL-DESIGN§1.3 / SPECIFICATION-DESIGN§6.4.
-pub const TAG_ORIGIN_DIRECT: u8 = 0;
-/// Origin byte for the `Materialized` provenance.
-pub const TAG_ORIGIN_MATERIALIZED: u8 = 1;
-
 /// Project an engine `OpKind` into the equivalent WAL payload (`WalOp` carries
-/// both the kind discriminant and the CBOR payload).
+/// both the kind discriminant and the payload record).
 pub fn project_op(op: &OpKind) -> WalOp {
     match op {
+        // TODO(JOURNAL14): the initial state (`Active` or `Writing`) and its replay.
         OpKind::CreateObject { oid } => WalOp::CreateObject(WalCreateObject {
             oid: oid.to_u64(),
-            generation: 0,
             created_ns: 0,
+            state: ObjectState::Active as u8,
         }),
         OpKind::DeleteObject { oid } => WalOp::DeleteObject(WalDeleteObject {
             oid: oid.to_u64(),
@@ -56,7 +51,6 @@ pub fn project_op(op: &OpKind) -> WalOp {
         OpKind::AddTag { oid, tag } => WalOp::AddTag(WalAddTag {
             oid: oid.to_u64(),
             tag: tag.raw(),
-            origin: TAG_ORIGIN_DIRECT,
         }),
         OpKind::RemoveTag { oid, tag } => WalOp::RemoveTag(WalRemoveTag {
             oid: oid.to_u64(),
@@ -101,8 +95,10 @@ pub fn project_op(op: &OpKind) -> WalOp {
         } => WalOp::WriteBlob(WalWriteBlob {
             oid: oid.to_u64(),
             content_hash: *content_hash,
-            extent: BlockRef::new(0, 0, 0, 0).into(),
             size: *size,
+            // TODO(BLOB1): the written extent's checksum and replicas.
+            extent_sum: 0,
+            replicas: Default::default(),
         }),
     }
 }
@@ -162,27 +158,41 @@ pub fn replay_wal_op(
         }
         // Ops outside the engine's mutation surface — silently skipped during
         // replay. Each is owned by its own subsystem and recovered there.
-        WalOp::ChunkInsertBatch(_)
-        | WalOp::ChunkListAppend(_)
-        | WalOp::ChunkListReplace(_)
-        | WalOp::ChunkListShrink(_)
-        | WalOp::ChunkObjectFinalize(_)
+        WalOp::Checkpoint(_)
+        | WalOp::SetRelationAnnotation(_)
+        | WalOp::SetOrder(_)
+        | WalOp::RenumberSequence(_)
+        | WalOp::WriteInline(_)
+        | WalOp::AppendChunks(_)
+        | WalOp::ReplaceChunks(_)
+        | WalOp::TruncateChunks(_)
+        | WalOp::PackObjects(_)
+        | WalOp::FinalizeObject(_)
+        | WalOp::ReclaimTerms(_)
+        | WalOp::OntologyPut(_)
+        | WalOp::OntologyDelete(_)
+        | WalOp::SubscriptionPut(_)
+        | WalOp::SubscriptionDelete(_)
+        | WalOp::SubscriptionAck(_)
+        | WalOp::PeerPut(_)
+        | WalOp::PeerDelete(_)
+        | WalOp::TransferPut(_)
+        | WalOp::TransferDelete(_)
+        | WalOp::StageVerified(_)
         | WalOp::BucketAlloc(_)
         | WalOp::BucketGenBump(_)
         | WalOp::BucketDiscard(_)
-        | WalOp::BackpointerInsert(_)
-        | WalOp::BackpointerRemove(_)
-        | WalOp::TagBitmapGrow(_)
-        | WalOp::TagBitmapShrink(_)
         | WalOp::SnapshotCreate(_)
+        | WalOp::SnapshotSwitch(_)
         | WalOp::SnapshotDelete(_)
         | WalOp::SnapshotUnlink(_)
         | WalOp::SnapshotDepthUpdate(_)
         | WalOp::ReconcileEnqueue(_)
         | WalOp::ReconcileDequeue(_)
         | WalOp::ReconcileMove(_)
-        | WalOp::ReconcileScanStep(_)
-        | WalOp::Checkpoint(_) => {
+        | WalOp::ReconcileReplicate(_)
+        | WalOp::ReconcileDropReplica(_)
+        | WalOp::ReconcileScanStep(_) => {
             // Engine doesn't model these in the in-memory mirror; ignore.
         }
     }

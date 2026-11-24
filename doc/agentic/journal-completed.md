@@ -1,6 +1,7 @@
 # Journal (WAL) — completed
 
-- `WalOpKind::FormatPromote = 30` — removed by BTREE9, each run fixing its own key format; 30 is unassigned until JOURNAL8 renumbers.
+- `WalOpKind::FormatPromote` — removed by BTREE9, each run fixing its own key format.
 - JOURNAL1: one `JournalPin`, defined in `crates/storage/src/journal_pin.rs` and exported by `mimisbrunnr-storage`; `mimisbrunnr-journal` has no pin type of its own.
 - Read-only WAL ring open that rejects mutations — `crates/journal/src/ring.rs`, test `open_read_only_rejects_mutations`.
 - JOURNAL7: XXH3-64 (seed 0) through one `checksum64` / `Checksum64` in `crates/storage/src/checksum.rs` (tests `xxh3_64_known_vector`, `incremental_equals_one_shot`, `one_flipped_bit_changes_the_checksum`) for every checksum, WAL included; structures with 32-bit fields store its low half until their layouts are rewritten; `crc32c` and `crc32fast` gone from the workspace.
+- JOURNAL8: every JOURNAL-DESIGN§1.3 op is a binary payload record (`crates/journal/src/payload.rs` writer/reader with natural alignment and zero-padding checks; `op!` records in `crates/journal/src/entry.rs`), `Value` tails through the `types` codec, no `ciborium` or `serde` in `crates/journal`; `WalOpKind` 0–43 contiguous; tests `op_kinds_are_0_to_43_contiguous_in_table_order`, `every_op_kind_round_trips`, `add_tag_is_12_bytes_padded_to_16`, `records_have_their_listed_sizes`, `a_2000_chunk_append_is_one_payload`, `lengths_past_the_payload_are_rejected`, `non_zero_padding_is_rejected`, `malformed_fields_are_rejected`. `Checkpoint` carries the `RootPointer` image until ENGINE12 and `RemoveAttr` carries `key` + `value_hash` until INDEX12.

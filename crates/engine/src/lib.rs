@@ -42,6 +42,4 @@ pub use disk_engine::{DiskEngine, EngineStatus};
 pub use engine::{BlobWriteResult, Engine};
 pub use error::EngineError;
 pub use oplog::{DEFAULT_OPLOG_CAPACITY, OpKind, OpLog, OpLogEntry};
-pub use wal_proj::{
-    TAG_ORIGIN_DIRECT, TAG_ORIGIN_MATERIALIZED, engine_value_hash, project_op, replay_wal_op,
-};
+pub use wal_proj::{engine_value_hash, project_op, replay_wal_op};

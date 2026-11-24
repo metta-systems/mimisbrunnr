@@ -8,7 +8,9 @@ license.workspace = true
 [dependencies]
 arbitrary-int = { workspace = true }
 bitbybit = { workspace = true }
-ciborium = { workspace = true }
 serde = { workspace = true }
 siphasher = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+ciborium = { workspace = true }

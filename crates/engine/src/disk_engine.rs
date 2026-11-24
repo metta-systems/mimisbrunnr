@@ -190,7 +190,7 @@ use mimisbrunnr_types::{
     ChangeInterest, DiskId, ObjectId, Query, SubscriptionId, TagId, Value,
 };
 use mimisbrunnr_unix::PathProjection;
-use mimisbrunnr_journal::{Checkpoint, Wal, WalOpKind};
+use mimisbrunnr_journal::{Checkpoint, Wal, WalOp, WalOpKind};
 use mimisbrunnr_watch::{Retention, SubscriptionEngine};
 use serde::{Deserialize, Serialize};
 
@@ -704,11 +704,13 @@ impl DiskEngine {
         new_root.recompute_crc();
 
         // 3. Append checkpoint WAL entry.
-        let cp = Checkpoint::from_root(&new_root, 0);
+        let checkpoint = WalOp::Checkpoint(Checkpoint {
+            gc_reserve_buckets: 0,
+            root_pointer: new_root,
+        });
         let lsn = self.wal.append(
             self.primary_device.as_ref(),
-            WalOpKind::Checkpoint,
-            &cp,
+            &checkpoint,
             self.engine.clock.now(),
         )?;
 

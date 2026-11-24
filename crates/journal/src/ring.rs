@@ -16,13 +16,12 @@ use {
     log::trace,
     mimisbrunnr_storage::{BLOCK_SIZE, BlockDevice, checksum64},
     mimisbrunnr_types::HybridTimestamp as LogicalHybridTimestamp,
-    serde::Serialize,
 };
 
 use crate::{
     entry::{
         WAL_ENTRY_FLAG_COMPRESSED, WAL_ENTRY_FLAG_ENCRYPTED, WAL_FRAMING_CRC_LEN,
-        WAL_MAX_PAYLOAD_PLAINTEXT, WAL_SECTOR_SIZE, WalEntryHeader, WalOpKind,
+        WAL_MAX_PAYLOAD_PLAINTEXT, WAL_SECTOR_SIZE, WalEntryHeader, WalOp, WalOpKind,
     },
     error::WalError,
     header::WalHeader,
@@ -273,25 +272,21 @@ impl Wal {
 
     // ---------- Append ----------
 
-    /// Append a CBOR-serialised payload as a fresh entry. Returns the assigned
+    /// Append `op` as a fresh entry. Returns the assigned
     /// LSN. The producer supplies the `HybridTimestamp` (via the
     /// in-process HLC; see `mimisbrunnr-types`). Panics on `next_lsn`
     /// overflow per ENCRYPTION-DESIGN§1.
     pub fn append(
         &mut self,
         device: &dyn BlockDevice,
-        op_kind: WalOpKind,
-        payload: &impl Serialize,
+        op: &WalOp,
         ts: LogicalHybridTimestamp,
     ) -> Result<u64, WalError> {
-        // Serialise CBOR.
-        let mut payload_bytes: Vec<u8> = Vec::new();
-        ciborium::ser::into_writer(payload, &mut payload_bytes)?;
-        self.append_raw(device, op_kind, &payload_bytes, ts, 0)
+        let (op_kind, payload) = op.encode()?;
+        self.append_raw(device, op_kind, &payload, ts, 0)
     }
 
-    /// Append already-serialised payload bytes. Useful when the caller already
-    /// has the encoded CBOR (e.g. from `WalOp::encode`). `flags` bits other
+    /// Append already-encoded payload bytes (from `WalOp::encode`). `flags` bits other
     /// than `WAL_ENTRY_FLAG_*` are ignored; the encrypted/compressed bits are
     /// rejected (ENCRYPTION3, JOURNAL5).
     pub fn append_raw(
@@ -557,11 +552,19 @@ impl Iterator for WalIter<'_> {
 mod tests {
     use {
         super::*,
-        crate::entry::{CreateObject, WalOp},
+        crate::entry::CreateObject,
         mimisbrunnr_storage::{BlockDevice, FileBlockDevice},
         std::sync::Arc,
         tempfile::NamedTempFile,
     };
+
+    fn create_object(oid: u64) -> WalOp {
+        WalOp::CreateObject(CreateObject {
+            oid,
+            created_ns: 12345,
+            state: 0,
+        })
+    }
 
     /// Wraps an `Arc<dyn BlockDevice>` for tests where we want to call &dyn
     /// methods without dragging the file path around.
@@ -594,22 +597,14 @@ mod tests {
         let (_tmp, dev) = open_test_dev(size);
         let mut wal = Wal::format(&*dev, 0, size).unwrap();
 
-        let op = CreateObject {
-            oid: 0xdead_beef,
-            generation: 1,
-            created_ns: 12345,
-        };
-        let lsn = wal.append(&*dev, WalOpKind::CreateObject, &op, ts()).unwrap();
+        let op = create_object(0xdead_beef);
+        let lsn = wal.append(&*dev, &op, ts()).unwrap();
         assert_eq!(lsn, 1);
 
         let entries: Vec<WalEntry> = wal.iter_from(&*dev, 0).map(|r| r.unwrap()).collect();
         assert_eq!(entries.len(), 1);
         let kind = WalOpKind::from_u8(entries[0].header.op_kind).unwrap();
-        let decoded = WalOp::decode(kind, &entries[0].payload).unwrap();
-        match decoded {
-            WalOp::CreateObject(d) => assert_eq!(d, op),
-            _ => panic!("wrong op variant"),
-        }
+        assert_eq!(WalOp::decode(kind, &entries[0].payload).unwrap(), op);
     }
 
     #[test]
@@ -619,12 +614,7 @@ mod tests {
         let mut wal = Wal::format(&*dev, 0, size).unwrap();
         let mut last = 0u64;
         for i in 0..100u32 {
-            let op = CreateObject {
-                oid: i as u64,
-                generation: 0,
-                created_ns: 0,
-            };
-            let lsn = wal.append(&*dev, WalOpKind::CreateObject, &op, ts()).unwrap();
+            let lsn = wal.append(&*dev, &create_object(i as u64), ts()).unwrap();
             assert!(lsn > last, "lsn not monotonic at iter {i}");
             last = lsn;
         }
@@ -663,12 +653,7 @@ mod tests {
         let size = 16 * BLOCK_SIZE as u64;
         let (_tmp, dev) = open_test_dev(size);
         let mut wal = Wal::format(&*dev, 0, size).unwrap();
-        let op = CreateObject {
-            oid: 1,
-            generation: 0,
-            created_ns: 0,
-        };
-        wal.append(&*dev, WalOpKind::CreateObject, &op, ts()).unwrap();
+        wal.append(&*dev, &create_object(1), ts()).unwrap();
         // Corrupt one byte deep in the first data sector.
         let abs = 2 * BLOCK_SIZE as u64 + (core::mem::size_of::<WalEntryHeader>() as u64) + 2;
         let mut byte = [0u8; 1];
@@ -708,12 +693,7 @@ mod tests {
         let (_tmp, dev) = open_test_dev(size);
         let mut wal = Wal::format(&*dev, 0, size).unwrap();
         for i in 0..5u32 {
-            let op = CreateObject {
-                oid: i as u64,
-                generation: 0,
-                created_ns: 0,
-            };
-            wal.append(&*dev, WalOpKind::CreateObject, &op, ts()).unwrap();
+            wal.append(&*dev, &create_object(i as u64), ts()).unwrap();
         }
         let used_before = wal.used_bytes();
         let read_before = wal.read_cursor();
@@ -736,12 +716,7 @@ mod tests {
         let (_tmp, dev) = open_test_dev(size);
         let mut wal = Wal::format(&*dev, 0, size).unwrap();
         for i in 0..5u32 {
-            let op = CreateObject {
-                oid: i as u64,
-                generation: 0,
-                created_ns: 0,
-            };
-            wal.append(&*dev, WalOpKind::CreateObject, &op, ts()).unwrap();
+            wal.append(&*dev, &create_object(i as u64), ts()).unwrap();
         }
         let collected: Vec<u64> = wal
             .iter_from(&*dev, 3)
@@ -765,24 +740,22 @@ mod tests {
 
     #[test]
     fn hand_built_op_kind_decodes_to_right_variant() {
-        // Build a WriteBlob payload by hand and verify that supplying
-        // op_kind = 8 (the pinned discriminant) decodes to the right variant.
-        let payload = crate::entry::WriteBlob {
+        // A WriteBlob through the ring carries op_kind 12 (JOURNAL-DESIGN§1.3).
+        let size = 16 * BLOCK_SIZE as u64;
+        let (_tmp, dev) = open_test_dev(size);
+        let mut wal = Wal::format(&*dev, 0, size).unwrap();
+        let op = WalOp::WriteBlob(crate::entry::WriteBlob {
             oid: 7,
             content_hash: [0xaa; 32],
-            extent: mimisbrunnr_storage::BlockRef::new(0, 1, 0, 1).into(),
             size: 4096,
-        };
-        let mut bytes = Vec::new();
-        ciborium::ser::into_writer(&payload, &mut bytes).unwrap();
-
-        let kind = WalOpKind::from_u8(8).unwrap();
-        assert_eq!(kind, WalOpKind::WriteBlob);
-        let op = WalOp::decode(kind, &bytes).unwrap();
-        match op {
-            WalOp::WriteBlob(p) => assert_eq!(p, payload),
-            _ => panic!("wrong variant"),
-        }
+            extent_sum: 1,
+            replicas: Default::default(),
+        });
+        wal.append(&*dev, &op, ts()).unwrap();
+        let entry = wal.iter_from(&*dev, 0).next().unwrap().unwrap();
+        assert_eq!(entry.header.op_kind, 12);
+        let kind = WalOpKind::from_u8(entry.header.op_kind).unwrap();
+        assert_eq!(WalOp::decode(kind, &entry.payload).unwrap(), op);
     }
 
     #[test]

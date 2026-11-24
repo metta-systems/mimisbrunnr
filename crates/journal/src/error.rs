@@ -13,13 +13,37 @@ pub enum WalError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// CBOR encoding error.
-    #[error("cbor encode: {0}")]
-    CborEncode(String),
+    /// A payload that is not a whole number of 8-byte words.
+    #[error("op {op_kind} payload of {length} bytes is not a multiple of 8")]
+    PayloadNotWordAligned { op_kind: u8, length: usize },
 
-    /// CBOR decoding error.
-    #[error("cbor decode: {0}")]
-    CborDecode(String),
+    /// A payload whose fields, counts or lengths run past its end.
+    #[error("op {op_kind} payload needs {needed} bytes, has {available}")]
+    PayloadTruncated {
+        op_kind: u8,
+        needed: usize,
+        available: usize,
+    },
+
+    /// Padding inside or after a payload record that is not zero.
+    #[error("op {op_kind} payload has non-zero padding at byte {offset}")]
+    PayloadPaddingNotZero { op_kind: u8, offset: usize },
+
+    /// A payload field outside its allowed values.
+    #[error("invalid payload field {field}")]
+    PayloadFieldInvalid { field: &'static str },
+
+    /// A variable part longer than its cap.
+    #[error("payload field {field} is {length} long, max {max}")]
+    PayloadFieldTooLong {
+        field: &'static str,
+        length: usize,
+        max: usize,
+    },
+
+    /// An attribute `Value` tail that does not encode or decode (INDEX-DESIGN§1.1).
+    #[error("value: {0}")]
+    Value(#[from] mimisbrunnr_types::TypesError),
 
     /// Magic mismatch on a parse.
     #[error("invalid magic: expected {expected:?}, got {actual:?}")]
@@ -68,22 +92,4 @@ pub enum WalError {
     /// Mutating call attempted on a WAL opened read-only.
     #[error("wal is read-only")]
     ReadOnly,
-}
-
-impl<T> From<ciborium::ser::Error<T>> for WalError
-where
-    T: std::fmt::Debug,
-{
-    fn from(value: ciborium::ser::Error<T>) -> Self {
-        WalError::CborEncode(format!("{value:?}"))
-    }
-}
-
-impl<T> From<ciborium::de::Error<T>> for WalError
-where
-    T: std::fmt::Debug,
-{
-    fn from(value: ciborium::de::Error<T>) -> Self {
-        WalError::CborDecode(format!("{value:?}"))
-    }
 }

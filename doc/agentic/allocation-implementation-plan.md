@@ -4,7 +4,7 @@ Design: [allocation-design.md](allocation-design.md) · Decisions: [allocation-d
 
 ## Pointers and entries
 
-- [ ] **ALLOCATION10 — Derived live sectors.** `live_sectors` maintained through `BucketAllocTable::add_live_sectors` / `remove_live_sectors` from the data entries and checkpoint node accounting, and replayed from them (ALLOCATION-DESIGN§1.2). Prerequisites: [ENGINE3](engine-implementation-plan.md) (trees in allocated buckets), [JOURNAL8](journal-implementation-plan.md) (the data ops), [METADATA3](metadata-implementation-plan.md) (backpointers to recount from). Acceptance: write, delete and move a set of extents, crash before checkpoint, reopen: every bucket's `live_sectors` equals a recount from backpointers.
+- [ ] **ALLOCATION10 — Derived live sectors.** `live_sectors` maintained through `BucketAllocTable::add_live_sectors` / `remove_live_sectors` from the data entries and checkpoint node accounting, and replayed from them (ALLOCATION-DESIGN§1.2). Prerequisites: [ENGINE3](engine-implementation-plan.md) (trees in allocated buckets), [METADATA3](metadata-implementation-plan.md) (backpointers to recount from). Acceptance: write, delete and move a set of extents, crash before checkpoint, reopen: every bucket's `live_sectors` equals a recount from backpointers.
 
 ## Region allocation
 

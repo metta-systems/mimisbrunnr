@@ -59,7 +59,7 @@ const_assert_eq!(core::mem::offset_of!(BlobRef, length), 8);
 /// Holds two scalars (`seq`, `lsn`), 24 `BlockRef` slots, a `flags` word and
 /// a trailing checksum (low 32 bits of `checksum64`) over bytes `[0..404]`.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable, Debug, Default)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, Default, PartialEq, Eq)]
 pub struct RootPointer {
     pub seq: u64, // [0..8]   monotonic; larger seq wins
     pub lsn: u64, // [8..16]  WAL LSN this root corresponds to

@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 bytemuck = { workspace = true, features = ["min_const_generics"] }
-ciborium = { workspace = true }
 log = { workspace = true }
 mimisbrunnr-types = { workspace = true }
 serde = { workspace = true }
