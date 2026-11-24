@@ -163,8 +163,10 @@ records (ONTOLOGY-DESIGN§1). It is **positional**:
 
 **Versioning.** Every top-level CBOR record persisted outside the WAL — an ontology record, a
 subscription record, a placement rule — is an array whose element 0 is a `u16` schema version.
-Fields are only ever appended. A reader decodes every version up to its own, supplying each
-field an older version lacks from the default its format section documents; a version newer
+Fields are only ever appended. Every field of a record's first version is required and has no
+default; a field appended in a later version is listed with the default a reader supplies when
+an older record lacks it. A reader decodes every version up to its own, supplying each
+field an older version lacks from that default; a version newer
 than the reader knows is a defined error, governed by the FORMAT-DESIGN§15 feature flags.
 Rewriting a record always writes the current version, so records migrate in place as they are
 rewritten (FORMAT-DESIGN§15.4). Values nested inside a record (`Value`, a query AST) are
@@ -332,8 +334,17 @@ A downgrade to version `V` is **safe** when `V ≥ fs_min_on_disk` and all
 older binary can mount the pool as long as every record it might encounter is in a version it
 can read.
 
-`downgrade_log_ref` points to a small CBOR-encoded list of `(timestamp, feature_bits, fs_format_version)`
-tuples — the historical sequence of feature activations. An older binary consults this on mount
+`downgrade_log_ref` points to the historical sequence of feature activations, a positional,
+versioned CBOR record (FORMAT-DESIGN§1.6), schema version 1:
+
+```text
+DowngradeLog   = [version, entries: [DowngradeEntry]]   // oldest first
+DowngradeEntry = [time_ns: int,                          // when the feature was activated
+                  incompat_features: uint,               // the superblock's bits after it
+                  fs_format_version: uint]
+```
+
+An older binary consults this on mount
 to detect "this pool was once written with feature X" even if X has since been disabled — the
 data residue may still violate X's invariants. If any historical incompat feature is unknown
 to the binary, mount is refused.

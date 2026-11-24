@@ -236,12 +236,14 @@ SubscriptionRecord = [version,
                       cursor: uint,          // LSN of the last acknowledged event
                       cursor_ns: int,        // time of that journal entry
                       state: uint,           // 0 Active, 1 Dormant, 2 Overflowed
-                      max_events: uint,      // bound on pending events, ≥ 1; default 1024
+                      max_events: uint,      // bound on pending events, ≥ 1; 1024 unless set
+                                             //   at creation
                       debounce_ms: uint,
                       pending_count: uint,   // pending events (bulk entries count their objects)
                       switched_to: uint,     // Overflowed by a head switch: the snapshot switched
                                              //   to (SNAPSHOTS-DESIGN§1.8); 0 otherwise
-                      expire_after_s: uint,  // expiry period; 0 never, 7 776 000 (90 days) default
+                      expire_after_s: uint,  // expiry period; 0 never; 7 776 000 (90 days)
+                                             //   unless set at creation
                       last_active_ns: int]   // last poll or ack by the consumer
 ```
 

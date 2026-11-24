@@ -110,7 +110,7 @@ its id from the `PlacementRule` id counter (ENGINE-DESIGN§1.2). Each value is a
 versioned CBOR record (FORMAT-DESIGN§1.6), schema version 1:
 
 ```text
-RuleRecord = [version, kind: uint, params…]
+PlacementRuleRecord = [version, kind: uint, params…]
 ```
 
 `kind` is one byte split by family, so bit 7 alone says which family a rule belongs to and the
@@ -121,7 +121,26 @@ low seven bits are its variant index in that family's enum (SPECIFICATION-DESIGN
 | `0x00`–`0x7f` | placement: acted on by reconcile | `0x00` Pin, `0x01` Prefer, `0x02` Replicate, `0x03` Colocate, `0x04` AutoTier, `0x05` Chunk; `0x06`–`0x7f` reserved |
 | `0x80`–`0xff` | presence: node-local, never synced | `0x80` KeepLocal, `0x81` Stub, `0x82` Prefetch, `0x83` Evict; `0x84`–`0xff` reserved |
 
-A new rule takes the next free index in its own family. An unassigned `kind` is a decode error.
+A new rule takes the next free index in its own family. `params…` follow `kind` in the record
+array, in this order:
+
+```text
+0x00 Pin        [query: Query, tier: uint]
+0x01 Prefer     [query: Query, tier: uint, priority: uint]           // priority 0..=255
+0x02 Replicate  [query: Query, min_replicas: uint, across_disks: bool] // min_replicas 1..=255
+0x03 Colocate   [query: Query]
+0x04 AutoTier   [hot_threshold_days: uint, warm_threshold_days: uint, cold_after: uint]
+0x05 Chunk      [query: Query, chunking: bytes(16)]                   // ChunkParamsRecord (INDEX-DESIGN§4.3)
+0x80 KeepLocal  [query: Query]
+0x81 Stub       [query: Query, prefix_bytes: uint]
+0x82 Prefetch   [trigger: Query, group_key: bytes(16), threshold: uint, target: Query]
+                                                                      // group_key: the key's TagUid
+0x83 Evict      [query: Query, unused_ns: uint, keep_prefix: uint]
+```
+
+`Query` is the stored form (QUERY-DESIGN§1.2); `tier` is a `StorageTier` (0 hot, 1 warm, 2 cold,
+3 glacier). Integers outside their field's range, an unassigned `kind`, and an element count
+other than the one listed for the `kind` are decode errors.
 
 **Administrative changes commit by checkpoint.** Changes to the pool state record, the disk
 descriptors, placement rules and cluster peers have no journal ops. An administrative command

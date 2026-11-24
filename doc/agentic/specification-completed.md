@@ -8,3 +8,4 @@
 - SPEC2: BTREE-DESIGN§1.3 specifies `min_key` / `max_key` maintenance per write kind, without naming code.
 - SPEC3: SPECIFICATION-DESIGN§6.2–6.3 summarise the object record and its content locator (all content kinds, `modified_ns` / `state_ns`) and link METADATA-DESIGN§1.1–1.2.
 - SPEC9: SPECIFICATION-DESIGN§9.3 states the owner-derived HCTR2 tweaks (object, chunk hash, packed block) and how chunk deduplication precedes encryption.
+- SPEC25: every persisted CBOR record has a positional, versioned listing — `Query` (QUERY-DESIGN§1.2), ontology records and `StoragePolicy` (ONTOLOGY-DESIGN§1), `PlacementRuleRecord` with each kind's parameters (POOL-DESIGN§1.3), `SubscriptionRecord` (SUBSCRIPTIONS-DESIGN§1), `DowngradeLog` (FORMAT-DESIGN§15.5); FORMAT-DESIGN§1.6 states that first-version fields have no default. Still open with their owners: `Cursor` (CLUSTER-D7), `ScanRecord` kinds (RECONCILE9), `ErrorEntry.kind` (POOL-D5).
